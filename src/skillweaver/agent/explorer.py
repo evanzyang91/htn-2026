@@ -93,6 +93,7 @@ from skillweaver.contracts import (
     Critic,
     Drag,
     Element,
+    ElementKind,
     LLMClient,
     LLMMessage,
     Navigate,
@@ -125,7 +126,9 @@ from skillweaver.skills.api import SkillLimits, describe_action
 from skillweaver.skills.sandbox import SkillRunner
 
 __all__ = [
+    "CATALOG_LINES",
     "MAX_BLOCK_ACTIONS",
+    "RE_OBSERVE_AFTER",
     "PROMPT_PATH",
     "Attempt",
     "Diagnosis",
@@ -153,8 +156,64 @@ at the limit and the actions it already performed are kept and judged.
 RECENT_MOVES = 8
 """How many past moves of this run are quoted back to the model."""
 
+RE_OBSERVE_AFTER = 3
+"""Tries that reach the screen with nothing before it is read again.
+
+The loop reasons about the last observation, and only an action that lands produces a
+new one - so a frame that was wrong when it was taken stays wrong forever. That
+happens: a client-rendered application is complete before it is drawn, and an agent
+that reads it too early sees a blank page, proposes nothing that exists on it, and
+spends its entire budget on a screen that stopped being true in the first second.
+
+Three rather than one, because the common case for a refused move is a model that
+named an element badly, and re-reading an unchanged screen to tell it so would cost an
+observation on every ordinary mistake.
+"""
+
 NEIGHBOURS = 6
 """How many known outgoing edges of the current state are quoted back to the model."""
+
+CATALOG_LINES = 80
+"""Elements listed in the prompt. See :meth:`ElementCatalog.render` for what is kept.
+
+A dense screen in the shipped sandbox reports around 85 elements, of which about 30
+are controls, so this fits every control on every screen of it with room to spare -
+and when it does not, controls are what stays.
+"""
+
+_CONTROLS: frozenset[Any] = frozenset(
+    {
+        ElementKind.button,
+        ElementKind.text_field,
+        ElementKind.checkbox,
+        ElementKind.radio,
+        ElementKind.link,
+        ElementKind.menu,
+        ElementKind.tab,
+    }
+)
+"""Kinds an agent acts on directly. Listed before anything else."""
+
+_SECONDARY: frozenset[Any] = frozenset({ElementKind.row, ElementKind.icon})
+"""Kinds that are often clickable but come in crowds - a row per record, an icon
+inside every button. Listed after the controls and before the prose."""
+
+
+def _choose(items: Sequence[tuple[str, Element]], limit: int) -> set[str]:
+    """The ids to show, controls first, then the clickable crowd, then text."""
+    if len(items) <= limit:
+        return {name for name, _ in items}
+    keep: set[str] = set()
+    for tier in (_CONTROLS, _SECONDARY, None):
+        for name, element in items:
+            if len(keep) >= limit:
+                return keep
+            if name in keep:
+                continue
+            if tier is None or element.kind in tier:
+                keep.add(name)
+    return keep
+
 
 DEFAULT_MAX_TOKENS = 1024
 """Cap on an acting reply. The answer is a small JSON object; a long one is a symptom."""
@@ -273,19 +332,46 @@ class ElementCatalog:
         shown = ", ".join(self._ids[:limit])
         return shown + (", ..." if len(self._ids) > limit else "") if shown else "(none)"
 
-    def render(self, limit: int = 60) -> str:
-        """The element list as the prompt shows it, one line per element."""
+    def render(self, limit: int = CATALOG_LINES) -> str:
+        """The element list as the prompt shows it, one line per element.
+
+        A busy screen has more elements than belong in a prompt, so some are left
+        out - but WHICH ones is the whole question. Leaving out the tail of reading
+        order, which is what this did first, hides whatever a page draws last: a
+        dialog, a compose window, the save bar under a long form. Those are exactly
+        the controls a task is about, and an element the agent cannot see is an
+        element it cannot act on, so the run fails with the button on the screen.
+
+        Controls are therefore listed first and text is what gets dropped. Missing a
+        paragraph costs nothing - OCR read it, and it is in the screenshot the model
+        is also shown - while missing the Send button ends the run. Within the
+        selection, reading order is preserved, because where things are relative to
+        each other is most of what a list of boxes says.
+        """
         if not self._by_id:
             return "  (perception found nothing on this screen)"
+        items = list(self._by_id.items())
+        keep = _choose(items, limit)
         lines = []
-        for name, element in list(self._by_id.items())[:limit]:
+        for name, element in items:
+            if name not in keep:
+                continue
             box = element.box
             text = f" {element.text!r}" if element.text else ""
             lines.append(
                 f"  [{name}] {element.kind.value}{text} at ({box.x},{box.y}) {box.w}x{box.h}"
             )
-        if len(self._by_id) > limit:
-            lines.append(f"  ... and {len(self._by_id) - limit} more")
+        dropped = len(items) - len(keep)
+        if dropped:
+            controls = sum(
+                1 for name, element in items if name not in keep and element.kind in _CONTROLS
+            )
+            lines.append(
+                f"  ... and {dropped} more, none of them controls"
+                if not controls
+                else f"  ... and {dropped} more, {controls} of them control(s) - this screen "
+                "has more on it than fits here"
+            )
         return "\n".join(lines)
 
 
@@ -655,9 +741,25 @@ class Explorer:
         self._remember_state(task, run.current)
         run.skills = self._retrieve(task)
 
+        stale = 0
         while True:
             if self._exhausted(run):
                 return
+            if stale >= RE_OBSERVE_AFTER:
+                # Nothing has reached the screen for several tries, so the picture
+                # being reasoned about may simply be out of date - a page that was
+                # still drawing when it was first read, an application that moved on
+                # by itself. Re-reading costs one observation and is the only way out:
+                # without it the loop asks about the same stale frame until its budget
+                # is gone, which is a transient turned into a total failure.
+                stale = 0
+                run.current = self._perceiver.observe(controller)
+                run.rejection = (
+                    "nothing your last few moves proposed reached the screen, so it has "
+                    "been read again - the elements below are what is on it now"
+                )
+                self._remember_state(task, run.current)
+                continue
             catalog = ElementCatalog(run.current.elements)
             answer = self._ask(task, run, catalog)
             try:
@@ -665,12 +767,15 @@ class Explorer:
                 self._refuse_repeat(move, run)
             except _Invalid as exc:
                 self._reject(run, exc, answer)
+                stale += 1
                 continue
             if self._exhausted(run):
                 return
+            before = run.current
             self._make_move(task, move, catalog, controller, run)
             if run.ok:
                 return
+            stale = 0 if run.current is not before else stale + 1
 
     def _make_move(
         self,

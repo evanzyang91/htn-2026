@@ -934,12 +934,36 @@ def _one_run(
     report: Any = None
     error = ""
 
+    # Ground truth as it stood the moment the task finished. Learning is not a passive
+    # observer: the admission gate puts the world BACK to re-run the candidate skill,
+    # so a run that archived a message and then taught a skill about it leaves the
+    # message un-archived if that replay fails. Scoring after ``run`` returned therefore
+    # scored the gate's leftovers and reported a task that was done as not done.
+    finished_state: dict[str, Any] = {}
+
+    def snapshot() -> None:
+        # The agent is handed this callable, not the referee. It takes nothing and
+        # returns nothing, so no fact about the world can travel through it INTO the
+        # agent - the ground-truth boundary is unchanged.
+        if finished_state:
+            return
+        try:
+            finished_state["state"] = dict(referee.state())
+        except SkillWeaverError as exc:
+            log.warning("eval.snapshot.failed", task=task.id, attempt=attempt, error=str(exc))
+
     try:
         with workbench.session(spec, budget) as agent:
             run_start = time.perf_counter()
             # The referee is NOT in scope for the agent: it is never placed on the
             # spec, never passed to the session, and never reachable from `agent`.
-            report = agent.run(spec, learn=(phase == "cold"), warm=(phase == "warm"), cold=True)
+            report = agent.run(
+                spec,
+                learn=(phase == "cold"),
+                warm=(phase == "warm"),
+                cold=True,
+                on_finished=snapshot,
+            )
             wall_ms = (time.perf_counter() - run_start) * 1000.0
     except Exception as exc:  # a broken run is one failed measurement, not a lost suite
         error = f"{type(exc).__name__}: {exc}"
@@ -951,7 +975,7 @@ def _one_run(
     after = meter() if meter is not None else None
 
     try:
-        verdict = score(task, referee.state())
+        verdict = score(task, finished_state.get("state") or referee.state())
     except SkillWeaverError as exc:
         verdict = Score(ok=False, results=())
         error = error or f"the referee could not read the application state: {exc}"

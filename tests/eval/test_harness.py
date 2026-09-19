@@ -170,13 +170,25 @@ class FakeAgent:
     behaviour: Behaviour
     task_id: str
 
-    def run(self, spec: Any, *, learn: bool = True, warm: bool = True, cold: bool = True) -> Any:
+    def run(
+        self,
+        spec: Any,
+        *,
+        learn: bool = True,
+        warm: bool = True,
+        cold: bool = True,
+        on_finished: Any = None,
+    ) -> Any:
         self.app.events.append(f"run:{self.task_id}")
         if self.behaviour.raises:
             raise SkillWeaverError(self.behaviour.raises)
         time.sleep(self.behaviour.seconds)
         if self.behaviour.mutate is not None:
             self.behaviour.mutate(self.app.state)
+        # Where the real agent calls it: the task is done, nothing has been learned
+        # from it yet, and the world still shows what the task achieved.
+        if on_finished is not None:
+            on_finished()
         return FakeReport(
             ok=self.behaviour.claims_ok,
             llm_calls=self.behaviour.llm_calls,
@@ -245,6 +257,86 @@ def a_suite(*tasks: EvalTask, warm_runs: int = 3) -> Suite:
 # --------------------------------------------------------------------------------------
 # The reset: the assertion the whole report rests on
 # --------------------------------------------------------------------------------------
+
+
+def test_a_task_is_scored_on_what_it_achieved_not_on_what_learning_left_behind() -> None:
+    """Learning is not a passive observer of the world.
+
+    The admission gate puts the application BACK and re-runs the candidate skill
+    there, to prove the skill works. So by the time ``run`` returns, the screen shows
+    whatever that replay left - and when the replay fails, it shows a world with the
+    task undone. Scoring then reported a task that was demonstrably done as not done,
+    and a cold run that worked went into the report as a failure.
+
+    The agent calls ``on_finished`` when the task is finished and before anything is
+    learned from it, and that is the moment the referee is read. Here the fake agent
+    does the task and the fake gate then wipes it, which is the shape of the live
+    failure exactly.
+    """
+    app = FakeApp()
+
+    def solve_then_have_learning_wipe_it(state: dict[str, Any]) -> None:
+        state["screen"] = "records"
+
+    bench = FakeWorkbench(
+        app,
+        script={
+            ("open_records", 1): Behaviour(
+                mutate=solve_then_have_learning_wipe_it,
+                decision="cold",
+                learned="a_new_skill",
+                skill_used=None,
+            )
+        },
+    )
+    # The gate's reset, standing in for the real one: it happens after the agent has
+    # called on_finished, and it undoes the task.
+    wrapped = _LearningWipesTheWorld(bench, app)
+
+    record = run_task(
+        a_task(), workbench=wrapped, referee=FakeReferee(app), suite=a_suite(), warm_runs=0
+    )
+
+    assert app.state["screen"] == "mail", "the gate really did undo the task"
+    assert record.runs[0].ok, "and the run is still scored on what it achieved"
+
+
+@dataclass(slots=True)
+class _LearningWipesTheWorld:
+    """A workbench whose agents undo the task while learning from it.
+
+    Exactly what the real admission gate does: it resets the application so it can
+    re-run the candidate skill where the recording stood.
+    """
+
+    inner: Any
+    app: FakeApp
+
+    @property
+    def store(self) -> Any:
+        return self.inner.store
+
+    @property
+    def data_dir(self) -> Path:
+        return self.inner.data_dir
+
+    @contextlib.contextmanager
+    def session(self, spec: Any, budget: Any) -> Iterator[Any]:
+        with self.inner.session(spec, budget) as agent:
+            yield _WipesAfterFinishing(agent, self.app)
+
+
+@dataclass(slots=True)
+class _WipesAfterFinishing:
+    """An agent whose learning step undoes the task, as the admission gate's reset does."""
+
+    inner: Any
+    app: FakeApp
+
+    def run(self, spec: Any, **kwargs: Any) -> Any:
+        report = self.inner.run(spec, **kwargs)
+        self.app.state["screen"] = "mail"  # the gate resetting the world to re-run
+        return report
 
 
 def test_the_app_is_reset_before_every_single_run() -> None:

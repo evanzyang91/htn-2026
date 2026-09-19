@@ -135,6 +135,43 @@ _SCROLL_QUIET_JS = """
 """
 
 
+_PAINT_QUIET_MS = 60
+"""How long the document may go unchanged before a page counts as drawn.
+
+``document.readyState === "complete"`` means the DOCUMENT has arrived, which on a
+client-rendered application says nothing about whether anything has been drawn: the
+markup is an empty root element and the content appears later, when a fetch returns.
+That is most applications, so an agent that captured on ``complete`` would regularly
+read a blank page - and the sandbox in this repository is one of them.
+"""
+
+_PAINT_QUIET_DEADLINE_MS = 2_500
+"""Hard ceiling on waiting to be drawn. A page that mutates forever - a clock, a
+progress bar, an animation - must not wedge the controller, so running out of time
+means waiting is over, not that anything failed."""
+
+_PAINT_QUIET_JS = """
+([quietMs, deadlineMs]) => new Promise((resolve) => {
+  const start = performance.now();
+  let lastChange = start;
+  const observer = new MutationObserver(() => { lastChange = performance.now(); });
+  observer.observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true, characterData: true,
+  });
+  const tick = () => {
+    const now = performance.now();
+    if (now - lastChange >= quietMs || now - start >= deadlineMs) {
+      observer.disconnect();
+      resolve(Math.round(now - start));
+    } else {
+      setTimeout(tick, 16);
+    }
+  };
+  setTimeout(tick, 16);
+})
+"""
+
+
 class BrowserController:
     """Playwright-backed eyes and hands on one browser page.
 
@@ -218,6 +255,12 @@ class BrowserController:
             self._page = self._context.new_page()
             if start_url is not None:
                 self._page.goto(start_url, timeout=self._navigation_timeout_ms)
+                # The same settle every other navigation gets. Without it the first
+                # capture of the session can catch an application that has loaded its
+                # document but not yet drawn anything - and an agent that starts by
+                # reading a blank page has no control to act on, so it never acts,
+                # never re-reads, and spends its whole budget on an empty screen.
+                self._settle(self._page)
         except Exception as exc:
             # A half-built controller still owns an OS process; do not leak it.
             self.close()
@@ -444,6 +487,24 @@ class BrowserController:
         """
         page.evaluate(_SCROLL_QUIET_JS, [_SCROLL_QUIET_MS, _SCROLL_QUIET_DEADLINE_MS])
 
+    def _await_paint_quiet(self, page: Page) -> None:
+        """Block until the document has stopped changing for a short quiet period.
+
+        A page whose content arrives from a fetch is complete long before it is drawn,
+        and a capture taken in between shows an agent an empty screen with nothing to
+        act on. Watching for mutations settles that for any application rather than
+        for one that happens to announce itself; a page that never stops changing is
+        released by the deadline.
+
+        Failures are swallowed on purpose: a context that vanished under the probe is
+        a navigation, which the caller is already looping on, and an engine without
+        ``MutationObserver`` should degrade to the old behaviour rather than break.
+        """
+        try:
+            page.evaluate(_PAINT_QUIET_JS, [_PAINT_QUIET_MS, _PAINT_QUIET_DEADLINE_MS])
+        except PlaywrightError:
+            return
+
     def _settle(self, page: Page) -> None:
         """Give the page its moment to react, and to finish arriving if the action
         sent it somewhere.
@@ -457,6 +518,12 @@ class BrowserController:
         On a page that is already idle this costs one round trip. A page that
         never finishes loading must not wedge the controller, so running out of
         ``settle_timeout_ms`` means settling is done, not that anything failed.
+
+        Arriving is not the same as being drawn. ``readyState`` reaching ``complete``
+        says the DOCUMENT is here, and on a client-rendered application the document
+        is an empty root element whose content appears when a fetch returns. So the
+        wait ends on the document going quiet - see :data:`_PAINT_QUIET_JS` - rather
+        than on it having loaded.
         """
         if self._settle_ms > 0:
             page.wait_for_timeout(self._settle_ms)
@@ -465,6 +532,7 @@ class BrowserController:
         while True:
             try:
                 if page.evaluate("() => document.readyState") == "complete":
+                    self._await_paint_quiet(page)
                     return
             except PlaywrightError:
                 # The context vanished under the probe: a navigation just

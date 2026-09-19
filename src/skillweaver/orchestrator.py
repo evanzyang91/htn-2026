@@ -82,7 +82,7 @@ from skillweaver.contracts import (
     TrajectoryStore,
     utcnow,
 )
-from skillweaver.errors import BudgetExceeded, SkillWeaverError
+from skillweaver.errors import BudgetExceeded, SkillNotFound, SkillWeaverError
 from skillweaver.graph.model import InMemorySiteGraph
 from skillweaver.graph.store import JSONGraphStore
 from skillweaver.logging_ import get_logger
@@ -113,6 +113,7 @@ __all__ = [
     "build_agent",
     "budget_from",
     "build_workbench",
+    "end_state_of",
     "navigating_environment",
     "recall_end_state",
     "task_spec",
@@ -415,7 +416,13 @@ class Agent:
     # -- the decision ------------------------------------------------------------------
 
     def run(
-        self, task: TaskSpec, *, learn: bool = True, warm: bool = True, cold: bool = True
+        self,
+        task: TaskSpec,
+        *,
+        learn: bool = True,
+        warm: bool = True,
+        cold: bool = True,
+        on_finished: Callable[[], None] | None = None,
     ) -> RunReport:
         """Do ``task`` and report which path did it.
 
@@ -426,6 +433,18 @@ class Agent:
                 exploration, which is what ``learn`` on the command line wants.
             cold: Whether exploration may be tried. ``False`` makes this a
                 library-only run that reports honestly when the library falls short.
+            on_finished: Called once, after the task has been attempted and BEFORE
+                anything is learned from it. It takes no arguments and its return
+                value is ignored, so nothing about the world can travel through it
+                INTO this agent - which is what lets an evaluation use it while its
+                ground truth stays out of reach.
+
+                It exists because learning is not a passive observer of the world:
+                the admission gate puts the world BACK and re-runs the candidate
+                skill there, so by the time :meth:`run` returns, the screen shows
+                whatever that replay left rather than what the task achieved. A
+                caller that wants to know what the task did has to look at this
+                moment, and there is no other one.
 
         Returns:
             A :class:`RunReport`. A failure is a report, not an exception.
@@ -434,6 +453,11 @@ class Agent:
             ControllerError: if the controller breaks mid-run.
             ProviderError: if a model call fails outright.
         """
+
+        def finished() -> None:
+            if on_finished is not None:
+                on_finished()
+
         candidates = self._retrieve(task)
         attempts: list[AttemptRecord] = []
 
@@ -441,6 +465,7 @@ class Agent:
             record, outcome = self._try_warm(task)
             attempts.append(record)
             if record.ok and outcome is not None:
+                finished()
                 self._persist()
                 return RunReport(
                     ok=True,
@@ -455,6 +480,7 @@ class Agent:
                 # The planner lets BudgetExceeded escape so an exhausted run STOPS.
                 # Exploring now would spend money the run has already been told it
                 # does not have.
+                finished()
                 self._persist()
                 return RunReport(
                     ok=False,
@@ -465,6 +491,7 @@ class Agent:
                 )
 
         if not cold:
+            finished()
             return RunReport(
                 ok=False,
                 task=task,
@@ -475,6 +502,9 @@ class Agent:
 
         record, outcome = self._try_cold(task)
         attempts.append(record)
+        # Before learning, not after: the admission gate resets the world to re-run
+        # the candidate, so what the task achieved is only visible from here.
+        finished()
         learned, admission, note = self._learn(task, outcome, enabled=learn)
         self._persist()
         return RunReport(
@@ -708,15 +738,32 @@ def recall_end_state(
         return None
     skills = [c.skill for c in candidates] or store.list(domain=task.domain)
     for skill in skills:
-        run_id = skill.provenance.trajectory_id
-        if not run_id:
-            continue
-        try:
-            trajectory = _load_light(trajectories, run_id)
-        except SkillWeaverError:
-            continue
-        if trajectory.ok and trajectory.steps:
-            return trajectory.steps[-1].after.fingerprint
+        found = end_state_of(trajectories, skill)
+        if found is not None:
+            return found
+    return None
+
+
+def end_state_of(trajectories: TrajectoryStore | None, skill: Skill) -> Fingerprint | None:
+    """The screen the run that taught ``skill`` ended on, or ``None``.
+
+    The per-skill form of :func:`recall_end_state`, and the one a judgment should use
+    once it is known WHICH skill ran. Guessing from retrieval's top candidate is fine
+    before anything has run and wrong afterwards: with a library of one they are the
+    same skill, and with a library of fourteen the critic ends up holding some other
+    task's finishing screen and rejecting a warm run that did exactly what it should.
+    """
+    if trajectories is None:
+        return None
+    run_id = skill.provenance.trajectory_id
+    if not run_id:
+        return None
+    try:
+        trajectory = _load_light(trajectories, run_id)
+    except SkillWeaverError:
+        return None
+    if trajectory.ok and trajectory.steps:
+        return trajectory.steps[-1].after.fingerprint
     return None
 
 
@@ -1001,6 +1048,18 @@ def build_agent(
     if expected is None:
         log.info("agent.warm.no_end_state", task=task.text, domain=task.domain)
 
+    def end_state_for(name: str) -> Fingerprint | None:
+        """Where the run that taught ``name`` ended.
+
+        Consulted once a plan has run, so the judgment is made against the screen the
+        skill that ACTUALLY ran finished on rather than against ``expected`` above,
+        which is retrieval's best guess from before anything happened.
+        """
+        try:
+            return end_state_of(trajectories, store.get(name, task.domain))
+        except SkillNotFound:
+            return None
+
     planner = Planner(
         store=store,
         retriever=retriever,
@@ -1012,6 +1071,7 @@ def build_agent(
         composer=Composer(llm, store, graph=graph) if compose else None,
         budget=budget,
         top_k=top_k,
+        end_states=end_state_for,
     )
     explorer = Explorer(
         llm,

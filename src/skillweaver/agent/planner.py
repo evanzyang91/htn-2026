@@ -60,7 +60,7 @@ controller are not evidence against a skill either.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -68,6 +68,7 @@ from skillweaver.agent.compose import Composer, Decomposition
 from skillweaver.contracts import (
     Action,
     Budget,
+    Candidate,
     Controller,
     Critic,
     Fingerprint,
@@ -90,7 +91,12 @@ from skillweaver.contracts import (
     Verdict,
     utcnow,
 )
-from skillweaver.errors import ControllerError, PerceptionError, SkillNotFound
+from skillweaver.errors import (
+    ControllerError,
+    PerceptionError,
+    SkillNotFound,
+    SkillWeaverError,
+)
 from skillweaver.graph.route import VERIFIED_ONLY, RoutingPolicy, find_route
 from skillweaver.logging_ import get_logger
 from skillweaver.skills.api import LimitExceeded
@@ -166,6 +172,10 @@ class Planner:
         max_candidates: How many of them to try to build a plan from, best first.
             A candidate is skipped when its arguments cannot be bound from the task
             or when no route to its precondition is known.
+        end_states: Looks up, by skill name, the screen the run that TAUGHT that skill
+            ended on. Used to judge a finished plan against the right screen rather
+            than against whichever skill retrieval happened to rank first; see
+            :meth:`_judge`. ``None`` leaves the critic as it was built.
     """
 
     __slots__ = (
@@ -173,6 +183,7 @@ class Planner:
         "_composer",
         "_controller",
         "_critic",
+        "_end_states",
         "_graph",
         "_last_failure",
         "_max_candidates",
@@ -199,6 +210,7 @@ class Planner:
         budget: Budget | None = None,
         top_k: int = 5,
         max_candidates: int = 3,
+        end_states: Callable[[str], Fingerprint | None] | None = None,
     ) -> None:
         self._store = store
         self._retriever = retriever
@@ -212,6 +224,7 @@ class Planner:
         self._budget = budget if budget is not None else Budget()
         self._top_k = top_k
         self._max_candidates = max_candidates
+        self._end_states = end_states
         self._last_failure: PlanFailure | None = None
 
     def __repr__(self) -> str:
@@ -276,7 +289,7 @@ class Planner:
             return None
 
         after = self._observe()
-        verdict = self._critic.judge(task.text, observation, after)
+        verdict = self._judge(task, used, observation, after)
         if not verdict.ok:
             self._last_failure = self._reject(task, used, verdict)
             return None
@@ -307,18 +320,39 @@ class Planner:
 
     def _build(self, task: TaskSpec, observation: Observation) -> tuple[Plan | None, Usage]:
         """``(plan, model usage)``. The usage is zero on every warm single-skill hit,
-        which is the whole point of separating this from :meth:`_perform`."""
+        which is the whole point of separating this from :meth:`_perform`.
+
+        Candidates are considered best-first, and a candidate is only RUN when nothing
+        that retrieval liked better is merely waiting to be told its arguments. That
+        rule is the difference between a fast path and a wrong one: a general skill
+        that takes no parameters - ``open_records_screen`` - binds trivially against
+        every task, so the first version of this loop skipped the skill the task was
+        actually about (because the sentence had not been read for its arguments yet)
+        and went off and opened the Records screen instead. It then had to be judged,
+        rejected and rescued by exploration, which is slower than never having run it
+        and leaves the user looking at a screen they did not ask for.
+
+        Reading the arguments out of the sentence is exactly what the composer is for,
+        so a better candidate that cannot be bound sends the plan there rather than
+        letting a worse one act.
+        """
         self._last_failure = None
         candidates = self._retriever.search(task.text, domain=task.domain, k=self._top_k)
 
         reasons: list[str] = []
         stage: FailureStage = "no_candidates"
+        ready: tuple[Candidate, dict[str, Any], Route] | None = None
+        outranked = False
         for candidate in candidates[: self._max_candidates]:
             skill = candidate.skill
             args = _bind_args(skill, task)
             if args is None:
                 stage = "unbindable_args"
                 reasons.append(f"{skill.name}: task supplies no value for a required parameter")
+                if ready is None:
+                    # Retrieval put this one ahead of anything runnable so far, and the
+                    # only thing it lacks is its arguments.
+                    outranked = True
                 continue
             route = self._route_to(observation.fingerprint, skill.precondition)
             if route is None:
@@ -328,23 +362,38 @@ class Planner:
                     f"to its start screen {skill.precondition.value!r}"  # type: ignore[union-attr]
                 )
                 continue
-            log.info(
-                "planner.hit",
-                task=task.text,
-                skill=skill.name,
-                score=round(candidate.score, 3),
-                route_steps=len(route.steps),
-            )
-            return (
-                Plan(
-                    steps=(*route.steps, SkillCall(skill.name, skill.domain, args)),
-                    skills_used=(skill.name,),
-                    estimated_ms=route.cost + skill.stats.mean_ms,
-                ),
-                Usage(),
-            )
+            if ready is None:
+                ready = (candidate, args, route)
+            if not outranked:
+                break
 
+        if ready is not None and not outranked:
+            return self._single(task, *ready), Usage()
+
+        # Outranked: the composer is the only thing that can turn the better candidate
+        # into a call, so it gets the chance. If it cannot, the answer is to decline -
+        # NOT to run the worse skill anyway. Declining hands a clean screen to the
+        # explorer, which can read the sentence; running the wrong errand performs
+        # something nobody asked for and still needs rescuing afterwards.
         return self._compose(task, observation, stage, reasons)
+
+    def _single(
+        self, task: TaskSpec, candidate: Candidate, args: dict[str, Any], route: Route
+    ) -> Plan:
+        """The plan that walks a route and runs one stored skill."""
+        skill = candidate.skill
+        log.info(
+            "planner.hit",
+            task=task.text,
+            skill=skill.name,
+            score=round(candidate.score, 3),
+            route_steps=len(route.steps),
+        )
+        return Plan(
+            steps=(*route.steps, SkillCall(skill.name, skill.domain, args)),
+            skills_used=(skill.name,),
+            estimated_ms=route.cost + skill.stats.mean_ms,
+        )
 
     def _compose(
         self,
@@ -497,6 +546,37 @@ class Planner:
         return None
 
     # -- verdict and bookkeeping --------------------------------------------------------
+
+    def _judge(
+        self, task: TaskSpec, used: list[str], before: Observation, after: Observation
+    ) -> Verdict:
+        """Judge the finished plan, against where the LAST skill that ran should end.
+
+        The critic this planner was built with carries an expected screen guessed
+        before anything ran - from whichever skill retrieval liked best, because at
+        that point nothing better is known. Once a plan has actually run, which skill
+        it was is no longer a guess, and using the guess instead is how a warm run that
+        did its job exactly gets rejected: with a library of one they are the same
+        skill, and with a library of fourteen the critic is holding some other task's
+        finishing screen.
+
+        Falls back to the critic as built whenever the end state cannot be looked up or
+        the critic cannot be specialised, so this is an improvement on the evidence
+        rather than a dependency.
+        """
+        expected = self._end_state_for(used)
+        rebind = getattr(self._critic, "for_end_state", None)
+        critic = self._critic if expected is None or rebind is None else rebind(expected)
+        return critic.judge(task.text, before, after)
+
+    def _end_state_for(self, used: list[str]) -> Fingerprint | None:
+        """Where the run that taught the last skill in the chain ended."""
+        if self._end_states is None or not used:
+            return None
+        try:
+            return self._end_states(used[-1])
+        except SkillWeaverError:
+            return None
 
     def _reject(self, task: TaskSpec, used: list[str], verdict: Verdict) -> PlanFailure:
         """Report a critic that says the task is not done.

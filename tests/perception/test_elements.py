@@ -491,15 +491,17 @@ def test_a_fused_row_says_every_line_printed_inside_it() -> None:
 
     merged = merge_elements([row], [sender, subject, preview])
 
-    assert len(merged) == 1
-    only = merged[0]
-    assert only.kind is ElementKind.button and only.box == row.box, "the click target is the row"
-    assert only.text == (
+    fused = next(e for e in merged if e.box == row.box)
+    assert fused.kind is ElementKind.button, "the click target is still the row"
+    assert fused.text == (
         "Billing Invoice 4471 is ready Invoice 4471 for the March hosting term is available."
     )
     index = ElementIndex(merged)
     assert index.find_text("Billing"), "the sender is findable"
     assert index.find_text("Invoice 4471 is ready"), "the subject is findable"
+    # The short lines are also kept where they are printed, because a row is far
+    # larger than a word on it and something drawn over one is not part of it.
+    assert {e.box for e in merged if e.source is ElementSource.ocr} == {sender.box, subject.box}
 
 
 def test_a_fused_control_does_not_repeat_a_line_it_reads_twice() -> None:
@@ -529,6 +531,107 @@ def test_a_very_wordy_control_is_cut_after_the_identifying_lines() -> None:
     assert text.startswith("Northwind IT ")
     assert len(text) <= MERGED_TEXT_LIMIT
     assert text.endswith("…")
+
+
+def test_a_paragraph_does_not_fuzzily_answer_a_two_word_query() -> None:
+    """A sentence containing one of the words is not the control you asked for.
+
+    On the live sandbox the settings page explains "Changes are not applied until you
+    confirm them", and a search for "Save changes" matched that paragraph - because a
+    bare "changes" scores 0.74 against the query. The agent clicked the explanation,
+    never scrolled to the save bar, and the task failed with the button on the page.
+    """
+    prose = _element(
+        Box(289, 109, 466, 21),
+        ElementKind.text,
+        "Preferences for this console. Changes are not applied until you confirm them.",
+    )
+    button = _element(Box(817, 705, 120, 32), ElementKind.button, "Savechanges")
+    index = ElementIndex([prose, button])
+
+    hits = index.find_text("Save changes")
+
+    assert [e.kind for e in hits] == [ElementKind.button], (
+        "only the button, and the OCR-run-together label still matches fuzzily"
+    )
+
+
+def test_a_single_word_query_still_matches_one_word_inside_a_line() -> None:
+    """The narrowing is about multi-word queries: a one-word query is still answered
+    by one word, which is what absorbs OCR mangling a word in the middle of a line."""
+    row = _element(Box(0, 0, 400, 20), ElementKind.row, "Subrnit order now")
+    assert ElementIndex([row]).find_text("Submit")
+
+
+def test_a_glyph_inside_a_field_does_not_adopt_the_fields_label() -> None:
+    """ "Tightest container" has to mean tightest CONTAINER.
+
+    The magnifier drawn inside the mail search box is fourteen pixels wide, and by a
+    symmetric overlap measure it "contains" the placeholder printed beside it. Giving
+    it the words left the search box with no text at all, and nothing on screen could
+    be found by asking for it.
+    """
+    field = _element(Box(1026, 61, 239, 33), ElementKind.text_field, "", 0.8, ElementSource.yolo)
+    glyph = _element(Box(1037, 70, 14, 15), ElementKind.icon, "", 0.7, ElementSource.yolo)
+    label = _element(
+        Box(1040, 68, 90, 16), ElementKind.text, "Search mail", 0.95, ElementSource.ocr
+    )
+
+    merged = merge_elements([field, glyph], [label])
+    hit = ElementIndex(merged).find_text("Search mail")[0]
+
+    assert hit.kind is ElementKind.text_field and hit.box == field.box
+
+
+def test_a_word_on_a_large_surface_stays_pointable_where_it_is_printed() -> None:
+    """The bulk-status menu on the live sandbox, which is where this came from.
+
+    Its items were not detected as boxes at all, so every item's text fell into the
+    wide table row drawn underneath it. With only the row to offer, clicking "Paused"
+    meant clicking the middle of a record - which sets no status and is not what
+    anybody asked for. The word is kept where it is printed as well.
+    """
+    row = _element(Box(0, 268, 1222, 45), ElementKind.row, "", 0.80, ElementSource.yolo)
+    item = _element(Box(320, 280, 62, 18), ElementKind.text, "Paused", 0.95, ElementSource.ocr)
+
+    merged = merge_elements([row], [item])
+    hit = ElementIndex(merged).find_text("Paused")[0]
+
+    assert hit.box == item.box, "the click lands on the word, not the middle of the row"
+    assert any(e.box == row.box and "Paused" in e.text for e in merged), (
+        "and the row still says what is printed on it, so a search for the row finds it"
+    )
+
+
+def test_a_button_is_not_split_from_its_own_label() -> None:
+    """The rule is about surfaces far larger than the word, not about every container:
+    a button is a few times the area of its label and stays one element."""
+    button = _element(Box(8, 64, 182, 36), ElementKind.button, "", 0.85, ElementSource.yolo)
+    label = _element(Box(60, 72, 78, 18), ElementKind.text, "Compose", 0.95, ElementSource.ocr)
+
+    merged = merge_elements([button], [label])
+
+    assert len(merged) == 1
+    assert merged[0].box == button.box and merged[0].text == "Compose"
+
+
+def test_a_label_joins_the_innermost_control_that_contains_it() -> None:
+    """An overlay's text must not be claimed by whatever it was drawn on top of.
+
+    A label menu opened over a message list puts "Travel" inside both the menu item
+    and the row behind it. The word is the menu item's; a merge that gave it to the
+    row left nothing on screen to click, and the agent could not apply a label that
+    was plainly visible.
+    """
+    row = _element(Box(240, 113, 970, 79), ElementKind.button, "", 0.80, ElementSource.yolo)
+    item = _element(Box(375, 131, 177, 31), ElementKind.button, "", 0.80, ElementSource.yolo)
+    label = _element(Box(390, 138, 60, 16), ElementKind.text, "Travel", 0.95, ElementSource.ocr)
+
+    merged = merge_elements([row, item], [label])
+
+    by_box = {e.box: e.text for e in merged}
+    assert by_box[item.box] == "Travel", "the menu item keeps its own label"
+    assert by_box[row.box] == "", "the row behind it does not take the word"
 
 
 def test_merge_keeps_two_genuinely_separate_elements() -> None:

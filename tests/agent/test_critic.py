@@ -84,12 +84,16 @@ def make_obs(
     )
 
 
-def fingerprints(matching: int, total: int = 10) -> tuple[Fingerprint, Fingerprint]:
+def fingerprints(
+    matching: int, total: int = 10, *, differing: int | None = None
+) -> tuple[Fingerprint, Fingerprint]:
     """Two distinct fingerprints whose ``similarity`` is exactly ``matching / total``.
 
     Lets a test land a score precisely inside or outside the ambiguity band around
     ``SAME_STATE_THRESHOLD`` without depending on what any real screen happens to hash to.
     """
+    if differing is not None:
+        total, matching = matching, matching - differing
     left = {f"p{i}": "same" for i in range(total)}
     right = {f"p{i}": ("same" if i < matching else "other") for i in range(total)}
     return Fingerprint("left", left), Fingerprint("right", right)
@@ -100,6 +104,15 @@ def band_pair() -> tuple[Observation, Observation]:
     left, right = fingerprints(6)
     assert left.similarity(right) == pytest.approx(0.6)
     return make_obs((element("a"),), fingerprint=left), make_obs((element("b"),), fingerprint=right)
+
+
+def incomparable_pair() -> tuple[Observation, Observation]:
+    """Two different fingerprints that share no parts, so how alike they are cannot be
+    measured - the one case a change check honestly cannot answer."""
+    return (
+        make_obs((element("a"),), fingerprint=Fingerprint("a")),
+        make_obs((element("b"),), fingerprint=Fingerprint("b")),
+    )
 
 
 ERROR_BANNER = element("Error: the payment was declined. Please try again.", y=200)
@@ -118,7 +131,7 @@ class TestCheckVerdict:
         assert len(result.reason) > 10, "a reason a human can read"
 
     def test_unknown_is_distinct_from_no(self) -> None:
-        before, after = band_pair()
+        before, after = incomparable_pair()
         unknown = C.state_changed()(before, after)
         no = C.state_changed()(before, before)
         assert unknown.outcome is C.Outcome.unknown
@@ -136,11 +149,29 @@ class TestCheckVerdict:
 
 
 class TestStateChanged:
-    def test_unknown_inside_the_ambiguity_band(self) -> None:
+    def test_a_screen_that_is_mostly_the_same_still_counts_as_changed(self) -> None:
+        """ "Did anything happen?" is not "is this still the same screen?".
+
+        Typing a name into a form leaves you on the same page with nearly the same
+        pixels - a same-state comparison says yes, it is still the settings screen -
+        and a step that reported that as "nothing changed" called a successful form
+        fill a failure and refused to do the next step. Only an indistinguishable
+        pair means nothing happened.
+        """
         before, after = band_pair()
+        assert before.fingerprint.similarity(after.fingerprint) == pytest.approx(0.6)
         result = C.state_changed()(before, after)
-        assert result.outcome is C.Outcome.unknown
-        assert "ambiguity band" in result.reason
+        assert result.outcome is C.Outcome.passed
+        assert "the screen changed" in result.reason
+
+    def test_a_single_differing_chunk_is_not_a_change(self) -> None:
+        """Slack for a frame that is the same picture measured slightly differently -
+        a caret, an anti-aliased edge - without which the veto would never fire."""
+        left, right = fingerprints(60, differing=1)
+        before = make_obs(fingerprint=left)
+        after = make_obs(fingerprint=right)
+        assert left.similarity(right) >= C.UNCHANGED_SIMILARITY
+        assert C.state_changed()(before, after).outcome is C.Outcome.failed
 
     def test_unknown_when_the_fingerprints_have_no_comparable_parts(self) -> None:
         before = make_obs(fingerprint=Fingerprint("a"))
@@ -164,9 +195,16 @@ class TestStateChanged:
 
 
 class TestStateUnchanged:
-    def test_unknown_inside_the_ambiguity_band(self) -> None:
-        before, after = band_pair()
-        assert C.state_unchanged()(before, after).outcome is C.Outcome.unknown
+    def test_it_is_the_exact_mirror_of_state_changed(self) -> None:
+        """Whatever one calls a change, the other calls the absence of one - including
+        the one case neither can answer."""
+        for pair in (band_pair(), incomparable_pair(), (make_obs(), make_obs())):
+            changed = C.state_changed()(*pair)
+            unchanged = C.state_unchanged()(*pair)
+            if changed.outcome is C.Outcome.unknown:
+                assert unchanged.outcome is C.Outcome.unknown
+            else:
+                assert changed.ok is not unchanged.ok
 
     def test_passes_when_nothing_moved(self, scenario: Scenario) -> None:
         result = C.state_unchanged()(observe(scenario, "list"), observe(scenario, "list"))

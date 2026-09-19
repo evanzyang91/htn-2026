@@ -60,6 +60,7 @@ from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 
 __all__ = [
     "AMBIGUITY_MARGIN",
+    "UNCHANGED_SIMILARITY",
     "ERROR_PHRASES",
     "Check",
     "CheckVerdict",
@@ -173,6 +174,55 @@ def _comparable(a: Fingerprint, b: Fingerprint) -> bool:
     return bool(set(a.parts) | set(b.parts))
 
 
+UNCHANGED_SIMILARITY = 0.98
+"""Above this, two observations are taken to be the same picture, not merely the same
+screen.
+
+A fingerprint is a few dozen chunks and similarity is the fraction of them that agree,
+so a single differing chunk on a busy screen already scores around ``0.96``: this is
+"everything agrees" with just enough slack for a frame that is genuinely identical to
+be scored by a different number of parts. Anything below it is a real, visible
+difference - one field now has text in it, one row is highlighted - which is precisely
+what a step is supposed to produce.
+
+Deliberately NOT :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`, which
+answers a different question. That one is ``0.62``, so using it here declared every
+form fill, every checkbox tick and every menu opening to be a step that did nothing.
+"""
+
+
+def _difference(
+    left: Fingerprint, right: Fingerprint, unchanged_above: float
+) -> tuple[Outcome, float, str]:
+    """``(outcome, similarity, detail)`` for "is anything different?".
+
+    ``failed`` means nothing is, ``passed`` means something is, and ``unknown`` is kept
+    for the one case where the question cannot be answered: two fingerprints that differ
+    but share no comparable parts, where a similarity of zero is an artefact of having
+    nothing to line up rather than evidence of change.
+    """
+    if left == right:
+        return Outcome.failed, 1.0, "the fingerprints are identical"
+    similarity = left.similarity(right)
+    if not _comparable(left, right):
+        return (
+            Outcome.unknown,
+            similarity,
+            "the fingerprints differ but carry no comparable parts, so whether the "
+            "screen changed cannot be measured",
+        )
+    detail = f"similarity {similarity:.3f} against an unchanged floor of {unchanged_above:.2f}"
+    if similarity >= unchanged_above:
+        return Outcome.failed, similarity, detail
+    return Outcome.passed, similarity, detail
+
+
+def _difference_confidence(similarity: float) -> float:
+    """How sure a change verdict is: certain at identical or wholly different, and
+    least sure in between, where a couple of chunks disagree."""
+    return _clamp(0.8 + 0.2 * abs(1.0 - 2.0 * _clamp(similarity)))
+
+
 @dataclass(frozen=True, slots=True)
 class _SameState:
     """Shared machinery: is ``left`` the same UI state as ``right``?
@@ -215,46 +265,61 @@ class _SameState:
 
 @dataclass(frozen=True, slots=True)
 class state_changed:  # noqa: N801 - a check reads as a verb at the call site
-    """Passes when ``after`` is a different UI state from ``before``.
+    """Passes when anything about the screen is different.
 
     The workhorse negative: a step that left the screen exactly as it found it did not
     do anything, whatever the model would like to say about it.
+
+    "Different" here means *perceptibly* different, not *a different screen*. Those are
+    two questions and answering this one with the other is how a critic starts calling
+    real work a failure: typing a name into a form leaves you on the same settings page
+    - same layout, same URL, almost the same pixels - and a check that asked "is this
+    still the settings page?" would answer yes and report that nothing happened. It did
+    happen, and the next step depends on it. Whether two screens are the SAME STATE is
+    :class:`matches_state`'s question, and it keeps :data:`AMBIGUITY_MARGIN` for it.
     """
 
-    threshold: float = SAME_STATE_THRESHOLD
-    margin: float = AMBIGUITY_MARGIN
+    unchanged_above: float = UNCHANGED_SIMILARITY
     name: str = field(default="state_changed", init=False)
 
     def __call__(self, before: Observation, after: Observation) -> CheckVerdict:
-        outcome, _, confidence, detail = _SameState(self.threshold, self.margin).compare(
-            before.fingerprint, after.fingerprint
+        outcome, similarity, detail = _difference(
+            before.fingerprint, after.fingerprint, self.unchanged_above
         )
         if outcome is Outcome.unknown:
             return _unknown(self.name, f"cannot tell whether the screen changed: {detail}")
-        if outcome is Outcome.passed:  # same state -> the screen did NOT change
-            return _failed(self.name, f"the screen did not change: {detail}", confidence)
-        return _passed(self.name, f"the screen changed: {detail}", confidence)
+        if outcome is Outcome.failed:
+            return _failed(
+                self.name,
+                f"the screen did not change: {detail}",
+                _difference_confidence(similarity),
+            )
+        return _passed(
+            self.name, f"the screen changed: {detail}", _difference_confidence(similarity)
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class state_unchanged:  # noqa: N801
-    """Passes when ``after`` is the same UI state as ``before``.
+    """Passes when nothing about the screen is different.
 
-    The mirror of :class:`state_changed`, for a step whose whole point is that nothing
-    moved - dismissing a tooltip, or a no-op guard.
+    The exact mirror of :class:`state_changed`, for a step whose whole point is that
+    nothing moved - dismissing a tooltip, or a no-op guard. Like its mirror it asks
+    whether anything is perceptibly different, not whether this is still the same
+    screen; for that, use :class:`matches_state`.
     """
 
-    threshold: float = SAME_STATE_THRESHOLD
-    margin: float = AMBIGUITY_MARGIN
+    unchanged_above: float = UNCHANGED_SIMILARITY
     name: str = field(default="state_unchanged", init=False)
 
     def __call__(self, before: Observation, after: Observation) -> CheckVerdict:
-        outcome, _, confidence, detail = _SameState(self.threshold, self.margin).compare(
-            before.fingerprint, after.fingerprint
+        outcome, similarity, detail = _difference(
+            before.fingerprint, after.fingerprint, self.unchanged_above
         )
         if outcome is Outcome.unknown:
             return _unknown(self.name, f"cannot tell whether the screen changed: {detail}")
-        if outcome is Outcome.passed:
+        confidence = _difference_confidence(similarity)
+        if outcome is Outcome.failed:
             return _passed(self.name, f"the screen did not change: {detail}", confidence)
         return _failed(self.name, f"the screen changed: {detail}", confidence)
 

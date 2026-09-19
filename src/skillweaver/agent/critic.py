@@ -188,7 +188,9 @@ class TieredCritic:
             so this is deliberately tight.
 
     The configuration is per-critic because :meth:`judge`'s signature is fixed by the
-    Protocol. Use :meth:`expecting` to derive a critic for one particular step.
+    Protocol. Use :meth:`expecting` to derive a critic with extra evidence for one
+    particular step, and :meth:`for_end_state` to derive one that expects a different
+    finishing screen.
     """
 
     def __init__(
@@ -206,6 +208,8 @@ class TieredCritic:
         self._max_tokens = max_tokens
         self._require_change = require_change
         self._check_errors = check_errors
+        self._expected_state = expected_state
+        self._extra_evidence: tuple[Check, ...] = tuple(evidence)
         derived: list[Check] = []
         if expected_state is not None:
             derived.append(matches_state_check(expected_state))
@@ -216,6 +220,27 @@ class TieredCritic:
         if check_errors:
             built.append(no_error_state())
         self._vetoes: tuple[Check, ...] = (*built, *vetoes)
+
+    def for_end_state(self, expected_state: Fingerprint | None) -> TieredCritic:
+        """A copy of this critic expecting a DIFFERENT screen. Shares the model.
+
+        Not :meth:`expecting`, which adds evidence and keeps what was already there.
+        This REPLACES the expected screen, which is what a caller needs once it knows
+        something the critic was built too early to know - most of all which stored
+        skill a warm run actually ran, and therefore where that run should finish.
+        Keeping both screens would demand the run end in two places at once, and it
+        would fail every time.
+        """
+        clone = TieredCritic(
+            self._llm,
+            evidence=self._extra_evidence,
+            expected_state=expected_state,
+            require_change=self._require_change,
+            check_errors=self._check_errors,
+            max_tokens=self._max_tokens,
+        )
+        clone._vetoes = self._vetoes
+        return clone
 
     def expecting(
         self, *evidence: Check, expected_state: Fingerprint | None = None

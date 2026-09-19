@@ -210,6 +210,7 @@ def build(
     *,
     critic: FakeCritic | None = None,
     compose: bool = False,
+    end_states: Any = None,
 ) -> Planner:
     """A planner wired to the fake app.
 
@@ -227,6 +228,7 @@ def build(
         controller=scenario.controller,
         perceiver=scenario.perceiver,
         composer=Composer(llm, store, graph=graph) if compose else None,
+        end_states=end_states,
     )
 
 
@@ -370,6 +372,63 @@ def test_a_skill_whose_arguments_the_task_cannot_supply_is_not_run(
     assert planner.last_failure is not None
     assert planner.last_failure.stage == "unbindable_args"
     assert performed(scenario) == []
+
+
+OPEN_ANYTHING = plant(
+    "open_the_invoice_list",
+    "Open the invoice list. Takes no arguments.",
+    "def run(ctx):\n    return True\n",
+    precondition=LIST,
+    docstring="Opens the invoice list from anywhere.",
+)
+"""A general, argument-free skill - the kind that quietly matches every task.
+
+It binds against anything, because there is nothing to bind, so a planner that ran
+the first candidate it COULD invoke would run this one on its way past whatever the
+task was really about.
+"""
+
+
+def test_a_better_skill_waiting_for_its_arguments_is_not_preempted_by_a_worse_one(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The failure this rule exists for, measured on the live sandbox.
+
+    ``pay_invoice`` is what the task is about but its ``company`` is still inside the
+    sentence; ``open_the_invoice_list`` needs no arguments and so binds instantly.
+    Running the one that binds means performing the wrong errand on a real screen and
+    then needing a critic to notice - slower than never having run it, and the user is
+    left looking at something they did not ask for.
+
+    With no composer wired, the right answer is to decline and say the arguments are
+    the problem, so the explorer can take over.
+    """
+    store.put(PAY_INVOICE)
+    store.put(OPEN_ANYTHING)
+    planner = build(scenario, store, graph, fake_llm)
+    task = TaskSpec(text="Confirm payment of the Acme Corp invoice.", domain=DOMAIN, params={})
+
+    assert planner.attempt(task, look(scenario)) is None
+    assert performed(scenario) == [], "nothing was performed, least of all the wrong skill"
+    assert planner.last_failure is not None
+    assert planner.last_failure.stage == "unbindable_args"
+    assert fake_llm.calls == 0
+
+
+def test_the_argument_free_skill_still_runs_when_it_is_the_best_match(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The rule is about rank, not about arguments: a skill that needs none is run
+    whenever nothing retrieval liked better is merely waiting to be told its own."""
+    store.put(PAY_INVOICE)
+    store.put(OPEN_ANYTHING)
+    planner = build(scenario, store, graph, fake_llm)
+    task = TaskSpec(text="Open the invoice list.", domain=DOMAIN, params={})
+
+    plan = planner.plan(task, look(scenario))
+    assert plan is not None
+    assert plan.skills_used == ("open_the_invoice_list",)
+    assert fake_llm.calls == 0
 
 
 # -- routing ------------------------------------------------------------------------------------
@@ -685,3 +744,44 @@ def test_a_repaired_version_makes_the_warm_path_work_again(
     assert store.get("pay_invoice", DOMAIN).demoted_reason is None
     assert scenario.solved
     assert fake_llm.calls == 0
+
+
+def test_the_verdict_is_measured_against_the_skill_that_actually_ran(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Which screen a warm run should finish on depends on which skill ran.
+
+    The critic is built before anything runs, so its expected screen is a guess taken
+    from whichever skill retrieval ranked first. With one skill in the library that
+    guess is always right; with fourteen it is usually some other task's finishing
+    screen, and a warm run that did its job exactly is rejected for landing in the
+    wrong place. Once a plan has run, the skill is known, and the known thing wins.
+    """
+    store.put(PAY_INVOICE)
+    asked: list[str] = []
+
+    def end_states(name: str) -> Fingerprint:
+        asked.append(name)
+        return DONE  # where the run that taught pay_invoice really ended
+
+    planner = build(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        # Built expecting the WRONG screen, as it would be when another skill outranks
+        # this one. Nothing else tells the planner otherwise.
+        critic=TieredCritic(None, expected_state=LIST),
+        end_states=end_states,
+    )
+    task = TaskSpec(
+        text="Confirm payment of the Acme Corp invoice.",
+        domain=DOMAIN,
+        params={"company": "Acme Corp"},
+    )
+
+    outcome = planner.attempt(task, look(scenario))
+
+    assert outcome is not None and outcome.ok, "judged against where THIS skill ends"
+    assert asked == ["pay_invoice"]
+    assert outcome.spend.llm_calls == 0, "and still without a model"

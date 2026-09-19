@@ -236,12 +236,62 @@ def _candidates(query: str, text: str) -> list[str]:
     return out
 
 
+WORD_MATCH_RATIO = 0.7
+"""How alike two words must be for one to be taken as the other, spelling aside.
+
+Used by :func:`_says_every_word`, which is a gate rather than a score, so this is
+loose on purpose: it only has to recognise OCR mangling a word, not rank anything.
+A single wrong character is always forgiven regardless, because on a short word it
+drags the ratio below any useful threshold - "Nxw" against "New" scores 0.67.
+"""
+
+
+def _says_every_word(query: str, candidate: str) -> bool:
+    """Whether every word of a multi-word query is somewhere in ``candidate``.
+
+    Character similarity alone cannot tell "Save changes" from "Changes are": they
+    share seven letters in a row, which scores 0.71 - comfortably above the fuzzy
+    floor - while sharing only one of the two words that were asked for. On the live
+    sandbox that made a paragraph reading "Changes are not applied until you confirm
+    them" answer a search for the save button, and the agent clicked the paragraph
+    instead of scrolling to the button.
+
+    Asking that each word be THERE is the test that distinguishes them, and it costs
+    nothing real: the commonest OCR artefact is running words together, and every word
+    of the query is still a substring of "Savechanges".
+
+    The caller also applies it the other way round - is everything this element says
+    part of the query? - but only against an element's WHOLE text, because OCR splits
+    labels as often as it joins them: a button reading "New Invoice" can arrive as two
+    elements, and an element that says only "Invoice" says nothing "New Invoice" does
+    not. A word carved out of the middle of a paragraph is a different thing entirely,
+    which is why that direction is not offered to the windows.
+    """
+    words = [w for w in candidate.split(" ") if w]
+    for wanted in query.split(" "):
+        if not wanted or wanted in candidate:
+            continue
+        if not any(
+            difflib.SequenceMatcher(None, wanted, word).ratio() >= WORD_MATCH_RATIO
+            or _levenshtein_within(wanted, word, 1)
+            for word in words
+        ):
+            return False
+    return True
+
+
 def _fuzzy_similarity(query: str, text: str) -> float:
     """Best similarity in ``0.0..1.0`` between ``query`` and any sensible piece of ``text``."""
     allowance = _edit_allowance(len(query))
+    every_word = " " in query
     best = 0.0
     for candidate in _candidates(query, text):
         if not candidate:
+            continue
+        if every_word and not (
+            _says_every_word(query, candidate)
+            or (candidate == text and _says_every_word(candidate, query))
+        ):
             continue
         ratio = difflib.SequenceMatcher(None, query, candidate).ratio()
         if allowance and ratio < 0.9 and _levenshtein_within(query, candidate, allowance):
@@ -415,9 +465,28 @@ class ElementIndex:
     def _order(self, element: Element) -> int:
         return self._rank.get(id(element), 0)
 
-    def _ranked(self, scored: list[tuple[float, Element]]) -> list[Element]:
-        """Sort by score descending, breaking ties by reading order for determinism."""
-        scored.sort(key=lambda pair: (-pair[0], self._order(pair[1])))
+    def _ranked(
+        self, scored: list[tuple[float, Element]], *, tightest_first: bool = False
+    ) -> list[Element]:
+        """Sort by score descending, breaking ties by reading order for determinism.
+
+        ``tightest_first`` adds a tie-break the LITERAL searches want: two elements can
+        match the same text equally well when one is printed inside the other - a menu
+        item over a table row, a word on a card - and the smaller one is the better
+        answer to "where is this text". It is where the words actually are, and a point
+        inside it is inside the larger one too, so choosing it can only be more precise.
+
+        :meth:`best` does not use it. There the question is which element a description
+        MEANS, and the smallest scrap of matching text on the screen is not
+        automatically the answer.
+        """
+        scored.sort(
+            key=lambda pair: (
+                -pair[0],
+                pair[1].box.area if tightest_first else 0,
+                self._order(pair[1]),
+            )
+        )
         return [element for _, element in scored]
 
     # -- contracts.ElementIndex ----------------------------------------------------
@@ -449,7 +518,7 @@ class ElementIndex:
             score = _text_score(q, text, fuzzy=fuzzy)
             if score > 0:
                 scored.append((score, element))
-        return self._ranked(scored)
+        return self._ranked(scored, tightest_first=True)
 
     def nearest(self, point: Point, kind: ElementKind | None = None) -> list[Element]:
         """Elements by distance from ``point`` to their box, nearest first.
@@ -575,6 +644,16 @@ _TEXT_TRUST: dict[ElementSource, int] = {
     ElementSource.yolo: 0,
 }
 
+STANDALONE_RATIO = 8.0
+"""How much bigger than a text line a control must be before the line is ALSO kept
+as an element of its own. See :func:`_pointable`.
+
+A button is a few times the area of its own label - ``Compose`` measures about five -
+so at eight nothing that is genuinely one control is split. A table row is fifty times
+the area of a word printed on it, and something drawn on top of that row is not part
+of it at all.
+"""
+
 MERGED_TEXT_LIMIT = 160
 """Characters kept when a fused control's lines are joined; see :func:`_fused_text`.
 
@@ -598,6 +677,22 @@ def overlap_ratio(a: Box, b: Box) -> float:
     if smaller <= 0:
         return 0.0
     return (ix * iy) / smaller
+
+
+def _holds(outer: Box, inner: Box, containment: float) -> bool:
+    """Whether ``inner`` really sits inside ``outer``, rather than merely touching it.
+
+    :func:`overlap_ratio` divides by the SMALLER box, which is the right question for
+    "are these the same thing" and the wrong one for "which of these holds the other":
+    by that measure a magnifier glyph 14 pixels wide "contains" the whole search field
+    it sits in. Dividing by the inner box asks the directional question, which is what
+    picking the tightest container needs.
+    """
+    if inner.area <= 0:
+        return False
+    ix = max(0, min(outer.x + outer.w, inner.x + inner.w) - max(outer.x, inner.x))
+    iy = max(0, min(outer.y + outer.h, inner.y + inner.h) - max(outer.y, inner.y))
+    return (ix * iy) / inner.area >= containment
 
 
 def _same_thing(a: Element, b: Element, iou: float, containment: float) -> bool:
@@ -653,12 +748,24 @@ def merge_elements(
     )
     clusters: list[list[Element]] = []
     for element in seeded:
+        # The INNERMOST match, not the first. A line of text can sit inside more than
+        # one control at once - most obviously when something is drawn on top of
+        # something else - and it belongs to the tightest one, the way a click does.
+        # Taking the first match instead let a menu opened over a list hand its item
+        # labels to the rows underneath it: the popover said "Travel" on screen and
+        # the only element carrying that word was the message row behind it.
+        best: list[Element] | None = None
+        best_holds = False
         for cluster in clusters:
-            if _same_thing(cluster[0], element, iou, containment):
-                cluster.append(element)
-                break
-        else:
+            if not _same_thing(cluster[0], element, iou, containment):
+                continue
+            holds = _holds(cluster[0].box, element.box, containment)
+            if best is None or (holds, -cluster[0].box.area) > (best_holds, -best[0].box.area):
+                best, best_holds = cluster, holds
+        if best is None:
             clusters.append([element])
+        else:
+            best.append(element)
 
     merged: list[Element] = []
     for cluster in clusters:
@@ -680,7 +787,43 @@ def merge_elements(
             source=ElementSource.merged,
         )
         merged.append(dataclasses.replace(fused, stable_id=stable_id(fused)))
+        merged.extend(_pointable(cluster, seed))
     return reading_order(merged)
+
+
+def _pointable(cluster: Sequence[Element], seed: Element) -> list[Element]:
+    """Text lines kept as elements of their own as well as being fused into ``seed``.
+
+    A word printed on a large surface is still a thing you can point at, and where it
+    is printed is the only place pointing at it works. Fusing gives the cluster the
+    seed's box, which is right for a button and its label - clicking anywhere on the
+    button is clicking the button - and wrong the moment the surface is much bigger
+    than the word: a menu drawn over a table has its items swallowed by the rows
+    underneath, and clicking the middle of a row that happens to contain the word
+    "Paused" sets no status at all.
+
+    So above :data:`STANDALONE_RATIO` the line is ALSO emitted where it really is. The
+    fused element still carries the word, so a search still finds the container; it
+    just no longer has only the container to offer.
+
+    Only for lines that came from reading text. A control fused into another control
+    is two detections of one thing, and emitting it twice would double-count a real
+    click target.
+    """
+    kept: list[Element] = []
+    for element in cluster[1:]:
+        if element.source is not ElementSource.ocr or element.kind is not ElementKind.text:
+            continue
+        if not normalize_text(element.text) or element.box.area <= 0:
+            continue
+        if seed.box.area < element.box.area * STANDALONE_RATIO:
+            continue
+        kept.append(
+            element
+            if element.stable_id is not None
+            else dataclasses.replace(element, stable_id=stable_id(element))
+        )
+    return kept
 
 
 def _fused_text(cluster: Sequence[Element], fallback: str) -> str:

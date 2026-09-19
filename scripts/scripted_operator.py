@@ -50,6 +50,7 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from skillweaver.contracts import LLMMessage, LLMResponse, Usage
@@ -61,6 +62,7 @@ __all__ = [
     "Step",
     "click",
     "find",
+    "squash",
     "key",
     "scroll",
     "type_text",
@@ -127,7 +129,7 @@ def parse_elements(prompt: str) -> list[Element]:
     return found
 
 
-def _squash(text: str) -> str:
+def squash(text: str) -> str:
     """Text with case, spaces and punctuation-ish noise removed.
 
     Real OCR of a rendered page runs words together and picks up stray glyphs -
@@ -159,13 +161,13 @@ def find(
             how a step says "the nav bar one, not the heading with the same word".
         exclude: Skip matches whose text also contains this.
     """
-    needle = _squash(wanted)
-    skip = _squash(exclude) if exclude else None
+    needle = squash(wanted)
+    skip = squash(exclude) if exclude else None
     hits = []
     for element in elements:
         if kind is not None and element.kind != kind:
             continue
-        squashed = _squash(element.text)
+        squashed = squash(element.text)
         if needle not in squashed:
             continue
         if skip and skip in squashed:
@@ -246,6 +248,14 @@ _ROLES = (
     ("synthesize", "Write a reusable skill"),
     ("compose", "You are the composer"),
 )
+"""How each of the four questions announces itself.
+
+Matched against the system prompt AND the user turn, because they do not all arrive
+the same way: the composer has no system prompt at all and puts its instructions in
+the message. Missing that made every composer call look like a judging call, so the
+composer got a verdict where it wanted a plan, declined, and no warm run with
+parameters to bind ever used the library.
+"""
 
 _HISTORY = re.compile(r"^\s*\d+\.\s+(?P<body>.*?)\s*->\s*(?P<verdict>ok|FAILED|performed)", re.M)
 
@@ -267,6 +277,9 @@ class ScriptedOperator:
     model: str = "scripted-operator"
     calls: dict[str, int] = field(default_factory=dict)
     unmatched: list[str] = field(default_factory=list)
+    debug_to: Path | None = None
+    """Write the next prompt here and then stop. For working out why a playbook did
+    not fire, which is otherwise invisible: the operator only sees a string."""
 
     def name(self) -> str:
         return self.model
@@ -290,9 +303,12 @@ class ScriptedOperator:
         temperature: float | None = None,
     ) -> LLMResponse:
         """Answer whichever of the four questions this prompt is asking."""
-        role = self._role(system or "")
-        self.calls[role] = self.calls.get(role, 0) + 1
         prompt = "\n\n".join(m.text for m in messages if m.text)
+        role = self._role(system or "", prompt)
+        self.calls[role] = self.calls.get(role, 0) + 1
+        if self.debug_to is not None:
+            with self.debug_to.open("a", encoding="utf-8", errors="replace") as sink:
+                sink.write(f"\n=== call {sum(self.calls.values())} role={role} ===\n{prompt}\n")
         answer = {
             "explore": self._explore,
             "critic": self._judge,
@@ -302,9 +318,9 @@ class ScriptedOperator:
         return LLMResponse(text=answer, usage=Usage(calls=1))
 
     @staticmethod
-    def _role(system: str) -> str:
+    def _role(system: str, prompt: str) -> str:
         for role, marker in _ROLES:
-            if marker in system:
+            if marker in system or marker in prompt:
                 return role
         return "critic"  # the safest default: judging is the only role with no side effect
 
@@ -354,9 +370,9 @@ class ScriptedOperator:
         match = re.search(r"^TASK:\s*(?P<task>.+)$", prompt, re.M)
         if match is None:
             return None
-        asked = _squash(match.group("task"))
+        asked = squash(match.group("task"))
         for sentence, playbook in self.playbooks.items():
-            if _squash(sentence) == asked:
+            if squash(sentence) == asked:
                 return playbook
         self.unmatched.append(match.group("task"))
         return None
@@ -393,17 +409,26 @@ class ScriptedOperator:
         return "```json\n" + json.dumps(playbook.skill) + "\n```"
 
     def _bind(self, prompt: str) -> str:
-        playbook = self._playbook_for(prompt)
+        # The composer states the task under a heading rather than after a "TASK:"
+        # label, so it is recognised the tolerant way - by finding a playbook's own
+        # sentence somewhere in the prompt.
+        playbook = self._playbook_for_run(prompt)
         if playbook is None or playbook.bind is None:
             return json.dumps({"steps": [], "why": "no stored skill covers this task"})
         return json.dumps(playbook.bind)
 
     def _playbook_for_run(self, prompt: str) -> Playbook | None:
-        """The playbook for a synthesis prompt, which names the task differently."""
+        """The playbook whose sentence appears in a prompt that does not label it.
+
+        The longest match wins, so a task sentence that contains another one cannot be
+        answered with the shorter task's plan.
+        """
+        found = squash(prompt)
+        best: Playbook | None = None
         for sentence, playbook in self.playbooks.items():
-            if _squash(sentence) in _squash(prompt):
-                return playbook
-        return None
+            if squash(sentence) in found and (best is None or len(sentence) > len(best.task)):
+                best = playbook
+        return best
 
 
 def _progress(prompt: str) -> tuple[int, int]:
