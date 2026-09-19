@@ -38,7 +38,13 @@ from. An exact match is a property of the demo site alone, which is why a gate t
 against the sandbox looks green until it meets a website.
 
 Prefer **headless** against a REAL site anyway: two fresh browsers of opposite modes on
-one Wikipedia page score 0.44. What else a live-site run needs is in `eval/wikipedia.yaml`.
+one Wikipedia page score 0.44. Block anything that renders only SOMETIMES, too:
+Wikipedia's fundraising banner appears on some loads, pushes the article down, and a page
+re-opened with one scores **0.04** against the same page recorded without one - one part
+in twenty-five, the URL - so the library never grows and a retrieval measurement has
+nothing to retrieve. Aborting `**/Special:BannerLoader*`, `**/Special:RecordImpression*`
+and `**/geoiplookup*` on the Playwright context makes one URL fingerprint identically
+every time. What else a live-site run needs is in `eval/wikipedia.yaml`.
 
 Perception is dominated by OCR - 84-97% of every observation's time on real pages -
 so the shipped fix is to not read the same pixels twice, and counts, not seconds, are how

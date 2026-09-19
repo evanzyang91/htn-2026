@@ -189,7 +189,7 @@ def test_why_reports_the_cosine_when_an_embedder_ranked_it(
 ) -> None:
     hit = SkillRetriever(library, fake_embedder).search("search the invoice list")[0]
     assert hit.why.startswith("cosine 0.")
-    assert "on summary+docstring" in hit.why
+    assert "on the skill's searchable text" in hit.why
 
 
 def test_why_mentions_a_skills_track_record(library: InMemorySkillStore) -> None:
@@ -261,3 +261,70 @@ def test_tokenize_drops_stopwords_and_noise() -> None:
         "company",
     ]
     assert tokenize("") == []
+
+
+# -- the sentence a skill was learned from ----------------------------------------------
+#
+# A summary is a model's description of a skill; the learned sentence is what a PERSON
+# typed to get it. Asking for the same errand again tends to reuse the person's words.
+
+
+LEARNED_FROM_WORDS = make(
+    "archive_statement",
+    "example.com",
+    "Move a finished statement out of the active list.",
+    "Selects the statement and moves it to the archive, where it no longer appears.",
+    provenance=Provenance(
+        "run-9",
+        "Tidy away last quarter's paperwork",
+        "fake-llm",
+        datetime(2026, 9, 19, tzinfo=UTC),
+    ),
+)
+"""Summary and learned sentence share no meaningful word, which is the whole point."""
+
+
+def test_the_learned_sentence_is_matched_when_the_summary_says_it_differently() -> None:
+    """A skill described as "move a statement to the archive" is found by the words
+    the person who asked for it actually used, which the summary never repeats."""
+    store = InMemorySkillStore()
+    store.put(LEARNED_FROM_WORDS)
+    store.put(EXPORT_CONTACTS)
+
+    hits = SkillRetriever(store).search("Tidy away last quarter's paperwork")
+
+    assert hits[0].skill.name == "archive_statement"
+    # Every word of the task is covered; the remaining 0.4 is the name-hit share, and
+    # "archive_statement" is the model's word for it, not the person's.
+    assert hits[0].score == pytest.approx(0.6)
+
+
+def test_a_word_for_word_repeat_is_called_out_in_why() -> None:
+    """The planner can bind a repeat with no model at all, so a human reading the
+    candidate over the demo's shoulder should be told that is what this is."""
+    store = InMemorySkillStore()
+    store.put(LEARNED_FROM_WORDS)
+
+    hit = SkillRetriever(store).search("tidy away last quarter's paperwork.")[0]
+
+    assert "the exact sentence this skill was learned from" in hit.why
+
+
+def test_a_task_that_is_not_the_learned_sentence_is_not_called_a_repeat() -> None:
+    store = InMemorySkillStore()
+    store.put(LEARNED_FROM_WORDS)
+
+    hit = SkillRetriever(store).search("tidy away this quarter's invoices")[0]
+
+    assert "the exact sentence" not in hit.why
+
+
+def test_the_learned_sentence_does_not_make_an_unrelated_task_match() -> None:
+    """Widening what is searched is only safe if "nothing is relevant" still comes
+    back empty: the point of the change is to reach the right skill sooner, not to
+    have an answer for everything."""
+    store = InMemorySkillStore()
+    for skill in (LEARNED_FROM_WORDS, SEARCH_INVOICE, PAY_INVOICE, EXPORT_CONTACTS):
+        store.put(skill)
+
+    assert SkillRetriever(store).search("recalibrate the telescope mirror") == []

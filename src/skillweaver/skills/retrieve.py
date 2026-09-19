@@ -6,10 +6,19 @@ Two signals, deliberately:
 summary and docstring. It understands that "pay a bill" and "settle an invoice" are
 the same errand.
 
-*Token overlap* between the task and the skill's name, summary, docstring and
-parameter names. It is crude, but it needs no model, no network and no API key - so
-the library is still useful on a laptop with the wifi off, and the demo still works
-when a provider is down. With no embedder configured this signal is the whole score.
+*Token overlap* between the task and the skill's name, summary, docstring, parameter
+names and - measurably the most useful of them - the sentence the skill was learned
+from. It is crude, but it needs no model, no network and no API key - so the library
+is still useful on a laptop with the wifi off, and the demo still works when a
+provider is down. With no embedder configured this signal is the whole score.
+
+The learned sentence (``provenance.task_text``) is in there because a summary is
+written by a model to describe a skill, while the learned sentence is what a PERSON
+actually typed to get it; asking for the same errand again tends to reuse the
+person's words, not the model's. Measured over the four skills the live Wikipedia
+suite builds, adding it left the top-ranked skill unchanged on all six tasks and
+widened the margin to the runner-up on four of them - most sharply on a verbatim
+repeat, which now scores a clean 1.0.
 
 They are blended (``lexical_weight``, 0.3 by default) rather than switched between,
 because the cheap signal is a good sanity check on the expensive one: a skill the
@@ -73,11 +82,18 @@ def _stems(tokens: Iterable[str]) -> set[str]:
     return {_stem(t) for t in tokens}
 
 
+def _normalized(text: str) -> str:
+    """``text`` reduced to its meaningful word stems, in order, so two phrasings of
+    the same sentence that differ only in punctuation, case or stopwords compare
+    equal. Used to spot a task that is the sentence a skill was learned from."""
+    return " ".join(_stem(t) for t in tokenize(text))
+
+
 def searchable_text(skill: Skill) -> str:
-    """The text a skill is matched on: its summary and docstring, as the contract
-    says, preceded by its rendered signature so the name and parameter names count
-    too."""
-    return f"{signature(skill)}\n{skill.summary}\n{skill.docstring}"
+    """The text a skill is matched on: its rendered signature - so the name and the
+    parameter names count - then the sentence it was learned from, its summary and
+    its docstring."""
+    return f"{signature(skill)}\n{skill.provenance.task_text}\n{skill.summary}\n{skill.docstring}"
 
 
 class SkillRetriever:
@@ -121,12 +137,17 @@ class SkillRetriever:
         the request beats a sprawling one that happens to contain them - with a name
         hit worth as much as the rest of the text together, because a skill called
         ``search_invoice`` really is what "search for an invoice" wants.
+
+        The body is the skill's summary, docstring, parameter names AND the sentence
+        it was learned from; see the module docstring for why the last one earns its
+        place.
         """
         if not task_tokens:
             return 0.0, [], []
         wanted = _stems(task_tokens)
         name_stems = _stems(tokenize(skill.name))
-        body_stems = _stems(tokenize(f"{skill.summary} {skill.docstring} {' '.join(skill.params)}"))
+        body = f"{skill.summary} {skill.docstring} {' '.join(skill.params)} "
+        body_stems = _stems(tokenize(body + skill.provenance.task_text))
 
         shared = [t for t in task_tokens if _stem(t) in (name_stems | body_stems)]
         on_name = [t for t in task_tokens if _stem(t) in name_stems]
@@ -181,14 +202,21 @@ class SkillRetriever:
 
     @staticmethod
     def _why(
-        cosine: float | None, shared: Sequence[str], on_name: Sequence[str], skill: Skill
+        cosine: float | None,
+        shared: Sequence[str],
+        on_name: Sequence[str],
+        skill: Skill,
+        *,
+        verbatim: bool = False,
     ) -> str:
         """The sentence a human reads next to the candidate."""
         parts: list[str] = []
+        if verbatim:
+            parts.append("the exact sentence this skill was learned from")
         if cosine is None:
             parts.append("no embedder: keyword and token overlap only")
         else:
-            parts.append(f"cosine {cosine:.2f} on summary+docstring")
+            parts.append(f"cosine {cosine:.2f} on the skill's searchable text")
         if shared:
             parts.append("shares " + ", ".join(f"'{w}'" for w in shared[:5]))
         else:
@@ -221,19 +249,23 @@ class SkillRetriever:
         task_tokens = tokenize(task)
         cosines = self._embed_all(task, skills)
         weight = self.lexical_weight if cosines is not None else 1.0
+        asked = _normalized(task)
 
         scored: list[Candidate] = []
+        below: list[str] = []
         for position, skill in enumerate(skills):
             lexical, shared, on_name = self._lexical(task_tokens, skill)
             cosine = None if cosines is None else cosines[position]
             score = lexical if cosine is None else (1.0 - weight) * cosine + weight * lexical
             if score <= self.min_score:
+                below.append(f"{skill.name}={score:.3f}")
                 continue
+            verbatim = _normalized(skill.provenance.task_text) == asked
             scored.append(
                 Candidate(
                     skill=skill,
                     score=round(score, 6),
-                    why=self._why(cosine, shared, on_name, skill),
+                    why=self._why(cosine, shared, on_name, skill, verbatim=verbatim),
                 )
             )
 
@@ -246,6 +278,8 @@ class SkillRetriever:
             considered=len(skills),
             returned=len(top),
             best=top[0].skill.name if top else "",
+            scores=", ".join(f"{c.skill.name}={c.score:.3f}" for c in scored),
+            below_min=", ".join(below),
             embedder=type(self.embedder).__name__ if self.embedder else "none",
         )
         return top

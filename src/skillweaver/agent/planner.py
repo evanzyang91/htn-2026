@@ -86,6 +86,7 @@ from skillweaver.agent.compose import Composer, Decomposition
 from skillweaver.contracts import (
     Action,
     Budget,
+    Candidate,
     Controller,
     Critic,
     Fingerprint,
@@ -113,7 +114,7 @@ from skillweaver.graph.route import VERIFIED_ONLY, RoutingPolicy, find_route
 from skillweaver.logging_ import get_logger
 from skillweaver.skills.api import LimitExceeded
 
-__all__ = ["FRAME_WORDS", "FailureStage", "PlanFailure", "Planner"]
+__all__ = ["FRAME_WORDS", "FailureStage", "PlanFailure", "Planner", "Rejection"]
 
 log = get_logger(__name__)
 
@@ -134,14 +135,34 @@ _PERFORMED_NOTHING = frozenset({"no_candidates", "unbindable_args", "no_route", 
 
 
 @dataclass(frozen=True, slots=True)
+class Rejection:
+    """One retrieved skill the planner looked at and turned down.
+
+    A warm run that explores is only diagnosable if the offer that was NOT taken is
+    recorded: ``score`` says how well retrieval thought the skill fit, and ``stage``
+    names the rule that discarded it. Without these two together, "the library was
+    not used" cannot be told apart from "the library had nothing".
+    """
+
+    skill: str
+    score: float
+    stage: FailureStage
+    reason: str
+
+    def __str__(self) -> str:
+        return f"{self.skill} (score {self.score:.3f}) -> {self.stage}"
+
+
+@dataclass(frozen=True, slots=True)
 class PlanFailure:
     """Why the fast path declined, in a form an explorer can use.
 
     ``stage`` says how far it got, ``reason`` is one human-readable line, ``skill``
     names the skill involved when there was one, ``demoted`` records whether that
-    skill was retired, and ``trace`` carries the failed skill's trace - the most
-    valuable thing an explorer can be handed, since it is a play-by-play of what the
-    library *thought* would work.
+    skill was retired, ``trace`` carries the failed skill's trace - the most valuable
+    thing an explorer can be handed, since it is a play-by-play of what the library
+    *thought* would work - and ``rejected`` holds every candidate that was offered
+    and discarded before anything ran.
     """
 
     stage: FailureStage
@@ -149,6 +170,7 @@ class PlanFailure:
     skill: str | None = None
     demoted: bool = False
     trace: tuple[str, ...] = ()
+    rejected: tuple[Rejection, ...] = ()
 
     @property
     def performed_nothing(self) -> bool:
@@ -330,6 +352,7 @@ class Planner:
         candidates = self._retriever.search(task.text, domain=task.domain, k=self._top_k)
 
         reasons: list[str] = []
+        looked_at: list[Rejection] = []
         stage: FailureStage = "no_candidates"
         for candidate in candidates[: self._max_candidates]:
             skill = candidate.skill
@@ -338,24 +361,29 @@ class Planner:
                 args = _bind_from_text(skill, task)
             if args is None:
                 stage = "unbindable_args"
-                reasons.append(
+                reason = (
                     f"{skill.name}: task supplies no value for a required parameter, and its "
                     f"wording does not line up with {skill.provenance.task_text!r}"
                 )
+                reasons.append(reason)
+                looked_at.append(Rejection(skill.name, candidate.score, "unbindable_args", reason))
                 continue
             route = self._route_to(observation.fingerprint, skill.precondition)
             if route is None:
                 stage = "no_route"
-                reasons.append(
+                reason = (
                     f"{skill.name}: no known route from {observation.fingerprint.value!r} "
                     f"to its start screen {skill.precondition.value!r}"  # type: ignore[union-attr]
                 )
+                reasons.append(reason)
+                looked_at.append(Rejection(skill.name, candidate.score, "no_route", reason))
                 continue
             log.info(
                 "planner.hit",
                 task=task.text,
                 skill=skill.name,
                 score=round(candidate.score, 3),
+                args=args,
                 route_steps=len(route.steps),
             )
             return (
@@ -367,7 +395,32 @@ class Planner:
                 Usage(),
             )
 
-        return self._compose(task, observation, stage, reasons)
+        self._report_miss(task, candidates, looked_at)
+        return self._compose(task, observation, stage, reasons, looked_at)
+
+    def _report_miss(
+        self, task: TaskSpec, candidates: Sequence[Candidate], looked_at: Sequence[Rejection]
+    ) -> None:
+        """One log line naming everything needed to explain a model-free path that
+        found nothing. It fires whenever no single stored skill was usable, whether
+        the composer then rescues the task for one model call or the run explores.
+
+        Four of six warm runs on the live Wikipedia suite reported ``skill_used=None``
+        and left no record of WHY, so the first question - was the skill never
+        offered, or offered and discarded? - could not be answered from a report. It
+        can now: this names what the library held for the domain, what every candidate
+        scored, and the rule that turned each one down.
+        """
+        shelf = [s.name for s in self._store.list(domain=task.domain)]
+        log.info(
+            "planner.miss",
+            task=task.text,
+            domain=task.domain,
+            library=", ".join(shelf) or "(empty)",
+            offered=", ".join(f"{c.skill.name}={c.score:.3f}" for c in candidates) or "(none)",
+            rejected=" | ".join(str(r) for r in looked_at) or "(none reached binding)",
+            why=" | ".join(f"{c.skill.name}: {c.why}" for c in candidates),
+        )
 
     def _compose(
         self,
@@ -375,6 +428,7 @@ class Planner:
         observation: Observation,
         stage: FailureStage,
         reasons: list[str],
+        looked_at: Sequence[Rejection] = (),
     ) -> tuple[Plan | None, Usage]:
         """The composite path: one model call, then the same model-free execution.
 
@@ -387,6 +441,7 @@ class Planner:
             self._last_failure = PlanFailure(
                 stage=stage,
                 reason=_joined(reasons) or f"no stored skill matches {task.text!r}",
+                rejected=tuple(looked_at),
             )
             return None, Usage()
 
@@ -395,6 +450,7 @@ class Planner:
             self._last_failure = PlanFailure(
                 stage="no_decomposition",
                 reason=result.rejected or "the composer proposed no chain",
+                rejected=tuple(looked_at),
             )
             return None, result.usage
 
@@ -611,16 +667,58 @@ def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     A required parameter the task has no value for means the task did not supply its
     arguments; :func:`_bind_from_text` gets a chance to read them out of the task's
     wording before the candidate is given up on.
+
+    Names that line up EXACTLY are taken first, and only then is what is left over
+    matched by :func:`_alias_for` - because the caller names a parameter and the
+    model that wrote the skill names it again, independently, and they routinely
+    disagree about one word. Measured on the live Wikipedia suite: the caller passes
+    ``link`` where ``open_linked_article`` declares ``link_title``, which cost that
+    task its whole warm path.
     """
     args: dict[str, Any] = {}
+    spare = {k: v for k, v in task.params.items() if k not in skill.params}
     for name, schema in skill.params.items():
         if name in task.params:
             args[name] = task.params[name]
-        elif _has_default(schema):
             continue
-        else:
+        alias = _alias_for(name, spare, skill.params)
+        if alias is not None:
+            args[name] = spare.pop(alias)
+            log.info("planner.param_alias", skill=skill.name, declared=name, supplied=alias)
+        elif not _has_default(schema):
             return None
     return args
+
+
+def _alias_for(name: str, spare: Mapping[str, Any], declared: Mapping[str, Any]) -> str | None:
+    """The one key of ``spare`` that plainly means the parameter ``name``, or ``None``.
+
+    Two names mean the same thing here when, split on underscores, one's words are a
+    subset of the other's: ``link`` and ``link_title``, ``query`` and ``search_query``.
+    Nothing is bound unless the reading is unambiguous in BOTH directions - exactly
+    one spare key fits this parameter, and that key fits no other declared parameter -
+    so a skill taking ``section`` and ``parent_section`` is never fed a ``section``
+    value twice, and a task carrying ``link`` and ``link_text`` is not guessed at.
+    """
+    wanted = _name_words(name)
+    fits = [key for key in spare if _shares_words(_name_words(key), wanted)]
+    if len(fits) != 1:
+        return None
+    key = fits[0]
+    words = _name_words(key)
+    rivals = [d for d in declared if d != name and _shares_words(words, _name_words(d))]
+    return None if rivals else key
+
+
+def _shares_words(left: frozenset[str], right: frozenset[str]) -> bool:
+    """Whether two parameter names plainly mean the same thing: one's words contain
+    the other's, and there is at least one word to contain. An empty name matches
+    nothing, so a parameter called ``_`` is never fed somebody else's value."""
+    return bool(left & right) and (left <= right or right <= left)
+
+
+def _name_words(name: str) -> frozenset[str]:
+    return frozenset(part for part in name.casefold().split("_") if part)
 
 
 # -- binding a plain-English repeat ------------------------------------------------------
@@ -690,6 +788,12 @@ def _bind_from_text(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     falls through to the composer, which spends one model call to read a sentence it
     has already seen the shape of.
 
+    When the diff says nothing, :func:`_from_template` gets a turn. The diff is blind
+    in exactly the two cases the live Wikipedia suite is full of: the sentence is
+    repeated WORD FOR WORD (no difference at all to attribute), or it changed in two
+    places and only one of them is the argument. See that function for how a slot is
+    located in the learned sentence instead.
+
     It declines far more often than it binds, deliberately: a wrong argument is much
     worse than a model call, because it runs real actions on a real screen behind the
     same preconditions and verifier as a correct one. It refuses unless
@@ -717,12 +821,14 @@ def _bind_from_text(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     if len(missing) != 1:
         return None
 
+    name = missing[0]
     learned = skill.provenance.task_text or ""
     span = _differing_span(learned, task.text)
     if span is None:
+        span = _from_template(skill, name, learned, task.text)
+    if span is None:
         return None
 
-    name = missing[0]
     value = _as_declared(span, skill.params[name])
     if value is _REFUSED:
         return None
@@ -777,6 +883,158 @@ def _differing_span(learned: str, asked: str) -> str | None:
 
     value = asked[asked_mid[0].start : asked_mid[-1].end]
     return value if 0 < len(value) <= _MAX_VALUE_CHARS else None
+
+
+# -- binding from the slot the learned sentence left ------------------------------------
+
+
+_DOUBLE_QUOTED = re.compile(r"[\"“]([^\"“”]{1,120})[\"”]")
+"""A span in double quotes, straight or curly. People quote the thing they mean."""
+
+_SINGLE_QUOTED = re.compile(r"(?<![\w'’])['‘]([^'‘’]{1,120})['’](?![\w])")
+"""A span in single quotes, with the apostrophe of ``Wikipedia's`` excluded by the
+look-around on both sides - otherwise every possessive opens a quotation."""
+
+_MIN_ANCHOR_TOKENS = 2
+"""How many tokens either side of a slot must line up before it is believed."""
+
+_MAX_TAIL_DRIFT = 2
+"""How many more (or fewer) tokens may follow the value than followed it when the
+skill was learned. A sentence that grew past this is a bigger errand, not a rephrasing."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Slot:
+    """Where a parameter's value sat inside the sentence a skill was learned from."""
+
+    start: int
+    end: int
+    value: str
+    quoted: bool
+
+
+def _from_template(skill: Skill, name: str, learned: str, asked: str) -> str | None:
+    """``asked``'s value for ``name``, read through the learned sentence as a template.
+
+    :func:`_differing_span` asks "what changed?", which has no answer in the two
+    cases that dominated the live Wikipedia misses of 2026-09-19::
+
+        learned: 'Search Wikipedia for "Ada Lovelace" and open her article.'
+        asked:   'Search Wikipedia for "Ada Lovelace" and open her article.'
+          -> nothing changed, so nothing is the argument, so the skill is not used
+
+        learned: 'Search Wikipedia for "Ada Lovelace" and open her article.'
+        asked:   'Search Wikipedia for "Photosynthesis" and open the article.'
+          -> TWO things changed ("her" -> "the"), so neither is trusted
+
+    This asks the other question: where in the learned sentence did the value sit?
+    :func:`_learned_slot` answers it from evidence already in the skill, and then
+
+    * a word-for-word repeat replays the learned value. It is not a guess: this skill
+      exists BECAUSE a run of this exact sentence succeeded with that value;
+    * a sentence whose value is quoted takes the asked sentence's one quoted span,
+      but only when the words anchoring the slot still line up (:func:`_anchored`).
+
+    Anything else returns ``None`` and the composer, which can read a sentence, is
+    left to do it.
+    """
+    slot = _learned_slot(skill, name, learned)
+    if slot is None:
+        return None
+    if _same_sentence(learned, asked):
+        return slot.value
+    if not slot.quoted:
+        return None
+    quoted = _quoted_spans(asked)
+    if len(quoted) != 1 or not _anchored(learned, slot, asked, quoted[0]):
+        return None
+    return quoted[0].value
+
+
+def _learned_slot(skill: Skill, name: str, learned: str) -> _Slot | None:
+    """Where ``name``'s value sat in ``learned``, or ``None`` when it cannot be shown.
+
+    Two independent sources, and they check each other:
+
+    *The one quoted span in the learned sentence.* A person quoting exactly one thing
+    in a one-parameter errand is quoting the parameter.
+
+    *A quoted example in the parameter's own schema description* - the synthesizer
+    writes ``e.g. 'Ada Lovelace'`` from the run it just watched - accepted only when
+    that example occurs exactly once in the learned sentence. That occurrence is the
+    proof: an example the sentence does not contain says nothing about where the
+    value was, and is ignored rather than trusted.
+
+    When both exist they must agree, so a skill learned from *Open the "Settings" page
+    and search for widgets* does not hand ``"Settings"`` to a ``query`` parameter whose
+    description says ``e.g. 'widgets'``.
+    """
+    quoted = _quoted_spans(learned)
+    examples = _quoted_spans(_description(skill.params.get(name)))
+    shown = [
+        found
+        for example in examples
+        if (found := _sole_occurrence(learned, example.value)) is not None
+    ]
+
+    if len(quoted) == 1:
+        if examples and not any(s.value.casefold() == quoted[0].value.casefold() for s in shown):
+            return None  # the description names a different value; do not guess
+        return quoted[0]
+    return shown[0] if len(shown) == 1 else None
+
+
+def _quoted_spans(text: str) -> list[_Slot]:
+    """Every quoted span of ``text``, in order, straight or curly, double or single."""
+    found = [
+        _Slot(m.start(1), m.end(1), m.group(1).strip(), True)
+        for pattern in (_DOUBLE_QUOTED, _SINGLE_QUOTED)
+        for m in pattern.finditer(text)
+    ]
+    found.sort(key=lambda s: s.start)
+    return [s for s in found if s.value]
+
+
+def _description(schema: Any) -> str:
+    text = schema.get("description") if isinstance(schema, Mapping) else None
+    return text if isinstance(text, str) else ""
+
+
+def _sole_occurrence(text: str, value: str) -> _Slot | None:
+    """``value``'s position in ``text`` when it appears exactly once, else ``None``."""
+    haystack, needle = text.casefold(), value.casefold()
+    first = haystack.find(needle)
+    if first < 0 or haystack.find(needle, first + 1) >= 0:
+        return None
+    return _Slot(first, first + len(needle), text[first : first + len(needle)], False)
+
+
+def _same_sentence(learned: str, asked: str) -> bool:
+    """Whether the two are the same sentence down to punctuation, ignoring case and
+    whitespace - the only reading under which the learned value is certainly right."""
+    return [t.key for t in _tokens(learned)] == [t.key for t in _tokens(asked)]
+
+
+def _anchored(learned: str, slot: _Slot, asked: str, found: _Slot) -> bool:
+    """Whether ``found`` sits where ``slot`` sat, judged by the words around it.
+
+    The tokens immediately BEFORE the value must be the same on both sides - that is
+    what makes this the same sentence shape rather than a different errand that also
+    quotes something - and the sentence must not have grown a new clause after the
+    value, which is how *search for "Alan Turing", open his article, and from there
+    open Bletchley Park* is refused: it is two errands, and the composer's job.
+    """
+    head_l, head_a = _tokens(learned[: slot.start]), _tokens(asked[: found.start])
+    tail_l, tail_a = _tokens(learned[slot.end :]), _tokens(asked[found.end :])
+
+    anchor = min(len(head_l), len(head_a), 4)
+    if anchor < _MIN_ANCHOR_TOKENS:
+        return False
+    if [t.key for t in head_l[-anchor:]] != [t.key for t in head_a[-anchor:]]:
+        return False
+    if [t.key for t in tail_l[:1]] != [t.key for t in tail_a[:1]]:
+        return False
+    return abs(len(tail_a) - len(tail_l)) <= _MAX_TAIL_DRIFT
 
 
 def _framed(tokens: Sequence[_Token], head: int, tail: int) -> bool:

@@ -885,10 +885,15 @@ def test_a_sentence_that_only_adds_words_supplies_no_argument(
     )
 
 
-def test_the_identical_sentence_supplies_no_argument(
+def test_the_identical_sentence_supplies_no_argument_when_nothing_marks_the_value(
     scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
 ) -> None:
-    """The value is in there somewhere and there is no way to tell which words it is."""
+    """The value is in there somewhere and nothing says which words it is.
+
+    Neither the learned sentence nor the parameter's description marks a slot, so the
+    template path has nothing to work from either and the planner still declines. The
+    two tests below are the same repeat with a slot to read.
+    """
     declines(
         scenario,
         store,
@@ -1028,3 +1033,391 @@ def test_the_composer_still_gets_the_sentences_this_path_declines(
     assert outcome is not None and outcome.ok
     assert llm.calls == 1
     assert outcome.spend.llm_calls == 1
+
+
+# -- the slot the learned sentence left ----------------------------------------------------------
+#
+# Measured on the live Wikipedia suite, 2026-09-19: four of six warm runs explored
+# although the right skill was stored, and every one of them was retrieval's TOP hit
+# discarded at ``unbindable_args``. The diff above is blind in exactly two shapes,
+# and between them they are all four runs:
+#
+#   * the sentence is repeated word for word, so nothing changed to attribute;
+#   * two things changed and only one is the argument ("her article" -> "the article").
+#
+# So the question is turned round: not "what changed?" but "where did the value sit?".
+# These tests are that path, and - as above - most of them are about declining.
+
+
+QUOTED_PAY = plant(
+    "pay_invoice",
+    "Confirm payment of a company's invoice from the invoice list.",
+    """
+def run(ctx, company):
+    ctx.ctl.type_text(company)
+    rows = ctx.see.find_text(company, fuzzy=False)
+    ctx.expect(bool(rows), "the search returned no row for " + company)
+    ctx.ctl.click(rows[0])
+    buttons = ctx.see.find_text("Confirm payment", fuzzy=False)
+    ctx.expect(bool(buttons), "no Confirm payment button on the invoice")
+    ctx.ctl.click(buttons[0])
+    return "confirmed"
+""",
+    precondition=LIST,
+    params={"company": {"type": "string"}},
+    docstring="Searches the invoice list for the company, opens its invoice and confirms payment.",
+)
+"""``pay_invoice`` again; the tests below give it a learned sentence that quotes."""
+
+DESCRIBED_PAY = plant(
+    "pay_invoice",
+    "Confirm payment of a company's invoice from the invoice list.",
+    QUOTED_PAY.code,
+    precondition=LIST,
+    params={
+        "company": {
+            "type": "string",
+            "description": "The company whose invoice to pay, e.g. 'Globex Industries'.",
+        }
+    },
+    docstring="Searches the invoice list for the company, opens its invoice and confirms payment.",
+)
+"""A skill whose parameter description carries the example the synthesizer saw."""
+
+
+def test_a_word_for_word_repeat_of_a_known_task_costs_zero_model_calls(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """THE SINGLE BIGGEST CAUSE OF THE LIVE MISSES.
+
+    Asking for a stored task in the very words it was learned from is the strongest
+    evidence a library can get, and it used to be the one thing the binder could not
+    read: no difference between the sentences meant no span, so the best possible
+    match was declined. Here the learned sentence quotes its value, so the repeat
+    replays it - and the composer, wired in and scripted empty, is never called.
+    """
+    store.put(learned_from(QUOTED_PAY, 'Pay the invoice for "Acme Corp"'))
+    planner = build(scenario, store, graph, fake_llm, compose=True)
+    task = TaskSpec(text='Pay the invoice for "Acme Corp"', domain=DOMAIN)
+
+    outcome = planner.attempt(task, look(scenario))
+
+    assert outcome is not None and outcome.ok
+    assert scenario.solved
+    assert fake_llm.calls == 0
+    assert outcome.spend.llm_calls == 0
+    assert outcome.skill_used == "pay_invoice"
+    assert performed(scenario) == [TYPE_ACME, CLICK_ROW, CLICK_CONFIRM]
+
+
+def test_a_repeat_is_the_same_sentence_through_case_and_punctuation(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """A person retyping a task does not reproduce its capitalisation or its full
+    stop, and neither difference changes what was asked for."""
+    store.put(learned_from(QUOTED_PAY, 'Pay the invoice for "Acme Corp".'))
+    planner = build(scenario, store, graph, fake_llm)
+
+    plan = planner.plan(
+        TaskSpec(text='pay the invoice for "Acme Corp".', domain=DOMAIN), look(scenario)
+    )
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("pay_invoice", DOMAIN, {"company": "Acme Corp"}),)
+
+
+def test_a_quoted_value_binds_although_the_rest_of_the_sentence_also_moved(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """THE OTHER HALF OF THE LIVE MISSES, in miniature.
+
+    The live sentence pair was *Search Wikipedia for "Ada Lovelace" and open HER
+    article* against *... for "Photosynthesis" and open THE article*: two differences,
+    of which one is the argument and the other is English. The diff refuses both,
+    correctly, because from its side they are indistinguishable. The quotes say which
+    is which, and the words around the slot still line up, so this binds.
+    """
+    store.put(learned_from(QUOTED_PAY, 'Pay "Globex Industries" and close her invoice'))
+    planner = build(scenario, store, graph, fake_llm)
+
+    plan = planner.plan(
+        TaskSpec(text='Pay "Acme Corp" and close the invoice', domain=DOMAIN), look(scenario)
+    )
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("pay_invoice", DOMAIN, {"company": "Acme Corp"}),)
+    assert fake_llm.calls == 0
+
+
+def test_an_example_in_the_parameter_description_locates_an_unquoted_value(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Nobody quotes every value, so there is a second way to find the slot.
+
+    The synthesizer writes the parameter's description from the run it just watched,
+    and the example it puts there is the value that run used. That is only believed
+    when the example actually occurs in the learned sentence - which is the proof it
+    WAS the value - and then a word-for-word repeat can replay it.
+    """
+    store.put(learned_from(DESCRIBED_PAY, "Pay the invoice for Globex Industries, please"))
+    planner = build(scenario, store, graph, fake_llm)
+
+    plan = planner.plan(
+        TaskSpec(text="Pay the invoice for Globex Industries, please", domain=DOMAIN),
+        look(scenario),
+    )
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("pay_invoice", DOMAIN, {"company": "Globex Industries"}),)
+    assert fake_llm.calls == 0
+
+
+def test_an_example_the_learned_sentence_never_contained_is_ignored(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The example is evidence only because the sentence contains it.
+
+    Here the skill was learned from a sentence about Acme while its description still
+    says ``e.g. 'Globex Industries'``. Nothing in that pair shows where the value sat,
+    so no slot is found and the repeat is declined rather than answered with the
+    description's example.
+    """
+    failure = declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(DESCRIBED_PAY, "Pay the invoice for Acme Corp"),
+        "Pay the invoice for Acme Corp",
+    )
+    assert failure.stage == "unbindable_args"
+
+
+def test_a_quoted_span_the_description_contradicts_is_refused(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Quotes around something that is NOT the argument must not become the argument.
+
+    The learned sentence quotes a screen name while the parameter's description names
+    a different value, so the two sources disagree about the slot and the planner
+    declines rather than pick one.
+    """
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(DESCRIBED_PAY, 'Open the "Unpaid" tab and pay Globex Industries'),
+        'Open the "Unpaid" tab and pay Globex Industries',
+    )
+
+
+def test_a_sentence_that_grew_a_second_errand_is_not_one_skill(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """THE GUARD THAT KEEPS THIS FROM BEING THE OBVIOUS WRONG FIX.
+
+    *Pay "Acme Corp", then archive it and email the receipt* quotes exactly one thing
+    and starts exactly like the learned sentence, so a rule that only looked at the
+    quotes would happily run a one-skill plan for a three-part errand. The sentence
+    grew a clause after the value, so this is refused and left to the composer, which
+    is what the live composite task needs.
+    """
+    failure = declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(QUOTED_PAY, 'Pay "Globex Industries" and close her invoice'),
+        'Pay "Acme Corp" and close the invoice, then archive it and email the receipt',
+    )
+    assert failure.stage == "unbindable_args"
+
+
+def test_a_differently_shaped_sentence_that_happens_to_quote_is_refused(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The words leading up to the value have to be the same words. A quoted name in
+    a sentence about something else is a different errand, not a new argument."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(QUOTED_PAY, 'Pay the invoice for "Globex Industries"'),
+        'Export the address book for "Acme Corp"',
+    )
+
+
+def test_two_quoted_spans_do_not_say_which_one_is_the_argument(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """One quoted thing in a one-parameter errand is the parameter. Two is a guess."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(QUOTED_PAY, 'Pay the invoice for "Globex Industries"'),
+        'Pay the invoice for "Acme Corp" in the "Unpaid" tab',
+    )
+
+
+def test_a_possessive_apostrophe_does_not_open_a_quotation(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """``Wikipedia's`` is not a quote, and a rule that thought it was would find a
+    slot in half the sentences a person writes."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(PAY_INVOICE, "Pay Acme's outstanding invoice"),
+        "Pay Acme's outstanding invoice",
+    )
+
+
+# -- the caller's name for a parameter and the skill's ----------------------------------------
+
+
+ALIASED_PAY = plant(
+    "pay_invoice",
+    "Confirm payment of a company's invoice from the invoice list.",
+    """
+def run(ctx, company_name):
+    ctx.ctl.type_text(company_name)
+    return company_name
+""",
+    precondition=LIST,
+    params={"company_name": {"type": "string"}},
+    docstring="Searches the invoice list for the company and confirms its payment.",
+)
+
+
+def test_a_caller_who_named_the_parameter_differently_is_still_understood(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The caller names a parameter and the model that wrote the skill names it again,
+    independently, and they routinely disagree about one word.
+
+    On the live suite the caller passed ``link`` where the stored skill declared
+    ``link_title``, and that alone cost the task its warm path. One name's words being
+    a subset of the other's is enough to line them up.
+    """
+    store.put(ALIASED_PAY)
+    planner = build(scenario, store, graph, fake_llm)
+    task = TaskSpec(text="Pay the invoice.", domain=DOMAIN, params={"company": "Acme Corp"})
+
+    plan = planner.plan(task, look(scenario))
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("pay_invoice", DOMAIN, {"company_name": "Acme Corp"}),)
+    assert fake_llm.calls == 0
+
+
+def test_an_exactly_named_parameter_is_never_stolen_by_an_alias(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """``section`` and ``parent_section`` both look like a supplied ``section``.
+
+    Exact names are bound first and the key is then spent, so the defaulted parameter
+    falls back to its default instead of being handed the same value a second time.
+    """
+    two_sections = plant(
+        "jump_to_section",
+        "Jump to a section of the open invoice.",
+        """
+def run(ctx, section, parent_section=""):
+    return parent_section + "/" + section
+""",
+        precondition=LIST,
+        params={"section": {"type": "string"}, "parent_section": {"type": "string", "default": ""}},
+        docstring="Jumps to a named section, optionally nested under a parent section.",
+    )
+    store.put(two_sections)
+    planner = build(scenario, store, graph, fake_llm)
+    task = TaskSpec(text="Jump to a section.", domain=DOMAIN, params={"section": "Childhood"})
+
+    plan = planner.plan(task, look(scenario))
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("jump_to_section", DOMAIN, {"section": "Childhood"}),)
+
+
+def test_an_ambiguous_parameter_name_is_refused(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Two supplied keys that both read as the declared parameter are a guess, and a
+    guessed argument runs real clicks on a real screen."""
+    store.put(ALIASED_PAY)
+    planner = build(scenario, store, graph, fake_llm, compose=False)
+    task = TaskSpec(
+        text="Pay the invoice.",
+        domain=DOMAIN,
+        params={"company": "Acme Corp", "name": "Globex Industries"},
+    )
+
+    assert planner.plan(task, look(scenario)) is None
+    assert planner.last_failure is not None
+    assert planner.last_failure.stage == "unbindable_args"
+
+
+# -- still saying no -------------------------------------------------------------------------
+
+
+def test_an_unrelated_task_is_still_declined_with_every_binder_in_play(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """THE PRICE OF THE FIX, CHECKED.
+
+    Making the library easier to reach is only worth anything if it did not become a
+    library that answers everything. The store holds three skills, two of them with a
+    quoted learned sentence and a described parameter - every new route to an argument
+    - and a task none of them does is still declined with the screen untouched.
+    """
+    store.put(learned_from(QUOTED_PAY, 'Pay the invoice for "Globex Industries"'))
+    store.put(learned_from(DESCRIBED_PAY, "Pay the invoice for Globex Industries"))
+    store.put(CONFIRM_PAYMENT)
+    planner = build(scenario, store, graph, fake_llm, compose=False)
+    task = TaskSpec(text='Export the address book as a "CSV" file.', domain=DOMAIN)
+
+    assert planner.attempt(task, look(scenario)) is None
+    assert performed(scenario) == []
+    assert scenario.controller.state == "list"
+    assert fake_llm.calls == 0
+    failure = planner.last_failure
+    assert failure is not None and failure.performed_nothing
+
+
+def test_a_warm_attempt_that_explores_records_what_it_was_offered(
+    scenario: Scenario,
+    store: InMemorySkillStore,
+    graph: InMemorySiteGraph,
+    fake_llm: FakeLLM,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """WHAT MADE THE LIVE MISSES TAKE A DAY TO EXPLAIN.
+
+    A run that reported ``skill_used=None`` said nothing about whether the library had
+    been consulted, so "never offered" and "offered and discarded" looked identical in
+    the report. Both questions are now answered in one line and on the failure itself:
+    what the domain held, what each candidate scored, and the rule that turned it down.
+    """
+    store.put(TWO_PARAMS)
+    planner = build(scenario, store, graph, fake_llm, compose=False)
+    task = TaskSpec(text="Pay the invoice for Acme Corp", domain=DOMAIN)
+
+    with caplog.at_level(logging.INFO, logger="skillweaver.agent.planner"):
+        assert planner.attempt(task, look(scenario)) is None
+
+    failure = planner.last_failure
+    assert failure is not None and failure.stage == "unbindable_args"
+    assert [r.skill for r in failure.rejected] == ["pay_invoice"]
+    assert failure.rejected[0].stage == "unbindable_args"
+    assert failure.rejected[0].score > 0.0
+
+    line = next(r.getMessage() for r in caplog.records if "planner.miss" in r.getMessage())
+    assert "library=pay_invoice" in line
+    assert "pay_invoice=0.700" in line, "the score retrieval gave it is in the line"
+    assert "pay_invoice (score 0.700) -> unbindable_args" in line
