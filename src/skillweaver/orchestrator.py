@@ -49,7 +49,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -88,6 +88,12 @@ from skillweaver.graph.store import JSONGraphStore
 from skillweaver.logging_ import get_logger
 from skillweaver.perception.elements import build_index, merge_elements
 from skillweaver.perception.fingerprint import StateFingerprinter
+from skillweaver.perception.ocr import (
+    DEFAULT_CACHE_SIZE,
+    CachingTextReader,
+    PerceptionCounters,
+    PerceptionCounts,
+)
 from skillweaver.skills.retrieve import SkillRetriever
 from skillweaver.skills.sandbox import SkillRunner
 from skillweaver.skills.store import FileSkillStore
@@ -105,6 +111,7 @@ __all__ = [
     "AttemptRecord",
     "ComposedPerceiver",
     "EnvironmentFor",
+    "PerceptionCounts",
     "RESET_URL_PARAM",
     "RunReport",
     "SynthesisFactory",
@@ -114,6 +121,7 @@ __all__ = [
     "budget_from",
     "build_workbench",
     "navigating_environment",
+    "perception_counts",
     "recall_end_state",
     "task_spec",
     "world_reset_from_url",
@@ -184,6 +192,11 @@ class AttemptRecord:
             warm path exists to make.**
         usd: Model spend charged to this attempt.
         seconds: Wall-clock seconds the attempt was charged.
+        perception: What the eyes did during this attempt - observations, captures,
+            detections and, above all, OCR reads against cache hits. It sits beside
+            ``llm_calls`` and ``usd`` because it is the same kind of fact: the cost
+            of the attempt, stated as a count so it means the same thing on a busy
+            machine as on an idle one.
         demoted: The skill retired because it ran and failed, or ``None``.
         performed_nothing: Whether the screen is untouched, so the next path may
             start from it as it stands.
@@ -201,6 +214,7 @@ class AttemptRecord:
     llm_calls: int = 0
     usd: float = 0.0
     seconds: float = 0.0
+    perception: PerceptionCounts = PerceptionCounts()
     demoted: str | None = None
     performed_nothing: bool = True
     run_id: str | None = None
@@ -210,7 +224,8 @@ class AttemptRecord:
         head = f"{self.path} path: {'ok' if self.ok else 'failed'}"
         where = f" at {self.stage}" if self.stage else ""
         chain = f" [{' -> '.join(self.skills_used)}]" if self.skills_used else ""
-        return f"{head}{where}{chain} ({self.llm_calls} model call(s)) - {self.reason}"
+        eyes = f", {self.perception}" if self.perception else ""
+        return f"{head}{where}{chain} ({self.llm_calls} model call(s){eyes}) - {self.reason}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +302,20 @@ class RunReport:
         return sum(a.steps for a in self.attempts)
 
     @property
+    def perception(self) -> PerceptionCounts:
+        """What the eyes did across every attempt of this run.
+
+        The headline this whole optimization is judged by is
+        ``report.perception.ocr_reads``: a task that used to need one OCR read per
+        observation and now needs one per CHANGED screen says so here, in a number that
+        does not move when the machine is loaded.
+        """
+        total = PerceptionCounts()
+        for attempt in self.attempts:
+            total = total + attempt.perception
+        return total
+
+    @property
     def run_id(self) -> str | None:
         """The trajectory id of the path that produced the result."""
         return self.outcome.trajectory.run_id if self.outcome is not None else None
@@ -312,6 +341,13 @@ class RunReport:
             )
         elif self.learning_note:
             lines.append(f"learned: nothing - {self.learning_note}")
+        eyes = self.perception
+        if eyes:
+            lines.append(
+                f"perception: {eyes.ocr_reads} OCR read(s) for {eyes.observations} "
+                f"observation(s) - {eyes.ocr_hits} served from cache "
+                f"({eyes.hit_rate:.0%}), {eyes.detections} detection(s)"
+            )
         verdict = "SOLVED" if self.ok else "NOT SOLVED"
         lines.append(
             f"{verdict} by the {self.decision} path "
@@ -438,7 +474,9 @@ class Agent:
         attempts: list[AttemptRecord] = []
 
         if warm:
+            mark = perception_counts(self._perceiver)
             record, outcome = self._try_warm(task)
+            record = self._charge_eyes(record, mark)
             attempts.append(record)
             if record.ok and outcome is not None:
                 self._persist()
@@ -473,7 +511,9 @@ class Agent:
                 candidates=candidates,
             )
 
+        mark = perception_counts(self._perceiver)
         record, outcome = self._try_cold(task)
+        record = self._charge_eyes(record, mark)
         attempts.append(record)
         learned, admission, note = self._learn(task, outcome, enabled=learn)
         self._persist()
@@ -488,6 +528,15 @@ class Agent:
             learned=learned,
             learning_note=note,
         )
+
+    def _charge_eyes(self, record: AttemptRecord, mark: PerceptionCounts) -> AttemptRecord:
+        """Attribute the perception work done since ``mark`` to ``record``.
+
+        Counted here rather than inside each attempt because the perceiver is shared by
+        the planner, the explorer and every skill they run, so the only honest boundary
+        for "what this attempt made the eyes do" is the attempt itself.
+        """
+        return replace(record, perception=perception_counts(self._perceiver) - mark)
 
     # -- the warm path -----------------------------------------------------------------
 
@@ -746,32 +795,102 @@ class ComposedPerceiver:
     them and fingerprint the result. Boxes are LOGICAL pixels throughout, because
     both producers are required to convert before they return.
 
+    Reading is 84% to 97% of that, measured on every live page tried, so the reader is
+    wrapped in a :class:`~skillweaver.perception.ocr.CachingTextReader` by default: an
+    observation of a screen nothing has touched costs a capture and a detection, and no
+    OCR at all. Everything the perceiver does is charged to :attr:`counters`, which is
+    what a run reports so the saving can be stated as a count rather than as seconds
+    measured on whatever else the machine happened to be doing.
+
     Args:
         detector: Finds controls. Required.
         reader: Reads text. ``None`` runs detection alone, which is what a machine
             without the OCR models can still do.
         fingerprinter: Identifies the screen. Defaults to
             :class:`~skillweaver.perception.fingerprint.StateFingerprinter`.
+        cache_size: Frames the text cache remembers. ``0`` reads every frame afresh,
+            which is how a caller turns the optimization off to measure against it.
+        counters: The tally to charge work to. A fresh one is made when not given.
+
+    Why the text is not read LAZILY
+    -------------------------------
+
+    The obvious next step is to defer the read until something actually asks for text,
+    so the steps that never touch it never pay. It is implementable -
+    :class:`~skillweaver.contracts.Observation` is a frozen slots dataclass, and a
+    subclass whose ``elements``, ``index`` and ``fingerprint`` are properties over one
+    memoized thunk passes ``isinstance``, equality and ``repr`` untouched - and it is
+    worth nothing, because of a dependency that is easy to miss:
+
+        ``fingerprint`` is computed FROM ``elements``, and ``elements`` includes the OCR
+        ones. :class:`~skillweaver.perception.fingerprint.StateFingerprinter`'s
+        structural hash bins every element by kind and position, text elements included,
+        so asking a screen what state it is in already requires the read.
+
+    Since every consumer in this project compares fingerprints - the explorer to
+    remember a state, the critic to judge a move, the planner to check a precondition -
+    a lazy field would materialize almost immediately. Measured rather than assumed: on
+    two live Wikipedia exploration runs, **12 of 12 and 9 of 9 observations had their
+    elements and fingerprint read**, so the laziness would have saved exactly zero reads
+    in both. The saving is real only for a fingerprinter that does not consume OCR
+    elements, and changing what ``StateFingerprinter`` hashes changes every stored graph
+    node id and every stored skill precondition - a coordination decision, not a local
+    one.
 
     This lives here rather than in :mod:`skillweaver.perception` only because that
     package has not grown a composing perceiver yet; it is wiring, and wiring is this
     module's job until it has a better home.
     """
 
-    __slots__ = ("_detector", "_fingerprinter", "_reader")
+    __slots__ = ("_counters", "_detector", "_fingerprinter", "_reader")
 
     def __init__(
         self,
         detector: Detector,
         reader: TextReader | None = None,
         fingerprinter: Fingerprinter | None = None,
+        *,
+        cache_size: int = DEFAULT_CACHE_SIZE,
+        counters: PerceptionCounters | None = None,
     ) -> None:
         self._detector = detector
-        self._reader = reader
+        self._reader: CachingTextReader | None
+        if isinstance(reader, CachingTextReader):
+            # A reader that already caches is reused rather than wrapped again, so two
+            # perceivers sharing one warm cache share its tally instead of each counting
+            # half the frames. It charges its reads where it was told to at construction,
+            # and a tally that only some of the work reaches is worse than none.
+            if counters is not None and counters is not reader.counters:
+                raise ValueError(
+                    "this reader already charges its reads to another PerceptionCounters; "
+                    "pass that one, or pass an unwrapped reader"
+                )
+            self._reader = reader
+            self._counters = reader.counters
+        else:
+            self._counters = counters if counters is not None else PerceptionCounters()
+            self._reader = (
+                None
+                if reader is None
+                else CachingTextReader(reader, capacity=cache_size, counters=self._counters)
+            )
         self._fingerprinter = fingerprinter if fingerprinter is not None else StateFingerprinter()
 
     def __repr__(self) -> str:
-        return f"ComposedPerceiver(reader={self._reader is not None})"
+        return (
+            f"ComposedPerceiver(reader={self._reader is not None}, "
+            f"counts={self._counters.snapshot()})"
+        )
+
+    @property
+    def counters(self) -> PerceptionCounters:
+        """The running tally of everything this perceiver has done."""
+        return self._counters
+
+    @property
+    def reader(self) -> CachingTextReader | None:
+        """The caching reader, or ``None`` when this perceiver reads no text."""
+        return self._reader
 
     def observe(self, controller: Controller) -> Observation:
         """One frame, fully understood.
@@ -781,11 +900,13 @@ class ComposedPerceiver:
             PerceptionError: if detection, reading or fingerprinting fails.
         """
         shot: Screenshot = controller.capture()
+        self._counters.captures += 1
         found: list[Element] = self._detector.detect(shot)
+        self._counters.detections += 1
         text: list[Element] = self._reader.read(shot) if self._reader is not None else []
         elements = tuple(merge_elements(found, text))
         url = controller.url()
-        return Observation(
+        observation = Observation(
             screenshot=shot,
             elements=elements,
             index=build_index(elements),
@@ -793,6 +914,23 @@ class ComposedPerceiver:
             url=url,
             taken_at=utcnow(),
         )
+        self._counters.observations += 1
+        return observation
+
+
+def perception_counts(perceiver: Perceiver | None) -> PerceptionCounts:
+    """What ``perceiver`` has done so far, or an empty tally when it does not count.
+
+    :class:`~skillweaver.contracts.Perceiver` says nothing about counters - a fake in a
+    test, or a perceiver another worker writes, is under no obligation to keep them - so
+    a report asks politely and reports nothing rather than failing when the answer is no.
+    """
+    counters = getattr(perceiver, "counters", None)
+    snapshot = getattr(counters, "snapshot", None)
+    if snapshot is None:
+        return PerceptionCounts()
+    result = snapshot()
+    return result if isinstance(result, PerceptionCounts) else PerceptionCounts()
 
 
 # --------------------------------------------------------------------------------------

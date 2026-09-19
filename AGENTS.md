@@ -35,6 +35,14 @@ admission gate needs 1.00 against the recorded starting screen before it will re
 candidate - so a headed run rejects good skills for the way a background window
 rendered. What else a live-site run needs is in `eval/wikipedia.yaml`.
 
+Perception is dominated by OCR - 84-97% of every observation's time on real pages -
+so the shipped fix is to not read the same pixels twice, and counts, not seconds, are how
+that is judged (seconds move with machine load; this project has been burned by that
+twice). `PerceptionCounters` and `CachingTextReader` in
+`src/skillweaver/perception/ocr.py` hold the measured reasons the cache key is the exact
+pixels and not "the same state", and `ComposedPerceiver` in `src/skillweaver/orchestrator.py`
+holds the measured reason the text is NOT read lazily. Read both before trying either again.
+
 `ultralytics` is a noisy import; three of its side effects have already cost time here.
 
 - It installs its own top-level `tests` package into the venv, which shadows this repository's

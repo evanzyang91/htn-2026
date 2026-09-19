@@ -28,7 +28,13 @@ from skillweaver.errors import PerceptionError
 from skillweaver.perception import crop as cropping
 from skillweaver.perception import screenshot as shots
 from skillweaver.perception.elements import ElementIndex, normalize_text, overlap_ratio, stable_id
-from skillweaver.perception.ocr import DEFAULT_MIN_CONFIDENCE, RapidOcrReader
+from skillweaver.perception.ocr import (
+    DEFAULT_MIN_CONFIDENCE,
+    CachingTextReader,
+    PerceptionCounters,
+    RapidOcrReader,
+    content_key,
+)
 
 SHOTS = Path(__file__).resolve().parents[1] / "fixtures" / "shots"
 RECORDS: dict[str, dict] = {
@@ -341,3 +347,152 @@ def test_the_engine_is_built_once_and_only_when_needed() -> None:
     reader.read(_load("login@1x"))
     reader.read(_load("login@1x"))
     assert len(calls) == 2
+
+
+# --------------------------------------------------------------------------------------
+# Not reading the same pixels twice
+# --------------------------------------------------------------------------------------
+
+
+def test_the_caching_reader_satisfies_the_text_reader_protocol() -> None:
+    assert isinstance(CachingTextReader(RapidOcrReader()), contracts.TextReader)
+
+
+def test_the_same_frame_is_read_once_and_then_remembered(reader: RapidOcrReader) -> None:
+    """The saving this cache exists for, against the real engine and real pixels."""
+    counters = PerceptionCounters()
+    caching = CachingTextReader(reader, counters=counters)
+    shot = _load("invoices@1x")
+
+    first = caching.read(shot)
+    repeats = [caching.read(_load("invoices@1x")) for _ in range(3)]
+
+    assert first, "the fixture has text; a cache test on an empty read proves nothing"
+    assert all(again == first for again in repeats), "a hit must be the read it replaces"
+    assert (counters.ocr_reads, counters.ocr_hits) == (1, 3)
+
+
+@pytest.mark.parametrize("other", ["login@1x", "invoices@2x"])
+def test_a_changed_page_is_never_served_a_previous_read(
+    reader: RapidOcrReader, read: dict[str, list[Element]], other: str
+) -> None:
+    """The bar the whole optimization is held to, with the real engine.
+
+    A stale read is far worse than a slow one: a skill cannot tell one from the other,
+    it just clicks. ``invoices@2x`` is the sharper case - the SAME page as the 1x
+    fixture, whose elements live at the same logical coordinates but whose bytes and
+    declared scale differ - so a cache keyed on anything looser than the pixels would
+    hand the 2x frame the 1x read and be none the wiser.
+    """
+    counters = PerceptionCounters()
+    caching = CachingTextReader(reader, counters=counters)
+
+    caching.read(_load("invoices@1x"))
+    served = caching.read(_load(other))
+
+    assert counters.ocr_reads == 2, f"{other} must be read, not served from the cache"
+    assert counters.ocr_hits == 0
+    assert served == read[other], "the changed page gets its own true read"
+
+
+def test_the_same_bytes_at_a_different_scale_are_a_different_frame() -> None:
+    """Geometry is part of the identity: the same PNG at 2x has boxes at half the
+    position, and serving one read for the other is the doubled-coordinate bug."""
+    engine = lambda _image: (  # noqa: E731
+        [[[[80, 264], [680, 264], [680, 352], [80, 352]], "Search invoices", 0.9]],
+        None,
+    )
+    counters = PerceptionCounters()
+    caching = CachingTextReader(RapidOcrReader(engine=engine), counters=counters)
+    png = _load("invoices@2x").png
+
+    at_1x = caching.read(shots.from_png(png, scale=1.0))
+    at_2x = caching.read(shots.from_png(png, scale=2.0))
+
+    assert counters.ocr_reads == 2 and counters.ocr_hits == 0
+    assert at_1x[0].box == Box(80, 264, 600, 88)
+    assert at_2x[0].box == Box(40, 132, 300, 44)
+
+
+def test_a_cached_read_cannot_be_corrupted_by_whoever_was_served_it() -> None:
+    """Every hit is a fresh list, so a caller that sorts or trims it harms nobody."""
+    caching = CachingTextReader(RapidOcrReader(engine=_one_word_engine("Keep")))
+    shot = _load("login@1x")
+
+    served = caching.read(shot)
+    served.clear()
+
+    assert [e.text for e in caching.read(shot)] == ["Keep"]
+
+
+def test_a_failed_read_is_not_remembered_as_an_answer() -> None:
+    """A transient engine fault must not become a permanent blind spot."""
+    attempts: list[int] = []
+
+    def flaky(_image: object) -> object:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("onnxruntime had a bad day")
+        return ([[[[0, 0], [20, 0], [20, 12], [0, 12]], "Recovered", 0.9]], None)
+
+    caching = CachingTextReader(RapidOcrReader(engine=flaky))
+    with pytest.raises(PerceptionError):
+        caching.read(_load("login@1x"))
+
+    assert [e.text for e in caching.read(_load("login@1x"))] == ["Recovered"]
+
+
+def test_the_cache_is_bounded_and_evicts_the_least_recently_used_frame() -> None:
+    reads: list[int] = []
+
+    def engine(_image: object) -> object:
+        reads.append(1)
+        return ([], None)
+
+    caching = CachingTextReader(RapidOcrReader(engine=engine), capacity=2)
+    a, b, c = (shots.resize(_load("login@1x"), width=w) for w in (640, 320, 160))
+
+    caching.read(a)
+    caching.read(b)
+    caching.read(a)  # a is now the most recently used, so b is next out
+    caching.read(c)
+
+    assert len(reads) == 3
+    caching.read(a)
+    assert len(reads) == 3, "a was kept"
+    caching.read(b)
+    assert len(reads) == 4, "b was evicted"
+
+
+def test_capacity_zero_reads_every_frame_and_still_counts() -> None:
+    """How a caller turns the optimization off to measure against it."""
+    counters = PerceptionCounters()
+    caching = CachingTextReader(
+        RapidOcrReader(engine=_one_word_engine("Hi")), capacity=0, counters=counters
+    )
+    for _ in range(3):
+        caching.read(_load("login@1x"))
+    assert (counters.ocr_reads, counters.ocr_hits) == (3, 0)
+
+
+def test_clearing_forgets_the_frames_but_keeps_the_tally() -> None:
+    counters = PerceptionCounters()
+    caching = CachingTextReader(RapidOcrReader(engine=_one_word_engine("Hi")), counters=counters)
+    caching.read(_load("login@1x"))
+    caching.read(_load("login@1x"))
+    caching.clear()
+    caching.read(_load("login@1x"))
+    assert (counters.ocr_reads, counters.ocr_hits) == (2, 1)
+
+
+def test_content_key_is_the_pixels_and_the_geometry() -> None:
+    shot = _load("invoices@1x")
+    same = shots.from_png(shot.png, scale=1.0, width=shot.width, height=shot.height)
+    assert content_key(shot) == content_key(same)
+    assert content_key(shot) != content_key(_load("login@1x"))
+    assert content_key(shot) != content_key(shots.rescale(shot, 2.0))
+
+
+def _one_word_engine(word: str):
+    """A stub RapidOCR that always recognizes ``word`` once, wherever it is asked."""
+    return lambda _image: ([[[[0, 0], [20, 0], [20, 12], [0, 12]], word, 0.9]], None)
