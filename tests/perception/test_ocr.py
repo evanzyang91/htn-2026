@@ -18,6 +18,7 @@ import json
 import subprocess
 import sys
 import types
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,11 @@ from skillweaver.errors import PerceptionError
 from skillweaver.perception import crop as cropping
 from skillweaver.perception import screenshot as shots
 from skillweaver.perception.elements import ElementIndex, normalize_text, overlap_ratio, stable_id
-from skillweaver.perception.ocr import DEFAULT_MIN_CONFIDENCE, RapidOcrReader
+from skillweaver.perception.ocr import (
+    DEFAULT_MIN_CONFIDENCE,
+    RapidOcrReader,
+    forget_ocr_caches,
+)
 
 SHOTS = Path(__file__).resolve().parents[1] / "fixtures" / "shots"
 RECORDS: dict[str, dict] = {
@@ -236,8 +241,22 @@ def test_importing_the_module_does_not_load_onnx_runtime() -> None:
     assert "cheap" in done.stdout
 
 
+@pytest.fixture
+def no_engine_in_hand() -> Iterator[None]:
+    """A reader here has to actually build an engine, rather than find one built.
+
+    Engines are cached per process so an evaluation does not rebuild one per run, and
+    an earlier test in this module will have put a real one there. These two tests are
+    about what happens when building fails, so the shelf has to be empty first - and
+    put back afterwards, because the tests that follow want the fast path.
+    """
+    forget_ocr_caches()
+    yield
+    forget_ocr_caches()
+
+
 def test_a_missing_engine_raises_perception_error_instead_of_reading_nothing(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, no_engine_in_hand: None
 ) -> None:
     """Degrading to an empty list would let an agent click blindly, so it must raise."""
     monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", None)
@@ -245,7 +264,9 @@ def test_a_missing_engine_raises_perception_error_instead_of_reading_nothing(
         RapidOcrReader().read(_load("login@1x"))
 
 
-def test_an_unloadable_model_raises_perception_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_unloadable_model_raises_perception_error(
+    monkeypatch: pytest.MonkeyPatch, no_engine_in_hand: None
+) -> None:
     def explode(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("model file is missing")
 
@@ -254,6 +275,32 @@ def test_an_unloadable_model_raises_perception_error(monkeypatch: pytest.MonkeyP
     monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", stub)
     with pytest.raises(PerceptionError, match="could not be loaded"):
         RapidOcrReader().read(_load("login@1x"))
+
+
+def test_an_engine_is_built_once_per_process_not_once_per_reader(
+    no_engine_in_hand: None,
+) -> None:
+    """What stops a fourteen-task evaluation paying ONNX Runtime's setup seventy times.
+
+    Sharing is safe because the engine is configuration plus weights and is used
+    read-only; two readers asking for the same thread count want the same object.
+    """
+    built: list[object] = []
+
+    class _Engine:
+        use_cls = True
+
+        def __init__(self, **_kwargs: object) -> None:
+            built.append(self)
+
+    stub = types.ModuleType("rapidocr_onnxruntime")
+    stub.RapidOCR = _Engine  # type: ignore[attr-defined]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, "rapidocr_onnxruntime", stub)
+        first = RapidOcrReader()
+        second = RapidOcrReader()
+        assert first._ensure_engine() is second._ensure_engine()  # noqa: SLF001
+    assert len(built) == 1
 
 
 def test_failed_inference_raises_perception_error() -> None:
@@ -399,7 +446,7 @@ def test_the_same_screen_read_twice_recognizes_nothing_the_second_time() -> None
     pixels have already been read is sent to the recognizer again.
     """
     engine = _StagedEngine({(10, 10): "Inbox", (10, 30): "Archived", (10, 50): "Sent"})
-    reader = RapidOcrReader(engine=engine)
+    reader = RapidOcrReader(engine=engine, private_cache=True)
     shot = _load("login@1x")
 
     first = reader.read(shot)
@@ -415,7 +462,7 @@ def test_only_the_lines_that_changed_are_recognized_again() -> None:
     """The case a real run is always in: one action changes part of one screen."""
     lines = {(10, 10): "Inbox", (10, 30): "Archived", (10, 50): "Sent"}
     engine = _StagedEngine(lines)
-    reader = RapidOcrReader(engine=engine)
+    reader = RapidOcrReader(engine=engine, private_cache=True)
     shot = _load("login@1x")
     reader.read(shot)
 
@@ -458,6 +505,7 @@ def test_the_staged_path_and_the_plain_path_agree_on_the_real_engine(
 
     shot = _load("invoices@1x")
     staged = reader.read(shot)
-    plain = RapidOcrReader(engine=_Opaque(reader._ensure_engine())).read(shot)  # noqa: SLF001
+    opaque = RapidOcrReader(engine=_Opaque(reader._ensure_engine()))  # noqa: SLF001
+    plain = opaque.read(shot)
 
     assert [(e.text, e.box) for e in staged] == [(e.text, e.box) for e in plain]

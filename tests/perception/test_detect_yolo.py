@@ -34,7 +34,11 @@ from skillweaver.contracts import (
     utcnow,
 )
 from skillweaver.errors import PerceptionError
-from skillweaver.perception.detect_yolo import YoloDetector, default_weights_path
+from skillweaver.perception.detect_yolo import (
+    YoloDetector,
+    default_weights_path,
+    forget_loaded_models,
+)
 from skillweaver.perception.labeling import (
     CLASS_NAMES,
     box_from_yolo,
@@ -592,6 +596,42 @@ requires_weights = pytest.mark.skipif(
         f"  uv run python scripts/train_detector.py --data data/models/ui-dataset/data.yaml"
     ),
 )
+
+
+@requires_weights
+def test_the_checkpoint_is_read_from_disk_once_per_process_not_once_per_detector() -> None:
+    """A detector is built per session and an evaluation opens a session per run, so
+    without this a fourteen-task suite re-read the same unchanged file seventy times.
+
+    The key carries the checkpoint's modification time and size as well as its path, so
+    retraining under the same name is picked up rather than silently served from before.
+    """
+    forget_loaded_models()
+    first, second = YoloDetector(), YoloDetector()
+    assert first._load() is second._load(), "the second detector reuses the loaded model"  # noqa: SLF001
+
+    retrained = YoloDetector()
+    stat = default_weights_path().stat()
+    with pytest.MonkeyPatch.context() as patch:
+        # Same path, different mtime: a different checkpoint as far as this is concerned.
+        patch.setattr(
+            Path,
+            "stat",
+            lambda self, *a, **k: _Stat(stat, mtime_ns=stat.st_mtime_ns + 1),
+        )
+        assert retrained._load() is not first._load()  # noqa: SLF001
+    forget_loaded_models()
+
+
+class _Stat:
+    """A stat result with one field replaced, for the retrained-checkpoint case."""
+
+    def __init__(self, real: object, *, mtime_ns: int) -> None:
+        self._real = real
+        self.st_mtime_ns = mtime_ns
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
 
 
 def test_the_fixture_frames_are_the_ones_the_floor_was_measured_on() -> None:

@@ -66,9 +66,26 @@ _BUILD_HINT = (
 )
 
 
+_loaded: dict[tuple[str, int, int, str | None], Any] = {}
+"""Models already read from disk this process, keyed by checkpoint identity.
+
+A detector is built per session and an evaluation opens one session per run, so
+without this the same unchanged file is read from disk dozens of times in a suite.
+See :meth:`YoloDetector._load` for why the key is what it is.
+"""
+
+_loaded_lock = threading.Lock()
+
+
 def default_weights_path() -> Path:
     """Where the detector expects its weights: ``<models_dir>/ui_detector.pt``."""
     return settings().models_dir / DEFAULT_WEIGHTS_NAME
+
+
+def forget_loaded_models() -> None:
+    """Drop every process-cached model. For a test that must load one afresh."""
+    with _loaded_lock:
+        _loaded.clear()
 
 
 class YoloDetector:
@@ -151,7 +168,18 @@ class YoloDetector:
         return self._weights if self._weights is not None else default_weights_path()
 
     def _load(self) -> Any:
-        """Load the model once, on first use.
+        """Load the model once, on first use, and once per process per checkpoint.
+
+        The instance cache is what stops one detector reloading between frames. The
+        process cache below it is what stops an evaluation reloading between RUNS:
+        every session builds its own detector, so a suite of fourteen tasks at five
+        runs each paid seventy loads of the same unchanged file - minutes of wall
+        clock spent reading a checkpoint that was already in memory.
+
+        Keyed by the path AND its modification time and size, so a checkpoint that
+        was retrained under the same name is read again rather than silently served
+        from before. Sharing is safe because a loaded model is used read-only here:
+        inference takes the image as an argument and keeps nothing of it.
 
         Raises:
             PerceptionError: if the file is absent or ultralytics cannot read it.
@@ -167,6 +195,13 @@ class YoloDetector:
                     f"YOLO detector weights not found at {path}. "
                     f"Set SKILLWEAVER_DATA_DIR or pass weights=..., or {_BUILD_HINT}"
                 )
+            stat = path.stat()
+            key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size, self._device)
+            with _loaded_lock:
+                shared = _loaded.get(key)
+            if shared is not None:
+                self._model = shared
+                return shared
             try:
                 YOLO = _import_yolo()
             except ImportError as exc:  # pragma: no cover - ultralytics is a hard dependency
@@ -176,6 +211,8 @@ class YoloDetector:
             except Exception as exc:  # noqa: BLE001 - a corrupt checkpoint is a perception failure
                 raise PerceptionError(f"could not load YOLO weights from {path}: {exc}") from exc
             self._check_classes(model, path)
+            with _loaded_lock:
+                _loaded[key] = model
             self._model = model
             return model
 

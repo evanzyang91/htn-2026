@@ -70,6 +70,7 @@ __all__ = [
     "DEFAULT_MIN_CONFIDENCE",
     "DEFAULT_THREADS",
     "RapidOcrReader",
+    "forget_ocr_caches",
 ]
 
 #: Recognitions below this score are dropped: at that level RapidOCR is reporting
@@ -108,6 +109,38 @@ def _threads() -> int:
     return max(1, min(wanted, cores))
 
 
+_engines: dict[int, Any] = {}
+"""RapidOCR engines already built this process, keyed by thread count.
+
+Building one costs a second or two of ONNX Runtime session setup. A reader is built
+per session and an evaluation opens a session per run, so without this a suite pays
+that cost once per run for an object that is identical every time and is used
+read-only.
+"""
+
+_shared_lines: OrderedDict[bytes, tuple[str, float]] = OrderedDict()
+"""Line crops recognized anywhere in this process, keyed by their pixels.
+
+Shared across readers on purpose, and safe to share for the same reason the cache is
+safe at all: the key IS the image. Two crops with the same digest are the same
+picture, so the text one reader found is the text another would have found.
+
+This is what makes the second run of a task cheap rather than only the second
+observation within one run. An evaluation closes the browser between runs and builds
+a fresh perceiver for the next one, so a per-reader cache would be thrown away
+exactly when the same screens are about to be read again.
+"""
+
+_lines_lock = threading.Lock()
+
+
+def forget_ocr_caches() -> None:
+    """Drop the shared engines and recognized lines. For tests and cold benchmarks."""
+    with _lines_lock:
+        _shared_lines.clear()
+        _engines.clear()
+
+
 class RapidOcrReader:
     """A :class:`~skillweaver.contracts.TextReader` backed by RapidOCR.
 
@@ -128,6 +161,9 @@ class RapidOcrReader:
         cache: Whether to remember recognized line crops between reads. ``False`` for a
             benchmark measuring the cold cost of a single frame.
         threads: ONNX Runtime threads. ``None`` uses :func:`_threads`.
+        private_cache: Keep this reader's recognized lines to itself instead of sharing
+            the process-wide store. Only a test comparing two readers wants this; the
+            default is what makes a second run of a task cheap.
     """
 
     __slots__ = ("_cache", "_engine", "_hits", "_lock", "_misses", "_threads", "min_confidence")
@@ -139,12 +175,20 @@ class RapidOcrReader:
         engine: Any | None = None,
         cache: bool = True,
         threads: int | None = None,
+        private_cache: bool = False,
     ) -> None:
         self.min_confidence = float(min_confidence)
         self._engine = engine
         self._lock = threading.Lock()
         self._threads = _threads() if threads is None else max(1, int(threads))
-        self._cache: OrderedDict[bytes, tuple[str, float]] | None = OrderedDict() if cache else None
+        lines: OrderedDict[bytes, tuple[str, float]] | None
+        if not cache:
+            lines = None
+        elif private_cache:
+            lines = OrderedDict()
+        else:
+            lines = _shared_lines
+        self._cache = lines
         self._hits = 0
         self._misses = 0
 
@@ -162,7 +206,12 @@ class RapidOcrReader:
         }
 
     def _ensure_engine(self) -> Any:
-        """Build the engine on first use.
+        """Build the engine on first use, and once per process per thread count.
+
+        ONNX Runtime session setup costs a second or two and produces an object that
+        is identical for the same settings and is only ever used read-only, so an
+        evaluation building a reader per run should pay for it once rather than once
+        per run.
 
         Raises:
             PerceptionError: if RapidOCR is not installed or its models cannot be
@@ -174,6 +223,11 @@ class RapidOcrReader:
         with self._lock:
             if self._engine is not None:
                 return self._engine
+            with _lines_lock:
+                shared = _engines.get(self._threads)
+            if shared is not None:
+                self._engine = shared
+                return shared
             try:
                 from rapidocr_onnxruntime import RapidOCR
             except ImportError as exc:
@@ -182,13 +236,16 @@ class RapidOcrReader:
                     f"({exc}). Install the project's dependencies with `make install`."
                 ) from exc
             try:
-                self._engine = RapidOCR(
+                engine = RapidOCR(
                     intra_op_num_threads=self._threads,
                     inter_op_num_threads=self._threads,
                 )
             except Exception as exc:  # model files missing, ONNX Runtime broken, ...
                 raise PerceptionError(f"OCR engine could not be loaded: {exc}") from exc
-            return self._engine
+            with _lines_lock:
+                _engines[self._threads] = engine
+            self._engine = engine
+            return engine
 
     def read(self, screenshot: Screenshot) -> list[Element]:
         """Read the text on ``screenshot``.
@@ -302,17 +359,23 @@ class RapidOcrReader:
     # -- the line cache ------------------------------------------------------------------
 
     def _remembered(self, crop: Any) -> tuple[str, float] | None:
-        """What this exact crop said last time, or ``None``."""
+        """What this exact crop said last time, or ``None``.
+
+        Locked because the default store is shared by every reader in the process and
+        an ``OrderedDict`` reordered from two threads at once is not merely stale, it
+        is corrupt.
+        """
         if self._cache is None:
             return None
         key = _digest(crop)
         if key is None:
             return None
-        found = self._cache.get(key)
-        if found is None:
-            self._misses += 1
-            return None
-        self._cache.move_to_end(key)
+        with _lines_lock:
+            found = self._cache.get(key)
+            if found is None:
+                self._misses += 1
+                return None
+            self._cache.move_to_end(key)
         self._hits += 1
         return found
 
@@ -323,10 +386,11 @@ class RapidOcrReader:
         key = _digest(crop)
         if key is None:
             return
-        self._cache[key] = answer
-        self._cache.move_to_end(key)
-        while len(self._cache) > CACHE_LINES:
-            self._cache.popitem(last=False)
+        with _lines_lock:
+            self._cache[key] = answer
+            self._cache.move_to_end(key)
+            while len(self._cache) > CACHE_LINES:
+                self._cache.popitem(last=False)
 
 
 def _digest(crop: Any) -> bytes | None:
