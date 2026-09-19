@@ -1,0 +1,31 @@
+{
+  "frames": [
+    {
+      "image": "mail_inbox.png",
+      "labels": "mail_inbox.txt",
+      "recipe": "mail_inbox",
+      "width": 1200,
+      "height": 780,
+      "scale": 1.0,
+      "elements": 55
+    },
+    {
+      "image": "rec_selected.png",
+      "labels": "rec_selected.txt",
+      "recipe": "rec_selected",
+      "width": 1200,
+      "height": 780,
+      "scale": 1.0,
+      "elements": 183
+    },
+    {
+      "image": "set_dialog.png",
+      "labels": "set_dialog.txt",
+      "recipe": "set_dialog",
+      "width": 1200,
+      "height": 780,
+      "scale": 2.0,
+      "elements": 46
+    }
+  ]
+}

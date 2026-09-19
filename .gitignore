@@ -22,6 +22,17 @@ runs/
 *.pt
 *.onnx
 
+# ...except the trained UI element detector, which ships with the repository so a
+# clean clone can run the demo with no training step and no network. Git will not
+# look inside an excluded directory, so every directory on the path has to be
+# un-excluded before the one file can be named. Everything else under data/ -
+# including the regenerable 240-frame dataset - stays ignored.
+!data/
+data/*
+!data/models/
+data/models/*
+!data/models/ui_detector.pt
+
 # OS / editors
 .DS_Store
 .idea/
