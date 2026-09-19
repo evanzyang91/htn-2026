@@ -96,6 +96,7 @@ reports the reset as failed, and no skill is stored.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -120,6 +121,8 @@ from skillweaver.perception.elements import build_index
 
 __all__ = [
     "DEFAULT_MAX_ROUNDS",
+    "SETTLE_BUDGET_MS",
+    "SETTLE_POLL_MS",
     "RESET_ACTIONS_PARAM",
     "Oracle",
     "ResetDidNotConverge",
@@ -154,6 +157,35 @@ control whose name lives in an ``aria-label`` and was never painted. See the mod
 docstring for why a reset may read it and the agent may not.
 """
 
+
+SETTLE_BUDGET_MS = 4000.0
+"""How long a converging step waits for the page to answer, before reading it again.
+
+**Not a sleep.** The loop polls, returns the instant the screen differs from the one
+that prompted the action, and on a page that responds immediately costs one extra read
+of a few milliseconds. That is the distinction
+:func:`~skillweaver.skills.refactor.strip_reflex_waits` draws, and this is the side of
+it that survives: a wait for something no load event covers.
+
+It exists because an undo on a real site is frequently NOT a navigation.
+``BrowserController`` settles an action by waiting for the page's load event, which is
+the right thing and covers nothing here: splitkb.com removes a cart line with an
+in-place fetch, so the load event never fires, the loop re-read the unchanged cart and
+- measured on 2026-09-19, a two-line cart - reported ``ResetDidNotConverge`` after
+twelve clicks with both lines still in it. Worse than the failure is what it looked
+like: the clicks were real, the anchor was right, and the step was correct. With a
+settle the same two lines come off in two rounds.
+
+Four seconds because the loop is already bounded by :data:`DEFAULT_MAX_ROUNDS` and the
+exit condition, so this only has to outlast one slow request; a step that will never
+converge still says so within ``max_rounds`` reads rather than ``max_rounds`` times
+this.
+"""
+
+SETTLE_POLL_MS = 120.0
+"""How often the settle above looks. Short enough that a fast page pays almost nothing
+for it, long enough that a ``via="screen"`` poll - which costs a real observation - is
+not run flat out."""
 
 DEFAULT_MAX_ROUNDS = 12
 """How many times a converging step may act before it gives up.
@@ -546,11 +578,62 @@ def _run_step(step: ResetStep, position: int, controller: Controller, read: _Rea
         if performed == step.max_rounds:
             break
         _perform(step, position, controller, read, seen=seen)
+        _await_answer(step, position, read, seen)
     raise ResetDidNotConverge(
         f"reset step {position} ({step}) performed {step.max_rounds} actions and the "
         "world still does not look put back. Either the step does not undo what it is "
         "aimed at, or its condition names text that does not change with the state."
     )
+
+
+def _await_answer(step: ResetStep, position: int, read: _Reader, before: ElementIndex) -> None:
+    """Wait for the page to answer the action just performed. See :data:`SETTLE_BUDGET_MS`.
+
+    Returns as soon as the screen differs from ``before`` or the step's exit condition
+    holds, and at the budget otherwise. Timing out is NOT a failure here: the next round
+    reads the screen and judges it on the same terms as every other round, so a page that
+    genuinely did not change still converges or still runs out of rounds. All this
+    decides is whether the loop is looking at the answer or at the question.
+
+    A read that fails is swallowed for the same reason: this is a poll, and the read at
+    the top of the next round is the one whose failure means something.
+    """
+    deadline = time.monotonic() + SETTLE_BUDGET_MS / 1000.0
+    start = _signature(before)
+    previous = start
+    changed = False
+    while time.monotonic() < deadline:
+        time.sleep(SETTLE_POLL_MS / 1000.0)
+        try:
+            now = read(step, position)
+        except SkillWeaverError:
+            continue
+        if _settled(now, step):
+            return
+        signature = _signature(now)
+        # Changed AND stopped changing. Waiting for the first change alone is not
+        # enough, because a page answers in two phases: splitkb.com's last cart line
+        # disappears one frame and "Your cart is empty" is painted the next, and a loop
+        # that returned in between saw a screen with nothing to click and nothing
+        # saying it was done - which _perform correctly reports as being on the wrong
+        # screen. One quiet poll is the difference.
+        if changed and signature == previous:
+            return
+        changed = changed or signature != start
+        previous = signature
+    log.info("agent.world_reset.unanswered", step=position, waited_ms=SETTLE_BUDGET_MS)
+
+
+def _signature(seen: ElementIndex) -> tuple[tuple[str, int, int], ...]:
+    """A cheap identity for one reading of the screen, for :func:`_await_answer`.
+
+    Text and position, not a fingerprint: this is asking "did anything at all move or
+    change wording", which is deliberately a much lower bar than
+    :meth:`~skillweaver.contracts.Fingerprint.similarity`. A removed cart line changes
+    it; so does a spinner, and that is fine - the exit condition, not this, decides
+    whether the world is back.
+    """
+    return tuple((element.text, element.box.x, element.box.y) for element in seen.all())
 
 
 def _settled(seen: ElementIndex, step: ResetStep) -> bool:

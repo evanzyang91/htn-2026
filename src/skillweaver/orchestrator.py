@@ -2256,7 +2256,7 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
             "--policy jev needs --perception dom: the policy chooses an index into the "
             "page's own list of named controls, which only the DOM path produces."
         )
-    return JevDriver(JevPolicy(LLMTextWriter(llm)), perceiver)
+    return JevDriver(JevPolicy(LLMTextWriter(llm), api_key=config.typesafe_api_key), perceiver)
 
 
 def budget_from(

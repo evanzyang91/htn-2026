@@ -163,6 +163,7 @@ class JevDriver:
             operation=decision.operation,
             confidence=round(decision.confidence, 3),
             probability=round(decision.probability, 3),
+            policy_ms=round(decision.policy_ms),
             latency_ms=round(decision.latency_ms),
             offered=len(pruned.controls),
             pruned=len(snapshot.controls) - len(pruned.controls),

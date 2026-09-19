@@ -28,9 +28,7 @@ Recognized variables::
     ANTHROPIC_API_KEY           Claude credentials (optional: the SDK also resolves
                                 its own credentials when this is unset)
     GEMINI_API_KEY              Gemini credentials (GOOGLE_API_KEY also accepted)
-    TYPESAFE_API_KEY            Jev policy credentials, read by skillweaver.llm.jev_
-                                itself rather than through Settings, so no credential
-                                is copied into a value this module puts in a repr
+    TYPESAFE_API_KEY            Jev policy credentials (skillweaver.llm.jev_)
 """
 
 from __future__ import annotations
@@ -172,6 +170,7 @@ class Settings:
     embedder_dir_override: Path | None = None
     anthropic_api_key: str | None = field(default=None, repr=False)
     gemini_api_key: str | None = field(default=None, repr=False)
+    typesafe_api_key: str | None = field(default=None, repr=False)
     default_budget: Budget = field(default_factory=Budget)
 
     @property
@@ -335,6 +334,7 @@ def load_settings(
         ),
         anthropic_api_key=merged.get("ANTHROPIC_API_KEY") or None,
         gemini_api_key=merged.get("GEMINI_API_KEY") or merged.get("GOOGLE_API_KEY") or None,
+        typesafe_api_key=merged.get("TYPESAFE_API_KEY") or None,
         default_budget=budget,
     )
     return check_settings(settings)

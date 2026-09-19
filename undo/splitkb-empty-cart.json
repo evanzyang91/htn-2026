@@ -1,0 +1,7 @@
+[
+  {"kind": "navigate", "url": "https://splitkb.com/cart"},
+  {"kind": "click",
+   "find": "remove ", "via": "dom",
+   "until_seen": "Your cart is empty",
+   "max_rounds": 12}
+]

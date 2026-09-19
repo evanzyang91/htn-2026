@@ -191,7 +191,12 @@ class PolicyDecision:
             no target. Reported so a low-confidence move is legible in a trajectory
             rather than indistinguishable from a certain one.
         why: One short line naming the choice, for the trajectory and the log.
-        latency_ms: Wall-clock of the provider call(s) behind this decision.
+        policy_ms: Wall-clock of the Jev round trip alone - the number upstream
+            publishes, and the only one comparable to it.
+        latency_ms: Wall-clock of everything behind this decision, which for
+            ``TYPE_TEXT`` includes the text model's call as well. Reported separately
+            from ``policy_ms`` because quoting one for the other is how a two-model
+            step comes to be described with a one-model number.
     """
 
     operation: str
@@ -200,6 +205,7 @@ class PolicyDecision:
     confidence: float = 0.0
     probability: float = 0.0
     why: str = ""
+    policy_ms: float = 0.0
     latency_ms: float = 0.0
 
 
@@ -359,9 +365,13 @@ class JevPolicy:
             invents one.
         model: The policy model. Defaults to ``TYPESAFE_MODEL`` or
             :data:`DEFAULT_TYPESAFE_MODEL`.
-        api_key: The credential. Defaults to ``TYPESAFE_API_KEY`` in the environment and
-            is registered with :func:`~skillweaver.llm.cassette.register_secret` so it is
-            scrubbed out of anything this project writes down.
+        api_key: The credential. ``None`` falls back to ``TYPESAFE_API_KEY`` in the
+            process environment - which is NOT the same as a ``.env`` file, so a shipped
+            command passes :attr:`~skillweaver.config.Settings.typesafe_api_key` instead
+            and gets both. Whichever it is, it is registered with
+            :func:`~skillweaver.llm.cassette.register_secret`, so its exact value is
+            scrubbed out of every cassette, payload and error message this project
+            writes down.
         cassette: A JSONL file of recorded round trips. ``None`` is live. See
             :meth:`_ask` for the format and what it is and is not good for.
         cassette_mode: ``"record"`` appends live round trips, ``"replay"`` serves them
@@ -444,7 +454,7 @@ class JevPolicy:
         body = _request(self._model, goal, snapshot, history, targets, offered)
         started = time.perf_counter()
         answers = self._ask(body)
-        latency = (time.perf_counter() - started) * 1000
+        policy_ms = (time.perf_counter() - started) * 1000
 
         operation = _validate_choice(answers.get("operation"), offered)
         chosen = str(operation["choice"])
@@ -454,7 +464,8 @@ class JevPolicy:
                 confidence=float(operation["confidence"]),
                 probability=float(operation["probabilities"][chosen]),
                 why=f"{chosen} ({operation['probabilities'][chosen]:.2f})",
-                latency_ms=latency,
+                policy_ms=policy_ms,
+                latency_ms=policy_ms,
             )
         # Only the head the operation selected is validated. An unused head cannot cause
         # an action, and refusing a decision because a head nobody asked came back odd
@@ -473,6 +484,7 @@ class JevPolicy:
             confidence=float(operation["confidence"]),
             probability=probability,
             why=f"{chosen} [{index}] {control.label!r} ({probability:.2f})",
+            policy_ms=policy_ms,
             latency_ms=(time.perf_counter() - started) * 1000,
         )
 
@@ -546,14 +558,26 @@ class JevPolicy:
         raise ProviderError(f"the Jev call to {self._model} exhausted retries") from last
 
     def _client(self) -> httpx.Client:
-        """The HTTP session, made once.
+        """The HTTP session, made once and kept alive.
 
-        HTTP/2 and a kept-alive connection, because the whole claim of this backend is
-        one round trip per step and a fresh TCP and TLS handshake on every step would
-        give most of that back.
+        The connection outliving the step is what matters here: the whole claim of this
+        backend is one round trip per step, and a fresh TCP and TLS handshake on every
+        step would give most of that back.
+
+        HTTP/2 is asked for and not required. Upstream pins it, but it needs the ``h2``
+        package, and ``httpx`` is only in this project's environment because the
+        Anthropic SDK depends on it - adding a dependency is an edit to
+        ``pyproject.toml``, which is shared surface and a coordination decision. So a
+        missing ``h2`` falls back to HTTP/1.1 with keep-alive, which keeps the saving
+        that matters and loses only multiplexing this client has no use for: it makes
+        one request at a time.
         """
         if self._session is None:
-            self._session = httpx.Client(http2=True, timeout=_TIMEOUT_SECONDS)
+            try:
+                self._session = httpx.Client(http2=True, timeout=_TIMEOUT_SECONDS)
+            except ImportError:
+                log.info("jev.http1", why="h2 is not installed; using HTTP/1.1 keep-alive")
+                self._session = httpx.Client(timeout=_TIMEOUT_SECONDS)
         return self._session
 
     def _charge(self, payload: Mapping[str, Any]) -> None:
