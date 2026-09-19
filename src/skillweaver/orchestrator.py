@@ -105,15 +105,18 @@ __all__ = [
     "AttemptRecord",
     "ComposedPerceiver",
     "EnvironmentFor",
+    "RESET_URL_PARAM",
     "RunReport",
     "SynthesisFactory",
     "Workbench",
+    "WorldReset",
     "build_agent",
     "budget_from",
     "build_workbench",
     "navigating_environment",
     "recall_end_state",
     "task_spec",
+    "world_reset_from_url",
 ]
 
 log = get_logger(__name__)
@@ -137,6 +140,23 @@ resolved per trajectory rather than per task.
 
 ``None`` means this world cannot be put back there - a desktop that cannot navigate, a
 run whose first screen has no URL - and the caller then admits nothing and says why.
+"""
+
+WorldReset = Callable[[], None]
+"""Put the world back the way it was before the run: "how do I undo this?".
+
+Re-opening a screen is not this. Most tasks worth learning CHANGE something - a
+message is archived, an invoice is paid, a row is deleted - and the screen the run
+started on no longer exists once they have. Without a way back, the admission gate
+can never stand a candidate where the recording stood, so no skill for such a task
+can ever be admitted. That is not a corner case; it is most of the product.
+
+What counts as one is whatever that world actually offers: a seed-restoring endpoint
+(:func:`world_reset_from_url`), a database snapshot rolled back, a container
+replaced, a fresh profile. skillweaver does not care which - it only needs the call.
+
+Raises (by contract): anything, and the caller treats a failure as "not restored"
+rather than as a crash; a gate that cannot reset still has a report to write.
 """
 
 
@@ -780,12 +800,22 @@ class ComposedPerceiver:
 # --------------------------------------------------------------------------------------
 
 
+RESET_URL_PARAM = "reset_url"
+"""The task parameter holding a :data:`WorldReset` endpoint.
+
+It rides in ``TaskSpec.params`` beside ``start_url`` rather than in a new argument
+to the session factory, so a caller that already builds a workbench - the evaluation
+harness, a test - keeps working unchanged and gains the hook by naming it.
+"""
+
+
 def task_spec(
     text: str,
     *,
     domain: str | None = None,
     target: Literal["browser", "desktop"] = "browser",
     url: str | None = None,
+    reset_url: str | None = None,
     params: dict[str, Any] | None = None,
 ) -> TaskSpec:
     """Build a :class:`~skillweaver.contracts.TaskSpec` the way the command line does.
@@ -794,10 +824,16 @@ def task_spec(
     ``--url https://example.com/invoices`` files its skills under ``example.com``
     without anyone having to say so twice. A desktop task with no domain gets
     ``"desktop"``.
+
+    ``reset_url`` is how this world is put back before the admission gate re-runs a
+    candidate; see :data:`WorldReset` for why a task that changes anything cannot be
+    learned without one.
     """
     merged: dict[str, Any] = dict(params or {})
     if url:
         merged.setdefault("start_url", url)
+    if reset_url:
+        merged.setdefault(RESET_URL_PARAM, reset_url)
     resolved = domain or (_host(url) if target == "browser" else None) or target
     return TaskSpec(text=text, domain=resolved, target=target, params=merged)
 
@@ -812,22 +848,68 @@ def _host(url: str | None) -> str | None:
     return parsed.hostname or None
 
 
+def world_reset_from_url(url: str, *, timeout: float = 10.0) -> WorldReset:
+    """A :data:`WorldReset` that restores the world by asking it to.
+
+    One GET to ``url``, and the application puts itself back to its seed state. The
+    sandbox site's ``/__reset`` is the instance this project ships, and any
+    application with a "restore the demo data" endpoint fits the same shape - which
+    is the point of taking a URL rather than knowing about the sandbox.
+
+    Args:
+        url: The endpoint to call. Its response body is read and discarded.
+        timeout: Seconds to wait before giving up.
+
+    Returns:
+        The callable. It raises ``OSError`` (``URLError`` and ``HTTPError`` are both
+        that) when the endpoint cannot be reached, which the caller reads as "the
+        world was not restored".
+    """
+
+    def reset() -> None:
+        import urllib.request
+
+        with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
+            response.read()
+        log.info("agent.world_reset", url=url)
+
+    return reset
+
+
 def navigating_environment(
     controller: Controller,
     perceiver: Perceiver,
     *,
     graph: SiteGraph | None = None,
+    restore: WorldReset | None = None,
 ) -> EnvironmentFor:
-    """Reset a browser by navigating to the URL the recorded run started on.
+    """Put the world back, then open the screen the recorded run started on.
 
-    The trajectory's own first screen is the target, not the task's start URL. They
-    differ exactly when it matters: a run that rescued a failed warm attempt began
-    part-way through the site, and sending the gate back to the front page would have
-    it judge the candidate on the wrong screen.
+    Two separate jobs, and only the second one is navigation. ``restore`` undoes what
+    the run CHANGED; navigating then returns to where it started. A browser can
+    always do the second and can never do the first, which is why a mutating task -
+    archive this message, pay this invoice - was unlearnable until ``restore`` was
+    passed: the gate arrived at a screen that no longer held what the recording held,
+    failed its precondition, and did so forever.
+
+    The trajectory's own first screen is the navigation target, not the task's start
+    URL. They differ exactly when it matters: a run that rescued a failed warm attempt
+    began part-way through the site, and sending the gate back to the front page would
+    have it judge the candidate on the wrong screen.
+
+    A ``restore`` that raises is reported, not propagated: the environment comes back
+    with ``restored=False`` and the gate says the world could not be put back, which
+    is a truer answer than a traceback out of a learning step.
 
     The returned callable declines - ``None`` - for a controller that cannot navigate
     (every desktop one) or a run whose first screen had no URL. Nothing is then
     admitted, and the report says so.
+
+    Args:
+        controller / perceiver: The world the candidate is re-run in.
+        graph: The site graph the candidate may read.
+        restore: How to put this world back. ``None`` means nothing can, and a
+            mutating task will be reported as unproved rather than as rejected.
     """
 
     def environment_for(trajectory: Trajectory) -> EnvironmentFactory | None:
@@ -838,8 +920,15 @@ def navigating_environment(
             return None
 
         def factory() -> ReplayEnvironment:
+            restored = False
+            if restore is not None:
+                try:
+                    restore()
+                    restored = True
+                except (OSError, SkillWeaverError) as exc:
+                    log.warning("agent.world_reset.failed", error=f"{type(exc).__name__}: {exc}")
             controller.perform(Navigate(url))
-            return ReplayEnvironment(controller, perceiver, graph)
+            return ReplayEnvironment(controller, perceiver, graph, restored=restored)
 
         return factory
 
@@ -1035,7 +1124,9 @@ def build_workbench(config: Settings | None = None) -> Workbench:
                 graph=graph,
                 trajectories=trajectories,
                 recorder=Recorder(resolved.trajectories_dir),
-                environment=navigating_environment(controller, perceiver, graph=graph),
+                environment=navigating_environment(
+                    controller, perceiver, graph=graph, restore=_reset_for(task)
+                ),
                 budget=budget,
             )
         finally:
@@ -1049,6 +1140,16 @@ def build_workbench(config: Settings | None = None) -> Workbench:
         trajectories=trajectories,
         session=session,
     )
+
+
+def _reset_for(task: TaskSpec) -> WorldReset | None:
+    """How to put this task's world back, if the task said.
+
+    ``None`` is a real answer and not a failure: the gate then reports that a
+    mutating task could not be proved, which is what is true.
+    """
+    url = task.params.get(RESET_URL_PARAM)
+    return world_reset_from_url(str(url)) if url else None
 
 
 def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver]:

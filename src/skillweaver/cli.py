@@ -162,6 +162,19 @@ UrlOpt = Annotated[
         show_default=False,
     ),
 ]
+ResetUrlOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--reset-url",
+        help="A URL that puts this site back to its starting state - the sandbox "
+        "site's http://localhost:8765/__reset, a demo app's 'restore seed data' "
+        "endpoint. The admission gate calls it before it re-runs a candidate skill. "
+        "WITHOUT IT, A TASK THAT CHANGES ANYTHING CANNOT BE LEARNED: archiving a "
+        "message is not undone by re-opening the inbox, so the gate can never stand "
+        "where the recording stood and no skill is ever stored.",
+        show_default=False,
+    ),
+]
 DomainOpt = Annotated[
     str | None,
     typer.Option(
@@ -210,6 +223,7 @@ def learn_command(
     target: TargetOpt = "browser",
     url: UrlOpt = None,
     domain: DomainOpt = None,
+    reset_url: ResetUrlOpt = None,
     param: ParamOpt = None,
     warm_first: Annotated[
         bool,
@@ -234,10 +248,15 @@ def learn_command(
     if it works a second time. Nothing enters the library on the strength of one
     lucky run.
 
+    Re-running it needs the starting screen back. If the task CHANGES anything - and
+    most worth learning do - pass `--reset-url`, or the gate will report that it
+    could not prove the skill and store nothing.
+
     Afterwards, `skillweaver run` on the same task takes the warm path instead.
 
         skillweaver learn "Confirm payment of the Acme Corp invoice" \\
-            --url https://acme.test/invoices -p company="Acme Corp"
+            --url https://acme.test/invoices --reset-url https://acme.test/__reset \\
+            -p company="Acme Corp"
     """
     _do(
         ctx,
@@ -245,6 +264,7 @@ def learn_command(
         target=target,
         url=url,
         domain=domain,
+        reset_url=reset_url,
         param=param,
         warm=warm_first,
         cold=True,
@@ -261,6 +281,7 @@ def run_command(
     target: TargetOpt = "browser",
     url: UrlOpt = None,
     domain: DomainOpt = None,
+    reset_url: ResetUrlOpt = None,
     param: ParamOpt = None,
     library_only: Annotated[
         bool,
@@ -301,6 +322,7 @@ def run_command(
         target=target,
         url=url,
         domain=domain,
+        reset_url=reset_url,
         param=param,
         warm=True,
         cold=not library_only,
@@ -317,6 +339,7 @@ def _do(
     target: str,
     url: str | None,
     domain: str | None,
+    reset_url: str | None,
     param: Sequence[str] | None,
     warm: bool,
     cold: bool,
@@ -341,6 +364,7 @@ def _do(
         domain=domain,
         target=target,  # type: ignore[arg-type]
         url=url,
+        reset_url=reset_url,
         params=_params(param),
     )
     try:
@@ -349,7 +373,29 @@ def _do(
     except SkillWeaverError as exc:
         _die(f"the run could not start: {exc}")
     _emit(_report_json(report) if as_json else report.explain(), as_json)
+    if not as_json:
+        _hint_at_reset(report, reset_url)
     raise typer.Exit(OK if report.ok else NO)
+
+
+def _hint_at_reset(report: RunReport, reset_url: str | None) -> None:
+    """Say what to do when the task was done but could not be learned.
+
+    A run that solved the task and stored nothing looks like a failure of the model.
+    Usually it is not: the task changed something, nothing could change it back, and
+    the gate refused to pretend it had proved a skill it never ran. That is one flag
+    away from working, and the run that just paid for a cold exploration is exactly
+    the moment to say so.
+    """
+    admission = report.admission
+    if admission is None or not admission.unproved or reset_url:
+        return
+    typer.echo(
+        "\nhint: this task changes something, so the admission gate could not put the "
+        "site back to re-run the skill it wrote. Pass --reset-url with an endpoint "
+        "that restores this site (the sandbox site has /__reset) and learn it again.",
+        err=True,
+    )
 
 
 def _params(pairs: Sequence[str] | None) -> dict[str, Any]:
@@ -1064,12 +1110,17 @@ def eval_run(
             err=True,
         )
         raise typer.Exit(CANNOT)
-    entry(
-        workbench=bench,
-        suite=suite,
-        out=out if out is not None else bench.settings.eval_dir,
-        repeat=repeat,
-    )
+    try:
+        entry(
+            workbench=bench,
+            suite=suite,
+            out=out if out is not None else bench.settings.eval_dir,
+            repeat=repeat,
+        )
+    except SkillWeaverError as exc:
+        # A suite that is missing or malformed is a command that could not run,
+        # not a crash - the same answer `run` gives, through the same door.
+        _die(f"the evaluation could not run: {exc}")
 
 
 def _eval_entry() -> Any:

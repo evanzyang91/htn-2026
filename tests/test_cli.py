@@ -35,22 +35,41 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner, Result
 
+from skillweaver import cli
 from skillweaver.cli import app, main
 from skillweaver.config import Settings, load_settings
-from skillweaver.contracts import Provenance, Skill, TaskSpec, Trajectory
+from skillweaver.contracts import (
+    Box,
+    Click,
+    Element,
+    ElementKind,
+    Provenance,
+    Skill,
+    TaskSpec,
+    Trajectory,
+)
+from skillweaver.errors import SkillWeaverError
 from skillweaver.graph.model import InMemorySiteGraph
 from skillweaver.orchestrator import (
+    RESET_URL_PARAM,
     Agent,
     AttemptRecord,
     RunReport,
     Workbench,
     build_agent,
+    navigating_environment,
     recall_end_state,
     task_spec,
+    world_reset_from_url,
 )
 from skillweaver.skills.retrieve import SkillRetriever
-from skillweaver.skills.synthesize import EnvironmentFactory, ReplayEnvironment
+from skillweaver.skills.synthesize import (
+    EnvironmentFactory,
+    ReplayEnvironment,
+    Synthesizer,
+)
 from tests.fakes import (
+    FakeCritic,
     FakeLLM,
     InMemorySkillStore,
     InMemoryTrajectoryRecorder,
@@ -58,6 +77,14 @@ from tests.fakes import (
     Scenario,
     make_scenario,
 )
+from tests.fakes.controller import (
+    FakeController,
+    FakeState,
+    clicks,
+    navigates,
+    render_png,
+)
+from tests.fakes.perception import FakePerceiver
 from tests.fakes.scenario import DOMAIN
 
 TASK = "Confirm payment of the Acme Corp invoice."
@@ -224,16 +251,19 @@ class World:
     def _environment(self, trajectory: Trajectory) -> EnvironmentFactory:
         """The admission gate's world, put back where the recording started.
 
-        The fake app resets to its first screen, which is this world's only way back -
-        the equivalent of a browser that can navigate. When a run began somewhere
-        else, the reset lands on the wrong screen and the gate refuses the candidate
-        at its precondition check, which is the behaviour being relied on, not a
-        limitation being worked around.
+        The fake app keeps no state outside its state machine, so ``reset()`` really
+        is a restore to the seed - ``restored=True`` - which is what entitles the gate
+        to read a precondition mismatch here as a fact about the SKILL. When a run
+        began somewhere else, the reset lands on the wrong screen and the gate refuses
+        the candidate at its precondition check, which is the behaviour being relied
+        on, not a limitation being worked around.
         """
 
         def factory() -> ReplayEnvironment:
             self.scenario.controller.reset()
-            return ReplayEnvironment(self.scenario.controller, self.scenario.perceiver, self.graph)
+            return ReplayEnvironment(
+                self.scenario.controller, self.scenario.perceiver, self.graph, restored=True
+            )
 
         return factory
 
@@ -466,6 +496,251 @@ def test_a_skill_that_fails_outright_is_demoted_and_reported(world: World) -> No
 
 
 # --------------------------------------------------------------------------------------
+# Putting the world back
+# --------------------------------------------------------------------------------------
+#
+# A mutating task - archive this message, pay this invoice, delete this row - is most of
+# what anyone would want to teach an agent, and it was unlearnable. The gate re-runs the
+# candidate from the screen the recording started on, and the only way back the
+# orchestrator offered was to re-open that screen's URL, which cannot undo a mutation.
+# The precondition therefore failed on every attempt, forever, for every such task.
+
+INBOX_URL = "https://mail.test/inbox"
+MAIL_DOMAIN = "mail.test"
+
+DANA_ROW = Element(
+    Box(24, 120, 700, 44), ElementKind.row, "Dana Whitfield  Q3 budget review", 0.95, "dana"
+)
+PRIYA_ROW = Element(
+    Box(24, 164, 700, 44), ElementKind.row, "Priya Raman  Standup notes", 0.95, "priya"
+)
+ARCHIVE_BUTTON = Element(Box(600, 60, 90, 32), ElementKind.button, "Archive", 0.95, "archive")
+ARCHIVED_NOTE = Element(Box(24, 92, 260, 24), ElementKind.text, "1 message archived", 0.9, "note")
+
+
+def mail_controller() -> FakeController:
+    """A two-screen mail app whose one action cannot be undone by re-opening it.
+
+    ``inbox`` holds Dana's message; clicking Archive moves to ``archived``, where it is
+    gone. Both screens answer to the SAME url, and navigating to it from ``archived``
+    stays on ``archived`` - which is the whole point, and exactly what a real inbox
+    does. ``reset()`` is the only way back, and stands in for whatever a real site
+    offers: a seed endpoint, a restored snapshot, a fresh account.
+    """
+    inbox = (DANA_ROW, PRIYA_ROW, ARCHIVE_BUTTON)
+    archived = (PRIYA_ROW, ARCHIVE_BUTTON, ARCHIVED_NOTE)
+    return FakeController(
+        {
+            "inbox": FakeState(render_png(inbox), inbox, INBOX_URL),
+            "archived": FakeState(render_png(archived), archived, INBOX_URL),
+        },
+        {
+            "inbox": [
+                (clicks(ARCHIVE_BUTTON), "archived"),
+                (navigates(INBOX_URL), "inbox"),
+            ],
+            "archived": [(navigates(INBOX_URL), "archived")],
+        },
+        start="inbox",
+    )
+
+
+def archive_trajectory(controller: FakeController, perceiver: FakePerceiver) -> Trajectory:
+    """The recording of one successful archive, made by actually doing it."""
+    recorder = InMemoryTrajectoryRecorder()
+    recorder.start("Archive the message from Dana Whitfield", MAIL_DOMAIN)
+    action = Click(ARCHIVE_BUTTON.box.center)
+    before = perceiver.observe(controller)
+    result = controller.perform(action)
+    recorder.step(action, before, perceiver.observe(controller), result)
+    return recorder.finish(ok=True, note="archived it")
+
+
+def test_re_navigating_is_not_a_reset_and_the_gate_says_so(caplog) -> None:
+    """Without a reset hook the world stays archived, and that is reported honestly.
+
+    ``navigating_environment`` does everything it can - it re-opens the recorded URL -
+    and the message is still archived afterwards. ``restored`` is ``False`` because
+    nothing restored anything, and that is what lets the gate distinguish "this skill
+    is wrong" from "I could not put the world back to find out".
+    """
+    controller = mail_controller()
+    perceiver = FakePerceiver.for_controller(controller)
+    trajectory = archive_trajectory(controller, perceiver)
+    assert controller.state == "archived"
+
+    factory = navigating_environment(controller, perceiver)(trajectory)
+    assert factory is not None
+    environment = factory()
+
+    assert environment.restored is False
+    assert controller.state == "archived", "re-opening the inbox un-archived the message"
+
+
+def test_a_reset_hook_is_what_actually_puts_the_world_back() -> None:
+    """With one, the same call lands on the recorded starting screen."""
+    controller = mail_controller()
+    perceiver = FakePerceiver.for_controller(controller)
+    trajectory = archive_trajectory(controller, perceiver)
+
+    environment = navigating_environment(controller, perceiver, restore=controller.reset)(
+        trajectory
+    )()
+
+    assert environment.restored is True
+    assert controller.state == "inbox"
+    assert environment.perceiver.observe(controller).fingerprint == (
+        trajectory.steps[0].before.fingerprint
+    )
+
+
+def test_a_reset_hook_that_fails_is_reported_as_not_restored_not_as_a_crash() -> None:
+    """A learning step must not die because a reset endpoint was down.
+
+    The run itself already succeeded; losing it to a traceback out of the gate would
+    throw away the expensive half of the work. The environment comes back unrestored
+    and the gate writes the honest report.
+    """
+    controller = mail_controller()
+    perceiver = FakePerceiver.for_controller(controller)
+    trajectory = archive_trajectory(controller, perceiver)
+
+    def broken_reset() -> None:
+        raise OSError("connection refused")
+
+    environment = navigating_environment(controller, perceiver, restore=broken_reset)(trajectory)()
+
+    assert environment.restored is False
+
+
+def _admit_archive(reset_url: str | None) -> Any:
+    """Learn the archive task end to end, with or without a way to put the world back."""
+    controller = mail_controller()
+    perceiver = FakePerceiver.for_controller(controller)
+    trajectory = archive_trajectory(controller, perceiver)
+    store = InMemorySkillStore()
+    restore = (lambda: controller.reset()) if reset_url else None
+    factory = navigating_environment(controller, perceiver, restore=restore)(trajectory)
+    assert factory is not None
+
+    code = (
+        "def run(ctx, sender):\n"
+        '    rows = ctx.see.find_text(sender, "row")\n'
+        '    ctx.expect(bool(rows), "no row from " + sender)\n'
+        '    buttons = ctx.see.find_text("Archive", "button")\n'
+        '    ctx.expect(bool(buttons), "no Archive button")\n'
+        "    ctx.ctl.click(buttons[0])\n"
+        "    return True\n"
+    )
+    draft = {
+        "name": "archive_message_from_sender",
+        "summary": "Archive the inbox message from a sender.",
+        "docstring": (
+            "Archives the message from `sender`.\n\n"
+            "Assumes: the inbox is on screen.\nEnds on: the inbox without that message."
+        ),
+        "params": {"sender": {"type": "string", "description": "Who sent it."}},
+        "example_args": {"sender": "Dana Whitfield"},
+        "requires": [],
+        "code": code,
+        "verifier_code": (
+            'def verify(ctx, result):\n    return not ctx.see.find_text("Dana Whitfield", "row")\n'
+        ),
+    }
+    llm = FakeLLM([json.dumps(draft)])
+    critic = FakeCritic(goal=trajectory.steps[-1].after.fingerprint)
+    admission = Synthesizer(llm, store, critic, max_repairs=2).admit(trajectory, factory)
+    return admission, store
+
+
+def test_a_mutating_task_is_learned_when_a_reset_hook_is_supplied() -> None:
+    """THE FIX, AS A USER MEETS IT.
+
+    Archiving is not idempotent, so this skill can only be proved if something puts
+    Dana's message back in the inbox first. With a reset hook there is such a thing,
+    the candidate is RE-RUN for real, its verifier and the critic both agree, and the
+    skill is stored - which is what makes the next run of this task warm.
+    """
+    admission, store = _admit_archive(reset_url="https://mail.test/__reset")
+
+    assert admission.ok, admission.reason
+    assert not admission.unproved
+    assert [s.name for s in store.list()] == ["archive_message_from_sender"]
+    assert store.get("archive_message_from_sender", MAIL_DOMAIN).version == 1
+
+
+def test_the_same_task_without_a_reset_hook_says_it_could_not_restore_the_world() -> None:
+    """And the failure names the real problem instead of blaming the skill.
+
+    This exact run - same trajectory, same model reply, same gate - stores nothing,
+    and it must be possible to tell that apart from a skill that was proved wrong.
+    Otherwise every mutating task looks like a model that cannot write code, and the
+    one thing that would fix it is never tried.
+    """
+    admission, store = _admit_archive(reset_url=None)
+
+    assert not admission.ok
+    assert admission.unproved
+    assert admission.attempts[-1].stage == "reset"
+    assert "could not restore the world" in admission.reason
+    assert store.list() == []
+
+
+def test_the_reset_url_reaches_the_gate_through_the_task(tmp_path: Path) -> None:
+    """``--reset-url`` is carried on the task, so the session builds the hook from it.
+
+    The URL is never fetched here: what is being pinned is that the flag survives the
+    command line into the spec the session factory reads, which is the whole path
+    between a person typing it and the gate having a way back.
+    """
+    spec = task_spec(
+        "Archive the message from Dana Whitfield",
+        url=INBOX_URL,
+        reset_url="https://mail.test/__reset",
+    )
+    assert spec.params[RESET_URL_PARAM] == "https://mail.test/__reset"
+    assert spec.domain == MAIL_DOMAIN
+
+    assert RESET_URL_PARAM not in task_spec("no reset here", url=INBOX_URL).params
+
+
+def test_world_reset_from_url_calls_the_endpoint_once() -> None:
+    """The one instance this project ships of a general hook."""
+    called: list[str] = []
+
+    class _Response:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b"ok"
+
+    def fake_urlopen(url: str, timeout: float = 0.0) -> Any:
+        called.append(url)
+        return _Response()
+
+    import urllib.request
+
+    original = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen  # type: ignore[assignment]
+    try:
+        world_reset_from_url("http://localhost:8765/__reset")()
+    finally:
+        urllib.request.urlopen = original  # type: ignore[assignment]
+
+    assert called == ["http://localhost:8765/__reset"]
+
+
+def test_learn_offers_reset_url_and_says_what_it_is_for() -> None:
+    """A flag nobody knows about fixes nothing."""
+    help_text = runner.invoke(app, ["learn", "--help"]).output
+    assert "--reset-url" in help_text
+
+
+# --------------------------------------------------------------------------------------
 # skills
 # --------------------------------------------------------------------------------------
 
@@ -667,18 +942,74 @@ def test_dashboard_build_works_before_anything_has_run(world: World, tmp_path: P
     assert result.exit_code == 0
 
 
-def test_eval_run_says_it_is_not_built_yet_instead_of_crashing(world: World) -> None:
-    """The seam is wired; the harness is another piece of work and has not landed.
+def test_eval_run_hands_the_harness_the_workbench_and_the_flags(
+    world: World, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """What `eval run` owes the harness, pinned without running one.
 
-    A missing module must produce a sentence a stranger can act on and exit code 2 -
-    "could not run at all" - not an ImportError traceback.
+    The harness is another worker's module, and a test that imports it would drive a
+    real browser and a real model inside `make test`. So the seam is what is tested:
+    the entry point is called ONCE, with this invocation's workbench and flags, and
+    the command exits 0. Whatever the harness then does is the harness's own tests.
     """
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "_eval_entry", lambda: lambda **kw: seen.append(kw))
+
+    result = world.invoke("eval", "run", "--out", str(tmp_path), "--repeat", "3")
+
+    assert result.exit_code == 0, result.output
+    assert len(seen) == 1
+    assert seen[0]["workbench"].store is world.store
+    assert seen[0]["out"] == tmp_path
+    assert seen[0]["repeat"] == 3
+    assert seen[0]["suite"] is None
+
+
+def test_eval_run_defaults_its_report_to_the_data_directory(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No --out means the configured eval directory, not the working directory."""
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "_eval_entry", lambda: lambda **kw: seen.append(kw))
+
+    world.invoke("eval", "run")
+
+    assert seen[0]["out"] == world.settings.eval_dir
+
+
+def test_a_broken_suite_is_a_clean_exit_two_not_a_traceback(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing or malformed suite is "could not run at all", like every other one.
+
+    Without this the harness's own exception reaches the terminal as a traceback,
+    which tells a stranger nothing and reports an exit code nobody can branch on.
+    """
+
+    def exploding(**_: Any) -> None:
+        raise SkillWeaverError("eval/tasks.yaml: no such file")
+
+    monkeypatch.setattr(cli, "_eval_entry", lambda: exploding)
+
     result = world.invoke("eval", "run")
 
     assert result.exit_code == 2
-    assert "not built yet" in result.output
+    assert "the evaluation could not run" in result.output
+    assert "eval/tasks.yaml" in result.output
     assert "Traceback" not in result.output
+
+
+def test_eval_run_without_a_harness_says_so_instead_of_crashing(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seam still answers when nothing is behind it."""
+    monkeypatch.setattr(cli, "_eval_entry", lambda: None)
+
+    result = world.invoke("eval", "run")
+
+    assert result.exit_code == 2
     assert "skillweaver.eval" in result.output
+    assert "Traceback" not in result.output
 
 
 # --------------------------------------------------------------------------------------
@@ -917,6 +1248,10 @@ def test_main_returns_the_exit_code_the_command_chose(tmp_path: Path) -> None:
 
     assert main([*data, "skills", "ls"]) == 0
     assert main([*data, "skills", "show", "definitely_not_a_skill"]) == 1
-    assert main([*data, "eval", "run"]) == 2
+    # CANNOT, through the configuration door. NOT `eval run`: that used to exit 2
+    # only because `skillweaver.eval` had no entry point, and the moment the harness
+    # landed this line started a real evaluation - a browser and a model - inside
+    # `make test`. An exit code is pinned with a command that cannot do anything.
+    assert main([*data, "--log-level", "nonsense", "skills", "ls"]) == 2
     assert main([*data, "--help"]) == 0
     assert main([*data, "no-such-command"]) == 2

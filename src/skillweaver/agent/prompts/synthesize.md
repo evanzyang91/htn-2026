@@ -79,6 +79,21 @@ followed by `[0]` is an `IndexError` and tells whoever reads the trace nothing.
 6. **Never write coordinates.** `ctx.ctl.click(Point(400, 140))` or
    `click((400, 140))` is a screenshot, not a skill: it breaks the first time the
    page moves. Find the element by its text or kind, check it, then click IT.
+   Each recorded step tells you which element its coordinate landed on. Use THAT
+   element. When it has no readable text - many checkboxes and icons do not, and no
+   amount of wishing makes the text appear - address it by kind and by its place in
+   reading order, which is the handle the recording gives you:
+
+   ```python
+   boxes = ctx.see.by_kind("checkbox")  # reading order, always a list
+   ctx.expect(len(boxes) >= 2, "the inbox rows have no checkboxes")
+   ctx.ctl.click(boxes[1])  # "checkbox number 2 of 9"
+   ```
+
+   Do NOT invent a `find_text` for words the recording never shows you. Searching
+   for a name that is not in the elements above returns `[]`, and a fallback that
+   then clicks "the nearest something" acts on the wrong row - which is how a skill
+   passes its own verifier and is thrown out by the critic.
 7. **Parameterize what varied.** The name, the amount, the query this run happened
    to use belongs in a parameter, not in a literal. What is structural - a button
    label, a column heading - stays a literal.
@@ -88,7 +103,14 @@ followed by `[0]` is an `IndexError` and tells whoever reads the trace nothing.
 
 ## What you must return
 
-One JSON object and nothing else - no prose around it, no commentary inside it:
+**One JSON object, and nothing else.** Your whole reply is that object: it begins
+with `{` and ends with `}`. No sentence introducing it, no sentence after it, no code
+fence, no tool call - you cannot see the screen and there is nothing to look at, only
+the recording above. Anything else and the reply is thrown away and asked for again,
+which costs the run money and teaches nobody anything.
+
+Keep the reply small enough to finish. A skill is a short procedure; if `code` is
+running long, the skill is too big, not the reply.
 
 ```json
 {
@@ -129,3 +151,7 @@ If your skill is handed back, you are given the error and the trace of the run t
 failed. Read the trace: it lists every action and every log line in order, then the
 failing line. Fix THAT, return the same JSON shape again, and do not change the parts
 that were working.
+
+If instead you are told the reply could not be READ, your skill has not been judged
+at all. Nothing about it is known to be wrong. Send the same answer again as the bare
+JSON object; do not rewrite working code to fix a punctuation complaint.

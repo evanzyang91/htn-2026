@@ -27,6 +27,12 @@ The gate, in order, for every attempt:
    before anything executes, and never admitted.
 3. **The precondition.** The environment is put back to the recorded starting screen
    and must actually be there; a skill proved against the wrong screen proves nothing.
+   When the world could not be put back at all - the run archived a message, and
+   re-opening the page does not un-archive it - the attempt stops at ``"reset"``
+   rather than ``"precondition"``. That distinction is the whole point: a skill that
+   was DISPROVED and a skill that could never be TRIED are different outcomes, and
+   reporting the second as the first is how a whole class of task silently becomes
+   unlearnable.
 4. **Execution.** The skill is RE-RUN through
    :class:`~skillweaver.skills.sandbox.SkillRunner` against that environment with the
    model's own example arguments, verifier included.
@@ -39,6 +45,14 @@ skill is rewritten, up to ``max_repairs`` times. Exhausting them is a clean
 ``Admission(ok=False)`` with every attempt attached, not an exception: a synthesizer
 that could not write this skill has not broken, it has simply not written it.
 
+A reply that cannot be read at all - prose around the object, a fence, an empty
+turn, a reply cut off by the token cap - is a FORMATTING failure, not a skill
+defect. It is retried (``max_format_retries``, with a larger token cap when the
+reply ran out of room) and does not spend a repair. Repairs are for code that was
+judged and found wanting; burning them on punctuation is how a run ends with
+nothing stored. Assistant prefill would be the tidier fix and is not available:
+``claude-opus-5`` rejects a conversation that ends on an assistant turn outright.
+
 Before any of that the draft goes through :mod:`skillweaver.skills.refactor`, which
 replaces literal coordinates with perception lookups and lifts this run's data into
 parameters. Hardening first, admission second: what is judged is what is stored.
@@ -47,14 +61,14 @@ parameters. Hardening first, admission second: what is judged is what is stored.
 from __future__ import annotations
 
 import json
-import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import resources
 from typing import Any, Literal
 
 from skillweaver.contracts import (
+    Action,
     Controller,
     Critic,
     Element,
@@ -95,16 +109,33 @@ PROMPT = "synthesize.md"
 ``skillweaver/agent/prompts/``. It states the published ``ctx`` surface exactly,
 forbids imports, and demands a verifier; :func:`load_prompt` reads it."""
 
-Stage = Literal["generation", "structure", "sandbox", "precondition", "execution", "critic"]
-"""Where an attempt stopped. Everything before ``execution`` is decided without
-touching the environment at all."""
+Stage = Literal[
+    "generation", "structure", "sandbox", "reset", "precondition", "execution", "critic"
+]
+"""Where an attempt stopped. Everything before ``reset`` is decided without touching
+the environment at all.
+
+``"reset"`` and ``"precondition"`` both mean the environment was not on the recorded
+starting screen, and they are not the same finding. ``"precondition"`` is a verdict
+on the SKILL: the world was genuinely put back and the screen still does not match.
+``"reset"`` is a verdict on the HARNESS: nothing put the world back, so the candidate
+was neither proved nor disproved and no amount of rewriting it would help."""
 
 _MAX_ELEMENTS = 18
 """Elements described per recorded screen. Enough to write a lookup against, short
 enough that a long list does not bury the ones that were acted on."""
 
 _MAX_TEXT = 80
-_FENCE = re.compile(r"```(?:json)?\s*(?P<body>\{.*?\})\s*```", re.DOTALL)
+
+_MAX_REPLY_TOKENS = 16000
+"""Ceiling on the token cap a re-ask may escalate to.
+
+Two reasons for this number and not a larger one. A reply that does not fit in it is
+not a skill, it is a program. And the Anthropic SDK refuses a NON-streaming request
+whose implied duration passes ten minutes - a real run died at ``max_tokens=32000``
+with "Streaming is required for operations that may take longer than 10 minutes"
+before this ceiling was lowered. 16000 is the contract's own default for
+``LLMClient.complete`` and has been exercised live against ``claude-opus-5``."""
 
 
 @lru_cache(maxsize=4)
@@ -135,16 +166,33 @@ class ReplayEnvironment:
     The gate asks for a FRESH one per attempt - see ``environment`` in
     :meth:`Synthesizer.admit` - so a repair never inherits the half-finished screen
     its predecessor left behind, which would let a broken skill pass by accident.
+
+    Attributes:
+        controller: The hands the candidate acts through.
+        perceiver: The eyes it sees through.
+        graph: The read-only site graph, when there is one.
+        restored: Whether something ACTUALLY put this world back to its starting
+            state - a seed reload, a fresh database, ``controller.reset()`` - as
+            opposed to merely re-opening the screen it started on. It decides what a
+            precondition mismatch is allowed to mean: with ``True`` the world was put
+            back and the candidate is judged, with ``False`` the gate cannot tell a
+            wrong skill from an unrestorable world and says the second, which is the
+            honest answer. Defaults to ``False`` because re-navigating is the thing
+            most callers can do and it is NOT a restore: nothing about re-opening
+            an inbox un-archives the message the run archived.
     """
 
     controller: Controller
     perceiver: Perceiver
     graph: GraphView | None = None
+    restored: bool = False
 
 
 EnvironmentFactory = Callable[[], ReplayEnvironment]
-"""Called once per admission attempt; must return the recorded environment reset to
-the trajectory's first screen (``controller.reset()``, a fresh page, a new browser)."""
+"""Called once per admission attempt; must return the recorded environment put back to
+the trajectory's first screen (``controller.reset()``, a fresh page, a new browser,
+a seed-restoring endpoint), with ``ReplayEnvironment.restored`` saying whether it
+managed to."""
 
 
 # --------------------------------------------------------------------------------------
@@ -206,6 +254,18 @@ class Admission:
         """How many times the skill was rewritten after the first draft."""
         return max(len(self.attempts) - 1, 0)
 
+    @property
+    def unproved(self) -> bool:
+        """Whether the gate never got to judge this skill because the world could not
+        be put back - as opposed to judging it and finding it wanting.
+
+        A caller that reports both as "rejected" tells its user the model wrote bad
+        code, when in fact the harness has no way to undo what the task changed and
+        NO skill for that task could ever be admitted. The fix is a reset hook, not a
+        better model, and only this flag says so.
+        """
+        return bool(self.attempts) and self.attempts[-1].stage == "reset"
+
     def __str__(self) -> str:
         name = self.skill.name if self.skill else "no skill"
         return f"admission {'ok' if self.ok else 'rejected'} ({name}): {self.reason}"
@@ -249,6 +309,41 @@ def _describe_screen(observation: Observation, label: str) -> str:
     return "\n".join(lines)
 
 
+def _describe_target(observation: Observation, action: Action) -> str | None:
+    """Which element the action landed on, named the way a skill can name it again.
+
+    The recording says ``click (236, 121)`` and the skill may not write that down -
+    rule 6 of the prompt, and rightly, because a coordinate is a screenshot. But
+    without this line the model is left guessing WHICH element that coordinate was,
+    and a wrong guess is admitted or rejected by luck.
+
+    It was rejected. In a live run the model wanted a row "from Dana Whitfield",
+    searched for that text, found none - OCR never reads the sender names on this
+    page - and archived a different message instead. So the element is named twice
+    over: by its text where there is any, and always by its kind and its place in
+    reading order, which is a handle a skill CAN reproduce from pixels when text
+    fails. ``None`` for an action with no point (typing, a key press).
+    """
+    point = getattr(action, "point", None)
+    if point is None:
+        return None
+    hits = [e for e in observation.elements if e.box.contains(point)]
+    if not hits:
+        return None
+    element = min(hits, key=lambda e: e.box.area)
+    same_kind = [e for e in observation.elements if e.kind is element.kind]
+    ordinal = same_kind.index(element) + 1
+    text = element.text.strip().replace("\n", " ")
+    if len(text) > _MAX_TEXT:
+        text = text[: _MAX_TEXT - 1] + "\u2026"
+    kind = element.kind.value
+    reads = f"reading {text!r}" if text else "with NO readable text"
+    return (
+        f"  this landed on the {kind} {reads}, which is {kind} number {ordinal} "
+        f"of {len(same_kind)} in reading order"
+    )
+
+
 def describe_trajectory(trajectory: Trajectory) -> str:
     """The recorded run as the text the model is asked to write a skill from.
 
@@ -267,6 +362,9 @@ def describe_trajectory(trajectory: Trajectory) -> str:
         parts.append("")
     for step in trajectory.steps:
         parts.append(f"STEP {step.index}: {describe_action(step.action)}")
+        target = _describe_target(step.before, step.action)
+        if target:
+            parts.append(target)
         if step.note:
             parts.append(f"  reason given at the time: {step.note}")
         parts.append(_describe_screen(step.after, "  screen after"))
@@ -305,38 +403,112 @@ def _repair_brief(attempt: Attempt) -> str:
 # --------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _Unreadable:
+    """Why one reply produced no draft.
+
+    Attributes:
+        why: The sentence the model is shown.
+        format_only: ``True`` when nothing JSON-shaped came back AT ALL - prose, a
+            fence with no object in it, an empty turn, a reply cut off mid-object.
+            Such a reply says nothing about the skill, so it is re-asked for rather
+            than charged to the repair budget. ``False`` is a real content defect -
+            a JSON object with no verifier, say - which IS the model's mistake to
+            fix and does spend a repair.
+        needs_room: Whether re-asking is only worth it with a larger token cap. An
+            empty reply counts: on a thinking model an empty turn usually means the
+            cap was spent before any text was written.
+    """
+
+    why: str
+    format_only: bool = True
+    needs_room: bool = False
+
+
+def _balanced_objects(text: str) -> Iterator[str]:
+    """Every balanced ``{...}`` span in ``text``, outermost first, in order.
+
+    String-aware, so a brace inside a JSON string - and Python code full of them is
+    exactly what these replies carry - does not end the span. This is what makes the
+    reader tolerant of the model explaining itself: prose before the object, a
+    ``{placeholder}`` in that prose, a second fenced snippet afterwards. Each of
+    those defeated a ``find("{")``/``rfind("}")`` pair, and each of them cost a
+    generation attempt in a live run.
+    """
+    depth, start, in_string, escaped = 0, -1, False, False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                yield text[start : index + 1]
+
+
 def _json_object(text: str) -> dict[str, Any] | None:
-    """The JSON object in a model reply, fenced or bare, or ``None``."""
-    candidates: list[str] = []
-    fenced = _FENCE.search(text)
-    if fenced:
-        candidates.append(fenced.group("body"))
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(text[start : end + 1])
-    for candidate in candidates:
+    """The skill object in a model reply, however it was wrapped, or ``None``.
+
+    Tries the whole reply first, then every balanced object in it. An object with a
+    ``code`` key is unmistakably the answer and wins immediately; any other object -
+    a ``{}`` in a code sample, say - is only a fallback, so a stray brace earlier in
+    the reply cannot shadow the real one.
+    """
+    fallback: dict[str, Any] | None = None
+    for candidate in (text.strip(), *_balanced_objects(text)):
+        if not candidate:
+            continue
         try:
             parsed = json.loads(candidate)
         except ValueError:
             continue
-        if isinstance(parsed, dict):
+        if not isinstance(parsed, dict):
+            continue
+        if "code" in parsed:
             return parsed
-    return None
+        if fallback is None:
+            fallback = parsed
+    return fallback
 
 
-def _parse_draft(text: str) -> tuple[_Draft | None, str]:
-    """A draft from one reply, or ``(None, why)``."""
+def _parse_draft(text: str, *, truncated: bool = False) -> tuple[_Draft | None, _Unreadable | None]:
+    """A draft from one reply, or ``(None, why it is not one)``.
+
+    Args:
+        text: The reply.
+        truncated: Whether the provider stopped at the token cap.
+    """
     data = _json_object(text)
     if data is None:
-        return None, "the reply was not a JSON object; return only the JSON object"
+        if not text.strip():
+            return None, _Unreadable("the reply was empty", needs_room=True)
+        if truncated:
+            return None, _Unreadable(
+                "the reply hit the token cap before the JSON object was closed",
+                needs_room=True,
+            )
+        return None, _Unreadable("the reply contained no JSON object")
     missing = [key for key in ("name", "summary", "docstring", "code") if not data.get(key)]
     if missing:
-        return None, f"the JSON object is missing {', '.join(missing)}"
+        return None, _Unreadable(
+            f"the JSON object is missing {', '.join(missing)}", format_only=False
+        )
     verifier = data.get("verifier_code")
     if not verifier or not str(verifier).strip():
-        return None, (
+        return None, _Unreadable(
             "the skill has no verifier: return verifier_code defining "
-            "def verify(ctx, result) that checks the end state with ctx.see"
+            "def verify(ctx, result) that checks the end state with ctx.see",
+            format_only=False,
         )
     requires = data.get("requires") or ()
     if isinstance(requires, str):
@@ -344,7 +516,9 @@ def _parse_draft(text: str) -> tuple[_Draft | None, str]:
     params = data.get("params") or {}
     example = data.get("example_args") or {}
     if not isinstance(params, dict) or not isinstance(example, dict):
-        return None, "params and example_args must both be JSON objects"
+        return None, _Unreadable(
+            "params and example_args must both be JSON objects", format_only=False
+        )
     return (
         _Draft(
             raw=text,
@@ -357,8 +531,70 @@ def _parse_draft(text: str) -> tuple[_Draft | None, str]:
             example_args=example,
             requires=tuple(str(r) for r in requires),
         ),
-        "",
+        None,
     )
+
+
+_FORMAT_NUDGE = (
+    "That reply could not be read: {why}.\n\n"
+    "Nothing about your skill has been judged - this is only the shape of the reply. "
+    "Send the same answer again as ONE JSON object and nothing else: no sentence "
+    "before it, no sentence after it, no code fence, no tool call. Begin with {{ and "
+    "end with }}."
+)
+"""What the model is shown after an unreadable reply. It says explicitly that the
+skill was not judged, so the model does not "fix" working code it was never told was
+broken."""
+
+
+def _echo(reply: str) -> tuple[LLMMessage, ...]:
+    """The model's own reply, as the assistant turn a follow-up hangs off.
+
+    Empty when the reply was empty. There is nothing to quote back, and an empty
+    assistant turn is worse than no turn: some providers refuse a conversation that
+    ends on one, and ``claude-opus-5`` refuses an assistant turn in final position
+    outright. A follow-up user turn on its own is accepted, and was confirmed against
+    the live API before this was written.
+    """
+    return (LLMMessage(role="assistant", text=reply),) if reply.strip() else ()
+
+
+def _not_at_the_start(candidate: Skill, similarity: float, *, restored: bool) -> str:
+    """Why the candidate was not run, in the words the difference deserves.
+
+    The same fingerprint mismatch means two opposite things. With the world genuinely
+    put back it is about the skill; without, it is about the harness, and saying so
+    is the difference between "your model wrote bad code" and "this task changes
+    something and nothing here can change it back", which is the reason a mutating
+    task could never be learned at all.
+    """
+    where = f"(similarity {similarity:.2f} to {candidate.precondition.value})"  # type: ignore[union-attr]
+    if restored:
+        return (
+            f"the environment is not on the recorded starting screen {where}; "
+            "the skill cannot be proved here"
+        )
+    return (
+        f"could not restore the world to the recorded starting screen {where}: this run "
+        "changed something that re-opening the same screen does not undo, so the skill "
+        "was neither proved nor disproved. Give the admission gate a way to put this "
+        "world back to its starting state and learn the task again."
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Generation:
+    """One draft, and the conversation that produced it.
+
+    ``messages`` is the conversation the final reply answered - including any
+    re-asks - so a repair is appended to what the model actually last saw.
+    """
+
+    draft: _Draft | None
+    unreadable: _Unreadable | None
+    reply: str
+    messages: tuple[LLMMessage, ...]
+    reasks: int = 0
 
 
 # --------------------------------------------------------------------------------------
@@ -378,6 +614,12 @@ class Synthesizer:
         max_repairs: How many times a rejected skill may be rewritten. ``0`` means
             one attempt and no repairs. Bounded because a model that cannot fix its
             code in three goes will not fix it in thirty, and every go costs money.
+            Only a JUDGED skill spends one - see ``max_format_retries``.
+        max_format_retries: How many times an UNREADABLE reply may simply be
+            re-asked for, per attempt. Prose around the object, an empty turn, a
+            reply cut off at the token cap: none of those is a fact about the skill,
+            so charging them to ``max_repairs`` spends the gate's whole budget on
+            punctuation and stores nothing. ``0`` restores the old behaviour.
         limits: Sandbox limits for the admission run.
         min_steps: Runs shorter than this are not worth a skill; ``synthesize``
             returns ``None`` for them.
@@ -392,6 +634,7 @@ class Synthesizer:
         "_critic",
         "_limits",
         "_llm",
+        "_max_format_retries",
         "_max_repairs",
         "_max_tokens",
         "_min_similarity",
@@ -408,6 +651,7 @@ class Synthesizer:
         critic: Critic,
         *,
         max_repairs: int = 2,
+        max_format_retries: int = 2,
         limits: SkillLimits | None = None,
         min_steps: int = 1,
         min_similarity: float = 1.0,
@@ -417,10 +661,13 @@ class Synthesizer:
     ) -> None:
         if max_repairs < 0:
             raise ValueError(f"max_repairs must not be negative, got {max_repairs}")
+        if max_format_retries < 0:
+            raise ValueError(f"max_format_retries must not be negative, got {max_format_retries}")
         self._llm = llm
         self._store = store
         self._critic = critic
         self._max_repairs = max_repairs
+        self._max_format_retries = max_format_retries
         self._limits = limits if limits is not None else SkillLimits()
         self._min_steps = min_steps
         self._min_similarity = min_similarity
@@ -448,17 +695,12 @@ class Synthesizer:
         """
         if not self._worth_keeping(trajectory):
             return None
-        response = self._llm.complete(
-            [LLMMessage(role="user", text=describe_trajectory(trajectory))],
-            system=self._prompt,
-            max_tokens=self._max_tokens,
-            temperature=self._temperature,
-        )
-        draft, why = _parse_draft(response.text)
-        if draft is None:
+        generation = self._generate([LLMMessage(role="user", text=describe_trajectory(trajectory))])
+        if generation.draft is None:
+            why = generation.unreadable.why if generation.unreadable else "nothing usable"
             log.info("skill.synthesize.unusable", run_id=trajectory.run_id, why=why)
             return None
-        candidate, error, _ = self._build(draft, trajectory)
+        candidate, error, _ = self._build(generation.draft, trajectory)
         if candidate is None:
             log.info("skill.synthesize.invalid", run_id=trajectory.run_id, error=error)
             return None
@@ -475,10 +717,17 @@ class Synthesizer:
         back to the model with its error and trace and the skill is rewritten, up to
         ``max_repairs`` times.
 
+        An attempt that stops at ``"reset"`` ends the loop at once: the world could
+        not be put back, so nothing was learned about the candidate and rewriting it
+        would only spend money to fail the same way. :attr:`Admission.unproved` marks
+        that outcome so a caller can say "give me a way to restore this world"
+        instead of "the model wrote bad code".
+
         Args:
             trajectory: The successful run to learn from.
             environment: Called once per attempt; returns the recorded environment
-                reset to the trajectory's first screen.
+                put back to the trajectory's first screen, saying through
+                :attr:`ReplayEnvironment.restored` whether it managed to.
 
         Returns:
             An :class:`Admission`. ``ok`` means - and only means - that this exact
@@ -499,16 +748,12 @@ class Synthesizer:
             log.info("skill.admit.skipped", run_id=trajectory.run_id, reason=reason)
             return Admission(ok=False, skill=None, reason=reason)
 
-        messages = [LLMMessage(role="user", text=describe_trajectory(trajectory))]
+        messages: list[LLMMessage] = [LLMMessage(role="user", text=describe_trajectory(trajectory))]
         attempts: list[Attempt] = []
         for index in range(self._max_repairs + 1):
-            response = self._llm.complete(
-                messages,
-                system=self._prompt,
-                max_tokens=self._max_tokens,
-                temperature=self._temperature,
-            )
-            attempt = self._attempt(index, response.text, trajectory, environment)
+            generation = self._generate(messages)
+            messages = list(generation.messages)
+            attempt = self._attempt(index, generation, trajectory, environment)
             attempts.append(attempt)
             if attempt.ok and attempt.skill is not None:
                 stored = self._store.put(attempt.skill)
@@ -533,10 +778,19 @@ class Synthesizer:
                 stage=attempt.stage,
                 error=attempt.error,
             )
+            if attempt.stage == "reset":
+                # Nothing was judged, so there is nothing for the model to repair.
+                log.warning("skill.admit.unrestorable", run_id=trajectory.run_id)
+                return Admission(
+                    ok=False,
+                    skill=None,
+                    attempts=tuple(attempts),
+                    reason=f"nothing was stored: {attempt.error}",
+                )
             if index < self._max_repairs:
                 messages = [
                     *messages,
-                    LLMMessage(role="assistant", text=response.text),
+                    *_echo(generation.reply),
                     LLMMessage(role="user", text=_repair_brief(attempt)),
                 ]
         last = attempts[-1]
@@ -550,18 +804,64 @@ class Synthesizer:
             ),
         )
 
+    # -- getting a readable reply ----------------------------------------------------------
+
+    def _generate(self, messages: Sequence[LLMMessage]) -> _Generation:
+        """One draft, re-asking for the JSON object when the reply is unreadable.
+
+        A re-ask is not a repair. It costs a model call and says so in the log, but
+        it does not advance the repair counter, because the skill has not been judged
+        - the reply merely could not be read. A reply that ran out of room gets a
+        bigger cap on the way round; a reply that was simply chatty does not need one.
+
+        Raises:
+            ProviderError: if a model call fails.
+        """
+        conversation = list(messages)
+        tokens = self._max_tokens
+        for reask in range(self._max_format_retries + 1):
+            response = self._llm.complete(
+                conversation,
+                system=self._prompt,
+                max_tokens=tokens,
+                temperature=self._temperature,
+            )
+            draft, unreadable = _parse_draft(
+                response.text, truncated=response.stop_reason == "max_tokens"
+            )
+            readable = draft is not None or (unreadable is not None and not unreadable.format_only)
+            if readable or reask == self._max_format_retries:
+                return _Generation(draft, unreadable, response.text, tuple(conversation), reask)
+            assert unreadable is not None  # `readable` is false only when it is set
+            if unreadable.needs_room:
+                tokens = min(tokens * 2, _MAX_REPLY_TOKENS)
+            log.info(
+                "skill.generate.reask",
+                why=unreadable.why,
+                reask=reask + 1,
+                of=self._max_format_retries,
+                max_tokens=tokens,
+            )
+            conversation = [
+                *conversation,
+                *_echo(response.text),
+                LLMMessage(role="user", text=_FORMAT_NUDGE.format(why=unreadable.why)),
+            ]
+        raise AssertionError("unreachable: the loop returns on its last iteration")
+
     # -- one attempt -----------------------------------------------------------------------
 
     def _attempt(
         self,
         index: int,
-        reply: str,
+        generation: _Generation,
         trajectory: Trajectory,
         environment: EnvironmentFactory,
     ) -> Attempt:
         """Everything that has to be true before a skill may be stored."""
-        draft, why = _parse_draft(reply)
+        draft = generation.draft
         if draft is None:
+            why = generation.unreadable.why if generation.unreadable else "nothing usable"
             return Attempt(index, "generation", False, error=why)
 
         candidate, error, hardening = self._build(draft, trajectory)
@@ -584,14 +884,10 @@ class Synthesizer:
             if similarity < self._min_similarity:
                 return Attempt(
                     index,
-                    "precondition",
+                    "precondition" if env.restored else "reset",
                     False,
                     skill=candidate,
-                    error=(
-                        "the environment is not on the recorded starting screen "
-                        f"(similarity {similarity:.2f} to {candidate.precondition.value}); "
-                        "the skill cannot be proved here"
-                    ),
+                    error=_not_at_the_start(candidate, similarity, restored=env.restored),
                     hardening=hardening,
                 )
 

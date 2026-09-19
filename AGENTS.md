@@ -17,6 +17,18 @@ assembling a planner and an explorer by hand.
 
 Test without a browser, a model or a network by using the doubles in `tests/fakes/` (fixtures in `tests/conftest.py`; `tests/fakes/scenario.py` is a small fake app to drive).
 
+Two live-API facts that no test can teach you, both already paid for in lost runs.
+`claude-opus-5` **refuses an assistant prefill** - a conversation ending on an assistant
+turn is a 400 - so JSON is obtained by asking tolerantly and re-asking, not by prefilling;
+and the Anthropic SDK **refuses a non-streaming request** whose implied duration passes
+ten minutes, which a large `max_tokens` alone is enough to trigger. Both are written up
+where they bite, at `_MAX_REPLY_TOKENS` in `src/skillweaver/skills/synthesize.py`.
+
+Anything the agent learns must be RE-RUN before it is stored, so a task that changes
+state cannot be learned unless something can change it back: pass `--reset-url`
+(`learn --help`), and see `WorldReset` in `src/skillweaver/orchestrator.py`. The sandbox
+site's `GET /__reset` is one instance of it.
+
 `ultralytics` is a noisy import; three of its side effects have already cost time here.
 
 - It installs its own top-level `tests` package into the venv, which shadows this repository's

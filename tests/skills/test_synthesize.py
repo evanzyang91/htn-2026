@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from skillweaver.contracts import Fingerprint, Trajectory, Verdict
+from skillweaver.contracts import Fingerprint, LLMResponse, Trajectory, Verdict
 from skillweaver.errors import SkillNotFound
 from skillweaver.llm.cassette import CassetteClient
 from skillweaver.skills.refactor import harden
@@ -106,11 +106,17 @@ def trajectory(scenario: Scenario) -> Trajectory:
 
 @pytest.fixture
 def environment(scenario: Scenario) -> Callable[[], ReplayEnvironment]:
-    """A factory handing the gate the recorded app, reset to its first screen."""
+    """A factory handing the gate the recorded app, put back to its first screen.
+
+    ``restored=True`` because ``controller.reset()`` genuinely is a restore: this app
+    keeps no state outside the state machine, so returning to ``list`` is returning
+    to the seed. That flag is what entitles a precondition mismatch here to be read
+    as a fact about the SKILL rather than about the harness.
+    """
 
     def build() -> ReplayEnvironment:
         scenario.controller.reset()
-        return ReplayEnvironment(scenario.controller, scenario.perceiver)
+        return ReplayEnvironment(scenario.controller, scenario.perceiver, restored=True)
 
     return build
 
@@ -225,7 +231,7 @@ def test_a_candidate_is_refused_when_the_environment_is_not_on_the_recorded_scre
     def wrong_screen() -> ReplayEnvironment:
         scenario.controller.reset()
         scenario.controller.perform(scenario.solution[0])  # one state further on
-        return ReplayEnvironment(scenario.controller, scenario.perceiver)
+        return ReplayEnvironment(scenario.controller, scenario.perceiver, restored=True)
 
     llm = FakeLLM([reply()])
     admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(trajectory, wrong_screen)
@@ -296,6 +302,230 @@ def test_a_negative_repair_bound_is_refused(fake_llm, skill_store, fake_critic):
 
 
 # --------------------------------------------------------------------------------------
+# A reply that could not be read
+# --------------------------------------------------------------------------------------
+#
+# Every case here was found by running the real command line against the live API. Two
+# of three admission attempts died reading the reply, the repair budget was spent on
+# punctuation, and the run finished with nothing stored - so the project's whole claim,
+# "learn it once and then repeat it for free", could not be demonstrated at all.
+
+
+def test_a_skill_wrapped_in_prose_is_read_rather_than_thrown_away(
+    trajectory, environment, critic, skill_store
+):
+    """The model explains itself on either side of the object; the object still counts.
+
+    The braces in that prose are the sharp bit: reading from the first `{` to the last
+    `}` swallows them and yields something that is not JSON, which is exactly how a
+    perfectly good skill used to be reported as "the reply was not a JSON object".
+    """
+    chatty = (
+        "Looking at the recording, the {company} value is what varied, so I lifted it "
+        "into a parameter.\n\n"
+        + json.dumps(json.loads(reply().split("```json\n")[1].split("\n```")[0]))
+        + "\n\nNote the closing } above - that is the whole object."
+    )
+    llm = FakeLLM([chatty])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(trajectory, environment)
+
+    assert admission.ok, admission.reason
+    assert llm.calls == 1, "a readable reply was re-asked for"
+    assert skill_store.get("confirm_invoice_payment", DOMAIN).version == 1
+
+
+def test_an_empty_reply_is_re_asked_for_and_does_not_spend_a_repair(
+    trajectory, environment, critic, skill_store
+):
+    """THE ONE THAT COST A LIVE RUN ITS SKILL.
+
+    The model returns nothing - on a thinking model, usually because the token cap went
+    on thinking. That says nothing whatever about the skill, so charging it to the
+    repair budget spends the gate's whole allowance on a reply that was never judged.
+    Here the budget is ``max_repairs=0``: under the old behaviour the empty turn WAS
+    the one and only attempt and the run ended with nothing. It is now a re-ask, the
+    skill that follows is admitted, and ``repairs`` is still zero.
+    """
+    llm = FakeLLM(["", reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(trajectory, environment)
+
+    assert admission.ok, admission.reason
+    assert admission.repairs == 0, "a reply that was never judged was charged as a repair"
+    assert len(admission.attempts) == 1
+    assert llm.calls == 2
+    assert skill_store.get("confirm_invoice_payment", DOMAIN).version == 1
+
+
+def test_an_empty_reply_is_re_asked_for_with_more_room_and_nothing_to_repair(
+    trajectory, environment, critic, skill_store
+):
+    """The re-ask raises the token cap and does not accuse the model of anything.
+
+    An empty turn means the reply ran out of room, so asking again with the same cap
+    invites the same silence. And the follow-up must not say the skill was rejected:
+    a model told to fix working code will change it.
+    """
+    llm = FakeLLM(["", reply()])
+    synthesizer(llm, skill_store, critic, max_repairs=0, max_tokens=4000).admit(
+        trajectory, environment
+    )
+
+    first, second = llm.requests
+    assert first.max_tokens == 4000
+    assert second.max_tokens == 8000, "the re-ask did not give the reply more room"
+    # Nothing to quote back, so there is no assistant turn - and no claim of rejection.
+    assert [m.role for m in second.messages] == ["user", "user"]
+    assert "could not be read" in second.messages[-1].text
+    assert "REJECTED" not in second.messages[-1].text
+
+
+def test_a_reply_cut_off_at_the_token_cap_is_re_asked_for_with_more_room(
+    trajectory, environment, critic, skill_store
+):
+    """A half-written object is a cap that was too small, not a skill that is wrong."""
+    cut_off = LLMResponse(text=reply()[:120], stop_reason="max_tokens")
+    llm = FakeLLM([cut_off, reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0, max_tokens=4000).admit(
+        trajectory, environment
+    )
+
+    assert admission.ok, admission.reason
+    assert admission.repairs == 0
+    assert [r.max_tokens for r in llm.requests] == [4000, 8000]
+
+
+def test_re_asks_are_bounded_and_the_last_one_is_reported_as_the_failure(
+    trajectory, environment, critic, skill_store
+):
+    """Tolerance is not patience: a model that will not return an object is given up on."""
+    llm = FakeLLM(["nope", "still nope"])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0, max_format_retries=1).admit(
+        trajectory, environment
+    )
+
+    assert not admission.ok
+    assert llm.calls == 2 and llm.remaining == 0
+    assert admission.attempts[-1].stage == "generation"
+    assert "no JSON object" in (admission.attempts[-1].error or "")
+    assert skill_store.list() == []
+
+
+def test_a_real_content_defect_still_spends_a_repair(trajectory, environment, critic, skill_store):
+    """The line between the two failures, stated as a test.
+
+    A JSON object with no verifier IS the model's mistake and IS worth a repair - it
+    is told what is missing and asked again. Only a reply that could not be read at
+    all escapes the budget. Getting this backwards would gut the gate: every rejection
+    would become a free retry.
+    """
+    llm = FakeLLM([reply(verifier_code=None), reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=1, max_format_retries=2).admit(
+        trajectory, environment
+    )
+
+    assert admission.ok, admission.reason
+    assert admission.repairs == 1, "a content defect was excused as a formatting problem"
+    assert llm.calls == 2
+    assert "verifier" in (admission.attempts[0].error or "")
+    assert "REJECTED" in llm.requests[1].messages[-1].text
+
+
+def test_a_negative_re_ask_bound_is_refused(fake_llm, skill_store, fake_critic):
+    with pytest.raises(ValueError, match="max_format_retries"):
+        Synthesizer(fake_llm, skill_store, fake_critic, max_format_retries=-1)
+
+
+# --------------------------------------------------------------------------------------
+# A world that cannot be put back
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unrestorable(scenario: Scenario) -> Callable[[], ReplayEnvironment]:
+    """The gate's world as a browser alone can offer it: re-opened, not put back.
+
+    This is what ``navigating_environment`` does without a reset hook. The app is left
+    standing where the recorded run left it - the payment is confirmed, and no amount
+    of re-opening the page un-confirms it - and ``restored=False`` says so. Replaying
+    the solution is idempotent: ``done`` is terminal, so a second call changes nothing.
+    """
+
+    def build() -> ReplayEnvironment:
+        for action in scenario.solution:
+            scenario.controller.perform(action)
+        return ReplayEnvironment(scenario.controller, scenario.perceiver, restored=False)
+
+    return build
+
+
+def test_a_mutating_task_cannot_be_proved_without_a_way_to_put_the_world_back(
+    trajectory, unrestorable, critic, skill_store
+):
+    """THE SECOND DEFECT, AT ITS SOURCE.
+
+    The recorded run ended on the confirmation page; that is where the world now
+    stands and re-opening a screen does not un-confirm a payment. The gate must not
+    call this a bad skill - it never ran it - and it must not quietly repair its way
+    through the budget trying to fix code that was never judged.
+    """
+    llm = FakeLLM([reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=2).admit(trajectory, unrestorable)
+
+    assert not admission.ok
+    assert admission.unproved, "a world that could not be restored was reported as a bad skill"
+    assert admission.attempts[-1].stage == "reset"
+    assert "could not restore the world" in (admission.attempts[-1].error or "")
+    assert "could not restore the world" in admission.reason
+    # No repair was attempted: there is nothing for the model to fix.
+    assert len(admission.attempts) == 1
+    assert llm.calls == 1 and llm.remaining == 0
+    assert skill_store.list() == []
+
+
+def test_the_same_task_is_admitted_once_the_world_can_be_put_back(
+    trajectory, environment, critic, skill_store
+):
+    """The other half of the pair: one reset hook is the whole difference.
+
+    Same trajectory, same model reply, same gate - and the skill is stored, because
+    ``environment`` really does restore the app. Without this half the fix could be a
+    weakened gate; with it, the gate is intact and the harness grew a hand.
+    """
+    llm = FakeLLM([reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(trajectory, environment)
+
+    assert admission.ok, admission.reason
+    assert not admission.unproved
+    assert skill_store.get("confirm_invoice_payment", DOMAIN).version == 1
+
+
+def test_a_restored_world_on_the_wrong_screen_is_still_the_skills_problem(
+    scenario, trajectory, critic, skill_store
+):
+    """``restored=True`` and a mismatch means what it always meant: wrong screen.
+
+    The distinction only buys something if it stays narrow. A harness that really did
+    put the world back and still finds the wrong screen has said something about the
+    candidate, and that must keep reading ``precondition``.
+    """
+
+    def restored_but_elsewhere() -> ReplayEnvironment:
+        scenario.controller.reset()
+        scenario.controller.perform(scenario.solution[0])
+        return ReplayEnvironment(scenario.controller, scenario.perceiver, restored=True)
+
+    llm = FakeLLM([reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
+        trajectory, restored_but_elsewhere
+    )
+
+    assert not admission.ok
+    assert not admission.unproved
+    assert admission.attempts[-1].stage == "precondition"
+    assert "could not restore the world" not in (admission.attempts[-1].error or "")
+
+
+# --------------------------------------------------------------------------------------
 # The candidate itself
 # --------------------------------------------------------------------------------------
 
@@ -357,8 +587,12 @@ def test_a_failed_or_trivial_run_is_not_worth_a_skill(trajectory, environment, s
 
 
 def test_an_unusable_reply_is_not_a_skill(trajectory, critic, skill_store):
-    llm = FakeLLM(["I could not work out what that run was doing."])
-    assert synthesizer(llm, skill_store, critic).synthesize(trajectory) is None
+    """A model that never returns an object is re-asked, and then given up on."""
+    prose = "I could not work out what that run was doing."
+    llm = FakeLLM([prose, prose, prose])
+    synth = synthesizer(llm, skill_store, critic, max_format_retries=2)
+    assert synth.synthesize(trajectory) is None
+    assert llm.calls == 3 and llm.remaining == 0  # the first ask and two re-asks
     assert skill_store.list() == []
 
 
@@ -528,7 +762,7 @@ def test_a_fingerprint_mismatch_is_reported_not_raised(trajectory, critic, skill
     """A precondition that matches nothing on screen fails the attempt cleanly."""
 
     def elsewhere() -> ReplayEnvironment:
-        return ReplayEnvironment(scenario.controller, scenario.perceiver)
+        return ReplayEnvironment(scenario.controller, scenario.perceiver, restored=True)
 
     llm = FakeLLM([reply()])
     synth = synthesizer(llm, skill_store, critic, max_repairs=0, min_similarity=2.0)
