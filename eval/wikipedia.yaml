@@ -45,11 +45,13 @@
 # in `headings` as exactly its title, so `headings contains Ada Lovelace` is a real
 # equality against one element rather than a search of the whole page.
 #
-# Note that `skillweaver eval run` does not yet choose such a referee: harness.run
-# builds an HttpReferee unconditionally, so pointing the shipped command at this file
-# asks en.wikipedia.org for /__state and fails. Running this suite today means
-# calling harness.run_suite directly with a live-site referee. That gap is one
-# argument in one function and is reported rather than papered over here.
+# `referee: dom` below is how this file asks for that referee, and it is the whole
+# difference between this suite and the sandbox one. A suite naming an application
+# that reports its own state leaves the key off and gets HttpReferee; this one names
+# a website, which has no /__state and never will, so it gets BrowserReferee and is
+# scored on the page the run ended on. `skillweaver eval run --suite eval/wikipedia.yaml`
+# is therefore an ordinary command - it used to build an HttpReferee whatever the
+# suite said, ask en.wikipedia.org for /__state, and fail before the first task.
 #
 # ----------------------------------------------------------------------------------
 # The checks, and why they are loose
@@ -69,7 +71,10 @@
 # ----------------------------------------------------------------------------------
 #
 #     cp /path/to/.env .          # ANTHROPIC_API_KEY, never committed
-#     # then drive harness.run_suite with a live-site referee; see the note above.
+#     uv run python -m skillweaver.cli eval run --suite eval/wikipedia.yaml
+#
+# `--only <task-id>` bounds it to one task, which is the polite way to check that the
+# loop still works here without paying for the whole suite.
 #
 # RUN THE BROWSER HEADLESS. Measured 2026-09-19: two HEADED Chromium windows showing
 # the identical Wikipedia page fingerprint at similarity 0.960, two headless ones at
@@ -88,6 +93,9 @@ base_url: https://en.wikipedia.org
 
 # A read-only world: "put it back" is a page load that changes nothing. See above.
 reset_path: /wiki/Main_Page
+
+# Ground truth comes from the live page, not from a control endpoint. See above.
+referee: dom
 
 warm_runs: 2
 bound_runs: 1

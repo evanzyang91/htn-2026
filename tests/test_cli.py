@@ -62,6 +62,7 @@ from skillweaver.orchestrator import (
     task_spec,
     world_reset_from_url,
 )
+from skillweaver.perception.ocr import PerceptionCounts
 from skillweaver.skills.api import SkillLimits
 from skillweaver.skills.retrieve import SkillRetriever
 from skillweaver.skills.synthesize import (
@@ -1343,3 +1344,123 @@ def test_main_returns_the_exit_code_the_command_chose(tmp_path: Path) -> None:
     assert main([*data, "--log-level", "nonsense", "skills", "ls"]) == 2
     assert main([*data, "--help"]) == 0
     assert main([*data, "no-such-command"]) == 2
+
+
+# --------------------------------------------------------------------------------------
+# What --json says about the eyes
+# --------------------------------------------------------------------------------------
+#
+# The perception counters are how an efficiency saving is stated honestly: seconds
+# move with machine load - this project has been burned by that twice - and counts do
+# not. `explain()` has carried them since the cache landed; `--json` did not, so
+# nothing downstream could consume the one number the optimization is judged by.
+
+
+def _a_report(*attempts: AttemptRecord) -> RunReport:
+    return RunReport(
+        ok=True,
+        task=task_spec(TASK, domain=DOMAIN),
+        decision="cold",
+        attempts=attempts,
+    )
+
+
+def test_json_carries_the_perception_counters_summed_across_every_attempt() -> None:
+    """Per ATTEMPT is what the agent records; per RUN is what a reader asked for.
+
+    A warm attempt that failed and a cold one that rescued it both cost OCR, and a
+    report quoting only the winner's would understate what the run actually spent.
+    """
+    report = _a_report(
+        AttemptRecord(
+            path="warm",
+            ok=False,
+            reason="the stored skill did not finish",
+            perception=PerceptionCounts(observations=2, captures=2, detections=2, ocr_reads=2),
+        ),
+        AttemptRecord(
+            path="cold",
+            ok=True,
+            reason="explored",
+            perception=PerceptionCounts(
+                observations=9, captures=9, detections=9, ocr_reads=3, ocr_hits=6
+            ),
+        ),
+    )
+
+    eyes = cli._report_json(report)["perception"]
+
+    assert eyes == {
+        "observations": 11,
+        "captures": 11,
+        "detections": 11,
+        "ocr_reads": 5,
+        "ocr_hits": 6,
+        "hit_rate": round(6 / 11, 4),
+    }
+
+
+def test_the_json_and_the_prose_never_quote_different_numbers_for_one_run() -> None:
+    """Two renderings of one fact, so they are pinned to the same fact.
+
+    The names are :class:`PerceptionCounts`' own for exactly this reason: a second
+    vocabulary here is how the two would drift into disagreeing about a run.
+    """
+    report = _a_report(
+        AttemptRecord(
+            path="cold",
+            ok=True,
+            reason="explored",
+            perception=PerceptionCounts(
+                observations=12, captures=12, detections=12, ocr_reads=4, ocr_hits=8
+            ),
+        )
+    )
+
+    eyes = cli._report_json(report)["perception"]
+    prose = next(line for line in report.explain().splitlines() if line.startswith("perception:"))
+
+    assert prose == (
+        f"perception: {eyes['ocr_reads']} OCR read(s) for {eyes['observations']} "
+        f"observation(s) - {eyes['ocr_hits']} served from cache "
+        f"({eyes['hit_rate']:.0%}), {eyes['detections']} detection(s)"
+    )
+
+
+def test_a_real_run_reports_its_perception_counters_through_the_command_line(
+    world: World,
+) -> None:
+    """The key is always there, whatever the eyes happen to have counted.
+
+    A consumer of `--json` cannot write `report["perception"]["ocr_reads"]` against a
+    field that appears only on runs that did some OCR.
+    """
+    world.script(SOLVE_FROM_LIST)
+
+    report = world.json("run", TASK, "--domain", DOMAIN, "-p", COMPANY, "--no-learn")
+
+    assert report["ok"]
+    assert set(report["perception"]) == {
+        "observations",
+        "captures",
+        "detections",
+        "ocr_reads",
+        "ocr_hits",
+        "hit_rate",
+    }
+    assert all(isinstance(v, int | float) for v in report["perception"].values())
+
+
+def test_eval_run_bounds_a_suite_to_the_tasks_it_was_asked_for(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--only` is how a run against somebody else's website stays small. Absent, the
+    harness is told nothing rather than an empty list, which would run no task at all."""
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(cli, "_eval_entry", lambda: lambda **kw: seen.append(kw))
+
+    world.invoke("eval", "run", "--only", "search_ada", "--only", "back_to_main")
+    world.invoke("eval", "run")
+
+    assert seen[0]["only"] == ["search_ada", "back_to_main"]
+    assert seen[1]["only"] is None

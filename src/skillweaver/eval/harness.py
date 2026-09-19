@@ -39,6 +39,12 @@ its world back and describe the result satisfies it, and
 "put the world back" capability, and this Protocol is offered as the shared shape for
 it rather than a second competing mechanism.
 
+The second implementation is :class:`BrowserReferee`, which exists because a PUBLIC
+website has no ``/__state`` to ask and never will. It reads the DOM of the page the
+run ended on - offline, after the fact - and a suite says which of the two it needs
+with one ``referee:`` key, so ``skillweaver eval run --suite <a live site>`` is an
+ordinary command rather than a rig somebody has to rebuild by hand.
+
 The ground-truth boundary
 -------------------------
 
@@ -94,7 +100,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 import yaml
 
-from skillweaver.contracts import Budget, Usage, utcnow
+from skillweaver.contracts import Budget, ElementKind, Usage, utcnow
 from skillweaver.errors import ConfigError, SkillWeaverError
 from skillweaver.eval.metrics import (
     RunPoint,
@@ -104,18 +110,22 @@ from skillweaver.eval.metrics import (
     task_metrics,
 )
 from skillweaver.logging_ import get_logger
-from skillweaver.orchestrator import task_spec, world_reset_from_url
+from skillweaver.orchestrator import ResetRefused, task_spec, world_reset_from_url
 
 __all__ = [
+    "BrowserReferee",
     "Check",
     "EvalTask",
     "HttpReferee",
+    "LiveReferee",
+    "REFEREES",
     "Referee",
     "RunRecord",
     "SCHEMA_VERSION",
     "Suite",
     "TaskRecord",
     "WARM_RUNS",
+    "build_referee",
     "load_suite",
     "render_summary",
     "resolve_path",
@@ -152,6 +162,20 @@ DEFAULT_SUITE = Path("eval/tasks.yaml")
 TAGS = ("single-step", "multi-step", "composite")
 """The shapes a task may be tagged with. A suite is rejected if it uses another, so a
 typo cannot quietly create a fourth category nobody reports on."""
+
+REFEREES = ("http", "dom")
+"""Where a suite's ground truth comes from, as its ``referee:`` key spells it.
+
+``"http"`` is :class:`HttpReferee` over an application that exposes its own state -
+the sandbox's ``/__state`` - and is the default because it is the better referee
+wherever it exists: the state is the server's own, not something scraped back out of
+a page. ``"dom"`` is :class:`BrowserReferee`, for a site nobody here controls and
+which therefore has no such endpoint. The choice belongs to the SUITE rather than to
+the command line: it is a fact about the application being evaluated, and a flag
+would let one report be produced two ways."""
+
+RefereeKind = Literal["http", "dom"]
+"""One of :data:`REFEREES`."""
 
 OPERATORS = ("equals", "contains", "count", "at_least", "absent")
 """The check vocabulary. Deliberately tiny - see ``eval/tasks.yaml`` for what each
@@ -219,6 +243,7 @@ class Suite:
     domain: str = "sandbox.test"
     base_url: str = "http://127.0.0.1:8765"
     reset_path: str = "/__reset"
+    referee: RefereeKind = "http"
     warm_runs: int = WARM_RUNS
     bound_runs: int = BOUND_RUNS
     source: str = ""
@@ -279,10 +304,26 @@ def load_suite(path: Path | str | None = None) -> Suite:
         domain=str(raw.get("domain") or "sandbox.test"),
         base_url=str(raw.get("base_url") or "http://127.0.0.1:8765").rstrip("/"),
         reset_path=str(raw.get("reset_path") or "/__reset"),
+        referee=_referee_kind(raw, resolved),
         warm_runs=warm,
         bound_runs=_count(raw, "bound_runs", BOUND_RUNS, resolved),
         source=str(resolved),
     )
+
+
+def _referee_kind(raw: Mapping[str, Any], source: Path) -> RefereeKind:
+    """The suite's ``referee:`` key, validated, defaulting to ``"http"``.
+
+    Rejected rather than defaulted when it is anything else, for the reason the whole
+    loader is strict: a suite that named ``dom`` and got ``http`` because of a typo
+    would ask a public website for ``/__state``, fail every reset, and report a table
+    of zeroes as though the agent had done the work badly.
+    """
+    value = raw.get("referee", "http")
+    if value not in REFEREES:
+        allowed = " or ".join(repr(name) for name in REFEREES)
+        raise ConfigError(f"{source}: 'referee' must be {allowed}, not {value!r}")
+    return value  # type: ignore[return-value]
 
 
 def _count(raw: Mapping[str, Any], key: str, default: int, source: Path) -> int:
@@ -480,6 +521,163 @@ class HttpReferee:
             return json.loads(body) if body else {}
         except json.JSONDecodeError as exc:
             raise SkillWeaverError(f"{url} did not return JSON: {exc}") from exc
+
+
+@runtime_checkable
+class LiveReferee(Protocol):
+    """A :class:`Referee` whose ground truth is the screen the run ended on.
+
+    A referee over an application that reports its own state can be asked at any
+    moment, because the state outlives the browser: the sandbox's ``/__state`` is
+    still there after the window has closed. A referee over a public website has no
+    such luxury. The only record that the agent reached ``/wiki/Charles_Babbage`` is
+    the page it left open, and :meth:`~skillweaver.orchestrator.Workbench.session`
+    closes the controller on the way out.
+
+    So a live-page referee is TOLD when to look, once, while the world still exists.
+    :func:`_one_run` calls :meth:`observe` inside the session - immediately after the
+    run, before the browser is torn down - and :meth:`state` afterwards returns what
+    was seen. Referees that do not need this do not implement it and are not called.
+
+    **This does not widen the ground-truth boundary by one inch.** The controller is
+    handed TO the referee, not the other way round; it is the same one-way read that
+    :class:`~skillweaver.controllers.browser.BrowserGroundTruth` is documented for -
+    "code that legitimately needs it takes it as an explicit argument" - and the
+    referee stays where it has always been, in a local variable of this module that
+    nothing on the agent's side can name.
+    """
+
+    def observe(self, controller: Any) -> None:
+        """Read ground truth from the world, now, while it is still open.
+
+        Called at most once per run. Raises nothing the harness cannot survive: a
+        failure here is recorded as the referee having seen nothing, which
+        :meth:`Referee.state` then reports.
+        """
+        ...
+
+
+class BrowserReferee:
+    """A :class:`Referee` over a LIVE PAGE, for a site with no control endpoints.
+
+    ``eval/tasks.yaml`` runs against an application this repository ships, which is
+    why :class:`HttpReferee` can ask it what is true. The live-site suite runs against
+    somebody else's website, which has no ``/__state`` and never will - and pointing
+    the shipped command at it made the harness ask ``en.wikipedia.org`` for one,
+    which is the bug this class exists to remove.
+
+    Ground truth here is the DOM, read by
+    :class:`~skillweaver.controllers.browser.BrowserGroundTruth` - **an offline
+    teacher, exactly as it is when it labels detector training data.** It produces
+    the three top-level keys the live suite's checks are written against::
+
+        url       the browser's exact current URL
+        headings  the text of every visible ``text`` element, in reading order
+        links     the text of every visible link
+
+    Only what is actually on screen is reported, because that is all
+    ``BrowserGroundTruth`` reports: elements are clipped to the viewport and the
+    invisible ones are dropped. A check therefore means "this was visible when the
+    run finished", which is the honest reading of a screen the agent had to navigate
+    to rather than a search of the whole document.
+
+    The reset, and why it is allowed to be refused
+    ----------------------------------------------
+
+    There is nothing to put back: a suite that uses this referee is read-only by
+    construction - see ``WorldReset`` in :mod:`skillweaver.orchestrator` for why a
+    task that changes state cannot be learned without a way back, and why a live site
+    therefore only ever gets read-only tasks. The reset is still performed, as one
+    ordinary GET of the suite's ``reset_path``, so that a site which has gone away is
+    noticed before six tasks are run against nothing.
+
+    A :class:`~skillweaver.orchestrator.ResetRefused` - the ``403`` a real website
+    answers to a URL that was never a reset hook - is NOT a failed reset here. It
+    means there is no reset endpoint, which is already known and already fine; the
+    world was never disturbed. Reporting it as ``reset_ok=False`` would mark every
+    run in the report as untrustworthy for doing exactly what it was designed to do.
+
+    Args:
+        base_url: The site, e.g. ``https://en.wikipedia.org``.
+        reset_path: The path loaded before each run. For a read-only suite this is
+            an ordinary page, and restoring nothing is the point.
+        timeout: Seconds to wait on that load.
+    """
+
+    __slots__ = ("_base", "_reset", "_reset_url", "_seen", "_timeout")
+
+    def __init__(self, base_url: str, *, reset_path: str = "/", timeout: float = 10.0) -> None:
+        self._base = base_url.rstrip("/")
+        self._reset_url = f"{self._base}{reset_path}"
+        self._reset = world_reset_from_url(self._reset_url, timeout=timeout)
+        self._timeout = timeout
+        self._seen: dict[str, Any] | None = None
+
+    def __repr__(self) -> str:
+        return f"BrowserReferee({self._base!r})"
+
+    @property
+    def reset_url(self) -> str:
+        """The page loaded before each run. See the class docstring."""
+        return self._reset_url
+
+    def reset(self) -> None:
+        """Load ``reset_path``, and forget the previous run's screen.
+
+        Forgetting is the load-bearing half. If :meth:`observe` never runs - the
+        session failed to open, the browser died - :meth:`state` must not score this
+        run against the screen the LAST one left behind, which would be the silent
+        kind of wrong number this harness exists to refuse.
+        """
+        self._seen = None
+        try:
+            self._reset()
+        except ResetRefused:
+            # Not a failure: see the class docstring. Nothing needed putting back.
+            log.info("eval.reset.not_a_hook", url=self._reset_url)
+        except OSError as exc:
+            raise SkillWeaverError(
+                f"the site at {self._base} did not answer {self._reset_url}: {exc}"
+            ) from exc
+
+    def observe(self, controller: Any) -> None:
+        """Read the page the run ended on. See :class:`LiveReferee`."""
+        from skillweaver.controllers.browser import BrowserGroundTruth
+
+        truth = BrowserGroundTruth(controller)
+        elements = truth.elements()
+        self._seen = {
+            "url": truth.url(),
+            "headings": [e.text for e in elements if e.kind is ElementKind.text and e.text],
+            "links": [e.text for e in elements if e.kind is ElementKind.link and e.text],
+        }
+        log.info(
+            "eval.referee.observed",
+            url=self._seen["url"],
+            headings=len(self._seen["headings"]),
+            links=len(self._seen["links"]),
+        )
+
+    def state(self) -> Mapping[str, Any]:
+        """What :meth:`observe` saw. Raises if it never got to look."""
+        if self._seen is None:
+            raise SkillWeaverError(
+                f"the referee never saw the page: the run against {self._base} ended "
+                "without a live browser to read, so there is no ground truth for it"
+            )
+        return self._seen
+
+
+def build_referee(suite: Suite, *, timeout: float = 10.0) -> Referee:
+    """The referee the suite asked for. **The only place that choice is made.**
+
+    Args:
+        suite: The loaded suite, whose ``referee`` key names the kind.
+        timeout: Seconds to wait on the reset endpoint.
+    """
+    if suite.referee == "dom":
+        return BrowserReferee(suite.base_url, reset_path=suite.reset_path, timeout=timeout)
+    return HttpReferee(suite.base_url, reset_path=suite.reset_path, timeout=timeout)
 
 
 def resolve_path(state: Any, path: str) -> Any:
@@ -937,10 +1135,16 @@ def _one_run(
     try:
         with workbench.session(spec, budget) as agent:
             run_start = time.perf_counter()
-            # The referee is NOT in scope for the agent: it is never placed on the
-            # spec, never passed to the session, and never reachable from `agent`.
-            report = agent.run(spec, learn=(phase == "cold"), warm=(phase == "warm"), cold=True)
-            wall_ms = (time.perf_counter() - run_start) * 1000.0
+            try:
+                # The referee is NOT in scope for the agent: it is never placed on the
+                # spec, never passed to the session, and never reachable from `agent`.
+                report = agent.run(spec, learn=(phase == "cold"), warm=(phase == "warm"), cold=True)
+            finally:
+                wall_ms = (time.perf_counter() - run_start) * 1000.0
+                # The last moment the world still exists. A run that RAISED is looked
+                # at too: what the screen reached before it broke is a fact, and the
+                # alternative is scoring it against nothing.
+                _show_the_run_to(referee, agent)
     except Exception as exc:  # a broken run is one failed measurement, not a lost suite
         error = f"{type(exc).__name__}: {exc}"
         log.warning("eval.run.raised", task=task.id, attempt=attempt, error=error)
@@ -996,6 +1200,25 @@ def _one_run(
         skill_used=record.skill_used,
     )
     return record
+
+
+def _show_the_run_to(referee: Referee, agent: Any) -> None:
+    """Let a live-page referee read the screen, if it is one that needs to.
+
+    One-way, and deliberately so: the controller travels TO the referee and nothing
+    travels back, so the agent gains no door to ground truth (see :class:`LiveReferee`).
+
+    Never raises. A referee that could not read the page is a referee that saw
+    nothing, which :meth:`BrowserReferee.state` reports as a missing verdict - and
+    that is a far better outcome than losing the run's timings to an exception thrown
+    inside the teardown of a session that had already finished its work.
+    """
+    if not isinstance(referee, LiveReferee):
+        return
+    try:
+        referee.observe(agent.controller)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.warning("eval.referee.could_not_look", error=f"{type(exc).__name__}: {exc}")
 
 
 def _spend_of(report: Any) -> float:
@@ -1104,6 +1327,9 @@ def run_suite(
         "bound_runs": bound,
         "source": suite.source,
         "base_url": suite.base_url,
+        # How `ok` was decided: the application's own state, or the DOM of the page
+        # the run ended on. A reader of these numbers is entitled to know which.
+        "referee": suite.referee,
         "tasks": [dict(r.to_json(), domain=suite.domain) for r in records],
         "metrics": summary.to_json(),
         "metrics_bound": bound_summary.to_json() if bound_summary.tasks else None,
@@ -1383,12 +1609,20 @@ def run(
     bound_runs: int | None = None,
     budget: Budget | None = None,
     meter: Meter | None = None,
+    only: Iterable[str] | None = None,
+    referee: Referee | None = None,
 ) -> Path:
     """Entry point for ``skillweaver eval run``. Loads the suite and runs it live.
 
-    The referee is built here, from the suite's ``base_url``, and never leaves this
-    function's frame except into :func:`run_suite`, which likewise hands it to nothing
-    the agent can see.
+    The referee is built here, from the suite's own ``referee`` key, and never leaves
+    this function's frame except into :func:`run_suite`, which likewise hands it to
+    nothing the agent can see.
+
+    **Which referee is the suite's decision, not the command's.** A suite naming an
+    application that reports its own state gets :class:`HttpReferee`; one naming a
+    public website gets :class:`BrowserReferee`, which reads the DOM offline. Before
+    this existed the harness built an ``HttpReferee`` unconditionally, so running the
+    live-site suite asked a website for ``/__state`` and could not start at all.
 
     ``repeat`` is passed through exactly as given. Note that ``cli.py`` - which this
     harness does not own - defaults that flag to ``1``, while this suite's own default
@@ -1403,29 +1637,34 @@ def run(
         repeat: Warm runs per task, after the cold one.
         budget: Limits per run.
         meter: Optional cumulative-usage reader, for token counts.
+        only: Run just these task ids. ``None`` runs the whole suite. This is how a
+            live run against somebody else's website is bounded to one task.
+        referee: Ground truth. ``None`` - the normal case - builds the one the suite
+            asked for.
 
     Returns:
         The path of the JSON report.
 
     Raises:
         ConfigError: if the suite cannot be loaded.
-        SkillWeaverError: if the sandbox is not reachable or the report cannot be
+        SkillWeaverError: if the application is not reachable or the report cannot be
             written.
     """
     loaded = load_suite(suite)
-    referee = HttpReferee(loaded.base_url, reset_path=loaded.reset_path)
+    judge = referee if referee is not None else build_referee(loaded)
     # Fail before running fourteen tasks against a world that is not there.
-    referee.reset()
+    judge.reset()
     destination = (
         Path(out) if out is not None else Path(getattr(workbench, "data_dir", "data")) / "eval"
     )
     return run_suite(
         workbench=workbench,
-        referee=referee,
+        referee=judge,
         suite=loaded,
         out_dir=destination,
         budget=budget,
         warm_runs=repeat,
         bound_runs=bound_runs,
         meter=meter,
+        only=only,
     )

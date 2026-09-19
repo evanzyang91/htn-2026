@@ -29,7 +29,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -43,17 +43,22 @@ from skillweaver.dashboard.build import (
     build_speedup_panel,
     read_eval_reports,
 )
-from skillweaver.errors import SkillWeaverError
+from skillweaver.errors import ConfigError, SkillWeaverError
 from skillweaver.eval.harness import (
+    BrowserReferee,
     Check,
     EvalTask,
     HttpReferee,
+    LiveReferee,
     Referee,
     Suite,
+    build_referee,
+    load_suite,
+    run,
     run_suite,
     run_task,
 )
-from skillweaver.orchestrator import world_reset_from_url
+from skillweaver.orchestrator import ResetRefused, world_reset_from_url
 
 SEED: dict[str, Any] = {"screen": "mail", "archived": [], "saved": 0}
 
@@ -69,6 +74,63 @@ WARM_MS = 0.004
 # --------------------------------------------------------------------------------------
 
 
+START_URL = "https://site.test/start"
+
+
+@dataclass(slots=True)
+class FakeDom:
+    """One screen, as the DOM reader script reports it. See :class:`FakePage`."""
+
+    url: str
+    elements: list[dict[str, Any]] = field(default_factory=list)
+
+
+def an_element(kind: str, text: str, y: int = 0) -> dict[str, Any]:
+    """One entry of the reader script's payload."""
+    return {"kind": kind, "text": text, "x": 0, "y": y, "w": 200, "h": 24}
+
+
+def a_page(url: str, headings: Sequence[str] = (), links: Sequence[str] = ()) -> FakeDom:
+    return FakeDom(
+        url=url,
+        elements=[an_element("text", t, i * 30) for i, t in enumerate(headings)]
+        + [an_element("link", t, 400 + i * 30) for i, t in enumerate(links)],
+    )
+
+
+class FakePage:
+    """The one Playwright object :class:`BrowserGroundTruth` touches: a page.
+
+    It answers ``evaluate`` with the payload the real reader script returns, so the
+    GENUINE ``BrowserGroundTruth`` runs in these tests - the parsing, the clipping and
+    the kind mapping are the shipped ones - without a browser or a socket anywhere.
+    """
+
+    def __init__(self, dom: FakeDom) -> None:
+        self._dom = dom
+
+    @property
+    def url(self) -> str:
+        return self._dom.url
+
+    def evaluate(self, script: str) -> dict[str, Any]:
+        return {"viewport": [1280, 800], "elements": list(self._dom.elements)}
+
+
+class FakeBrowserControl:
+    """Stands in for ``BrowserController`` where ground truth reaches into it.
+
+    Reads :attr:`FakeApp.page` every time, so a referee shown this controller after a
+    run sees the screen the run ENDED on rather than the one it started from.
+    """
+
+    def __init__(self, app: FakeApp) -> None:
+        self.app = app
+
+    def _live_page(self) -> FakePage:
+        return FakePage(self.app.page)
+
+
 @dataclass(slots=True)
 class FakeApp:
     """The application under evaluation: some state, and a log of what happened to it.
@@ -76,9 +138,13 @@ class FakeApp:
     ``events`` is the point of this class. It records ``"reset"`` and ``"run:<task>"``
     in order, so a test can assert that every run was preceded by a reset rather than
     counting resets and hoping they landed in the right places.
+
+    ``page`` is the same world seen the other way: what a referee that can only read a
+    live screen would find. Only the live-referee tests look at it.
     """
 
     state: dict[str, Any] = field(default_factory=lambda: deepcopy(SEED))
+    page: FakeDom = field(default_factory=lambda: a_page(START_URL, ["Start"]))
     events: list[str] = field(default_factory=list)
     reset_fails_on: set[int] = field(default_factory=set)
     resets: int = 0
@@ -88,6 +154,7 @@ class FakeApp:
         if self.resets in self.reset_fails_on:
             raise SkillWeaverError("the reset endpoint refused")
         self.state = deepcopy(SEED)
+        self.page = a_page(START_URL, ["Start"])
         self.events.append("reset")
 
 
@@ -169,6 +236,18 @@ class FakeAgent:
     app: FakeApp
     behaviour: Behaviour
     task_id: str
+    has_controller: bool = True
+
+    @property
+    def controller(self) -> FakeBrowserControl:
+        """The open world, as :attr:`skillweaver.orchestrator.Agent.controller` is.
+
+        A session that opened no browser has none, and a referee that needed to look
+        at one has to say so rather than guess; ``has_controller=False`` is that case.
+        """
+        if not self.has_controller:
+            raise AttributeError("this session opened no controller")
+        return FakeBrowserControl(self.app)
 
     def run(self, spec: Any, *, learn: bool = True, warm: bool = True, cold: bool = True) -> Any:
         self.app.events.append(f"run:{self.task_id}")
@@ -208,6 +287,7 @@ class FakeWorkbench:
     attempts: dict[str, int] = field(default_factory=dict)
     seen_specs: list[Any] = field(default_factory=list)
     seen_budgets: list[Any] = field(default_factory=list)
+    opens_a_controller: bool = True
 
     @contextlib.contextmanager
     def session(self, spec: Any, budget: Any) -> Iterator[FakeAgent]:
@@ -219,7 +299,7 @@ class FakeWorkbench:
         behaviour = self.script.get((task_id, n), WARM if n > 1 else COLD)
         if behaviour.learned:
             self.store.skills.append(behaviour.learned)
-        yield FakeAgent(self.app, behaviour, task_id)
+        yield FakeAgent(self.app, behaviour, task_id, self.opens_a_controller)
 
 
 def a_task(task_id: str = "open_records", text: str | None = None) -> EvalTask:
@@ -888,3 +968,304 @@ def test_a_budget_is_passed_through_to_every_session() -> None:
     )
 
     assert bench.seen_budgets == [limits, limits], "the same limits bound every run"
+
+
+# --------------------------------------------------------------------------------------
+# Which referee: the suite's decision, and the live-page one
+# --------------------------------------------------------------------------------------
+#
+# The bug this section pins: `run()` built an HttpReferee whatever the suite said, so
+# evaluating a public website asked en.wikipedia.org for /__state and the shipped
+# command could not start. The live numbers this project quotes had to be produced by
+# a rig somebody rebuilt by hand, which is the same as saying nobody else could check
+# them.
+#
+# Nothing here opens a socket or a browser. `urlopen` is replaced, and the referee's
+# DOM reading runs the GENUINE BrowserGroundTruth against a fake page object.
+
+
+def a_live_suite(*tasks: EvalTask, warm_runs: int = 1) -> Suite:
+    return Suite(
+        tasks=tasks or (a_live_task(),),
+        name="live-suite",
+        domain="site.test",
+        base_url="https://site.test",
+        reset_path="/start",
+        referee="dom",
+        warm_runs=warm_runs,
+        source="tests/eval/test_harness.py",
+    )
+
+
+def a_live_task(task_id: str = "open_records") -> EvalTask:
+    return EvalTask(
+        id=task_id,
+        text=task_id,
+        tags=("single-step",),
+        expect=(
+            Check("url", "contains", "/records"),
+            Check("headings", "contains", "Records"),
+        ),
+    )
+
+
+def land_on(app: FakeApp, url: str, headings: Sequence[str] = ()) -> Callable[[Any], None]:
+    """A run that navigates. Takes the state dict it is handed and ignores it: this
+    world's ground truth is the screen, not a server's mapping."""
+
+    def mutate(_state: dict[str, Any]) -> None:
+        app.page = a_page(url, headings)
+
+    return mutate
+
+
+def test_a_suite_says_which_referee_it_needs_and_http_is_the_default(tmp_path: Path) -> None:
+    """The default is the better referee, and it is what every existing suite gets."""
+    document = {
+        "suite": "s",
+        "base_url": "http://127.0.0.1:8765",
+        "tasks": [
+            {
+                "id": "t",
+                "text": "do it",
+                "tags": ["single-step"],
+                "expect": [{"path": "screen", "equals": "records"}],
+            }
+        ],
+    }
+    default = load_suite(_suite_file(tmp_path, document, "default.yaml"))
+    live = load_suite(_suite_file(tmp_path, {**document, "referee": "dom"}, "live.yaml"))
+
+    assert default.referee == "http"
+    assert live.referee == "dom"
+    assert isinstance(build_referee(default), HttpReferee)
+    assert isinstance(build_referee(live), BrowserReferee)
+
+
+def test_a_suite_naming_a_referee_that_does_not_exist_is_rejected(tmp_path: Path) -> None:
+    """Defaulting would be the dangerous answer: a suite that meant 'dom' and was
+    given 'http' because of a typo asks a public website for /__state, fails every
+    reset, and reports a table of zeroes as though the agent had done the work badly."""
+    document = {
+        "suite": "s",
+        "referee": "playwright",
+        "tasks": [
+            {
+                "id": "t",
+                "text": "do it",
+                "tags": ["single-step"],
+                "expect": [{"path": "screen", "equals": "records"}],
+            }
+        ],
+    }
+    with pytest.raises(ConfigError, match="'referee' must be"):
+        load_suite(_suite_file(tmp_path, document, "typo.yaml"))
+
+
+def _suite_file(tmp_path: Path, document: Any, name: str) -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps(document), encoding="utf-8")  # JSON is valid YAML
+    return path
+
+
+def test_the_browser_referee_is_a_referee_and_asks_to_be_shown_the_screen() -> None:
+    live = BrowserReferee("https://site.test", reset_path="/start")
+
+    assert isinstance(live, Referee)
+    assert isinstance(live, LiveReferee), "it cannot be asked once the browser has gone"
+    assert not isinstance(HttpReferee("http://127.0.0.1:8765"), LiveReferee), (
+        "an application that reports its own state outlives the window; do not go and look"
+    )
+
+
+def test_the_browser_referee_reads_url_headings_and_links_off_the_page() -> None:
+    """The three keys the live suite's checks are written against, and no others."""
+    app = FakeApp()
+    app.page = a_page("https://site.test/records?from=search", ["Records", "42 rows"], ["Home"])
+    live = BrowserReferee("https://site.test", reset_path="/start")
+
+    live.observe(FakeBrowserControl(app))
+
+    assert live.state() == {
+        "url": "https://site.test/records?from=search",
+        "headings": ["Records", "42 rows"],
+        "links": ["Home"],
+    }
+
+
+def test_the_browser_referee_reset_loads_the_page_the_suite_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent = fake_http(monkeypatch)
+
+    BrowserReferee("https://site.test", reset_path="/start").reset()
+
+    assert sent == ["GET https://site.test/start"]
+
+
+def test_a_site_that_refuses_to_be_reset_has_not_failed_to_be_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 from a real website means there is no reset hook there, which is already
+    known: a suite judged from the DOM is read-only and nothing needed putting back.
+    Calling it a failed reset would mark every run in the report as untrustworthy for
+    doing exactly what it was designed to do."""
+    fake_http(monkeypatch, raises=ResetRefused("403"))
+
+    BrowserReferee("https://site.test", reset_path="/start").reset()  # does not raise
+
+
+def test_a_site_that_cannot_be_reached_at_all_is_a_failed_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_http(monkeypatch, raises=urllib.error.URLError("Connection refused"))
+
+    with pytest.raises(SkillWeaverError, match="did not answer"):
+        BrowserReferee("https://site.test", reset_path="/start").reset()
+
+
+def test_the_live_referee_is_shown_the_screen_before_the_browser_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole mechanism, end to end offline.
+
+    A referee over a live page has one moment to read ground truth: after the run and
+    before the session tears the browser down. Score it afterwards, as an application
+    that reports its own state is scored, and there is nothing left to read.
+    """
+    fake_http(monkeypatch)
+    app = FakeApp()
+    arrive = Behaviour(mutate=land_on(app, "https://site.test/records", ["Records"]))
+    bench = FakeWorkbench(app, script={("open_records", n): arrive for n in (1, 2)})
+    live = BrowserReferee("https://site.test", reset_path="/start")
+
+    record = run_task(
+        a_live_task(), workbench=bench, referee=live, suite=a_live_suite(), warm_runs=1
+    )
+
+    assert [r.ok for r in record.runs] == [True, True]
+    assert all(r.reset_ok for r in record.runs)
+
+
+def test_a_run_the_referee_could_not_see_is_not_scored_on_the_last_ones_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The silent-wrong-number case, refused.
+
+    A referee that kept the previous run's screen would score a session that never
+    opened as a success, because the screen it remembered was the one that passed.
+    """
+    fake_http(monkeypatch)
+    app = FakeApp()
+    app.page = a_page("https://site.test/records", ["Records"])
+    bench = FakeWorkbench(app, script={}, opens_a_controller=False)
+    live = BrowserReferee("https://site.test", reset_path="/start")
+    live.observe(FakeBrowserControl(app))
+    assert live.state()["url"].endswith("/records"), "a passing screen, remembered"
+
+    record = run_task(
+        a_live_task(), workbench=bench, referee=live, suite=a_live_suite(), warm_runs=0
+    )
+
+    assert record.runs[0].ok is False
+    assert "never saw the page" in record.runs[0].error
+
+
+def test_the_live_referee_is_never_handed_to_the_agent_either(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Showing the referee a controller is a ONE-WAY read, and this is the assertion
+    that keeps it one: the controller travels to the referee, and the referee travels
+    nowhere. A referee the agent could reach would make every number here a
+    measurement of nothing - see the sandbox-referee test of the same name."""
+    fake_http(monkeypatch)
+    app = FakeApp()
+    live = BrowserReferee("https://site.test", reset_path="/start")
+    bench = FakeWorkbench(app, script={})
+
+    run_task(a_live_task(), workbench=bench, referee=live, suite=a_live_suite(), warm_runs=1)
+
+    assert bench.seen_specs
+    for spec in bench.seen_specs:
+        held = [getattr(spec, f.name) for f in fields(spec)] + list(spec.params.values())
+        assert not any(isinstance(v, BrowserReferee | FakeReferee | HttpReferee) for v in held)
+        assert "referee" not in spec.params
+        assert not any("headings" in str(v) for v in held), "nor the shape of the truth"
+
+
+def test_a_suite_over_a_public_site_never_asks_it_for_a_state_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """THE regression test: the shipped entry point, on a suite that names a website.
+
+    `run()` used to build an HttpReferee whatever the suite said, so this exact call
+    asked the site for /__state and the command failed before the first task. The
+    report it now writes records which referee decided `ok`, because a reader of these
+    numbers is entitled to know.
+    """
+    sent = fake_http(monkeypatch)
+    app = FakeApp()
+    arrive = Behaviour(mutate=land_on(app, "https://site.test/records", ["Records"]))
+    bench = FakeWorkbench(app, script={("open_records", 1): arrive})
+    document = {
+        "suite": "live-suite",
+        "domain": "site.test",
+        "base_url": "https://site.test",
+        "reset_path": "/start",
+        "referee": "dom",
+        "tasks": [
+            {
+                "id": "open_records",
+                "text": "open_records",
+                "tags": ["single-step"],
+                "expect": [
+                    {"path": "url", "contains": "/records"},
+                    {"path": "headings", "contains": "Records"},
+                ],
+            }
+        ],
+    }
+
+    written = run(
+        workbench=bench,
+        suite=_suite_file(tmp_path, document, "live.yaml"),
+        out=tmp_path / "out",
+        repeat=0,
+    )
+
+    report = json.loads(written.read_text(encoding="utf-8"))
+    assert report["referee"] == "dom"
+    assert not any("__state" in url for url in sent), sent
+    assert sent == ["GET https://site.test/start"] * 2, "one startup check, one per run"
+    assert report["tasks"][0]["runs"][0]["ok"] is True
+
+
+def test_only_runs_the_named_tasks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """How a run against somebody else's website is bounded to what it needs to show."""
+    fake_http(monkeypatch, '{"screen": "records"}')
+    app = FakeApp()
+    bench = FakeWorkbench(app, script={})
+    document = {
+        "suite": "s",
+        "base_url": "http://127.0.0.1:8765",
+        "tasks": [
+            {
+                "id": t,
+                "text": t,
+                "tags": ["single-step"],
+                "expect": [{"path": "screen", "equals": "records"}],
+            }
+            for t in ("first", "second", "third")
+        ],
+    }
+
+    written = run(
+        workbench=bench,
+        suite=_suite_file(tmp_path, document, "three.yaml"),
+        out=tmp_path / "out",
+        repeat=0,
+        only=["second"],
+    )
+
+    report = json.loads(written.read_text(encoding="utf-8"))
+    assert [t["task_id"] for t in report["tasks"]] == ["second"]

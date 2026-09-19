@@ -455,7 +455,16 @@ def _params(pairs: Sequence[str] | None) -> dict[str, Any]:
 
 
 def _report_json(report: RunReport) -> dict[str, Any]:
-    """The report as data: the same facts ``explain`` prints, for a harness to read."""
+    """The report as data: the same facts ``explain`` prints, for a harness to read.
+
+    ``perception`` sits beside ``llm_calls`` for the reason it sits beside it in the
+    prose: it is the same kind of fact - what the run COST - and it is the one kind
+    that does not move when the machine is busy. Seconds saved by not reading the same
+    pixels twice shrink on a loaded box and grow on an idle one; ``ocr_reads`` does
+    neither. The field names are :class:`~skillweaver.perception.ocr.PerceptionCounts`'
+    own, so this and ``explain()`` can never quote different numbers for one run.
+    """
+    eyes = report.perception
     return {
         "ok": report.ok,
         "task": report.task.text,
@@ -464,6 +473,14 @@ def _report_json(report: RunReport) -> dict[str, Any]:
         "rescued": report.rescued,
         "llm_calls": report.llm_calls,
         "steps": report.steps,
+        "perception": {
+            "observations": eyes.observations,
+            "captures": eyes.captures,
+            "detections": eyes.detections,
+            "ocr_reads": eyes.ocr_reads,
+            "ocr_hits": eyes.ocr_hits,
+            "hit_rate": round(eyes.hit_rate, 4),
+        },
         "run_id": report.run_id,
         "candidates": [
             {"skill": c.skill.name, "score": round(c.score, 4), "why": c.why}
@@ -1126,12 +1143,29 @@ def eval_run(
             help="Warm runs per task after the cold one, for the cold-versus-warm comparison.",
         ),
     ] = 1,
+    only: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--only",
+            help="Run just this task id. Repeatable. Default: every task in the suite.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Run the evaluation suite and write a cold-versus-warm report.
 
     Measures the project's actual claim: the same tasks done once by exploration and
     then again from the library, with the time and the model calls of each recorded
     side by side. `skillweaver dashboard build` renders the result.
+
+    The suite says what it is run against and how it is judged, including which
+    referee reads ground truth - an application that reports its own state, or the
+    live page itself. Nothing about that is a flag here, so one suite cannot be
+    scored two ways.
+
+    `--only` bounds a run to named tasks. A suite that hits a real website costs real
+    time and somebody else's bandwidth, and one task is usually enough to see that
+    the loop works there.
     """
     bench = _bench(ctx)
     entry = _eval_entry()
@@ -1154,6 +1188,7 @@ def eval_run(
             suite=suite,
             out=out if out is not None else bench.settings.eval_dir,
             repeat=repeat,
+            only=list(only) if only else None,
         )
     except SkillWeaverError as exc:
         # A suite that is missing or malformed is a command that could not run,
