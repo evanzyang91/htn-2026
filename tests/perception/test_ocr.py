@@ -861,6 +861,17 @@ def test_the_child_is_told_the_pool_size_by_every_name_that_reads_one() -> None:
     assert str(Path("src")) in env["PYTHONPATH"] or "skillweaver" in env["PYTHONPATH"]
 
 
+def test_the_child_inherits_the_batch_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped reader reads in a CHILD, so a knob the child cannot see is no knob.
+
+    ``rec_batch`` is read in the process that builds the engine, which on the shipped
+    path is the worker - so the only thing that carries the setting across is the
+    environment being copied rather than rebuilt.
+    """
+    monkeypatch.setenv("SKILLWEAVER_OCR_REC_BATCH", "6")
+    assert _worker_env(2)["SKILLWEAVER_OCR_REC_BATCH"] == "6"
+
+
 def test_the_worker_command_starts_this_interpreter_and_nothing_else() -> None:
     argv = _worker_argv()
     assert argv[0] == sys.executable and argv[1] == "-c"
