@@ -40,7 +40,7 @@ from skillweaver.contracts import (
     Wait,
     utcnow,
 )
-from skillweaver.errors import ControllerError
+from skillweaver.errors import ControllerError, PerceptionError
 from skillweaver.skills.api import (
     RunLedger,
     SkillAPI,
@@ -354,3 +354,114 @@ def test_an_observation_is_still_an_observation(scenario: Scenario) -> None:
     assert isinstance(observation, Observation)
     assert observation.taken_at <= utcnow()
     assert observation.elements
+
+
+# --------------------------------------------------------------------------------------
+# A failed observation is written down before it is re-raised
+# --------------------------------------------------------------------------------------
+#
+# The other half of the same story. The clock above forgives a slow page; it cannot
+# forgive an infinite one, because it is never read again once a call has left the
+# interpreter. Perception bounds that itself now and raises when it gives up, and this
+# is where the ledger learns that the EYES were what failed - which is what stops
+# ``sandbox.py`` recording the run against the skill.
+
+
+class BlindPerceiver:
+    """A ``contracts.Perceiver`` whose read was abandoned."""
+
+    def __init__(self, exc: BaseException | None = None) -> None:
+        self.exc = exc or PerceptionError("OCR did not return within 60s and was abandoned")
+        self.calls = 0
+
+    def observe(self, _controller: Any) -> Any:
+        self.calls += 1
+        raise self.exc
+
+
+def test_a_failed_observation_is_recorded_on_the_ledger_and_still_raised(
+    scenario: Scenario,
+) -> None:
+    ledger = RunLedger(SkillLimits(max_seconds=100))
+    ctx = SkillAPI(scenario.controller, BlindPerceiver(), ledger=ledger)
+
+    with pytest.raises(PerceptionError):
+        ctx.observe()
+
+    assert len(ledger.perception_failures) == 1
+    assert "abandoned" in ledger.perception_failures[0]
+    assert any("perception FAILED" in line for line in ledger.trace), "and the trace says so"
+
+
+def test_ctx_see_records_the_same_failure(scenario: Scenario) -> None:
+    """``ctx.see`` is the path skill code actually takes, so it must not be a hole."""
+    ledger = RunLedger(SkillLimits(max_seconds=100))
+    ctx = SkillAPI(scenario.controller, BlindPerceiver(), ledger=ledger)
+
+    with pytest.raises(PerceptionError):
+        _ = ctx.see
+
+    assert len(ledger.perception_failures) == 1
+
+
+def test_a_failed_observation_is_not_cached_as_an_answer(scenario: Scenario) -> None:
+    """Two blind observations are two failures, not one failure and one stale index."""
+    ledger = RunLedger(SkillLimits(max_seconds=100))
+    blind = BlindPerceiver()
+    ctx = SkillAPI(scenario.controller, blind, ledger=ledger)
+
+    for _ in range(2):
+        with pytest.raises(PerceptionError):
+            ctx.observe()
+
+    assert blind.calls == 2
+    assert len(ledger.perception_failures) == 2
+
+
+def test_a_failed_observation_still_banks_its_time_as_blocked(scenario: Scenario) -> None:
+    """The wait was the world's, however it ended; the skill must not be charged for it."""
+    ledger = RunLedger(SkillLimits(max_seconds=100))
+    slow = SlowPerceiver(scenario.perceiver, delay=0.1)
+    ctx = SkillAPI(scenario.controller, _failing_after(slow), ledger=ledger)
+
+    with pytest.raises(PerceptionError):
+        ctx.observe()
+
+    assert ledger.blocked_seconds >= 0.1
+
+
+def test_an_observation_that_works_records_nothing(scenario: Scenario) -> None:
+    """The list has to stay empty in the ordinary case or it means nothing."""
+    ledger = RunLedger()
+    ctx = SkillAPI(scenario.controller, scenario.perceiver, ledger=ledger)
+    ctx.observe()
+    assert ledger.perception_failures == []
+
+
+def test_a_controller_failure_is_not_recorded_as_a_perception_failure(
+    scenario: Scenario,
+) -> None:
+    """Only the eyes going dark is the eyes going dark; everything else is the skill's
+    business as before."""
+    ledger = RunLedger(SkillLimits(max_seconds=100))
+
+    class Broken:
+        def observe(self, _controller: Any) -> Any:
+            raise ControllerError("the browser is gone")
+
+    ctx = SkillAPI(scenario.controller, Broken(), ledger=ledger)
+    with pytest.raises(ControllerError):
+        ctx.observe()
+    assert ledger.perception_failures == []
+
+
+def _failing_after(inner: Any) -> Any:
+    """A perceiver that does ``inner``'s work and then refuses to answer, so the time
+    is genuinely spent before the failure rather than asserted about."""
+
+    class Late:
+        def observe(self, controller: Any) -> Any:
+            inner.observe(controller)
+            raise PerceptionError("OCR did not return within 60s and was abandoned")
+
+    return Late()

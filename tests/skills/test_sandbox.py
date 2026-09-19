@@ -10,6 +10,7 @@ somewhere else (a failed expectation).
 
 from __future__ import annotations
 
+import sys
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -40,7 +41,12 @@ from skillweaver.skills.api import (
     StepLimitExceeded,
     TimeLimitExceeded,
 )
-from skillweaver.skills.sandbox import SAFE_BUILTINS, SkillRunner, scan_code
+from skillweaver.skills.sandbox import (
+    NOT_THE_SKILL,
+    SAFE_BUILTINS,
+    SkillRunner,
+    scan_code,
+)
 from tests.fakes import (
     FakeController,
     FakeGroundTruth,
@@ -592,3 +598,179 @@ def test_the_errors_stay_distinguishable_for_synthesis() -> None:
         assert not issubclass(error, StepLimitExceeded | TimeLimitExceeded | DepthLimitExceeded)
     assert not issubclass(ExpectationFailed, SandboxViolation)
     assert utcnow().tzinfo is not None
+
+
+# --------------------------------------------------------------------------------------
+# When the EYES fail, the skill is not the one that failed
+# --------------------------------------------------------------------------------------
+#
+# A 12-task evaluation once wedged inside the OCR engine and had to be killed by hand.
+# Perception now abandons such a read and raises; these tests are about what the
+# sandbox does with that news. Getting it wrong is not a cosmetic error - a failure
+# recorded against a skill demotes it, and this project has demoted a good skill once
+# already for something it did not do.
+
+
+class BlindPerceiver:
+    """A ``contracts.Perceiver`` whose eyes have stopped working.
+
+    ``PerceptionTimeout`` is what the real reader raises when it abandons a read; it is
+    a plain ``PerceptionError`` here so this file does not have to import the OCR
+    module to describe a broken observation.
+    """
+
+    def __init__(self, exc: BaseException | None = None) -> None:
+        self.exc = exc or PerceptionError(
+            "OCR did not return within 60s and was abandoned; the engine process "
+            "(pid 4242) was killed"
+        )
+        self.calls = 0
+
+    def observe(self, _controller: Any) -> Any:
+        self.calls += 1
+        raise self.exc
+
+
+def _blind_context(runner: SkillRunner, scenario: Scenario) -> Any:
+    return runner.context(scenario.controller, BlindPerceiver(), domain=DOMAIN)
+
+
+SEES = "def run(ctx):\n    return ctx.see.find_text('anything')\n"
+
+
+def test_a_run_the_eyes_broke_during_is_not_recorded_against_the_skill(
+    runner: SkillRunner, skill_store: InMemorySkillStore, scenario: Scenario
+) -> None:
+    """The honest entry is NO entry: nothing was learned about this skill.
+
+    Recording it as a failure would demote a skill for the OCR engine's sake;
+    recording it as a success would be a lie. ``test_a_failed_run_is_recorded_too``
+    above is the contrast - an ordinary failure still counts.
+    """
+    skill_store.put(make("looks", SEES))
+
+    result = runner.run(skill_store.get("looks", DOMAIN), {}, _blind_context(runner, scenario))
+
+    assert not result.ok
+    stats = skill_store.get("looks", DOMAIN).stats
+    assert (stats.runs, stats.successes) == (0, 0), "a broken engine is not a skill's record"
+
+
+def test_the_error_says_perception_failed_rather_than_leaving_it_to_be_guessed(
+    runner: SkillRunner, skill_store: InMemorySkillStore, scenario: Scenario
+) -> None:
+    """The cause travels in ``error``, which is what a repair prompt and an admission
+    report both read. "the skill threw" and "the eyes stopped" are different news."""
+    skill_store.put(make("looks", SEES))
+
+    result = runner.run(skill_store.get("looks", DOMAIN), {}, _blind_context(runner, scenario))
+
+    assert result.error is not None
+    assert result.error.startswith(NOT_THE_SKILL)
+    assert "abandoned" in result.error, "and it names what actually happened"
+    assert any("perception FAILED" in line for line in result.trace)
+
+
+def test_a_skill_that_swallows_a_failed_observation_and_then_fails_is_still_not_blamed(
+    runner: SkillRunner, skill_store: InMemorySkillStore, scenario: Scenario
+) -> None:
+    """The verdict follows what HAPPENED, not which exception happened to escape.
+
+    Skill code can catch ``Exception``, so the blameless case cannot be decided from
+    the exception the runner sees; the ledger remembers the failed observation
+    instead.
+    """
+    skill_store.put(
+        make(
+            "tries",
+            "def run(ctx):\n"
+            "    try:\n"
+            "        rows = ctx.see.find_text('anything')\n"
+            "    except Exception:\n"
+            "        rows = []\n"
+            "    ctx.expect(bool(rows), 'nothing on screen')\n",
+        )
+    )
+
+    result = runner.run(skill_store.get("tries", DOMAIN), {}, _blind_context(runner, scenario))
+
+    assert not result.ok
+    assert result.error is not None and result.error.startswith(NOT_THE_SKILL)
+    assert skill_store.get("tries", DOMAIN).stats.runs == 0
+
+
+def test_a_skill_that_survives_a_failed_observation_is_recorded_as_the_success_it_was(
+    runner: SkillRunner, skill_store: InMemorySkillStore, scenario: Scenario
+) -> None:
+    """Succeeding is evidence either way, so it is written down."""
+    skill_store.put(
+        make(
+            "copes",
+            "def run(ctx):\n"
+            "    try:\n"
+            "        ctx.see.find_text('anything')\n"
+            "    except Exception:\n"
+            "        ctx.log('read the page from memory instead')\n"
+            "    return 'done'\n",
+        )
+    )
+
+    result = runner.run(skill_store.get("copes", DOMAIN), {}, _blind_context(runner, scenario))
+
+    assert result.ok and result.value == "done"
+    stats = skill_store.get("copes", DOMAIN).stats
+    assert (stats.runs, stats.successes) == (1, 1)
+
+
+def test_an_ordinary_failure_carries_no_perception_label(
+    runner: SkillRunner, ctx: Any, skill_store: InMemorySkillStore
+) -> None:
+    """The label has to be rare enough to mean something."""
+    skill_store.put(make("flops", "def run(ctx):\n    ctx.expect(False, 'nope')\n"))
+
+    result = runner.run(skill_store.get("flops", DOMAIN), {}, ctx)
+
+    assert result.error is not None and not result.error.startswith(NOT_THE_SKILL)
+    assert skill_store.get("flops", DOMAIN).stats.runs == 1
+
+
+def test_the_deadline_tracer_cannot_see_a_call_that_has_left_the_interpreter() -> None:
+    """The claim the whole OCR bound rests on, checked rather than assumed.
+
+    ``sys.settrace`` is driven by the interpreter's own frame events. A thread inside
+    a native call produces none until it returns, so the clock is never read and the
+    limit never fires - which is exactly why a read wedged in onnxruntime ran for 36
+    minutes with this tracer installed. ``time.sleep`` stands in for that native call:
+    it releases the GIL and blocks in the OS, executing no bytecode.
+
+    The Python half of the assertion is the control. The same duration spent in
+    ordinary Python produces thousands of events, which is why the tracer is still the
+    right tool for ``while True: pass`` and the wrong one for anything below it.
+    """
+    events: list[str] = []
+
+    def counting(frame: Any, event: str, _arg: Any) -> Any:
+        events.append(event)
+        return counting
+
+    def sleep_natively() -> None:
+        time.sleep(0.2)
+
+    def spin_in_python() -> None:
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            pass
+
+    before = sys.gettrace()
+    try:
+        sys.settrace(counting)
+        sleep_natively()
+        native = len(events)
+        events.clear()
+        spin_in_python()
+        pythonic = len(events)
+    finally:
+        sys.settrace(before)
+
+    assert native <= 4, f"a native call produced {native} trace events; it must produce ~none"
+    assert pythonic > 100, "the control: ordinary Python is traced densely"

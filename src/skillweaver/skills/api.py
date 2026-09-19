@@ -34,6 +34,11 @@ observations. The ledger is shared by a whole composition, so a skill that calls
 three skills is still held to one step budget. The clock it checks is the skill's
 OWN: time spent blocked in the controller or the detector is not charged, because a
 dense real page whose OCR takes four seconds is a slow world, not a runaway skill.
+That forgiveness is not a licence for the world to take forever: this clock cannot
+bound a call that is executing no Python at all, so the controller and the perceiver
+each bound their own - see :class:`~skillweaver.perception.ocr.OcrWorker` - and a
+failure of theirs arrives here as an exception, recorded by
+:meth:`RunLedger.note_perception_failure` so the skill is not blamed for it.
 
 *Silence.* ``ctx.log`` and every action land in the ledger's trace, which becomes
 ``SkillResult.trace`` - the thing skill synthesis feeds back to a model when a skill
@@ -81,6 +86,7 @@ from skillweaver.errors import (
     ConfigError,
     ControllerError,
     ExpectationFailed,
+    PerceptionError,
     SkillNotFound,
     SkillWeaverError,
 )
@@ -221,6 +227,7 @@ class RunLedger:
     depth: int = 0
     stack: list[tuple[str, str]] = field(default_factory=list)
     trace: list[str] = field(default_factory=list)
+    perception_failures: list[str] = field(default_factory=list)
     started: float = field(default_factory=time.monotonic)
     _truncated: bool = field(default=False, repr=False)
     _blocked: float = field(default=0.0, repr=False)
@@ -269,10 +276,31 @@ class RunLedger:
                 self._blocked += time.monotonic() - self._blocked_since
                 self._blocked_since = None
 
+    def note_perception_failure(self, why: str) -> None:
+        """Record that an OBSERVATION failed during this run, and say so in the trace.
+
+        Kept separately from the trace because it changes a verdict, not just a
+        report. A skill whose eyes stopped working has not failed its task - nothing
+        at all has been learned about it - and ``sandbox.py`` reads this list to
+        decide not to hold the run against it. See :meth:`SkillAPI.observe`, which is
+        the only place that calls this.
+        """
+        self.perception_failures.append(why)
+        self.note(f"perception FAILED: {why}")
+
     def check_time(self) -> None:
         """Raise :class:`TimeLimitExceeded` once the limit is reached.
 
         ``max_seconds`` of ``0`` means no limit; see :class:`SkillLimits`.
+
+        This is a PYTHON-level check and it can only fire while Python is running.
+        It is reached from :meth:`charge_step`, from the runner, and from a trace hook
+        that fires every few frames - all three of which a call that has wedged inside
+        a native library executes none of. Bounding such a call is the job of whoever
+        makes it; :class:`~skillweaver.perception.ocr.OcrWorker` is where perception
+        does it, and it is the reason this ledger sees a
+        :class:`~skillweaver.errors.PerceptionError` rather than never being reached
+        again.
         """
         limit = self.limits.max_seconds
         if limit > 0:
@@ -664,11 +692,25 @@ class SkillAPI:
         planner or the runner may want the screenshot, url or fingerprint too.
 
         The time the perceiver takes is banked as blocked, not charged - see
-        :meth:`RunLedger.blocked`."""
+        :meth:`RunLedger.blocked`.
+
+        Raises:
+            PerceptionError: whatever the perceiver raises, recorded on the ledger
+                first through :meth:`RunLedger.note_perception_failure`. The record is
+                what keeps the blame straight: a read that was abandoned because the
+                OCR engine wedged is not this skill failing, and the run must not be
+                counted against it - including in the case where skill code catches
+                the exception and then fails for its own reasons.
+            TimeLimitExceeded: if the limit is already spent.
+        """
         if self._observation is None:
             self.ledger.check_time()
-            with self.ledger.blocked():
-                self._observation = self._perceiver.observe(self._controller)
+            try:
+                with self.ledger.blocked():
+                    self._observation = self._perceiver.observe(self._controller)
+            except PerceptionError as exc:
+                self.ledger.note_perception_failure(f"{type(exc).__name__}: {exc}")
+                raise
         return self._observation
 
     def _forget_observation(self) -> None:

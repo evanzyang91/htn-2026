@@ -68,6 +68,18 @@ twice). `PerceptionCounters` and `CachingTextReader` in
 pixels and not "the same state", and `ComposedPerceiver` in `src/skillweaver/orchestrator.py`
 holds the measured reason the text is NOT read lazily. Read both before trying either again.
 
+**Every limit in this project is enforced from Python, so none of them bounds a native
+call.** The skill clock is read by `charge_step`, by the runner and by a trace hook that
+fires on Python frames; a thread inside ONNX Runtime executes no frames and is therefore
+unbounded - once measured as 36 minutes at 98.8% CPU with no log line and no error. So
+anything that calls into a native library bounds its OWN work and reports failing to:
+`OcrWorker` in `perception/ocr.py` runs the read in a process it can kill, and its
+`DEFAULT_OCR_THREADS` is explicit because ONNX Runtime otherwise sizes its pool from the
+core count and spins (the measured table is in that module's docstring). A failed
+observation is recorded on the ledger by `SkillAPI.observe`, and `sandbox.py` then keeps
+that run out of the skill's statistics entirely: a skill whose eyes broke has not failed
+its task, and demoting it for that is a defect this project has shipped once already.
+
 `ultralytics` is a noisy import; three of its side effects have already cost time here.
 
 - It installs its own top-level `tests` package into the venv, which shadows this repository's

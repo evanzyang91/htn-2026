@@ -26,6 +26,16 @@ by every action, a wall-clock timeout enforced by a line tracer so a ``while Tru
 is interrupted rather than hung, and a composition-depth cap so two skills calling
 each other stop at depth three instead of exhausting the interpreter's stack.
 
+    The tracer's reach ends at Python. It fires on Python frames, so it bounds skill
+    code and nothing else: a call that has wedged inside a native library executes no
+    frames, fires no events, and the clock is simply never read again. That is not a
+    hole to be patched here - a limit enforced from an interpreter cannot interrupt a
+    call that has left it - so each native thing the sandbox reaches through bounds
+    its own work and reports failing to. See
+    :class:`~skillweaver.perception.ocr.OcrWorker`, which kills its process, and
+    :meth:`~skillweaver.skills.api.SkillAPI.observe`, which records the failure on the
+    ledger so this module does not then blame the skill for it.
+
 Everything else about a run is reporting. A failure of any kind comes back as
 ``SkillResult(ok=False, error=..., trace=...)`` with the failing line and its source
 text, and every execution - nested calls included - is folded into the store's
@@ -78,12 +88,22 @@ from skillweaver.skills.api import (
 
 __all__ = [
     "BANNED_BUILTINS",
+    "NOT_THE_SKILL",
     "SAFE_BUILTINS",
     "SkillRunner",
     "scan_code",
 ]
 
 log = get_logger(__name__)
+
+NOT_THE_SKILL = "perception failed, not the skill: "
+"""Opens the ``error`` of a run that failed while an observation was failing.
+
+A fixed prefix rather than a new field on
+:class:`~skillweaver.contracts.SkillResult`, which is shared surface. Everything that
+reads an error - a repair prompt, an admission report, a log line - gets the cause in
+the first six words, and a reader that only pattern-matches can test for this string.
+"""
 
 _SAFE_BUILTIN_NAMES = (
     # arithmetic and numbers
@@ -334,6 +354,12 @@ class SkillRunner:
         slice of the run: its log lines, its actions and, on failure, the skill
         frames with their source.
 
+        A run the EYES broke during is reported differently: its ``error`` opens with
+        :data:`NOT_THE_SKILL` and names the perception failure, because "the OCR read
+        was abandoned" and "this skill does not work" are different pieces of news and
+        only one of them is about the skill. Such a run is also kept out of the
+        library's statistics entirely - see :meth:`_execute`.
+
         Raises:
             BudgetExceeded: the one exception allowed out, so an exhausted agent run
                 stops instead of starting the next skill.
@@ -343,6 +369,7 @@ class SkillRunner:
             ledger = RunLedger(self._limits)
         top_level = ledger.depth == 0
         mark, steps_before = len(ledger.trace), ledger.steps
+        blind_before = len(ledger.perception_failures)
         started = time.perf_counter()
 
         try:
@@ -356,6 +383,8 @@ class SkillRunner:
             error = f"{type(exc).__name__}: {exc}"
             if lineno is not None:
                 error += f" (line {lineno})"
+            if len(ledger.perception_failures) > blind_before:
+                error = NOT_THE_SKILL + error
             lines = [
                 f"{frame.name}() line {frame.lineno}: {(frame.line or '').strip()}"
                 for frame in frames
@@ -421,11 +450,20 @@ class SkillRunner:
         The ``finally`` is the point: statistics accumulate as a side effect of
         running, including for a skill that failed, so ``SkillStats.successes`` over
         ``runs`` means what it says.
+
+        With one exclusion, and it is deliberate. A failure that happened while the
+        EYES were broken - an OCR read abandoned, a screenshot that would not decode -
+        says nothing about the skill, so it is not written down at all. Recording it
+        as a failure would demote a skill for something it did not do, and recording
+        it as a success would be a lie; the honest entry is no entry. A run that
+        SUCCEEDED despite a failed observation is still recorded, because succeeding
+        is evidence either way.
         """
         ledger.check_time()
         with ledger.descend(skill.name, skill.domain):
             ledger.note(f"call {skill.name}({_render_args(args)})")
             ok = False
+            blind_before = len(ledger.perception_failures)
             started = time.perf_counter()
             try:
                 value = self._call(skill, args, ctx)
@@ -433,7 +471,15 @@ class SkillRunner:
                 ok = True
                 return value
             finally:
-                self._record(skill, ok, (time.perf_counter() - started) * 1000)
+                if ok or len(ledger.perception_failures) == blind_before:
+                    self._record(skill, ok, (time.perf_counter() - started) * 1000)
+                else:
+                    log.info(
+                        "skill.run.blameless",
+                        name=skill.name,
+                        domain=skill.domain,
+                        why=ledger.perception_failures[-1],
+                    )
 
     def _call(self, skill: Skill, args: Mapping[str, Any], ctx: SkillContext) -> Any:
         namespace = self._namespace(skill)
@@ -508,10 +554,18 @@ def _deadline_tracer(ledger: RunLedger) -> Any:
     """A ``sys.settrace`` function that interrupts skill code once the ledger's
     wall-clock limit is spent.
 
-    This is what makes the timeout real: a budget checked only when a skill acts
-    cannot stop ``while True: pass``, and a watchdog thread cannot interrupt CPython
-    bytecode. The clock is read every ``_TRACE_STRIDE`` events rather than every one,
-    which keeps a tight loop cheap while still noticing within microseconds of work.
+    This is what makes the timeout real FOR SKILL CODE: a budget checked only when a
+    skill acts cannot stop ``while True: pass``, and a watchdog thread cannot
+    interrupt CPython bytecode. The clock is read every ``_TRACE_STRIDE`` events
+    rather than every one, which keeps a tight loop cheap while still noticing within
+    microseconds of work.
+
+    It is also the whole of what this mechanism can do, and the limit is structural.
+    Tracing is driven by the interpreter's own frame events, so a thread that has
+    entered a native call produces none until it comes back: zero events, zero clock
+    reads, no limit. A 12-task evaluation once sat at 98.8% CPU for 36 minutes inside
+    ONNX Runtime's thread pool with this tracer installed and never fired once. The
+    bound on such a call has to live where the call is made, not here.
     """
     counter = 0
 
