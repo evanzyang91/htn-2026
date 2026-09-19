@@ -149,7 +149,20 @@ class SkillLimits:
     """
 
     max_steps: int = 40
-    max_seconds: float = 20.0
+    max_seconds: float = 90.0
+    """Wall clock for the whole composition.
+
+    20.0 until a real website was driven with it, where it was not a limit on runaway
+    code but a limit on the NETWORK. One add-to-cart on a live shop is about ten
+    seconds of page loads; a chain of two plus a navigation between them measured
+    20.38s and was killed at 20.00s - a correct plan, correctly routed, thrown away
+    for being on the internet. The local sandbox this number was calibrated against
+    finishes the same work in under a second, which is exactly why it looked generous.
+
+    It still has to catch a skill that loops forever, and at 90s it does: nothing that
+    works takes anywhere near this, and anything that does is not a skill yet.
+    """
+
     max_depth: int = 3
     max_trace_lines: int = 200
 
