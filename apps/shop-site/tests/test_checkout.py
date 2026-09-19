@@ -16,7 +16,9 @@ def test_checkout_opens_from_the_cart(page, state):
     s = state()
     assert s["ui"]["cartOpen"] is True and s["ui"]["checkoutOpen"] is True
     assert page.locator("[data-testid=checkout-panel]").is_visible()
-    assert page.locator("[data-testid=checkout-summary]").inner_text() == "2 items · subtotal $93.98"
+    assert (
+        page.locator("[data-testid=checkout-summary]").inner_text() == "2 items · subtotal $93.98"
+    )
 
 
 def test_back_to_cart_returns_to_the_lines_view(page, state):
@@ -123,7 +125,11 @@ def test_confirm_branch_places_the_order(page, state):
 
     # save was left unchecked, so the form resets to blank
     assert s["ui"]["form"] == {
-        "name": "", "email": "", "address": "", "shipping": "standard", "save": False,
+        "name": "",
+        "email": "",
+        "address": "",
+        "shipping": "standard",
+        "save": False,
     }
 
     page.click("[data-testid=shop-banner-dismiss]")

@@ -37,9 +37,16 @@ def test_response_echoes_seq_and_returns_the_complete_state(base_url, seed):
 
 def test_every_catalog_action_round_trips(base_url):
     assert post(base_url, "shop.search", {"q": "rope"})["state"]["ui"]["search"] == "rope"
-    assert post(base_url, "shop.category", {"category": "Outdoor"})["state"]["ui"]["category"] == "Outdoor"
-    assert post(base_url, "shop.priceBand", {"band": "25to75"})["state"]["ui"]["priceBand"] == "25to75"
-    assert post(base_url, "shop.sort", {"sort": "rating-desc"})["state"]["ui"]["sort"] == "rating-desc"
+    assert (
+        post(base_url, "shop.category", {"category": "Outdoor"})["state"]["ui"]["category"]
+        == "Outdoor"
+    )
+    assert (
+        post(base_url, "shop.priceBand", {"band": "25to75"})["state"]["ui"]["priceBand"] == "25to75"
+    )
+    assert (
+        post(base_url, "shop.sort", {"sort": "rating-desc"})["state"]["ui"]["sort"] == "rating-desc"
+    )
 
 
 def test_invalid_filter_values_are_ignored_not_errors(base_url):

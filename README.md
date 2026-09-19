@@ -9,6 +9,20 @@ composes stored skills into faster, model-free runs. It sees through screenshots
 (YOLO for elements, OCR for text) and keeps a graph per site of known screens and the
 actions that move between them. Browser first; a real desktop controller too.
 
+## See it work
+
+```sh
+make install
+make demo          # or: uv run python scripts/demo.py --watch
+```
+
+A browser opens and does one errand on a storefront it has never seen - add an item to
+the cart, fill in a checkout, place the order - by exploring. Then it does the same
+errand again from memory, several times faster and with one model call instead of
+thirteen, and prints the Python it wrote for itself in between. About a minute.
+
+Drop `--watch` to run it headless in about thirty seconds.
+
 ## What it measures
 
 Three applications, one agent, nothing in it told which it is looking at. A mail

@@ -62,7 +62,11 @@ def test_reset_restores_the_exact_seed_state(page, base_url, state, seed):
     assert after["ui"]["dialogOpen"] is False
     assert after["ui"]["banner"] is None
     assert after["ui"]["form"] == {
-        "name": "", "email": "", "address": "", "shipping": "standard", "save": False,
+        "name": "",
+        "email": "",
+        "address": "",
+        "shipping": "standard",
+        "save": False,
     }
 
 

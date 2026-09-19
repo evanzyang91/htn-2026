@@ -92,8 +92,10 @@ def test_clicking_a_card_title_opens_the_detail_panel(page, state):
 def test_rename_a_ticket_from_the_detail_panel(page, state):
     page.click("[data-testid=card-title-t03]")
     settle(page)
-    assert page.input_value("[data-testid=detail-title-input]") == \
-        "Rewrite onboarding copy for the pairing step"
+    assert (
+        page.input_value("[data-testid=detail-title-input]")
+        == "Rewrite onboarding copy for the pairing step"
+    )
 
     page.fill("[data-testid=detail-title-input]", "Pairing step copy, second pass")
     settle(page)
@@ -103,7 +105,10 @@ def test_rename_a_ticket_from_the_detail_panel(page, state):
     s = state()
     assert ticket(s, "t03")["title"] == "Pairing step copy, second pass"
     assert s["ui"]["banner"] == "Renamed LAN-3 to Pairing step copy, second pass"
-    assert page.locator("[data-testid=card-title-t03]").inner_text() == "Pairing step copy, second pass"
+    assert (
+        page.locator("[data-testid=card-title-t03]").inner_text()
+        == "Pairing step copy, second pass"
+    )
 
 
 def test_save_title_is_disabled_when_the_draft_is_empty(page):

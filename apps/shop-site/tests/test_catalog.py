@@ -53,7 +53,9 @@ def test_filters_compose(page):
     page.click("[data-testid=price-under25]")
     settle(page)
     assert sorted(names(page)) == [
-        "Anchor Claw Hammer", "Dockside Socket Wrench", "Ebb Tide Hand Saw",
+        "Anchor Claw Hammer",
+        "Dockside Socket Wrench",
+        "Ebb Tide Hand Saw",
     ]
 
 

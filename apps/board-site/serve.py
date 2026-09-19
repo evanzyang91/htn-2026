@@ -204,7 +204,9 @@ def apply_action(state, action, p):
                     "key": f"LAN-{n}",
                     "title": title,
                     "description": c["description"].strip(),
-                    "assignee": c["assignee"] if c["assignee"] in board["assignees"] else board["assignees"][0],
+                    "assignee": c["assignee"]
+                    if c["assignee"] in board["assignees"]
+                    else board["assignees"][0],
                     "priority": c["priority"] if c["priority"] in board["priorities"] else "Medium",
                     "column": "backlog",
                     "comments": [],

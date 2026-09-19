@@ -99,8 +99,11 @@ def test_the_full_action_vocabulary_round_trips(base_url):
     assert s["ui"]["compose"]["title"] == "Throwaway"
     s = post(base_url, "board.composeClose")["state"]
     assert s["ui"]["compose"] == {
-        "open": False, "title": "", "description": "",
-        "assignee": "Mira Solano", "priority": "Medium",
+        "open": False,
+        "title": "",
+        "description": "",
+        "assignee": "Mira Solano",
+        "priority": "Medium",
     }
     post(base_url, "board.composeOpen")
     post(base_url, "board.composeField", {"field": "title", "value": "Ship the export"})
@@ -110,8 +113,13 @@ def test_the_full_action_vocabulary_round_trips(base_url):
     assert s["ui"]["compose"]["priority"] == "High"
     s = post(base_url, "board.create")["state"]
     new = ticket(s, "t15")
-    assert (new["key"], new["title"], new["assignee"], new["priority"], new["column"]) == \
-        ("LAN-15", "Ship the export", "Theo Barros", "High", "backlog")
+    assert (new["key"], new["title"], new["assignee"], new["priority"], new["column"]) == (
+        "LAN-15",
+        "Ship the export",
+        "Theo Barros",
+        "High",
+        "backlog",
+    )
     assert s["ui"]["banner"] == "Created LAN-15 in Backlog"
 
     # archive dialog: open, cancel, open, confirm
