@@ -1,0 +1,174 @@
+# A second suite: six search-and-navigation tasks against the LIVE en.wikipedia.org.
+#
+# ██  THIS SUITE HITS THE PUBLIC INTERNET.  ██
+#
+# It is therefore NOT part of `make test`, and no test in tests/ runs it. The only
+# thing tested offline is that this file parses and validates
+# (tests/eval/test_wikipedia_suite.py); running it is a deliberate, paid, by-hand act
+# against a website neither this project nor its authors control. Wikipedia can
+# redesign a skin, rename a section or rate-limit a client at any time, so a red run
+# here is a fact about today rather than a regression in this repository.
+#
+# Why it exists: eval/tasks.yaml measures the agent against a sandbox built for it,
+# where every element is clean, every screen is small and OCR is fast. That proves
+# the loop works; it cannot prove the loop works on a real page. This suite is the
+# claim "it works on Wikipedia" written down as something that can be falsified.
+#
+# ----------------------------------------------------------------------------------
+# What is different from eval/tasks.yaml
+# ----------------------------------------------------------------------------------
+#
+# *Nothing is mutated.* Every task reads and navigates. That is not a softer choice
+# than the sandbox suite, it is the only honest one: this project's rule is that a
+# task which changes state cannot be learned without something that can change it
+# back (see WorldReset in orchestrator.py), and we have no way to put Wikipedia back
+# and no business trying. Read-only tasks need no undo, so they are learnable here
+# exactly as they are in the sandbox.
+#
+# *The reset is a no-op, deliberately.* `reset_path` below points at the main page,
+# so the harness's per-run reset is one ordinary page load that restores nothing
+# because nothing was disturbed. Writing it this way rather than leaving the default
+# /__reset - which would 404 on every run and be logged as a failed reset - keeps
+# `reset_ok` in the report meaning what it says.
+#
+# *Ground truth comes from the DOM, not from a control endpoint.* The sandbox has
+# GET /__state; Wikipedia obviously does not. The `expect` checks below are written
+# against a state mapping read by an OFFLINE TEACHER over the live page - the shape
+# `BrowserGroundTruth` in controllers/browser.py already produces:
+#
+#     url       the browser's exact current URL, as a string
+#     headings  the text of every visible `text` element - an article title, a
+#               paragraph, a caption - as a list of strings
+#     links     the text of every visible link, as a list of strings
+#
+# which is enough for "did it land on the right article": an article's <h1> arrives
+# in `headings` as exactly its title, so `headings contains Ada Lovelace` is a real
+# equality against one element rather than a search of the whole page.
+#
+# Note that `skillweaver eval run` does not yet choose such a referee: harness.run
+# builds an HttpReferee unconditionally, so pointing the shipped command at this file
+# asks en.wikipedia.org for /__state and fails. Running this suite today means
+# calling harness.run_suite directly with a live-site referee. That gap is one
+# argument in one function and is reported rather than papered over here.
+#
+# ----------------------------------------------------------------------------------
+# The checks, and why they are loose
+# ----------------------------------------------------------------------------------
+#
+# `url contains /wiki/Ada_Lovelace` rather than `url equals ...`: a real browser
+# arrives with query strings and fragments that vary by route - ?wprov=... from the
+# search suggestion, #Childhood from a contents link - and a check that failed on a
+# tracking parameter would be measuring Wikipedia's analytics, not this agent. The
+# substring is still specific: no other article's URL contains it.
+#
+# The operators are exactly the five eval/tasks.yaml documents; nothing new was
+# added to the harness for this file.
+#
+# ----------------------------------------------------------------------------------
+# Running it
+# ----------------------------------------------------------------------------------
+#
+#     cp /path/to/.env .          # ANTHROPIC_API_KEY, never committed
+#     # then drive harness.run_suite with a live-site referee; see the note above.
+#
+# RUN THE BROWSER HEADLESS. Measured 2026-09-19: two HEADED Chromium windows showing
+# the identical Wikipedia page fingerprint at similarity 0.960, two headless ones at
+# 1.000. The admission gate requires 1.0 against the recorded starting screen before
+# it will re-run a candidate, so a headed run can reject a perfectly good skill for
+# the way a background window rendered.
+#
+# Six tasks at three shapes each is a real amount of live traffic and real money.
+# Keep `warm_runs` low here - the point of a warm run on a live site is to show the
+# stored skill replays at all, and the variance that three runs buy on the sandbox is
+# not worth six more page loads of somebody else's bandwidth.
+
+suite: wikipedia
+domain: en.wikipedia.org
+base_url: https://en.wikipedia.org
+
+# A read-only world: "put it back" is a page load that changes nothing. See above.
+reset_path: /wiki/Main_Page
+
+warm_runs: 2
+bound_runs: 1
+
+tasks:
+  # -- single-step: one interaction on a page that is already open --------------------
+
+  - id: follow_link_to_babbage
+    text: From this article, open the linked article about Charles Babbage.
+    tags: [single-step]
+    start_path: /wiki/Ada_Lovelace
+    params: {link: "Charles Babbage"}
+    expect:
+      - path: url
+        contains: /wiki/Charles_Babbage
+      - path: headings
+        contains: Charles Babbage
+
+  - id: back_to_main_page
+    text: Go to Wikipedia's main page.
+    tags: [single-step]
+    start_path: /wiki/Charles_Babbage
+    expect:
+      - path: url
+        contains: /wiki/Main_Page
+
+  # -- multi-step: type, submit, land ------------------------------------------------
+
+  - id: search_ada_lovelace
+    # The task firstmate measured by hand on 2026-09-19: learned cold in 5 steps and
+    # 3 model calls, stored as a parameterised skill, and then replayed.
+    text: Search Wikipedia for "Ada Lovelace" and open her article.
+    tags: [multi-step]
+    start_path: /wiki/Main_Page
+    params: {query: "Ada Lovelace"}
+    expect:
+      - path: url
+        contains: /wiki/Ada_Lovelace
+      - path: headings
+        contains: Ada Lovelace
+
+  - id: search_photosynthesis
+    # Deliberately the SAME SHAPE as search_ada_lovelace with a different term. This
+    # is the task whose warm replay died at "skill ran for 20.89s of 20.00s allowed":
+    # the skill was right, the page was slow, and the sandbox charged it for OCR.
+    # Its warm run is the direct evidence that the time limit was the problem.
+    text: Search Wikipedia for "Photosynthesis" and open the article.
+    tags: [multi-step]
+    start_path: /wiki/Main_Page
+    params: {query: "Photosynthesis"}
+    expect:
+      - path: url
+        contains: /wiki/Photosynthesis
+      - path: headings
+        contains: Photosynthesis
+
+  - id: contents_to_childhood
+    # Wikipedia's contents sidebar sets a fragment rather than loading a page, so the
+    # check looks for the anchor. "Childhood" is a subsection of "Biography" on this
+    # article - a deeper target than the top-level entry, which is the point.
+    text: Use this article's table of contents to jump to the "Childhood" section.
+    tags: [multi-step]
+    start_path: /wiki/Ada_Lovelace
+    params: {section: "Childhood"}
+    expect:
+      - path: url
+        contains: "#Childhood"
+
+  # -- composite: two things the library should end up chaining -----------------------
+
+  - id: search_turing_then_bletchley
+    # Search, then follow a link out of what the search found. If the library has
+    # learned search_ada_lovelace and follow_link_to_babbage, this is the task it
+    # should be able to compose rather than explore.
+    text: Search Wikipedia for "Alan Turing", open his article, and from there open
+      the article about Bletchley Park.
+    tags: [composite]
+    start_path: /wiki/Main_Page
+    params: {query: "Alan Turing", link: "Bletchley Park"}
+    expect:
+      - path: url
+        contains: /wiki/Bletchley_Park
+      - path: headings
+        contains: Bletchley Park

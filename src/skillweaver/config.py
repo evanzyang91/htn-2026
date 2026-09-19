@@ -15,6 +15,8 @@ Recognized variables::
     SKILLWEAVER_MAX_SECONDS     default Budget.max_seconds      (default: 300)
     SKILLWEAVER_MAX_USD         default Budget.max_usd          (default: 2.0)
     SKILLWEAVER_MAX_LLM_CALLS   default Budget.max_llm_calls    (default: 60)
+    SKILLWEAVER_SKILL_MAX_SECONDS
+                                default SkillLimits.max_seconds (default: 45)
     ANTHROPIC_API_KEY           Claude credentials (optional: the SDK also resolves
                                 its own credentials when this is unset)
     GEMINI_API_KEY              Gemini credentials (GOOGLE_API_KEY also accepted)
@@ -35,6 +37,16 @@ from skillweaver.errors import ConfigError
 DEFAULT_CLAUDE_MODEL = "claude-opus-5"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-computer-use-preview-10-2025"
 
+DEFAULT_SKILL_MAX_SECONDS = 45.0
+"""Wall-clock seconds one stored skill may spend running its OWN code.
+
+Not a guess. A skill is a short procedure and the code between two observations is
+milliseconds of it, so this number is a runaway-loop tripwire rather than a work
+allowance - see :class:`~skillweaver.skills.api.SkillLimits`, which does not charge a
+skill for the time it sits blocked on a screenshot or on OCR. Forty-five seconds is
+long enough that no honest procedure on a real, slow page reaches it and short enough
+that ``while True`` is a pause rather than a hang."""
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _TARGETS = ("browser", "desktop")
 
@@ -49,6 +61,7 @@ class Settings:
     log_level: str = "INFO"
     claude_model: str = DEFAULT_CLAUDE_MODEL
     gemini_model: str = DEFAULT_GEMINI_MODEL
+    skill_max_seconds: float = DEFAULT_SKILL_MAX_SECONDS
     anthropic_api_key: str | None = field(default=None, repr=False)
     gemini_api_key: str | None = field(default=None, repr=False)
     default_budget: Budget = field(default_factory=Budget)
@@ -148,6 +161,9 @@ def load_settings(
         log_level=log_level,
         claude_model=merged.get("SKILLWEAVER_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
         gemini_model=merged.get("SKILLWEAVER_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
+        skill_max_seconds=_number(
+            merged, "SKILLWEAVER_SKILL_MAX_SECONDS", DEFAULT_SKILL_MAX_SECONDS, float
+        ),
         anthropic_api_key=merged.get("ANTHROPIC_API_KEY") or None,
         gemini_api_key=merged.get("GEMINI_API_KEY") or merged.get("GOOGLE_API_KEY") or None,
         default_budget=budget,

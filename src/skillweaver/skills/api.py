@@ -31,7 +31,9 @@ route but cannot teach the graph things it has not verified.
 *Unbounded work.* Every action goes through the :class:`RunLedger`, which charges a
 step and checks the clock, so a skill cannot outrun its budget between two
 observations. The ledger is shared by a whole composition, so a skill that calls
-three skills is still held to one step budget.
+three skills is still held to one step budget. The clock it checks is the skill's
+OWN: time spent blocked in the controller or the detector is not charged, because a
+dense real page whose OCR takes four seconds is a slow world, not a runaway skill.
 
 *Silence.* ``ctx.log`` and every action land in the ledger's trace, which becomes
 ``SkillResult.trace`` - the thing skill synthesis feeds back to a model when a skill
@@ -44,10 +46,11 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
+from skillweaver.config import DEFAULT_SKILL_MAX_SECONDS, settings
 from skillweaver.contracts import (
     Action,
     ActionKind,
@@ -75,6 +78,7 @@ from skillweaver.contracts import (
     Wait,
 )
 from skillweaver.errors import (
+    ConfigError,
     ControllerError,
     ExpectationFailed,
     SkillNotFound,
@@ -93,6 +97,7 @@ __all__ = [
     "SkillLimits",
     "StepLimitExceeded",
     "TimeLimitExceeded",
+    "default_max_seconds",
     "describe_action",
 ]
 
@@ -131,6 +136,23 @@ class DepthLimitExceeded(LimitExceeded):
     """``ctx.call`` nested deeper than ``SkillLimits.max_depth`` skills."""
 
 
+def default_max_seconds() -> float:
+    """The configured skill time limit: ``SKILLWEAVER_SKILL_MAX_SECONDS``, else
+    :data:`~skillweaver.config.DEFAULT_SKILL_MAX_SECONDS`.
+
+    Read at construction rather than at import, so a process that sets the variable
+    - the command line does, for ``--skill-max-seconds`` - gets the limit it asked
+    for without every caller of :class:`SkillLimits` having to thread it through. An
+    unreadable environment falls back to the default instead of refusing to run a
+    skill: a misspelt variable is a configuration complaint the command line already
+    makes, and it is not a reason for the sandbox to have no limit at all.
+    """
+    try:
+        return settings().skill_max_seconds
+    except ConfigError:
+        return DEFAULT_SKILL_MAX_SECONDS
+
+
 @dataclass(frozen=True, slots=True)
 class SkillLimits:
     """Hard limits for one top-level skill execution, nested calls included.
@@ -142,14 +164,19 @@ class SkillLimits:
 
     Attributes:
         max_steps: Controller actions the whole composition may perform.
-        max_seconds: Wall-clock seconds the whole composition may take.
+        max_seconds: Seconds of the composition's OWN running time - see
+            :meth:`RunLedger.elapsed_seconds`, which does not count time spent
+            blocked in the controller or the perceiver. ``0`` disables the limit
+            entirely, which only a test has any business doing. Defaults to
+            :func:`default_max_seconds`, so the environment and the command line can
+            raise it for a slow site without this class being edited.
         max_depth: How deep ``ctx.call`` may nest; ``1`` forbids composition.
         max_trace_lines: Trace lines kept before truncating, so a spinning skill
             cannot exhaust memory through ``ctx.log``.
     """
 
     max_steps: int = 40
-    max_seconds: float = 20.0
+    max_seconds: float = field(default_factory=default_max_seconds)
     max_depth: int = 3
     max_trace_lines: int = 200
 
@@ -169,6 +196,24 @@ class RunLedger:
 
     Inspect ``steps``, ``depth``, ``stack`` and ``trace`` after a run; the runner
     turns them into a :class:`~skillweaver.contracts.SkillResult`.
+
+    What the clock does and does not count
+    --------------------------------------
+
+    The time limit exists to interrupt a runaway loop in code a model wrote. It is
+    NOT a budget for how long the world may take to answer, and the two used to be
+    conflated: a Wikipedia article is dense enough that one screenshot plus OCR takes
+    seconds, so a three-observation skill that did its job perfectly could spend its
+    whole allowance sitting still and be killed for it. That is what
+    :meth:`blocked` fixes. Time inside the controller or the perceiver is banked in
+    ``blocked_seconds`` and subtracted, so :attr:`elapsed_seconds` is the time the
+    skill's own Python was running.
+
+    Nothing is lost by this. A skill that spins is spinning in its own code and the
+    tracer in ``sandbox.py`` still catches it within microseconds; a skill that acts
+    forever is stopped by ``max_steps``; and a skill that sleeps on purpose through
+    ``ctx.ctl.wait`` IS charged, because a deliberate sleep is the skill spending its
+    own time rather than the page being slow.
     """
 
     limits: SkillLimits = field(default_factory=SkillLimits)
@@ -178,21 +223,65 @@ class RunLedger:
     trace: list[str] = field(default_factory=list)
     started: float = field(default_factory=time.monotonic)
     _truncated: bool = field(default=False, repr=False)
+    _blocked: float = field(default=0.0, repr=False)
+    _blocked_since: float | None = field(default=None, repr=False)
+    _blocked_depth: int = field(default=0, repr=False)
 
     # -- time ---------------------------------------------------------------------------
 
     @property
+    def blocked_seconds(self) -> float:
+        """Seconds spent waiting on the controller or the perceiver, an unfinished
+        wait included - so the figure is right when read from inside one."""
+        pending = 0.0 if self._blocked_since is None else time.monotonic() - self._blocked_since
+        return self._blocked + pending
+
+    @property
     def elapsed_seconds(self) -> float:
-        """Wall-clock seconds since the ledger was created."""
-        return time.monotonic() - self.started
+        """Seconds the skill's OWN code has been running: wall-clock since the ledger
+        was created, less :attr:`blocked_seconds`.
+
+        Never negative and never decreasing while no wait is open, so the message a
+        :class:`TimeLimitExceeded` carries is a number a reader can act on.
+        """
+        return max(time.monotonic() - self.started - self.blocked_seconds, 0.0)
+
+    @contextmanager
+    def blocked(self) -> Iterator[None]:
+        """Hold the clock for the duration of a wait on the world.
+
+        Re-entrant, and it stops the clock from the moment it is entered rather than
+        banking the time on the way out: the deadline tracer fires while a screenshot
+        is still being taken, so a limit that only learned about the wait afterwards
+        would trip during exactly the wait it was meant to forgive.
+
+        Never swallows the exception a failing controller or perceiver raises; the
+        time is banked on the way out either way.
+        """
+        if self._blocked_depth == 0:
+            self._blocked_since = time.monotonic()
+        self._blocked_depth += 1
+        try:
+            yield
+        finally:
+            self._blocked_depth -= 1
+            if self._blocked_depth == 0 and self._blocked_since is not None:
+                self._blocked += time.monotonic() - self._blocked_since
+                self._blocked_since = None
 
     def check_time(self) -> None:
-        """Raise :class:`TimeLimitExceeded` once the wall-clock limit is reached."""
+        """Raise :class:`TimeLimitExceeded` once the limit is reached.
+
+        ``max_seconds`` of ``0`` means no limit; see :class:`SkillLimits`.
+        """
         limit = self.limits.max_seconds
         if limit > 0:
             elapsed = self.elapsed_seconds
             if elapsed >= limit:
-                raise TimeLimitExceeded(f"skill ran for {elapsed:.2f}s of {limit:.2f}s allowed")
+                raise TimeLimitExceeded(
+                    f"skill ran for {elapsed:.2f}s of {limit:.2f}s allowed "
+                    f"(not counting {self.blocked_seconds:.2f}s waiting on the page)"
+                )
 
     # -- steps --------------------------------------------------------------------------
 
@@ -303,6 +392,12 @@ class ActionView:
     :class:`~skillweaver.errors.ControllerError` so straight-line skill code does not
     have to check a result it would only ignore.
 
+    The time an action spends inside the controller is not charged to the skill's
+    clock - a browser that takes a second to settle after a click is a slow browser,
+    not a runaway skill - with one exception: a :class:`~skillweaver.contracts.Wait`
+    IS charged, because a skill asking to sleep is spending its own time and is
+    exactly the shape a "just wait longer" repair takes.
+
     The wrapped controller is held in a private slot and is not reachable from skill
     code: the sandbox rejects ``_``-prefixed attribute access at compile time.
     """
@@ -333,8 +428,10 @@ class ActionView:
                 action is attempted.
         """
         self._ledger.charge_step(describe_action(action))
+        waiting = nullcontext() if isinstance(action, Wait) else self._ledger.blocked()
         try:
-            result = self._controller.perform(action)
+            with waiting:
+                result = self._controller.perform(action)
         finally:
             if self._on_action is not None:
                 self._on_action()
@@ -495,9 +592,13 @@ class SkillAPI:
         ``ctx.see`` twice in a row costs one capture, and reading it after acting
         costs a fresh one. Never hold on to it across an action.
 
+        Observing costs no time against the skill's limit, however slow the page: a
+        capture and an OCR pass on a dense article can take seconds, and charging
+        them would kill honest skills for reading a real web page.
+
         Raises:
             PerceptionError: if observing fails.
-            TimeLimitExceeded: if the wall-clock limit is already spent.
+            TimeLimitExceeded: if the limit is already spent.
         """
         return self.observe().index
 
@@ -560,10 +661,14 @@ class SkillAPI:
 
     def observe(self) -> Observation:
         """The current (possibly cached) observation. ``ctx.see`` is its index; a
-        planner or the runner may want the screenshot, url or fingerprint too."""
+        planner or the runner may want the screenshot, url or fingerprint too.
+
+        The time the perceiver takes is banked as blocked, not charged - see
+        :meth:`RunLedger.blocked`."""
         if self._observation is None:
             self.ledger.check_time()
-            self._observation = self._perceiver.observe(self._controller)
+            with self.ledger.blocked():
+                self._observation = self._perceiver.observe(self._controller)
         return self._observation
 
     def _forget_observation(self) -> None:

@@ -29,6 +29,12 @@ state cannot be learned unless something can change it back: pass `--reset-url`
 (`learn --help`), and see `WorldReset` in `src/skillweaver/orchestrator.py`. The sandbox
 site's `GET /__reset` is one instance of it.
 
+Against a REAL site, run the browser **headless**. Two headed Chromium windows on the
+identical Wikipedia page fingerprint at 0.96 and two headless ones at 1.00, and the
+admission gate needs 1.00 against the recorded starting screen before it will re-run a
+candidate - so a headed run rejects good skills for the way a background window
+rendered. What else a live-site run needs is in `eval/wikipedia.yaml`.
+
 `ultralytics` is a noisy import; three of its side effects have already cost time here.
 
 - It installs its own top-level `tests` package into the venv, which shadows this repository's

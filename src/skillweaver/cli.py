@@ -33,13 +33,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 
-from skillweaver.config import Settings, load_settings
+from skillweaver.config import Settings, load_settings, settings
 from skillweaver.contracts import Skill, Transition, UIState, action_to_dict
 from skillweaver.errors import ConfigError, SkillNotFound, SkillWeaverError
 from skillweaver.orchestrator import (
@@ -210,6 +211,18 @@ CallsOpt = Annotated[
     int | None,
     typer.Option("--max-llm-calls", help="Cap on model calls.", show_default=False),
 ]
+SkillSecondsOpt = Annotated[
+    float | None,
+    typer.Option(
+        "--skill-max-seconds",
+        help="Cap on the seconds a STORED SKILL may spend running its own code - "
+        "the sandbox's runaway-loop tripwire, not the run budget that --max-seconds "
+        "sets. Time the skill sits waiting on a screenshot or on OCR is not counted "
+        "against it, so raise this only for a skill that genuinely computes. "
+        "Overrides SKILLWEAVER_SKILL_MAX_SECONDS for this invocation.",
+        show_default=False,
+    ),
+]
 JsonOpt = Annotated[
     bool,
     typer.Option("--json", help="Print machine-readable JSON instead of prose."),
@@ -237,6 +250,7 @@ def learn_command(
     max_seconds: SecondsOpt = None,
     max_usd: UsdOpt = None,
     max_llm_calls: CallsOpt = None,
+    skill_max_seconds: SkillSecondsOpt = None,
     as_json: JsonOpt = False,
 ) -> None:
     """Learn a task by trial and error, and keep what worked as a reusable skill.
@@ -270,6 +284,7 @@ def learn_command(
         cold=True,
         learn=True,
         budget_flags=(max_steps, max_seconds, max_usd, max_llm_calls),
+        skill_max_seconds=skill_max_seconds,
         as_json=as_json,
     )
 
@@ -303,6 +318,7 @@ def run_command(
     max_seconds: SecondsOpt = None,
     max_usd: UsdOpt = None,
     max_llm_calls: CallsOpt = None,
+    skill_max_seconds: SkillSecondsOpt = None,
     as_json: JsonOpt = False,
 ) -> None:
     """Do a task the fastest way the agent knows.
@@ -328,6 +344,7 @@ def run_command(
         cold=not library_only,
         learn=not no_learn,
         budget_flags=(max_steps, max_seconds, max_usd, max_llm_calls),
+        skill_max_seconds=skill_max_seconds,
         as_json=as_json,
     )
 
@@ -345,12 +362,14 @@ def _do(
     cold: bool,
     learn: bool,
     budget_flags: tuple[int | None, float | None, float | None, int | None],
+    skill_max_seconds: float | None,
     as_json: bool,
 ) -> None:
     """Open a session, run one task, print the report, exit with its verdict."""
     bench = _bench(ctx)
     if target not in ("browser", "desktop"):
         _die(f"--target must be 'browser' or 'desktop', not {target!r}")
+    _apply_skill_seconds(skill_max_seconds)
     steps, seconds, usd, calls = budget_flags
     budget = budget_from(
         bench.settings,
@@ -376,6 +395,25 @@ def _do(
     if not as_json:
         _hint_at_reset(report, reset_url)
     raise typer.Exit(OK if report.ok else NO)
+
+
+def _apply_skill_seconds(seconds: float | None) -> None:
+    """Make ``--skill-max-seconds`` the configured skill time limit for this process.
+
+    The limit is read by :func:`skillweaver.skills.api.default_max_seconds` at the
+    moment a ``SkillLimits`` is built, which happens inside the session this command
+    is about to open - in ``build_agent``, several layers below any argument this
+    file could pass down. Setting the variable the setting is already named after is
+    what keeps the promise at the top of this module: one configuration mechanism,
+    which flags override per invocation, rather than a second path that only the
+    command line knows about.
+    """
+    if seconds is None:
+        return
+    if seconds <= 0:
+        _die(f"--skill-max-seconds must be greater than zero, got {seconds!r}")
+    os.environ["SKILLWEAVER_SKILL_MAX_SECONDS"] = repr(float(seconds))
+    settings.cache_clear()
 
 
 def _hint_at_reset(report: RunReport, reset_url: str | None) -> None:

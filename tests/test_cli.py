@@ -35,9 +35,9 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner, Result
 
-from skillweaver import cli
+from skillweaver import cli, config
 from skillweaver.cli import app, main
-from skillweaver.config import Settings, load_settings
+from skillweaver.config import DEFAULT_SKILL_MAX_SECONDS, Settings, load_settings
 from skillweaver.contracts import (
     Box,
     Click,
@@ -62,6 +62,7 @@ from skillweaver.orchestrator import (
     task_spec,
     world_reset_from_url,
 )
+from skillweaver.skills.api import SkillLimits
 from skillweaver.skills.retrieve import SkillRetriever
 from skillweaver.skills.synthesize import (
     EnvironmentFactory,
@@ -738,6 +739,93 @@ def test_learn_offers_reset_url_and_says_what_it_is_for() -> None:
     """A flag nobody knows about fixes nothing."""
     help_text = runner.invoke(app, ["learn", "--help"]).output
     assert "--reset-url" in help_text
+
+
+# --------------------------------------------------------------------------------------
+# --skill-max-seconds
+# --------------------------------------------------------------------------------------
+#
+# A stored skill runs under SkillLimits, whose wall-clock cap used to be the literal
+# 20.0 written into skills/api.py. That killed a working Wikipedia skill - the page
+# was slow, not the skill - so the cap is now configurable from both ends. These
+# tests are about the command-line end reaching the sandbox at all: the limit is read
+# where a SkillLimits is built, several layers below anything this file can pass down,
+# so what is asserted is the process setting the flag promises to change.
+
+
+@pytest.fixture
+def clean_skill_seconds(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run with no ``SKILLWEAVER_SKILL_MAX_SECONDS`` set, and leave none behind.
+
+    ``monkeypatch`` restores the environment; the cache over it is this fixture's job,
+    because a leaked value would silently change the limit of every later test in the
+    process.
+    """
+    monkeypatch.delenv("SKILLWEAVER_SKILL_MAX_SECONDS", raising=False)
+    config.settings.cache_clear()
+    try:
+        yield
+    finally:
+        config.settings.cache_clear()
+
+
+def test_both_commands_offer_the_skill_time_limit() -> None:
+    for command in ("learn", "run"):
+        help_text = runner.invoke(app, [command, "--help"]).output
+        assert "--skill-max-seconds" in help_text, command
+
+
+def test_the_flag_becomes_the_limit_a_stored_skill_runs_under(
+    world: World, clean_skill_seconds: None
+) -> None:
+    """End to end through the real command, asserted where it lands: the default
+    limits a ``SkillRunner`` is built with inside the session."""
+    assert SkillLimits().max_seconds == DEFAULT_SKILL_MAX_SECONDS
+
+    world.invoke("run", TASK, "--domain", DOMAIN, "--library-only", "--skill-max-seconds", "90")
+
+    assert SkillLimits().max_seconds == 90.0
+
+
+def test_the_flag_works_on_learn_as_well(world: World, clean_skill_seconds: None) -> None:
+    world.script(LEARN_SCRIPT)
+
+    world.invoke("learn", TASK, "--domain", DOMAIN, "-p", COMPANY, "--skill-max-seconds", "75")
+
+    assert SkillLimits().max_seconds == 75.0
+
+
+def test_without_the_flag_the_configured_limit_stands(
+    world: World, clean_skill_seconds: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """There is one configuration mechanism, and a flag that was not passed does not
+    reset it to a default - the promise at the top of cli.py."""
+    monkeypatch.setenv("SKILLWEAVER_SKILL_MAX_SECONDS", "12.5")
+    config.settings.cache_clear()
+
+    world.invoke("run", TASK, "--domain", DOMAIN, "--library-only")
+
+    assert SkillLimits().max_seconds == 12.5
+
+
+def test_a_limit_of_zero_is_refused_before_anything_opens(
+    world: World, clean_skill_seconds: None
+) -> None:
+    """``0`` means "no limit" to ``SkillLimits`` itself, which is a thing a test may
+    want and a thing a command line must never hand somebody by accident."""
+    result = world.invoke("run", TASK, "--domain", DOMAIN, "--skill-max-seconds", "0")
+
+    assert result.exit_code == 2
+    assert "--skill-max-seconds must be greater than zero" in result.output
+    assert world.llm.calls == 0, "the run never started"
+    assert SkillLimits().max_seconds == DEFAULT_SKILL_MAX_SECONDS
+
+
+def test_a_negative_limit_is_refused_too(world: World, clean_skill_seconds: None) -> None:
+    result = world.invoke("run", TASK, "--domain", DOMAIN, "--skill-max-seconds", "-5")
+
+    assert result.exit_code == 2
+    assert "must be greater than zero" in result.output
 
 
 # --------------------------------------------------------------------------------------
