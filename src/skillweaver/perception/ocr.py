@@ -44,12 +44,12 @@ Recognition is the read
 
 "OCR is expensive" is too coarse to optimize against, because RapidOCR is three models
 and they are not close to equal. Timed by the engine's own per-stage clock on live
-Wikipedia at 1280x800, medians of five, ``rec_batch_num=6`` as shipped::
+Wikipedia at 1280x800, medians of five, at RapidOCR's shipped ``rec_batch_num=6``::
 
     frame            lines     det      cls      rec    total
-    Ada Lovelace        70    89 ms    28 ms   899 ms   1033 ms
-    Photosynthesis      75    84 ms    32 ms   804 ms    938 ms
-    dense table         58    87 ms    27 ms   923 ms   1055 ms
+    Ada Lovelace        70    77 ms    28 ms   840 ms    966 ms
+    Photosynthesis      75    76 ms    29 ms   776 ms    901 ms
+    dense table         58    76 ms    25 ms   881 ms    999 ms
 
 **Recognition is ~87% of a read; detection is ~8% and the angle classifier ~3%.**
 Three consequences, each of which kills a plausible idea:
@@ -71,24 +71,54 @@ per page, so it buys the smallest win on offer at the price of a correctness arg
 
 What is worth it is how many lines go into one ONNX Runtime call. RapidOCR sorts the
 crops by aspect ratio, batches ``rec_batch_num`` of them, and pads each batch to its
-widest member. Six is its default. Measured on the frames above, speedup against that
-default::
+widest member. Six is its default; one is ~1.5x faster, and almost all of the
+difference is recognition - the same three frames at ``rec_batch_num=1`` read in
+648/633/616 ms with rec down to 518/502/494 ms while det and cls do not move.
+
+The headline number is measured as MATCHED ADJACENT PAIRS: each pair runs both arms
+back to back with the order coin-flipped, so the ratio comes from two runs that saw the
+same machine. Pooled over two sets of six pairs on three frames, **36 of 36 paired
+comparisons favour one line per call**, median 1.51x and 1.53x, per frame 1.44-1.62x.
+The set-1 pairs held that ratio while the machine's load average climbed from 3.9 to
+6.4 under them, which is the evidence that this is not a load artifact; the absolute
+times drifted by 5% over the same span, which is the evidence that pooling unpaired
+timings here would have been worthless.
+
+An unpaired sweep of the other sizes, so the shape is on record even though its window
+straddled a load change::
 
     rec_batch_num      1       2       4       6      12
-    speedup         1.51x   0.84x   1.16x   1.00x    (slower)
+    ada             1.54x   0.82x   1.15x   1.00x   1.06x
+    photosynthesis  1.41x   0.79x   1.07x   1.00x   1.03x
+    dense table     1.64x   0.86x   1.11x   1.00x   0.96x
 
-**One line per call is ~1.5x on the whole read, and the ordering is not monotone**, so
-the padding arithmetic is not the explanation: sorted crops waste only ~14% on a batch
-of six, nowhere near 1.5x, and padding cannot make batch 2 the worst of the five. What
-fits is memory: a batch of six lines of Wikipedia body text is a 3x48x~1900 input per
-line and the intermediate feature maps are far larger again, so batch 1 stays in cache
-where batch 6 streams. Whatever the mechanism, the number is measured on every page
-tried and in both directions, and :data:`DEFAULT_REC_BATCH` is 1 because of it.
+**The ordering is not monotone**, which is what rules out the padding arithmetic:
+sorted crops waste only ~14% on a batch of six, nowhere near 1.5x, and padding grows
+with the batch so it cannot make 2 the worst of the five and 4 better again. That dip
+reproduced in three independent runs. What fits is memory - a batch of six lines of
+Wikipedia body text is a 3x48x~1900 input per line and the intermediate feature maps
+are far larger again, so batch 1 stays in cache where batch 6 streams - but the
+mechanism is inference and the measurement is not, so treat the number as the fact and
+that paragraph as the guess. :data:`DEFAULT_REC_BATCH` is 1 because of the number.
+
+It is worth ~0.7s of a warm replay and no more, which is the honest size of it. **A
+1.5x read is not a 1.5x replay, and nothing here should be read as claiming it is.**
+Reading is ~88% of an OBSERVATION, and a warm replay barely observes: on the live
+Wikipedia suite it makes four observations and only TWO text reads (the frame cache
+serves the other two), against a run whose remaining seconds are page loads, interpreter
+start and model loads that this change does not touch. So the saving end to end is two
+reads' worth:
+measured over ten matched pairs at a stable load, 12.05s -> 11.31s, median +0.73s, all
+ten pairs positive - against the +0.70s that two reads at 1.00s and 0.65s predict. Four
+earlier pairs taken while load swung 2.9-4.5 gave +0.27s and two negative pairs, which
+is what this effect looks like when the sample is too small for the run's own variance:
+~2s of OCR inside ~12s of interpreter start, model loads and two live page fetches.
 
 It costs no accuracy. Checked on eight live frames, including three scrolled ones:
 every text element the batch-6 read found is still found by ``find_text`` at the same
-place - 0 lost of 548 - and recall against the DOM's own labels goes from 338/385 to
-340/385, because a batch padded less loses fewer of the spaces between words.
+place - 0 lost of 548, matched by box overlap and not just by string - and recall
+against the DOM's own labels goes from 338/385 to 340/385, because a batch padded less
+loses fewer of the spaces between words.
 
 A cheaper read is not the same as a cached one, and the cache cannot be pushed down to
 the line to make up the difference. Keyed on a line's exact pixels, a per-line cache

@@ -114,6 +114,15 @@ by default because the demo is watched; every shipped command gets it through th
 `BrowserController` in `orchestrator._open_world`. What else a live-site run needs is in
 `eval/wikipedia.yaml`.
 
+A skill learned against a LIVE site can stop matching its own start screen within hours,
+so do not assume a stored one still replays: a Wikipedia skill learned at 10:14 failed at
+17:00 with `no_route`, its Charles Babbage start screen fingerprinting differently in BOTH
+render modes and differently from each other. Re-learning fixed it in one step. The cause
+was not established and the mode crossing above is NOT it - that was the first guess and
+it was wrong, which is the thing worth knowing, because `no_route` against a real site
+reads like a routing bug and is usually the page having moved. Budget a learn run before
+measuring anything that needs a warm hit.
+
 A real site can refuse an automated browser outright, and the shipped answer is a
 LAUNCH mode, not a trick: `--chrome-profile <dir>` (`SKILLWEAVER_CHROME_PROFILE`) runs
 the real Google Chrome on this machine out of a profile directory that survives the
