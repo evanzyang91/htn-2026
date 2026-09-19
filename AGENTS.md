@@ -342,11 +342,15 @@ zero-window check reads quiet before the request has even started (measured: 25-
 Wikipedia and splitkb), and a window taxes every action on every site.
 
 And a verifier that passes on the wrong screen is worse than none, because it is what turns
-a skill that did nothing into a stored one. A synthesized verifier matching `"Keycaps"` -
-the word the top nav says on EVERY page of that shop - passed 5 replays in which the cart
-was empty all 5 times; `/cart.js` said `item_count=0`. The warm critic caught it every time
-and the report said `warm miss`, which is the system working. Check a replay against the
-SITE, never against the skill's own say-so.
+a skill that did nothing into a stored one, and then into a STATISTIC. A synthesized
+verifier matching `"Keycaps"` - the word the top nav says on EVERY page of that shop -
+passed 8 replays whose carts were empty all 8 times by `/cart.js` (`item_count=0`), and
+`SkillStats` for it read **14 runs, 14 successes**. Nothing in the library can notice this:
+`record_run` is told `ok` by the sandbox, and the sandbox is told `ok` by the verifier. The
+warm CRITIC caught it every time and the report said `warm miss`, which is the system
+working exactly as `RunReport.warm_missed` intends - so read the critic's verdict and the
+site, never `SkillStats` and never the skill's own say-so, when you are asking whether a
+replay did the job.
 
 ## Maintaining this file
 
