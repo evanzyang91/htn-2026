@@ -51,9 +51,21 @@ state cannot be learned unless something can change it back: pass `--reset-url`
 (`learn --help`), and see `WorldReset` in `src/skillweaver/orchestrator.py`. The sandbox
 site's `GET /__reset` is one instance of it.
 
-Four things about driving a real page that cost whole task suites before they were
+When the gate refuses a candidate, the code it refused is written to `rejected.json`
+beside the run, with the sandbox trace of each attempt. Read that before theorising: it
+carries the coordinates each step actually clicked, which is how the headed/headless
+skew above was found and is faster than any amount of reasoning about the markup.
+
+Five things about driving a real page that cost whole task suites before they were
 understood, all of them now written up where they bite:
 
+- **Headed Chromium does not paint what the detector was trained on.** The dataset is
+  captured headless (`scripts/build_ui_dataset.py`), so serving a headed window is a
+  train/serve skew, and it costs exactly the elements that have no text and can only be
+  detected: on Sauce Labs' storefront the cart icon is found in every headless frame and
+  in none of the headed ones, which silently cost three admission runs. Live runs are
+  headless unless `--watch` says the run is a demonstration; see `WATCH_PARAM` in
+  `orchestrator.py`. Measure headless, or the number is not the one the agent gets.
 - A page is `readyState: complete` long before it has DRAWN anything, and an agent that
   reads it then sees a blank screen and never reads it again. `_settle` in
   `controllers/browser.py` waits for the document to go quiet, and `RE_OBSERVE_AFTER`

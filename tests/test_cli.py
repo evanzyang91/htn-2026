@@ -68,6 +68,7 @@ from skillweaver.skills.synthesize import (
     ReplayEnvironment,
     Synthesizer,
 )
+from skillweaver.trajectory.store import TrajectoryFileStore
 from tests.fakes import (
     FakeCritic,
     FakeLLM,
@@ -218,7 +219,9 @@ class World:
     settings: Settings
     store: InMemorySkillStore = field(default_factory=InMemorySkillStore)
     graph: InMemorySiteGraph = field(default_factory=InMemorySiteGraph)
-    trajectories: InMemoryTrajectoryStore = field(default_factory=InMemoryTrajectoryStore)
+    trajectories: InMemoryTrajectoryStore | TrajectoryFileStore = field(
+        default_factory=InMemoryTrajectoryStore
+    )
     llm: FakeLLM = field(default_factory=FakeLLM)
 
     def script(self, replies: Sequence[str]) -> FakeLLM:
@@ -455,6 +458,37 @@ def test_a_rescued_run_is_not_admitted_when_it_cannot_be_replayed(world: World) 
     assert report["ok"] and report["decision"] == "cold"
     assert report["learned"] is None
     assert "precondition" in report["learning_note"]
+
+
+def test_a_rejected_candidate_leaves_its_code_beside_the_run(world: World, tmp_path: Path) -> None:
+    """The code the gate threw out is written down, because it is the only copy.
+
+    An admitted skill is in the library and a failed run is in the trajectory, but a
+    REJECTED candidate is neither: it costs model calls, it is the whole evidence for
+    why a site cannot be learned yet, and until it is written beside the run it exists
+    only in memory. The log line names the exception; it does not carry the code that
+    raised it, which is what a person needs in order to fix the prompt.
+    """
+    world.trajectories = TrajectoryFileStore(tmp_path / "recorded")
+    _plant_half_done_skill(world)
+    world.script((*SOLVE_FROM_SEARCHED, skill_reply(), skill_reply(), skill_reply()))
+
+    report = world.json("run", TASK, "--domain", DOMAIN, "-p", COMPANY)
+    assert report["learned"] is None, "this run is only interesting because it was rejected"
+
+    run_id = world.trajectories.list()[-1]
+    written = json.loads(
+        (world.trajectories.path_of(run_id) / "rejected.json").read_text(encoding="utf-8")
+    )
+    assert "precondition" in written["reason"]
+    attempts = written["attempts"]
+    assert len(attempts) == 3, "every attempt is kept, not only the last"
+    # The code as JUDGED, which is the hardening pass's rewrite rather than the
+    # model's draft - that is the version that actually failed, so it is the one
+    # worth keeping.
+    assert all(entry["code"].startswith("def run(ctx") for entry in attempts), "no code recorded"
+    assert all("Confirm payment" in entry["code"] for entry in attempts)
+    assert all(entry["verifier_code"] and entry["error"] for entry in attempts)
 
 
 def test_a_skill_that_fails_outright_is_demoted_and_reported(world: World) -> None:

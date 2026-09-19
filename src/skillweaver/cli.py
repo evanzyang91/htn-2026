@@ -43,6 +43,7 @@ from skillweaver.config import Settings, load_settings
 from skillweaver.contracts import Skill, Transition, UIState, action_to_dict
 from skillweaver.errors import ConfigError, SkillNotFound, SkillWeaverError
 from skillweaver.orchestrator import (
+    WATCH_PARAM,
     RunReport,
     Workbench,
     budget_from,
@@ -214,6 +215,15 @@ JsonOpt = Annotated[
     bool,
     typer.Option("--json", help="Print machine-readable JSON instead of prose."),
 ]
+WatchOpt = Annotated[
+    bool,
+    typer.Option(
+        "--watch",
+        help="Open a browser window you can see. Headed Chromium does not paint what "
+        "the detector was trained on, so a watched run perceives slightly less than a "
+        "measured one: use it to demonstrate, not to benchmark.",
+    ),
+]
 
 
 @app.command("learn")
@@ -233,6 +243,7 @@ def learn_command(
             "even when a skill exists, which is what 'learn' should mean.",
         ),
     ] = False,
+    watch: WatchOpt = False,
     max_steps: StepsOpt = None,
     max_seconds: SecondsOpt = None,
     max_usd: UsdOpt = None,
@@ -269,6 +280,7 @@ def learn_command(
         warm=warm_first,
         cold=True,
         learn=True,
+        watch=watch,
         budget_flags=(max_steps, max_seconds, max_usd, max_llm_calls),
         as_json=as_json,
     )
@@ -299,6 +311,7 @@ def run_command(
             "Use when you want the run without growing the library.",
         ),
     ] = False,
+    watch: WatchOpt = False,
     max_steps: StepsOpt = None,
     max_seconds: SecondsOpt = None,
     max_usd: UsdOpt = None,
@@ -327,6 +340,7 @@ def run_command(
         warm=True,
         cold=not library_only,
         learn=not no_learn,
+        watch=watch,
         budget_flags=(max_steps, max_seconds, max_usd, max_llm_calls),
         as_json=as_json,
     )
@@ -344,6 +358,7 @@ def _do(
     warm: bool,
     cold: bool,
     learn: bool,
+    watch: bool,
     budget_flags: tuple[int | None, float | None, float | None, int | None],
     as_json: bool,
 ) -> None:
@@ -359,13 +374,16 @@ def _do(
         max_usd=usd,
         max_llm_calls=calls,
     )
+    params = _params(param)
+    if watch:
+        params[WATCH_PARAM] = True
     spec = task_spec(
         text,
         domain=domain,
         target=target,  # type: ignore[arg-type]
         url=url,
         reset_url=reset_url,
-        params=_params(param),
+        params=params,
     )
     try:
         with bench.session(spec, budget) as agent:

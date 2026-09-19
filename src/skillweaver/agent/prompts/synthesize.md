@@ -24,8 +24,13 @@ ctx.ctl.type_text("text")  # types into whatever has focus
 ctx.ctl.press("Enter")  # a chord: press("Meta", "a")
 ctx.ctl.scroll(target, dx=0, dy=0)  # positive dy scrolls DOWN
 ctx.ctl.wait(250)  # milliseconds
-ctx.ctl.supports("navigate")  # -> bool
+ctx.ctl.supports("scroll")  # -> bool; ASKS a question, it does not add a method
 ```
+
+Those five are the whole of `ctx.ctl`. Anything else is an `AttributeError` at the
+first call, including `ctx.ctl.navigate` - there is no way to type a URL, and you do
+not need one: you are handed the screen the recording started on, and every other
+screen is reached by pressing something on it, the way a person reaches it.
 
 A failed action raises; you never have to check a result. `click` takes an element
 you just found - NOT coordinates (see "Never write coordinates" below).

@@ -47,6 +47,7 @@ always wrong.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -668,6 +669,7 @@ class Agent:
                 version=admission.skill.version,
             )
             return admission.skill, admission, ""
+        self._record_rejection(outcome.trajectory.run_id, admission)
         return None, admission, admission.reason
 
     # -- bookkeeping -------------------------------------------------------------------
@@ -680,6 +682,47 @@ class Agent:
         except SkillWeaverError as exc:
             log.warning("agent.retrieve.failed", task=task.text, error=str(exc))
             return ()
+
+    def _record_rejection(self, run_id: str, admission: Admission) -> None:
+        """Write the candidates the gate threw out beside the run that produced them.
+
+        A rejection is the only part of learning that costs model calls and leaves
+        nothing behind: the stored library holds what was admitted, so the code that
+        failed - the thing you need in order to see WHY a site cannot be learned yet -
+        used to exist only in memory and was dropped on return. The error line in the
+        log names the exception and not the line that raised it.
+
+        Best-effort, like every other write here: a run that cannot record its
+        rejection is still a run, and this must never turn a failed lesson into a
+        failed run. A store that keeps trajectories in memory has nowhere to put
+        this and is skipped rather than adapted - the record is for a person
+        reading the run afterwards, and there is no afterwards for that store.
+        """
+        directory_of = getattr(self._trajectories, "path_of", None)
+        if directory_of is None:
+            return
+        attempts = [
+            {
+                "index": attempt.index,
+                "stage": attempt.stage,
+                "error": attempt.error,
+                "name": None if attempt.skill is None else attempt.skill.name,
+                "code": None if attempt.skill is None else attempt.skill.code,
+                "verifier_code": None if attempt.skill is None else attempt.skill.verifier_code,
+                "trace": list(attempt.trace),
+            }
+            for attempt in admission.attempts
+        ]
+        try:
+            path = directory_of(run_id) / "rejected.json"
+            path.write_text(
+                json.dumps({"reason": admission.reason, "attempts": attempts}, indent=2),
+                encoding="utf-8",
+            )
+        except (SkillWeaverError, OSError) as exc:
+            log.warning("agent.rejection.save_failed", run_id=run_id, error=str(exc))
+        else:
+            log.info("agent.rejection.recorded", run_id=run_id, attempts=len(attempts), path=path)
 
     def _save(self, trajectory: Trajectory) -> None:
         """Persist a trajectory, tolerating a store that cannot take it."""
@@ -846,6 +889,18 @@ class ComposedPerceiver:
 # Wiring
 # --------------------------------------------------------------------------------------
 
+
+WATCH_PARAM = "watch"
+"""Open a browser window you can see, instead of the headless one.
+
+Off by default, and the default is a PERCEPTION decision rather than a preference.
+The detector is trained on headless captures (``scripts/build_ui_dataset.py`` defaults
+to ``headless=True``), and headed Chromium does not paint the same pixels: on Sauce
+Labs' storefront the top-right cart icon - which carries no text, so detection is the
+only way to it - is found in every headless frame and in none of the headed ones. A
+window that is nicer to watch is not worth serving the model a page it was not trained
+on; ``--watch`` says the run is being demonstrated rather than measured.
+"""
 
 RESET_URL_PARAM = "reset_url"
 """The task parameter holding a :data:`WorldReset` endpoint.
@@ -1230,7 +1285,10 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
     else:
         from skillweaver.controllers.browser import BrowserController
 
-        controller = BrowserController(headless=False, start_url=task.params.get("start_url"))
+        controller = BrowserController(
+            headless=not task.params.get(WATCH_PARAM),
+            start_url=task.params.get("start_url"),
+        )
     # Not ``default_weights_path()``: that reads the process-wide settings, which a
     # --data-dir on this invocation has already overridden.
     detector = YoloDetector(config.models_dir / DEFAULT_WEIGHTS_NAME)
