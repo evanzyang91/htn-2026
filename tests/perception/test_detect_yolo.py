@@ -42,7 +42,12 @@ from skillweaver.contracts import (
     utcnow,
 )
 from skillweaver.errors import PerceptionError
-from skillweaver.perception.detect_yolo import YoloDetector, default_weights_path
+from skillweaver.perception.detect_yolo import (
+    DEFAULT_CONFIDENCE,
+    DEFAULT_MAX_DETECTIONS,
+    YoloDetector,
+    default_weights_path,
+)
 from skillweaver.perception.labeling import (
     CLASS_NAMES,
     box_from_yolo,
@@ -498,14 +503,16 @@ class _StubModel:
     def __init__(self, boxes: _StubBoxes) -> None:
         self._boxes = boxes
         self.seen_shape: tuple[int, ...] | None = None
+        self.seen_kwargs: dict[str, object] = {}
 
     def predict(self, source, **kwargs):  # noqa: ANN001, ANN003 - mirrors ultralytics
         self.seen_shape = source.shape
+        self.seen_kwargs = dict(kwargs)
         return [_StubResult(self._boxes)]
 
 
-def detector_with(boxes: _StubBoxes) -> tuple[YoloDetector, _StubModel]:
-    detector = YoloDetector()
+def detector_with(boxes: _StubBoxes, **options: object) -> tuple[YoloDetector, _StubModel]:
+    detector = YoloDetector(**options)  # type: ignore[arg-type]
     model = _StubModel(boxes)
     detector._model = model  # noqa: SLF001 - substituting the one thing we cannot ship
     return detector, model
@@ -718,3 +725,69 @@ def test_detections_stay_inside_the_viewport_and_carry_a_real_confidence() -> No
             assert element.box.area > 0
             assert 0 <= element.box.x and element.box.x + element.box.w <= shot.width
             assert 0 <= element.box.y and element.box.y + element.box.h <= shot.height
+
+
+# -- the detection cap -----------------------------------------------------------------
+
+
+def test_the_cap_reaches_the_model_as_max_det() -> None:
+    """The ceiling has to be applied during NMS, not after it.
+
+    Trimming a returned list to 300 would be a different operation: ultralytics
+    ranks by confidence inside ``max_det``, so handing the number over is what makes
+    the survivors the 300 most confident boxes rather than the first 300 the model
+    happened to emit.
+    """
+    one_button = _StubBoxes(
+        rows=[(0.0, 0.0, 10.0, 10.0)], scores=[0.9], classes=[class_id(ElementKind.button)]
+    )
+    detector, model = detector_with(one_button)
+    detector.detect(blank_screenshot())
+    assert model.seen_kwargs["max_det"] == DEFAULT_MAX_DETECTIONS
+    assert model.seen_kwargs["conf"] == DEFAULT_CONFIDENCE
+
+    custom, model = detector_with(one_button, max_detections=1000)
+    custom.detect(blank_screenshot())
+    assert model.seen_kwargs["max_det"] == 1000
+
+
+def test_what_a_cap_would_drop_is_the_least_confident_tail() -> None:
+    """``detect`` sorts before it returns, so a ceiling is always a cut through the
+    bottom of the confidence order - never through the middle of it."""
+    scores = [0.31, 0.92, 0.25, 0.67, 0.44]
+    detector, _ = detector_with(
+        _StubBoxes(
+            rows=[(float(i) * 20, 0.0, float(i) * 20 + 15, 15.0) for i in range(len(scores))],
+            scores=scores,
+            classes=[class_id(ElementKind.button)] * len(scores),
+        )
+    )
+    returned = [element.confidence for element in detector.detect(blank_screenshot())]
+    assert returned == sorted(scores, reverse=True)
+
+
+@requires_weights
+def test_the_cap_does_not_bind_on_any_committed_fixture() -> None:
+    """The claim ``DEFAULT_MAX_DETECTIONS`` is documented on: on real frames the cap
+    truncates nothing, so no control is invisible to the agent because of it.
+
+    Measured the same way here as it was there - the same frames detected twice,
+    once at the shipped ceiling and once with it effectively removed - because
+    "there is headroom" is a property of the WEIGHTS, and a retrain that made the
+    detector three times denser would silently turn the ceiling into a truncation.
+    This is the test that would notice.
+    """
+    capped = YoloDetector()
+    uncapped = YoloDetector(max_detections=10 * DEFAULT_MAX_DETECTIONS)
+    counts: dict[str, tuple[int, int]] = {}
+    for frame in load_fixture_frames():
+        counts[frame.name] = (
+            len(capped.detect(frame.screenshot)),
+            len(uncapped.detect(frame.screenshot)),
+        )
+
+    truncated = {name: pair for name, pair in counts.items() if pair[0] != pair[1]}
+    assert not truncated, f"the cap is truncating real frames: {truncated}"
+
+    densest = max(pair[1] for pair in counts.values())
+    assert densest < DEFAULT_MAX_DETECTIONS, f"no headroom left: densest frame is {densest}"

@@ -81,6 +81,14 @@ twice). `PerceptionCounters` and `CachingTextReader` in
 `src/skillweaver/perception/ocr.py` hold the measured reasons the cache key is the exact
 pixels and not "the same state", and `ComposedPerceiver` in `src/skillweaver/orchestrator.py`
 holds the measured reason the text is NOT read lazily. Read both before trying either again.
+The SECOND cost is the one a cache hit still pays: `merge_elements` compares every
+candidate against every cluster, so it grows quadratically with the element count while
+the text read does not grow with it at all - the reader reads the whole frame and is
+keyed on pixels, so nothing about how many elements are detected can change it. That is
+why the detector's ceiling is where it is; `DEFAULT_MAX_DETECTIONS` in
+`perception/detect_yolo.py` carries the measurement, including the fact that the cap
+truncates NO real page - what loses elements on a dense page is recall, by a factor of
+three, and not the cap.
 
 **Every limit in this project is enforced from Python, so none of them bounds a native
 call.** The skill clock is read by `charge_step`, by the runner and by a trace hook that

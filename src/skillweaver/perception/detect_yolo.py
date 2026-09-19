@@ -63,16 +63,56 @@ DEFAULT_IOU = 0.5
 value would merge two adjacent buttons into one box."""
 
 DEFAULT_MAX_DETECTIONS = 300
-"""Ceiling on boxes per frame. A dense table screen genuinely has a couple of
-hundred elements; far more than that is a model melting down, not a screen.
+"""Ceiling on boxes per frame, kept at 300 on the measurement below rather than on
+the worry it was originally written with.
 
-A known, measured limit rather than a safe margin: a Hacker News front page has
-323 visible elements and a frame in the training set has 306, so a page CAN carry
-more than this. Detections come back sorted by confidence, so what a cap drops is
-the least confident tail - but on a page like that the count is a truncation, not
-a measurement. Raising it costs NMS time on every frame, which is exactly what the
-skill-timeout work is trying to buy back, so it stays where it is and stays
-written down."""
+**It does not bind on a real page.** A page CAN carry more than 300 elements - a
+Hacker News front page has 320 by the DOM, and a frame in the training set has 306
+- but that is a count of what is THERE, not of what this detector returns. Across
+sixteen dense live page/viewport pairs, the number of detections at this cap
+equalled the number with the cap effectively removed (``max_detections=3000``)
+every single time; the largest was 135, on an MDN reference page whose DOM reports
+402 elements at 1440x2000. The densest committed fixture returns 177
+(``rec_selected``), and Hacker News itself returns 9. What loses elements on a
+dense page is RECALL - see ``tests/perception/fixtures/README.md`` - and it loses
+them by a factor of three, while the cap loses none. Raising the cap would not
+have made one more control clickable on any page measured here.
+
+The only frame found that reaches it at all is a synthetic grid of 900 real
+``<button>`` elements, which returns 307 uncapped. Even there the cut is not
+arbitrary: the boxes either side of rank 300 score 0.269 down to 0.250, so the cap
+can only ever bite inside the :data:`DEFAULT_CONFIDENCE` floor band - it discards
+what the model was already barely willing to admit.
+
+**Both reasons previously recorded for not raising it are wrong, and the right one
+is a different cost entirely.** It does not buy back OCR time: the reader reads the
+WHOLE FRAME and its cache is keyed on pixels, so the number of detections cannot
+change how much text is read - measured, ``ocr_reads`` and the line count are
+identical at 300 and at 3000. Nor does it buy back NMS time: on the same dense
+frame, median detect time was 69.5 / 68.1 / 69.4 ms at a cap of 300 / 1000 / 3000,
+which is flat, against 1809 ms for that frame's text read (96% of one uncached
+observation).
+
+What more detections actually cost is downstream and superlinear.
+:func:`~skillweaver.perception.elements.merge_elements` compares every candidate
+against every cluster it has opened, so on that frame's own boxes the merge takes
+20.9 ms for 133 detections, 180.8 ms for 1064 and 1057.6 ms for 3059 - and unlike
+the text read it is paid on EVERY observation, including one the text cache serves
+for free. So the cap earns its place as a bound on that quadratic for the frame
+where the model does melt down, not as a saving on any frame that exists. Making
+the merge cheap enough that the ceiling stops mattering is the follow-up; until
+then, raising this number raises a quadratic.
+
+One side effect worth knowing, since the cap sits in front of a cache: at the cap,
+a 3-pixel scroll of that synthetic grid swapped one element out of the surviving
+set and one in (Jaccard 0.992, against 1.000 uncapped), because the cut reshuffles
+inside the confidence floor. It did not reach state identity - the fingerprint
+scored 1.000 either way - and no real page measured comes within 2.2x of the cap,
+so this is a property to remember if the detector ever gets much denser, not a
+live defect.
+
+Timings are medians on one machine at load average 4.6-5.6, quoted only against
+each other."""
 
 _BUILD_HINT = (
     "build it with:\n"
