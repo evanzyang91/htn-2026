@@ -91,6 +91,9 @@ from tests.fakes.scenario import DOMAIN
 
 TASK = "Confirm payment of the Acme Corp invoice."
 COMPANY = "company=Acme Corp"
+START_URL = "https://fake.test/invoices"
+"""What a person types as ``--url``. Its host IS :data:`DOMAIN`, which is the whole
+point: ``learn`` files under it and a bare repeat has to find its way back to it."""
 
 runner = CliRunner()
 
@@ -348,6 +351,104 @@ def test_learn_then_run_is_cold_then_warm_with_zero_model_calls(world: World) ->
     assert report["attempts"][0]["llm_calls"] == 0
     assert report["attempts"][0]["skills_used"] == ["confirm_invoice_payment"]
     assert report["learned"] is None and report["rescued"] is False
+
+
+def test_a_bare_repeat_after_a_learn_with_a_url_still_takes_the_warm_path(
+    world: World,
+) -> None:
+    """THE TWO COMMANDS THIS PROJECT'S OWN README TELLS A NEW USER TO TYPE.
+
+    Every other test on this page passes ``--domain`` to both commands, which is
+    exactly why the defect this pins survived: ``learn`` is given a ``--url``, so what
+    it stores is filed under that host, while a repeat has no reason to pass either
+    flag - the whole point is that the agent already knows how. That silence used to
+    resolve to the literal target, ``"browser"``, and the lookup happened in a
+    namespace nothing is ever stored in.
+
+    It did not fail. It missed, fell through to exploration, re-solved the task with
+    the model and reported a plain success, so a measurement taken this way records a
+    solve while the claim being measured - learn once, then repeat for free - is not
+    being exercised at all.
+    """
+    world.script(LEARN_SCRIPT)
+    first = world.invoke("learn", TASK, "--url", START_URL, "-p", COMPANY)
+    assert first.exit_code == 0, first.output
+    assert [s.domain for s in world.store.list()] == [DOMAIN], "learn filed it elsewhere"
+
+    spent_learning = world.llm.calls
+    report = world.json("run", TASK, "-p", COMPANY)  # no --url, no --domain
+
+    assert report["domain"] == DOMAIN
+    assert report["domain_resolved_by"] == "library"
+    assert report["decision"] == "warm", "the bare repeat did not take the warm path"
+    assert report["llm_calls"] == 0
+    assert world.llm.calls == spent_learning, "the repeat consulted the model"
+    assert world.scenario.solved, "the app did not actually reach the confirmation page"
+
+
+def test_a_bare_repeat_says_which_skill_answered_for_the_domain(world: World) -> None:
+    """A run that resolves its own namespace has decided something on the caller's
+    behalf, and a decision nobody can see is one nobody can correct."""
+    world.script(LEARN_SCRIPT)
+    world.invoke("learn", TASK, "--url", START_URL, "-p", COMPANY)
+
+    result = world.invoke("run", TASK, "-p", COMPANY)
+
+    assert f"resolved: {DOMAIN}" in result.output
+    assert "confirm_invoice_payment" in result.output
+
+
+def test_a_task_nothing_in_the_library_accounts_for_does_not_borrow_a_domain(
+    world: World,
+) -> None:
+    """The neighbouring trap: retrieval RANKS, so a one-skill library ranks that skill
+    first for every sentence in the world. Being the only thing stored must not make
+    it the answer, or a bare run would be sent to an unrelated site."""
+    world.script(LEARN_SCRIPT)
+    world.invoke("learn", TASK, "--url", START_URL, "-p", COMPANY)
+
+    result = world.invoke(
+        "run", "Book a table for six at the Thai place on Friday", "--library-only", "--json"
+    )
+    report = json.loads(result.output)
+
+    assert report["domain"] == "browser"
+    assert report["domain_resolved_by"] == "target"
+    assert report["ok"] is False
+
+
+def test_a_cold_run_after_a_warm_miss_is_not_reported_as_a_plain_success(
+    world: World,
+) -> None:
+    """The half that would have caught the defect months earlier.
+
+    ``SOLVED by the cold path`` is true and useless after the library was consulted
+    and missed: it is the line a demo and a measurement both quote, and it read
+    identically whether the fast path did not apply or had been asked the wrong
+    question entirely.
+    """
+    world.script(LEARN_SCRIPT)
+
+    result = world.invoke("run", TASK, "--domain", DOMAIN, "-p", COMPANY)
+
+    assert result.exit_code == 0, result.output
+    assert "SOLVED by the cold path AFTER A WARM MISS" in result.output
+    assert "the library was consulted first and missed at empty_library" in result.output
+
+
+def test_an_empty_namespace_names_the_namespaces_that_are_not_empty(world: World) -> None:
+    """ "The library holds no skill for domain 'browser'" stops one question short of
+    the answer. Naming what the library DOES hold is what turns it into a diagnosis."""
+    world.script(LEARN_SCRIPT)
+    world.invoke("learn", TASK, "--url", START_URL, "-p", COMPANY)
+
+    result = world.invoke(
+        "run", "Book a table for six at the Thai place on Friday", "--library-only", "--json"
+    )
+    report = json.loads(result.output)
+
+    assert report["attempts"][0]["stage"] == "empty_library"
+    assert DOMAIN in report["attempts"][0]["reason"], "it did not say where the skills ARE"
 
 
 def test_the_warm_run_is_faster_because_it_skips_the_model_not_the_work(world: World) -> None:

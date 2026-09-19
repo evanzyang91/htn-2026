@@ -57,7 +57,7 @@ always wrong.
 from __future__ import annotations
 
 import enum
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -66,7 +66,7 @@ from typing import Any, Literal
 from skillweaver.agent.compose import Composer
 from skillweaver.agent.critic import TieredCritic
 from skillweaver.agent.explorer import Explorer
-from skillweaver.agent.planner import PlanFailure, Planner
+from skillweaver.agent.planner import MIN_ACCOUNTED_FOR, PlanFailure, Planner, bind_args
 from skillweaver.config import Settings, settings
 from skillweaver.contracts import (
     Budget,
@@ -105,7 +105,7 @@ from skillweaver.perception.ocr import (
     PerceptionCounters,
     PerceptionCounts,
 )
-from skillweaver.skills.retrieve import SkillRetriever
+from skillweaver.skills.retrieve import SkillRetriever, accounted_for
 from skillweaver.skills.sandbox import SkillRunner
 from skillweaver.skills.store import FileSkillStore
 from skillweaver.skills.synthesize import (
@@ -123,6 +123,7 @@ __all__ = [
     "Agent",
     "AttemptRecord",
     "ComposedPerceiver",
+    "DomainChoice",
     "EnvironmentFor",
     "NavigatingEnvironment",
     "PerceptionCounts",
@@ -142,6 +143,7 @@ __all__ = [
     "recall",
     "recall_end_state",
     "reset_world",
+    "resolve_domain",
     "task_spec",
     "world_reset_from_url",
 ]
@@ -317,6 +319,34 @@ class RunReport:
         )
 
     @property
+    def warm_missed(self) -> bool:
+        """Whether the library was consulted, could not plan the task, and exploring paid.
+
+        :attr:`rescued` is the louder cousin of this: there the library RAN something
+        and was wrong. Here it declined before touching the screen - an empty
+        namespace, no candidate, no route - and the run then explored.
+
+        That is a legitimate cold start on a task nobody has taught yet, and it is
+        also exactly what a lookup in the WRONG namespace looks like. The two are
+        indistinguishable from the outside, which is the whole problem: ``run``
+        without a ``--url`` used to resolve its domain to the literal string
+        ``"browser"``, miss a library it was standing next to, explore from a blank
+        page and print ``SOLVED by the cold path``. True, and useless. So every
+        fall-through says that the library was consulted and what it said, and the
+        verdict line says the answer cost full price - see :meth:`explain`. A cold
+        path that is reported as a plain success is how a defect like that survives
+        for months.
+        """
+        warm, cold = self.warm, self.cold
+        return (
+            warm is not None
+            and not warm.ok
+            and warm.performed_nothing
+            and cold is not None
+            and cold.ok
+        )
+
+    @property
     def llm_calls(self) -> int:
         """Model calls across every attempt of this run."""
         return sum(a.llm_calls for a in self.attempts)
@@ -352,12 +382,23 @@ class RunReport:
             offered = ", ".join(f"{c.skill.name} ({c.score:.2f})" for c in self.candidates)
             lines.append(f"retrieved: {offered}")
         else:
-            lines.append("retrieved: nothing - the library has no candidate for this task")
+            lines.append(
+                f"retrieved: nothing - the library holds no candidate for this task "
+                f"under domain {self.task.domain!r}"
+            )
         lines += [f"  {attempt}" for attempt in self.attempts]
         if self.rescued:
             lines.append(
                 "NOTE: a stored skill ran, did not work, and exploration rescued the "
                 "run. The library was WRONG about this task, not merely slow."
+            )
+        elif self.warm_missed:
+            warm = self.warm
+            assert warm is not None  # warm_missed says so
+            lines.append(
+                f"NOTE: the library was consulted first and missed at {warm.stage} - "
+                f"{warm.reason}. Exploration then paid the full cold-path price for "
+                f"this answer."
             )
         if self.learned is not None:
             lines.append(
@@ -374,8 +415,13 @@ class RunReport:
                 f"({eyes.hit_rate:.0%}), {eyes.detections} detection(s)"
             )
         verdict = "SOLVED" if self.ok else "NOT SOLVED"
+        # "SOLVED by the cold path" on its own reads as a plain success, and after a
+        # warm attempt that was tried and missed it is the single most misleading
+        # sentence this report can end on: the fast path did not apply, and the
+        # headline is where that has to be said.
+        after = " AFTER A WARM MISS" if (self.rescued or self.warm_missed) else ""
         lines.append(
-            f"{verdict} by the {self.decision} path "
+            f"{verdict} by the {self.decision} path{after} "
             f"in {self.steps} action(s) and {self.llm_calls} model call(s)"
         )
         return "\n".join(lines)
@@ -617,7 +663,10 @@ class Agent:
                     path="warm",
                     ok=False,
                     stage="empty_library",
-                    reason=f"the library holds no skill for domain {task.domain!r}",
+                    reason=(
+                        f"the library holds no skill for domain {task.domain!r}"
+                        f"{self._held_elsewhere(task.domain)}"
+                    ),
                 ),
                 None,
             )
@@ -658,6 +707,24 @@ class Agent:
 
         failure = self._planner.last_failure
         return self._warm_failure(task, failure), None
+
+    def _held_elsewhere(self, domain: str) -> str:
+        """What the library holds under OTHER domains, as a clause to append.
+
+        "The library holds no skill for domain 'browser'" is true and stops one
+        question short of the answer. Naming the namespaces that DO hold something is
+        what turns it into a diagnosis: a reader who sees ``'browser'`` empty while
+        ``en.wikipedia.org`` holds four skills has been handed the bug rather than a
+        shrug. Empty is worth saying too - it is the ordinary first run.
+        """
+        try:
+            others = sorted({s.domain for s in self._store.list() if s.domain != domain})
+        except SkillWeaverError:  # a report is not worth failing a run for
+            return ""
+        if not others:
+            return "; the library holds nothing under any other domain either"
+        named = ", ".join(others[:4]) + (", ..." if len(others) > 4 else "")
+        return f"; it DOES hold skills under {len(others)} other domain(s): {named}"
 
     @staticmethod
     def _warm_failure(task: TaskSpec, failure: PlanFailure | None) -> AttemptRecord:
@@ -1134,6 +1201,239 @@ def _host(url: str | None) -> str | None:
 
     parsed = urlparse(url if "//" in url else f"//{url}")
     return parsed.hostname or None
+
+
+# --------------------------------------------------------------------------------------
+# Which namespace a task means
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DomainChoice:
+    """Which library namespace a task belongs to, and on whose authority.
+
+    Attributes:
+        domain: The namespace to file under and to look in.
+        start_url: Where to open the world, when something knows. For a looked-up
+            domain this is the page the winning skill's start screen was last seen
+            at, which is what makes a bare repeat runnable at all.
+        source: Who decided. ``"named"`` a ``--domain``; ``"url"`` the host of a
+            ``--url``; ``"library"`` a stored skill that answered for this task;
+            ``"target"`` nothing did, and the target's own name is the fallback.
+        skill: The skill that answered, for ``"library"``. Empty otherwise.
+        score: That skill's retrieval score.
+        why: One line for a human: what was consulted and what it said.
+    """
+
+    domain: str
+    start_url: str | None = None
+    source: Literal["named", "url", "library", "target"] = "target"
+    skill: str = ""
+    score: float = 0.0
+    why: str = ""
+
+    @property
+    def looked_up(self) -> bool:
+        """Whether the library, rather than the caller, named this domain."""
+        return self.source == "library"
+
+    def __str__(self) -> str:
+        head = f"{self.domain}"
+        if self.skill:
+            head += f" (from {self.skill}, {self.score:.2f})"
+        return f"{head} - {self.why}" if self.why else head
+
+
+def resolve_domain(
+    text: str,
+    *,
+    target: Literal["browser", "desktop"] = "browser",
+    url: str | None = None,
+    domain: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    retriever: SkillRetriever | None = None,
+    graph: SiteGraph | None = None,
+    k: int = 10,
+) -> DomainChoice:
+    """Which library namespace ``text`` means, when the caller did not say.
+
+    A skill is filed under a domain, and a lookup happens in one. ``learn`` is given
+    a ``--url``, so what it stores is filed under that host. A repeat has no reason to
+    pass one - the whole point is that the agent already knows how - and resolving
+    that silence to the literal target (``"browser"``) files the lookup in a namespace
+    nothing is ever stored in. The miss is then guaranteed, and the run explores from
+    a blank page and reports a plain success at full cold-path price. That is not a
+    corner case: it is the two commands this project's own README tells a new user to
+    type, and it made the project's entire claim untestable from the command line.
+
+    So the silence is resolved by ASKING THE LIBRARY instead of guessing: every
+    domain is searched, and the best candidate that the planner would actually run
+    names its own domain. Where the caller did say - a ``--domain``, or a ``--url``
+    to take the host of - nothing is looked up and what they said stands.
+
+    Ranking is not the authority here, and cannot be
+    ------------------------------------------------
+
+    Retrieval RANKS, so it has a winner whenever the library is non-empty, and a
+    library with one skill in it ranks that skill first for every sentence in the
+    world. Letting the top of a cross-domain ranking name the domain would therefore
+    send a Wikipedia task to a grocery site for no better reason than that the
+    grocery site was the only thing stored - the same mistake, in a new place, that
+    :data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR` was calibrated to stop
+    (short generic names rank perfectly and account for nothing; see
+    :mod:`skillweaver.skills.retrieve`).
+
+    So a candidate only gets to name the domain when it passes the planner's own
+    admission question: does it account for the whole request
+    (:func:`~skillweaver.skills.retrieve.accounted_for` against
+    :data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR`)? That is the same test, run
+    with the same code, that decides whether a skill is worth performing at all. When
+    nothing passes it, nothing is resolved and ``source`` is ``"target"``, which the
+    report then states rather than dressing up as a cold start that was always going
+    to be cold.
+
+    Arguments count towards that account exactly as they do in the planner, and for
+    the same reason - a skill learned on *Ada Lovelace* has no text about
+    *photosynthesis*, and ordering it to search for one is what it is FOR. They are
+    taken from :func:`~skillweaver.agent.planner.bind_args` when it binds them for
+    free, and from the caller's own ``-p`` values otherwise. What is deliberately NOT
+    reachable from here is the composer: it binds a sentence the cheap binder cannot,
+    and it costs a model call to do it, which is not a price a question about
+    NAMESPACES may pay. So a candidate the composer would have rescued is judged on
+    its bare text here, which is the strict direction.
+
+    Measured against the live Wikipedia library on 2026-09-19, for *Search Wikipedia
+    for computer vision and open the article*: the skill learned from that exact
+    sentence accounts for 1.000 of it, the one learned from *Ada Lovelace* for 0.667
+    and a link-following skill for 0.500, while a grocery errand scores 0.000 against
+    all three. The cut sits in the gap rather than on top of a case.
+
+    Args:
+        text: The task, in the words it was asked in.
+        target: Which world it drives.
+        url: ``--url``, if given. Its host wins when there is one.
+        domain: ``--domain``, if given. Always wins.
+        params: The values the caller supplied (``-p``), which count towards a
+            candidate's account of the request exactly as they do in the planner.
+        retriever: Retrieval over the whole library. ``None`` disables the lookup,
+            which leaves the old fallback and is what a caller with no library wants.
+        graph: The site graph, consulted only to find where the winning skill's start
+            screen lives. ``None`` means the caller gets a domain and no URL.
+        k: How many candidates to consider.
+
+    Returns:
+        A :class:`DomainChoice`. Never raises: a retrieval or graph failure leaves the
+        domain unresolved, because failing to look something up is not a reason to
+        refuse to run.
+    """
+    if domain:
+        return DomainChoice(domain=domain, start_url=url, source="named", why="named with --domain")
+    host = _host(url) if target == "browser" else None
+    if host:
+        return DomainChoice(domain=host, start_url=url, source="url", why="the host of --url")
+    if target != "browser" or retriever is None:
+        return DomainChoice(
+            domain=target,
+            start_url=url,
+            source="target",
+            why="nothing named a domain, so the target's own name is used",
+        )
+
+    probe = TaskSpec(text=text, domain="", target=target, params=dict(params or {}))
+    try:
+        candidates = retriever.search(text, domain=None, k=k)
+    except SkillWeaverError as exc:
+        log.warning("domain.lookup.failed", task=text, error=str(exc))
+        return DomainChoice(
+            domain=target,
+            start_url=url,
+            source="target",
+            why=f"the library could not be searched ({exc})",
+        )
+
+    passed_over: list[str] = []
+    for candidate in candidates:
+        skill = candidate.skill
+        # The planner's own question, never asked more loosely than the planner asks
+        # it: the arguments when they bind for free, and the skill's bare text when
+        # they do not - because what binds them there is the composer, which costs a
+        # model call and cannot run before the browser is even open.
+        args = bind_args(skill, probe) or probe.params
+        share = accounted_for(text, skill, args)
+        if share < MIN_ACCOUNTED_FOR:
+            passed_over.append(f"{skill.name}@{skill.domain} (accounts for {share:.0%})")
+            continue
+        log.info(
+            "domain.resolved",
+            task=text,
+            domain=skill.domain,
+            skill=skill.name,
+            score=round(candidate.score, 3),
+            accounted_for=round(share, 3),
+            passed_over=", ".join(passed_over) or "(none)",
+        )
+        return DomainChoice(
+            domain=skill.domain,
+            start_url=_where_it_starts(graph, skill) or url,
+            source="library",
+            skill=skill.name,
+            score=candidate.score,
+            why=(
+                f"the library answered: {skill.name} accounts for "
+                f"{share:.0%} of this request and is filed under {skill.domain}"
+            ),
+        )
+
+    log.info(
+        "domain.unresolved",
+        task=text,
+        considered=len(candidates),
+        passed_over=", ".join(passed_over) or "(none)",
+    )
+    return DomainChoice(
+        domain=target,
+        start_url=url,
+        source="target",
+        why=(
+            f"the whole library was searched and no stored skill accounts for this "
+            f"request ({_or_nothing(passed_over)}), so the target's own name is used"
+        ),
+    )
+
+
+def _or_nothing(passed_over: Sequence[str]) -> str:
+    """``passed_over`` as one clause, naming what was looked at and turned down."""
+    if not passed_over:
+        return "it holds nothing"
+    return "passed over " + "; ".join(passed_over[:4])
+
+
+def _where_it_starts(graph: SiteGraph | None, skill: Skill) -> str | None:
+    """The URL ``skill``'s start screen was last seen at, or ``None``.
+
+    Resolving the domain is only half of a bare repeat: the browser still has to open
+    somewhere, and a warm attempt against ``about:blank`` fails at ``no_route`` having
+    consulted the right library. The site graph already records where each screen was
+    seen (:attr:`~skillweaver.contracts.UIState.url_pattern`), and the skill declares
+    which screen it starts on, so the two together answer it without a new memory and
+    without a guess.
+
+    A graph that has never seen that screen answers ``None`` and the caller keeps
+    whatever URL it had, which is the honest outcome: the domain is still right, and
+    the warm attempt will report what it could not route to.
+    """
+    if graph is None or skill.precondition is None:
+        return None
+    try:
+        graph.load(skill.domain)
+        states = graph.states(skill.domain)
+    except SkillWeaverError as exc:
+        log.warning("domain.graph.unreadable", domain=skill.domain, error=str(exc))
+        return None
+    for state in states:
+        if state.fingerprint == skill.precondition and state.url_pattern:
+            return state.url_pattern
+    return None
 
 
 class ResetRefused(OSError):

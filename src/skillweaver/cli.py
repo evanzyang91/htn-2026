@@ -44,10 +44,12 @@ from skillweaver.config import Settings, load_settings, settings
 from skillweaver.contracts import Skill, Transition, UIState, action_to_dict
 from skillweaver.errors import ConfigError, SkillNotFound, SkillWeaverError
 from skillweaver.orchestrator import (
+    DomainChoice,
     RunReport,
     Workbench,
     budget_from,
     build_workbench,
+    resolve_domain,
     task_spec,
 )
 
@@ -181,7 +183,9 @@ DomainOpt = Annotated[
     typer.Option(
         "--domain",
         help="Site or app the task belongs to ('acme.test', 'desktop:finder'). "
-        "Defaults to the host of --url, or to the target.",
+        "Defaults to the host of --url. With neither, the whole library is searched "
+        "and a stored skill that accounts for this task names its own domain - which "
+        "is what lets a warm repeat drop the --url the learn run needed.",
         show_default=False,
     ),
 ]
@@ -327,6 +331,12 @@ def run_command(
     screen it starts on, run its Python, verify. A warm hit consults NO model in the
     action loop, and the printed report says so with a call count.
 
+    `--url` is not needed for a task that has been learned. With no `--url` and no
+    `--domain` the library is searched across every domain, and a stored skill that
+    accounts for this request names both the domain to look in and the page to open;
+    the run says which skill answered. Without that, a repeat would look for the
+    skill under the literal name of the target and never find it.
+
     If the library cannot plan the task - or plans it, runs it, and the result does
     not pass verification - the run falls through to exploration. That fall-through is
     always reported: a warm attempt that failed and was rescued is the most important
@@ -378,23 +388,48 @@ def _do(
         max_usd=usd,
         max_llm_calls=calls,
     )
-    spec = task_spec(
+    params = _params(param)
+    where = resolve_domain(
         text,
-        domain=domain,
         target=target,  # type: ignore[arg-type]
         url=url,
+        domain=domain,
+        params=params,
+        retriever=bench.retriever if warm else None,
+        graph=bench.graph if warm else None,
+    )
+    spec = task_spec(
+        text,
+        domain=where.domain,
+        target=target,  # type: ignore[arg-type]
+        url=where.start_url,
         reset_url=reset_url,
-        params=_params(param),
+        params=params,
     )
     try:
         with bench.session(spec, budget) as agent:
             report = agent.run(spec, learn=learn, warm=warm, cold=cold)
     except SkillWeaverError as exc:
         _die(f"the run could not start: {exc}")
-    _emit(_report_json(report) if as_json else report.explain(), as_json)
+    if where.looked_up and not as_json:
+        _say_where(where)
+    _emit(_report_json(report, where) if as_json else report.explain(), as_json)
     if not as_json:
         _hint_at_reset(report, reset_url)
     raise typer.Exit(OK if report.ok else NO)
+
+
+def _say_where(where: DomainChoice) -> None:
+    """Announce a domain the caller did not name and the library did.
+
+    A run that resolves its own namespace has made a decision on the caller's behalf,
+    and a decision nobody can see is one nobody can correct. Printed only when the
+    library answered, because a ``--domain`` or a ``--url`` repeated back is noise.
+    """
+    typer.echo(
+        f"resolved: {where.domain} - {where.why}"
+        + (f"\n          starting at {where.start_url}" if where.start_url else "")
+    )
 
 
 def _apply_skill_seconds(seconds: float | None) -> None:
@@ -454,7 +489,7 @@ def _params(pairs: Sequence[str] | None) -> dict[str, Any]:
     return out
 
 
-def _report_json(report: RunReport) -> dict[str, Any]:
+def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[str, Any]:
     """The report as data: the same facts ``explain`` prints, for a harness to read.
 
     ``perception`` sits beside ``llm_calls`` for the reason it sits beside it in the
@@ -470,7 +505,9 @@ def _report_json(report: RunReport) -> dict[str, Any]:
         "task": report.task.text,
         "domain": report.task.domain,
         "decision": report.decision,
+        "domain_resolved_by": where.source if where is not None else "named",
         "rescued": report.rescued,
+        "warm_missed": report.warm_missed,
         "llm_calls": report.llm_calls,
         "steps": report.steps,
         "perception": {

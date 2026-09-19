@@ -134,7 +134,15 @@ from skillweaver.logging_ import get_logger
 from skillweaver.skills.api import LimitExceeded
 from skillweaver.skills.retrieve import accounted_for, unaddressed
 
-__all__ = ["FRAME_WORDS", "FailureStage", "PlanFailure", "Planner", "Rejection"]
+__all__ = [
+    "FRAME_WORDS",
+    "MIN_ACCOUNTED_FOR",
+    "FailureStage",
+    "PlanFailure",
+    "Planner",
+    "Rejection",
+    "bind_args",
+]
 
 log = get_logger(__name__)
 
@@ -412,9 +420,7 @@ class Planner:
         stage: FailureStage = "no_candidates"
         for candidate in candidates[: self._max_candidates]:
             skill = candidate.skill
-            args = _bind_args(skill, task)
-            if args is None:
-                args = _bind_from_text(skill, task)
+            args = bind_args(skill, task)
             if args is None:
                 stage = "unbindable_args"
                 reason = (
@@ -731,6 +737,27 @@ class Planner:
     def _mean_ms(self, call: SkillCall) -> float:
         skill = self._lookup(call)
         return skill.stats.mean_ms if skill is not None else 0.0
+
+
+def bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
+    """The arguments ``skill`` would be called with for ``task``, or ``None`` to decline.
+
+    The model-free half of the warm path, in one name: the values the caller supplied
+    (:func:`_bind_args`), and failing that the one value the task's own wording
+    differs from the sentence the skill was learned in (:func:`_bind_from_text`).
+
+    Public because binding is half of "would the planner run this skill for this
+    task?", and that whole question is asked in a second place - resolving which
+    DOMAIN a bare ``run`` means, in
+    :func:`~skillweaver.orchestrator.resolve_domain`. Asking it there with a
+    reimplemented binder would be asking a different question in the same words: a
+    parameterized repeat binds its argument from the task's wording, and
+    :func:`~skillweaver.skills.retrieve.accounted_for` only clears
+    :data:`MIN_ACCOUNTED_FOR` once that argument is in hand. One definition, so the
+    two callers cannot drift apart.
+    """
+    args = _bind_args(skill, task)
+    return args if args is not None else _bind_from_text(skill, task)
 
 
 def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:

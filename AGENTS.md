@@ -139,6 +139,25 @@ winner even when nothing fits, so closest is not runnable until it has an accoun
 the whole request (`MIN_ACCOUNTED_FOR` in `src/skillweaver/agent/planner.py`, which
 carries the measurements it was calibrated from).
 
+A skill is FILED under a domain and a lookup HAPPENS in one, so the project's whole
+claim rests on the two agreeing - and the two commands the README tells a new user to
+type do not name the same one. `learn` is given a `--url`, so what it stores is filed
+under that host; the repeat has no reason to pass one, because the point is that the
+agent already knows how. That silence is resolved by searching every domain and
+letting a skill that accounts for the request name its own, plus the page its start
+screen was last seen at, in `resolve_domain` (`orchestrator.py`). Resolution is never
+looser than the planner's own gate and deliberately cannot reach the composer, so a
+verbatim repeat whose argument was never quoted is judged on the skill's bare text -
+`bind_args` binds only from a quoted slot, which is why such a repeat is warm for ONE
+composer call rather than zero. Drive the acceptance path WITHOUT `--domain`: a test
+that passes it to both commands cannot see any of this, which is how the namespaces
+were free to disagree for months.
+
+And a fall-through is not a success. A warm attempt that missed and was rescued by
+exploration reports the miss in its headline (`RunReport.warm_missed` and `rescued`,
+`orchestrator.py`); `SOLVED by the cold path` on its own is the sentence that hid the
+defect above, because it is what a demo and a measurement both quote.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
