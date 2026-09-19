@@ -517,20 +517,65 @@ ERROR_PHRASES: tuple[str, ...] = (
     r"unable to",
     r"could ?n[o']?t",
     r"must be",
-    r"please (?:enter|select|provide|correct|fix|choose)",
+    r"please (?:correct|fix)",
     r"warning",
     r"exception",
     r"timed out",
     r"unauthori[sz]ed",
     r"forbidden",
     r"does ?n[o']?t match",
+    r"not found",
+    r"not available",
 )
 """Word-boundary patterns that mark a dialog, alert or validation message.
 
 Deliberately a *phrase* list rather than single alarming words: ``"required"`` alone
 fires on the label "Required fields are marked", while ``"is required"`` and
-``"required field"`` only fire on the message. Everything here was chosen to be rare in
-ordinary UI chrome and common in failure text.
+``"required field"`` only fire on the message.
+
+**A call to action is not a failure, and this list once could not tell the two apart.**
+It carried ``please (?:enter|select|provide|correct|fix|choose)``, which is form copy
+at least as often as it is validation copy: Wikipedia's own fundraising appeal says
+"Please select an amount (CAD)", so a run that had just finished correctly was told its
+end screen was an error state and went off to fight a banner. The appeal is blocked at
+the controller now (``SOMETIMES_ONLY_OVERLAYS`` in :mod:`skillweaver.controllers.browser`)
+but the pattern would still fire on any page with a form call to action, so the verbs
+that only ASK - enter, select, provide, choose - are gone and only the two that follow a
+failure are kept.
+
+Measured on 2026-09-19 over 47 captured frames, each one a real screen read by the
+shipped OCR: 11 distinct observations from the runs in ``data/trajectories``, the 7
+committed detector fixtures, 27 pages opened headless (Wikipedia article, main page,
+login, create-account, search, upload wizard, donate; python.org home and login;
+github.com login; sqlite.org home and forum; 8 sandbox screens), and two forced
+fundraising appeals - the copy this defect came from, which only renders with the
+controller's blocking turned off. 42 of them carry no error; 5 do (python.org and
+sqlite.org 404s, a GitHub 404, Wikipedia's permission-denied edit page and its
+missing-article page).
+
+===========================  =========================  ====================
+pattern set                  ordinary frames that fire  error frames caught
+===========================  =========================  ====================
+before                       3 of 42 (7.1%)             1 of 5
+``please`` verbs narrowed    1 of 42 (2.4%)             1 of 5
+plus ``not found``/``not
+available``                  1 of 42 (2.4%)             2 of 5
+===========================  =========================  ====================
+
+The two additions are the only candidates of two dozen tried that caught a real error
+frame and fired on NO ordinary one; everything else that sounded like failure text
+(``sorry``, ``no permission``, ``does not exist``) is left out because the corpus gave
+no evidence for it. The one false positive left is an sqlite.org forum thread whose
+TITLE quotes ``"runtime error : unique constraint failed"``: a page discussing an error
+reads exactly like a page showing one, and no word list separates them.
+
+**Recall is low here for a reason that is not vocabulary.** Three of the four missed
+error frames are missed because OCR runs words together - Wikipedia's permission page
+reads ``donothavepermissionto edit thispage``, so ``\\bpermission\\b`` never matches.
+Matching against the text with all spacing removed recovers that frame and costs one
+more false positive (a Wikipedia search-results page), which is not a trade this corpus
+justifies taking; it is written down here so the next attempt starts from the
+measurement rather than from the word list.
 """
 
 _ERROR_RE = re.compile(r"\b(?:" + "|".join(ERROR_PHRASES) + r")\b", re.IGNORECASE)

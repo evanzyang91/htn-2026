@@ -78,14 +78,11 @@ from importlib import resources
 from typing import Any, Literal
 
 from skillweaver.contracts import (
-    Action,
     Controller,
     Critic,
-    Element,
     GraphView,
     LLMClient,
     LLMMessage,
-    Observation,
     Perceiver,
     Provenance,
     Skill,
@@ -98,10 +95,11 @@ from skillweaver.contracts import (
 from skillweaver.errors import SandboxViolation
 from skillweaver.logging_ import get_logger
 from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
-from skillweaver.skills.api import SkillLimits, describe_action
+from skillweaver.skills.api import SkillLimits
 from skillweaver.skills.model import SkillInvalid, make_skill
 from skillweaver.skills.refactor import Hardening, harden
 from skillweaver.skills.sandbox import SkillRunner, scan_code
+from skillweaver.trajectory.render import describe_trajectory
 
 __all__ = [
     "MIN_PRECONDITION_SIMILARITY",
@@ -111,6 +109,7 @@ __all__ = [
     "ReplayEnvironment",
     "Stage",
     "Synthesizer",
+    "describe_trajectory",
     "load_prompt",
 ]
 
@@ -132,12 +131,6 @@ starting screen, and they are not the same finding. ``"precondition"`` is a verd
 on the SKILL: the world was genuinely put back and the screen still does not match.
 ``"reset"`` is a verdict on the HARNESS: nothing put the world back, so the candidate
 was neither proved nor disproved and no amount of rewriting it would help."""
-
-_MAX_ELEMENTS = 18
-"""Elements described per recorded screen. Enough to write a lookup against, short
-enough that a long list does not bury the ones that were acted on."""
-
-_MAX_TEXT = 80
 
 _MAX_REPLY_TOKENS = 16000
 """Ceiling on the token cap a re-ask may escalate to.
@@ -370,91 +363,12 @@ class _Draft:
 # --------------------------------------------------------------------------------------
 # Describing the run to the model
 # --------------------------------------------------------------------------------------
-
-
-def _describe_element(element: Element) -> str:
-    text = element.text.strip().replace("\n", " ")
-    if len(text) > _MAX_TEXT:
-        text = text[: _MAX_TEXT - 1] + "…"
-    box = element.box
-    return f"  - {element.kind.value} {text!r} at ({box.x}, {box.y}) {box.w}x{box.h}"
-
-
-def _describe_screen(observation: Observation, label: str) -> str:
-    elements: Sequence[Element] = observation.elements[:_MAX_ELEMENTS]
-    url = observation.url or "none"
-    lines = [f"{label} (url: {url}, screen id: {observation.fingerprint.value})"]
-    lines.extend(_describe_element(e) for e in elements)
-    if len(observation.elements) > _MAX_ELEMENTS:
-        lines.append(f"  - ... and {len(observation.elements) - _MAX_ELEMENTS} more elements")
-    return "\n".join(lines)
-
-
-def _describe_target(observation: Observation, action: Action) -> str | None:
-    """Which element the action landed on, named the way a skill can name it again.
-
-    The recording says ``click (236, 121)`` and the skill may not write that down -
-    rule 6 of the prompt, and rightly, because a coordinate is a screenshot. But
-    without this line the model is left guessing WHICH element that coordinate was,
-    and a wrong guess is admitted or rejected by luck.
-
-    It was rejected. In a live run the model wanted a row "from Dana Whitfield",
-    searched for that text, found none - OCR never reads the sender names on this
-    page - and archived a different message instead. So the element is named twice
-    over: by its text where there is any, and always by its kind and its place in
-    reading order, which is a handle a skill CAN reproduce from pixels when text
-    fails. ``None`` for an action with no point (typing, a key press).
-    """
-    point = getattr(action, "point", None)
-    if point is None:
-        return None
-    hits = [e for e in observation.elements if e.box.contains(point)]
-    if not hits:
-        return None
-    element = min(hits, key=lambda e: e.box.area)
-    same_kind = [e for e in observation.elements if e.kind is element.kind]
-    ordinal = same_kind.index(element) + 1
-    text = element.text.strip().replace("\n", " ")
-    if len(text) > _MAX_TEXT:
-        text = text[: _MAX_TEXT - 1] + "\u2026"
-    kind = element.kind.value
-    reads = f"reading {text!r}" if text else "with NO readable text"
-    return (
-        f"  this landed on the {kind} {reads}, which is {kind} number {ordinal} "
-        f"of {len(same_kind)} in reading order"
-    )
-
-
-def describe_trajectory(trajectory: Trajectory) -> str:
-    """The recorded run as the text the model is asked to write a skill from.
-
-    Deterministic for a given trajectory - no timestamps, no ordering by dict - so
-    the same run produces the same request, which is what makes an LLM cassette
-    replay and a repair prompt diffable.
-    """
-    parts = [
-        f"TASK: {trajectory.task}",
-        f"DOMAIN: {trajectory.domain}",
-        f"STEPS: {len(trajectory.steps)}",
-        "",
-    ]
-    if trajectory.steps:
-        parts.append(_describe_screen(trajectory.steps[0].before, "STARTING SCREEN"))
-        parts.append("")
-    for step in trajectory.steps:
-        parts.append(f"STEP {step.index}: {describe_action(step.action)}")
-        target = _describe_target(step.before, step.action)
-        if target:
-            parts.append(target)
-        if step.note:
-            parts.append(f"  reason given at the time: {step.note}")
-        parts.append(_describe_screen(step.after, "  screen after"))
-        parts.append("")
-    if trajectory.steps:
-        parts.append(_describe_screen(trajectory.steps[-1].after, "FINAL SCREEN (the goal)"))
-    parts.append("")
-    parts.append("Write the skill for this task as the JSON object described above.")
-    return "\n".join(parts)
+#
+# :func:`~skillweaver.trajectory.render.describe_trajectory` is the whole of it, and it
+# lives with the recording rather than here: what a trajectory MEANS - which steps were
+# one move, which moves the critic threw out - is a property of the recording, and this
+# module only asks for it. Re-exported because that is where every caller and test
+# already reaches for it.
 
 
 def _repair_brief(attempt: Attempt) -> str:

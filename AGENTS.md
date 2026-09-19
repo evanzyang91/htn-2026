@@ -169,6 +169,14 @@ composer call rather than zero. Drive the acceptance path WITHOUT `--domain`: a 
 that passes it to both commands cannot see any of this, which is how the namespaces
 were free to disagree for months.
 
+A trajectory step is one ACTION, not one decision. A move that ran a code block is
+several steps, and the agent's stated reason and the critic's verdict both sit on its
+LAST one, so anything reading a recording has to regroup before it can say what the run
+meant: `moves_of` in `trajectory/render.py`, which is also where the run is turned into
+the text the synthesizer is shown. A rejected move there fell short of what it CLAIMED -
+measured on one whose action the task still needed - so it is marked as suspect and
+never dropped.
+
 And a fall-through is not a success. A warm attempt that missed and was rescued by
 exploration reports the miss in its headline (`RunReport.warm_missed` and `rescued`,
 `orchestrator.py`); `SOLVED by the cold path` on its own is the sentence that hid the

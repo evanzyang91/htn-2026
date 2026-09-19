@@ -434,6 +434,37 @@ class TestNoErrorState:
             result = C.no_error_state()(observe(scenario, "list"), observe(scenario, state))
             assert result.outcome is C.Outcome.passed, state
 
+    @pytest.mark.parametrize(
+        "copy",
+        [
+            "Please select an amount (CAD). The average donation in Canada is around $12.",
+            "Please enter your username",
+            "Please provide a shipping address",
+            "Please choose a payment method",
+        ],
+    )
+    def test_a_call_to_action_is_not_a_failure(self, scenario: Scenario, copy: str) -> None:
+        """The first of these is Wikipedia's fundraising appeal, which once demoted a
+        CORRECT end screen to an error state and sent the explorer off to fight a
+        banner. Asking is not failing; see ``ERROR_PHRASES`` for the measurement."""
+        result = C.no_error_state()(observe(scenario, "list"), make_obs((element(copy, y=200),)))
+
+        assert result.outcome is C.Outcome.passed, result.reason
+
+    @pytest.mark.parametrize(
+        "copy",
+        [
+            "Error 404: File not found",
+            "The document /doesnotexist.html is not available on this server",
+            "Please correct the highlighted fields",
+            "Payment declined. Please try again.",
+        ],
+    )
+    def test_real_failure_copy_still_fails(self, scenario: Scenario, copy: str) -> None:
+        result = C.no_error_state()(observe(scenario, "list"), make_obs((element(copy, y=200),)))
+
+        assert result.outcome is C.Outcome.failed, result.reason
+
 
 # --------------------------------------------------------------------------------------
 # Composition
