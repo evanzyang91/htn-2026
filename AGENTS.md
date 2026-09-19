@@ -11,6 +11,11 @@ Two rules the code cannot tell you, because this repository is built by many wor
 
 Test without a browser, a model or a network by using the doubles in `tests/fakes/` (fixtures in `tests/conftest.py`; `tests/fakes/scenario.py` is a small fake app to drive).
 
+`ultralytics` installs its own top-level `tests` package into the venv, which shadows this
+repository's `tests/` in any plain `python` process. Pytest is unaffected; a script that needs
+the fakes must bind them first:
+`sys.modules["tests"] = types.ModuleType("tests"); sys.modules["tests"].__path__ = ["tests"]`.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
