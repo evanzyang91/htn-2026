@@ -319,3 +319,192 @@ def test_a_run_missing_its_attempt_falls_back_to_its_position() -> None:
 def test_a_malformed_report_yields_empty_metrics_rather_than_a_traceback(report: dict) -> None:
     """This is a reporting path: a summary that says "nothing to report" beats a crash."""
     assert suite_metrics_from_report(report).tasks == ()
+
+
+# --------------------------------------------------------------------------------------
+# The guard: a run that failed ground truth cannot reach a number
+# --------------------------------------------------------------------------------------
+#
+# The 2026-09-19 ordering suite found the shape these tests are about. The task
+# `order_appears_in_history` retrieved a trivial navigation skill, ran it in 4 to 8
+# seconds with ZERO model calls, and got the task wrong all four times - faster and
+# cheaper than every honest run in the suite. A wrong answer is the cheapest answer
+# this architecture can give, so every efficiency figure improves when the library is
+# confidently wrong, and only ground truth points the other way.
+
+
+def wrong(attempt: int, ms: float, *, calls: int = 0, used_library: bool = True) -> RunPoint:
+    """A warm run the referee failed: fast, free and wrong, the dangerous shape."""
+    return RunPoint(
+        attempt=attempt, ok=False, wall_ms=ms, llm_calls=calls, usd=0.0, used_library=used_library
+    )
+
+
+def test_a_failed_run_cannot_move_a_single_reported_figure() -> None:
+    """The guard stated as a property rather than a case.
+
+    Whatever the failed runs look like - 1ms, no model calls, free, carried by the
+    library - every number computed from the successes is bit-for-bit the same as if
+    they had never been recorded. If this ever fails, some figure found a second way
+    in and the door in :func:`_measured` is no longer the only one.
+    """
+    honest = [cold(4000.0, calls=14, usd=0.40), warm(2, 500.0), warm(3, 700.0)]
+    polluted = [*honest, wrong(4, 1.0), wrong(5, 8.0, calls=0), wrong(6, 40.0)]
+
+    clean, dirty = task_metrics("t", honest), task_metrics("t", polluted)
+    for field in (
+        "cold_ms",
+        "warm_ms",
+        "speedup",
+        "cold_llm_calls",
+        "warm_llm_calls",
+        "call_reduction",
+        "cold_usd",
+        "warm_usd",
+        "comparable",
+    ):
+        assert getattr(clean, field) == getattr(dirty, field), field
+    assert dirty.speedup == pytest.approx(4000.0 / 600.0)
+    assert dirty.warm_failures == 3
+
+
+def test_a_suite_headline_is_unmoved_by_failed_runs_however_fast_they_were() -> None:
+    """The same property one level up, where the number actually gets quoted."""
+    honest = task_metrics("t", [cold(4000.0), warm(2, 500.0), warm(3, 700.0)])
+    polluted = task_metrics("t", [cold(4000.0), warm(2, 500.0), warm(3, 700.0), wrong(4, 1.0)])
+    assert suite_metrics([polluted]).pooled_speedup == suite_metrics([honest]).pooled_speedup
+    assert suite_metrics([polluted]).mean_speedup == suite_metrics([honest]).mean_speedup
+    assert suite_metrics([polluted]).total_call_reduction == (
+        suite_metrics([honest]).total_call_reduction
+    )
+
+
+def test_the_fast_and_wrong_shape_is_named_rather_than_averaged_away() -> None:
+    """`order_appears_in_history` as it actually ran: 91s cold, four warm runs at
+    4-8s with no model calls, every one of them wrong."""
+    metrics = task_metrics(
+        "order_appears_in_history",
+        [
+            cold(91_000.0, calls=19),
+            wrong(2, 4_200.0),
+            wrong(3, 8_100.0),
+            wrong(4, 5_400.0),
+            wrong(5, 6_300.0),
+        ],
+    )
+    assert metrics.speedup is None, "a wrong answer is not a fast answer"
+    assert metrics.warm_failures == 4
+    assert metrics.warm_failures_from_library == 4, "a stored skill carried every one of them"
+    assert metrics.warm_failed_llm_calls == 0.0, "free, and wrong"
+    assert metrics.warm_failed_ms == pytest.approx(6_000.0)
+    assert metrics.flattered_by_failures is True
+    # The report file must carry all of it, not just the objects in memory: the
+    # dashboard and anyone auditing the numbers read the JSON, not this dataclass.
+    written = metrics.to_json()
+    assert written["speedup"] is None
+    assert written["warm_failed_ms"] == 6_000.0
+    assert written["warm_failed_llm_calls"] == 0.0
+    assert written["warm_failures_from_library"] == 4
+    assert written["flattered_by_failures"] is True
+    assert "every warm run failed" in metrics.note
+    assert "excluded" in metrics.note
+    assert "carried by a stored skill" in metrics.note
+    assert "flattered" in metrics.note
+
+
+def test_a_comparable_task_still_says_what_its_speedup_left_out() -> None:
+    """The quieter half: the speedup is real, and it is an average of two runs out of
+    three. A note saying so is the difference between a figure and an auditable one."""
+    metrics = task_metrics("flaky", [cold(1000.0), warm(2, 250.0), wrong(3, 10.0), warm(4, 350.0)])
+    assert metrics.speedup == pytest.approx(1000.0 / 300.0), "unchanged by the failure"
+    assert metrics.warm_failed_ms == 10.0
+    assert metrics.flattered_by_failures is True
+    assert "1 of 3 warm run(s) failed ground truth" in metrics.note
+    assert "would have flattered this task" in metrics.note
+
+
+def test_a_slow_failure_is_excluded_but_is_not_called_flattering() -> None:
+    """A run that failed slowly would have made the report look WORSE, so excluding
+    it is not what saved the number and the note does not claim it was."""
+    metrics = task_metrics("slow_fail", [cold(1000.0), warm(2, 250.0), wrong(3, 9_000.0)])
+    assert metrics.speedup == 4.0
+    assert metrics.flattered_by_failures is False
+    assert "failed ground truth" in metrics.note
+    assert "flattered" not in metrics.note
+
+
+def test_a_healthy_task_keeps_an_empty_note() -> None:
+    """The note column only speaks when something is wrong, so every word in it counts."""
+    assert task_metrics("clean", [cold(1000.0), warm(2, 250.0)]).note == ""
+
+
+def test_the_suite_names_every_task_its_failures_would_have_flattered() -> None:
+    flattered = task_metrics("order_appears_in_history", [cold(91_000.0), wrong(2, 4_000.0)])
+    honest = task_metrics("remove_from_cart", [cold(60_000.0), warm(2, 4_300.0)])
+    summary = suite_metrics([flattered, honest])
+
+    assert summary.flattered_tasks == ("order_appears_in_history",)
+    assert summary.warm_runs == 2
+    assert summary.warm_runs_excluded == 1
+    assert summary.wrong_skill_runs == 1
+    assert summary.pooled_speedup == pytest.approx(60_000.0 / 4_300.0), (
+        "the flattered task contributes nothing to the headline"
+    )
+    assert "order_appears_in_history" in summary.warm_failures
+    assert summary.to_json()["flattered_tasks"] == ["order_appears_in_history"]
+
+
+# --------------------------------------------------------------------------------------
+# Where a report's verdict comes from
+# --------------------------------------------------------------------------------------
+
+
+def test_the_referees_checks_outrank_a_bare_ok_in_the_report() -> None:
+    """A report carries the referee's ``score`` and a one-boolean ``ok``. Only one of
+    them is evidence, so only one of them decides."""
+    point = RunPoint.from_mapping(
+        {"attempt": 2, "ok": True, "wall_ms": 40.0, "score": {"ok": False, "checks": []}}
+    )
+    assert point.ok is False
+    assert point.verified is True
+
+
+def test_a_report_without_the_referees_checks_is_read_but_marked_unverified() -> None:
+    point = RunPoint.from_mapping({"attempt": 1, "ok": True, "wall_ms": 40.0})
+    assert point.ok is True
+    assert point.verified is False
+
+    metrics = task_metrics(
+        "unchecked",
+        [point, RunPoint.from_mapping({"attempt": 2, "ok": True, "wall_ms": 10.0})],
+    )
+    assert metrics.speedup == 4.0, "an unverified report is still readable"
+    assert metrics.unverified_runs == 2
+    assert "taken on trust" in metrics.note
+
+
+def test_a_failed_run_in_a_report_file_is_excluded_the_same_way() -> None:
+    """End to end through the reader the dashboard shares, because that is the path a
+    published number actually travels."""
+    report = {
+        "tasks": [
+            {
+                "task_id": "order_appears_in_history",
+                "runs": [
+                    {"attempt": 1, "ok": True, "wall_ms": 91_000.0, "llm_calls": 19},
+                    {
+                        "attempt": 2,
+                        "ok": True,  # what a run that did not check would have said
+                        "wall_ms": 4_200.0,
+                        "llm_calls": 0,
+                        "skill_used": "open_top_nav_tab",
+                        "score": {"ok": False, "checks": []},
+                    },
+                ],
+            }
+        ]
+    }
+    summary = suite_metrics_from_report(report)
+    assert summary.pooled_speedup is None, "21x, had the bare ok been believed"
+    assert summary.tasks[0].warm_failures_from_library == 1
+    assert summary.flattered_tasks == ("order_appears_in_history",)

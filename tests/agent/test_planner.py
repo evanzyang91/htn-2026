@@ -23,7 +23,7 @@ import pytest
 
 from skillweaver.agent.compose import Composer, Decomposition
 from skillweaver.agent.critic import CriticVerdict, TieredCritic
-from skillweaver.agent.planner import PlanFailure, Planner
+from skillweaver.agent.planner import MIN_ACCOUNTED_FOR, PlanFailure, Planner
 from skillweaver.contracts import (
     Action,
     Click,
@@ -371,6 +371,158 @@ def test_a_skill_whose_arguments_the_task_cannot_supply_is_not_run(
     assert planner.plan(task, look(scenario)) is None
     assert planner.last_failure is not None
     assert planner.last_failure.stage == "unbindable_args"
+    assert performed(scenario) == []
+
+
+# -- a candidate that has no account of the task ---------------------------------------------
+#
+# The ordering suite of 2026-09-19 asked for "order two Vegetable Rolls from Sakura
+# Counter, then open the Orders tab and confirm the order is listed there" and the
+# library answered with a skill that opens a navigation tab. It bound, it routed, it
+# ran in four seconds with no model call, and it was wrong all four times - the
+# cheapest possible way to be wrong, and the one a wall-clock table rewards. These
+# tests are about the line that now stops it, and about the two things that line must
+# NOT do: reject a skill being reused with new arguments, or start accepting a skill
+# for a task nobody taught it.
+
+
+OPEN_TAB = plant(
+    "open_top_nav_tab",
+    "Open a tab in the top navigation bar.",
+    """
+def run(ctx, tab):
+    hits = ctx.see.find_text(tab, fuzzy=True)
+    ctx.expect(bool(hits), "no tab called " + tab)
+    ctx.ctl.click(hits[0])
+    return tab
+""",
+    precondition=LIST,
+    params={"tab": {"type": "string", "default": "Invoices"}},
+    docstring="Clicks a tab in the top navigation bar and leaves that tab's screen up.",
+)
+"""The trivial navigation skill, in the shape that caused the finding: a short generic
+name, a default for its only parameter, and no account of any errand at all."""
+
+
+def test_a_skill_with_no_account_of_the_task_is_not_run(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The finding, reproduced in miniature and then refused.
+
+    ``open_top_nav_tab`` binds - its one parameter has a default - and it has a route,
+    so before this check every gate the planner had said yes. What it does not have is
+    any account of paying, of Acme Corp or of an invoice, which is the whole request.
+    """
+    store.put(OPEN_TAB)
+    planner = build(scenario, store, graph, fake_llm)
+
+    assert planner.attempt(scenario.task, look(scenario)) is None
+    assert performed(scenario) == [], "nothing may be performed on a candidate this weak"
+    assert scenario.controller.state == "list"
+    assert fake_llm.calls == 0
+
+    failure = planner.last_failure
+    assert isinstance(failure, PlanFailure)
+    assert failure.stage == "unaccounted"
+    assert failure.performed_nothing
+    assert not failure.demoted, "the skill is not broken; it is simply not this task's skill"
+
+
+def test_the_words_it_could_not_account_for_are_named_in_the_rejection(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """A run that declined is only diagnosable if it says what was missing."""
+    store.put(OPEN_TAB)
+    planner = build(scenario, store, graph, fake_llm)
+
+    assert planner.plan(scenario.task, look(scenario)) is None
+    failure = planner.last_failure
+    assert failure is not None
+    assert "payment" in failure.reason and "acme" in failure.reason
+    rejected = {r.skill: r for r in failure.rejected}
+    assert rejected["open_top_nav_tab"].stage == "unaccounted"
+    assert rejected["open_top_nav_tab"].score > 0.0, "it really was ranked, and really was wrong"
+
+
+def test_the_skill_that_does_the_task_is_still_run(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The guard against fixing this by refusing everything: with both skills on the
+    shelf the right one is still retrieved, still run, and still model-free."""
+    store.put(OPEN_TAB)
+    store.put(PAY_INVOICE)
+    planner = build(scenario, store, graph, fake_llm)
+
+    outcome = planner.attempt(scenario.task, look(scenario))
+
+    assert outcome is not None and outcome.ok
+    assert outcome.skill_used == "pay_invoice"
+    assert outcome.spend.llm_calls == 0
+
+
+def test_a_skill_reused_with_unfamiliar_arguments_is_not_rejected_for_them(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The false positive this check would be worthless without.
+
+    ``pay_invoice`` was learned on Acme Corp and says nothing anywhere about Initech.
+    Paying Initech's invoice is precisely what the skill is FOR, and the words it
+    cannot be expected to know arrive as its argument - so they are accounted for.
+    """
+    store.put(PAY_INVOICE)
+    planner = build(scenario, store, graph, fake_llm)
+    task = TaskSpec(
+        text="Confirm payment of the Initech invoice.",
+        domain=DOMAIN,
+        params={"company": "Initech"},
+    )
+
+    plan = planner.plan(task, look(scenario))
+
+    assert plan is not None, "a skill reused with new arguments must still be usable"
+    assert plan.skills_used == ("pay_invoice",)
+
+
+def test_a_task_the_library_cannot_do_still_declines_rather_than_reaching(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """With a full shelf and an errand on none of it, the answer is still no.
+
+    This is the other half of "do not raise a threshold until one case passes": the
+    check has to keep declining the tasks that were already declined, for the same
+    reason, rather than becoming a number that only this one case trips.
+    """
+    store.put(OPEN_TAB)
+    store.put(PAY_INVOICE)
+    store.put(SEARCH_INVOICE)
+    planner = build(scenario, store, graph, fake_llm)
+    task = TaskSpec(text="Export the address book as a CSV file.", domain=DOMAIN)
+
+    assert planner.attempt(task, look(scenario)) is None
+    assert performed(scenario) == []
+    assert planner.last_failure is not None
+    assert planner.last_failure.performed_nothing
+
+
+def test_the_composer_is_still_consulted_after_an_unaccounted_candidate(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph
+) -> None:
+    """Rejecting a single skill must not close the composite path.
+
+    A chain is built exactly out of skills that each do PART of an errand, so the
+    candidate this check turns down as a whole answer may still be a piece of one.
+    The planner passes it over and goes on to ask, which is what the model call below
+    proves; the composer here declines, and that decline - not the rejection - is what
+    is reported.
+    """
+    store.put(OPEN_TAB)
+    llm = FakeLLM(['{"steps": [], "why": "opening a tab does not pay anything"}'])
+    planner = build(scenario, store, graph, llm, compose=True)
+
+    assert planner.plan(scenario.task, look(scenario)) is None
+    assert llm.calls == 1, "the composite path must still be reached"
+    assert planner.last_failure is not None
+    assert planner.last_failure.stage == "no_decomposition"
     assert performed(scenario) == []
 
 
@@ -1421,3 +1573,30 @@ def test_a_warm_attempt_that_explores_records_what_it_was_offered(
     assert "library=pay_invoice" in line
     assert "pay_invoice=0.700" in line, "the score retrieval gave it is in the line"
     assert "pay_invoice (score 0.700) -> unbindable_args" in line
+
+
+def test_the_calibration_gap_this_line_sits_in() -> None:
+    """The measurement :data:`MIN_ACCOUNTED_FOR` was chosen from, pinned.
+
+    Taken 2026-09-19 from the ordering suite's own library, built by running all
+    twelve tasks cold against the sandbox app, then scoring every task against every
+    stored skill offline. Only candidates that BIND are listed: the rest are rejected
+    a step earlier and never reach this check.
+
+    The point of pinning it is that the threshold must keep separating these two
+    populations, not merely keep the one failing case out. A change that pushes a
+    right-hand number below the line, or a left-hand number above it, has broken
+    something whatever the case that prompted it does.
+    """
+    wrong_but_bindable = [
+        0.42,  # order_appears_in_history  <- the finding: open_order_screen, ok=False
+        0.24,  # order_with_address_and_tip <- the same skill, the same shape
+        0.60,  # open_order_screen against filter_by_cuisine and search_for_a_dish
+    ]
+    right_and_bindable = [
+        1.00,  # 6 tasks whose own skill was in the library and took its arguments
+        0.90,  # place_an_order: its skill adds the dish and leaves "place" undone
+    ]
+    assert max(wrong_but_bindable) < MIN_ACCOUNTED_FOR < min(right_and_bindable)
+    assert MIN_ACCOUNTED_FOR - max(wrong_but_bindable) >= 0.1, "too close to the wrong answers"
+    assert min(right_and_bindable) - MIN_ACCOUNTED_FOR >= 0.1, "too close to the right ones"

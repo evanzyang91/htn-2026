@@ -39,12 +39,39 @@ and :attr:`SuiteMetrics.regressions` names it. ``success_delta`` is **warm minus
 cold**, in ``-1.0..1.0``, so a negative number means the library broke a task that
 exploration could do - the single worst thing this suite can find, and
 :attr:`SuiteMetrics.warm_failures` names those too.
+
+The one door a run gets in through
+----------------------------------
+
+A wrong answer is the CHEAPEST answer this architecture can give. On 2026-09-19 the
+ordering suite's ``order_appears_in_history`` retrieved a trivial navigation skill,
+ran it in 4 to 8 seconds with zero model calls, and got the task wrong all four
+times - faster and cheaper than any honest run in the suite. Every efficiency figure
+this project reports gets BETTER when a skill does the wrong thing quickly, so the
+metric and the truth point in opposite directions and only ground truth separates
+them.
+
+That is why every timing and every saving below is computed from :func:`_measured`
+and from nowhere else. It is one function, four lines long, and it admits a run only
+when :attr:`RunPoint.ok` - the OFFLINE REFEREE's verdict, never the agent's own -
+says the task was achieved. There is deliberately no second path to a sample: a
+future edit that wants to average something has to go through that door or write a
+new one in plain sight.
+
+Excluding a run is not enough on its own, because a number that quietly drops its
+most flattering runs is still a number nobody can audit. So the failures are counted
+and NAMED rather than averaged away: :attr:`TaskMetrics.warm_failed_ms` says how fast
+the excluded runs were, :attr:`TaskMetrics.warm_failures_from_library` says how many
+of them a stored skill carried - the fast-free-and-wrong shape exactly - and
+:attr:`TaskMetrics.flattered_by_failures` is ``True`` when counting them would have
+made the task look better. :attr:`TaskMetrics.note` says so in the sentence the
+markdown summary already prints next to the speedup.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import fmean
 from typing import Any
 
@@ -85,6 +112,11 @@ class RunPoint:
         used_library: Whether a stored skill carried the run. A "warm" run with this
             ``False`` explored instead, which means it was not warm at all - see
             :attr:`SuiteMetrics.warm_runs_that_explored`.
+        verified: Whether ``ok`` came from a referee's per-check score rather than
+            from a bare boolean somebody wrote into the report. A run constructed
+            directly is trusted, because the only thing that does that is the
+            harness, which holds the referee; a run read back out of a report is
+            trusted only when the report carries the checks that prove it.
     """
 
     attempt: int
@@ -93,6 +125,7 @@ class RunPoint:
     llm_calls: int = 0
     usd: float = 0.0
     used_library: bool = False
+    verified: bool = True
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any], position: int = 0) -> RunPoint:
@@ -102,14 +135,27 @@ class RunPoint:
         falls back to the position in the list, and anything unparsable becomes the
         field's default rather than raising, because a report that is half readable
         is worth more than an exception.
+
+        One place it is NOT tolerant. A report carries two verdicts per run: ``ok``,
+        which the harness writes from the referee, and ``score``, the referee's own
+        per-check detail. Where a report has both, the ``score`` wins, because ``ok``
+        is one boolean that any writer could have filled in from the agent's own
+        claim while ``score`` is the evidence. A run whose score is absent is still
+        read - most reports are honest and refusing them all would answer nothing -
+        but it is marked ``verified=False`` and counted in
+        :attr:`TaskMetrics.unverified_runs` so a reader knows which numbers rest on
+        an unshown check.
         """
+        scored = raw.get("score")
+        checked = isinstance(scored, Mapping) and isinstance(scored.get("ok"), bool)
         return cls(
             attempt=_as_int(raw.get("attempt"), position + 1),
-            ok=bool(raw.get("ok", False)),
+            ok=bool(scored["ok"]) if checked else bool(raw.get("ok", False)),  # type: ignore[index]
             wall_ms=_as_float(raw.get("wall_ms"), 0.0),
             llm_calls=_as_int(raw.get("llm_calls"), 0),
             usd=_as_float(raw.get("usd"), 0.0),
             used_library=_as_bool(raw.get("used_library"), raw.get("skill_used") is not None),
+            verified=checked,
         )
 
 
@@ -125,6 +171,27 @@ def _as_float(value: Any, default: float) -> float:
 
 def _as_bool(value: Any, default: bool) -> bool:
     return bool(value) if isinstance(value, bool) else default
+
+
+# --------------------------------------------------------------------------------------
+# The gate: the only way a run reaches a timing or a saving
+# --------------------------------------------------------------------------------------
+
+
+def _measured(runs: Iterable[RunPoint]) -> list[RunPoint]:
+    """The runs a timing or a saving may be computed from: the ones that WORKED.
+
+    Every mean in this module starts here, and nothing else in it filters a sample.
+    A run that did not achieve the task is not a measurement of doing the task - it
+    is a measurement of giving up, and the cheapest way to give up is to confidently
+    do the wrong thing fast. Averaging one in does not merely add noise, it moves the
+    headline in the flattering direction, which is why this is a gate and not a
+    guideline.
+
+    ``ok`` is the offline referee's verdict. Nothing here consults what the agent
+    believed about itself.
+    """
+    return [run for run in runs if run.ok]
 
 
 # --------------------------------------------------------------------------------------
@@ -212,9 +279,23 @@ class TaskMetrics:
         warm_failures: How many warm runs failed.
         warm_explored: How many warm runs solved the task by exploring rather than
             from the library - runs that were warm in name only.
+        warm_failed_ms: Mean wall-clock of the warm runs that FAILED, which no figure
+            above is computed from. Reported so the excluded runs can be seen rather
+            than merely counted: next to :attr:`warm_ms` it says whether the library
+            was wrong slowly or wrong fast.
+        warm_failed_llm_calls: Mean model calls of those same failed warm runs. A
+            zero here is the worst reading in this class - free, and wrong.
+        warm_failures_from_library: How many of the failed warm runs a stored skill
+            carried. This is the fast-free-and-wrong shape the 2026-09-19 ordering
+            suite found: retrieval answered confidently with an unrelated skill.
+        unverified_runs: Runs whose ``ok`` arrived without the referee's checks
+            behind it. See :meth:`RunPoint.from_mapping`.
         comparable: Whether :attr:`speedup` could be computed at all.
-        note: Why it could not, when it could not. Empty when everything is fine.
+        note: Why it could not, when it could not - and, when it could, what was
+            left out of it. Empty only when nothing was excluded and nothing failed.
         regressed: Whether the warm runs were SLOWER than the cold one.
+        flattered_by_failures: Whether counting the failed warm runs would have made
+            this task look BETTER than the truth.
     """
 
     task_id: str
@@ -232,6 +313,10 @@ class TaskMetrics:
     warm_usd: float | None = None
     warm_failures: int = 0
     warm_explored: int = 0
+    warm_failed_ms: float | None = None
+    warm_failed_llm_calls: float | None = None
+    warm_failures_from_library: int = 0
+    unverified_runs: int = 0
     comparable: bool = False
     note: str = ""
 
@@ -239,6 +324,24 @@ class TaskMetrics:
     def regressed(self) -> bool:
         """Whether the library made this task slower. Never true when incomparable."""
         return self.speedup is not None and self.speedup < 1.0
+
+    @property
+    def flattered_by_failures(self) -> bool:
+        """Whether the runs this task's numbers EXCLUDE were faster than the ones
+        they are made of.
+
+        True is the dangerous shape stated exactly: the library answered wrong, and
+        answered wrong faster than it answers right, so any figure that counted those
+        runs would have rewarded the wrong answer. The comparison is against the warm
+        mean where there is one and against the cold run where every warm run failed
+        - in the second case nothing honest survives to compare, and the failures
+        being faster than the cold baseline is precisely what would have made the task
+        look like the best result in the suite.
+        """
+        if self.warm_failed_ms is None or self.warm_failed_ms <= 0.0:
+            return False
+        reference = self.warm_ms if self.warm_ms is not None else self.cold_ms
+        return reference is not None and self.warm_failed_ms < reference
 
     def to_json(self) -> dict[str, Any]:
         """The metrics as plain data, for the report file and the markdown summary."""
@@ -258,8 +361,13 @@ class TaskMetrics:
             "warm_usd": _round(self.warm_usd, 6),
             "warm_failures": self.warm_failures,
             "warm_explored": self.warm_explored,
+            "warm_failed_ms": _round(self.warm_failed_ms, 1),
+            "warm_failed_llm_calls": _round(self.warm_failed_llm_calls, 2),
+            "warm_failures_from_library": self.warm_failures_from_library,
+            "unverified_runs": self.unverified_runs,
             "comparable": self.comparable,
             "regressed": self.regressed,
+            "flattered_by_failures": self.flattered_by_failures,
             "note": self.note,
         }
 
@@ -282,13 +390,18 @@ def task_metrics(task_id: str, runs: Iterable[RunPoint]) -> TaskMetrics:
         return TaskMetrics(task_id=task_id, note="no runs were recorded")
 
     cold, warm = ordered[0], ordered[1:]
-    warm_ok = [r for r in warm if r.ok]
+    # The one gate. Every mean below is over a list that came out of it, and the
+    # failed runs are kept in `warm_failed` to be REPORTED, never to be averaged in.
+    counted_cold = _measured([cold])  # empty unless the cold run achieved the task
+    warm_ok = _measured(warm)
+    warm_failed = [r for r in warm if not r.ok]
 
-    cold_ms = cold.wall_ms if cold.ok else None
+    cold_ms = cold.wall_ms if counted_cold else None
     warm_ms = fmean(r.wall_ms for r in warm_ok) if warm_ok else None
+    warm_calls = fmean(r.llm_calls for r in warm_ok) if warm_ok else None
     factor = speedup(cold_ms, warm_ms)
 
-    return TaskMetrics(
+    computed = TaskMetrics(
         task_id=task_id,
         runs=len(ordered),
         cold_ok=cold.ok,
@@ -297,18 +410,82 @@ def task_metrics(task_id: str, runs: Iterable[RunPoint]) -> TaskMetrics:
         cold_ms=cold_ms,
         warm_ms=warm_ms,
         speedup=factor,
-        cold_llm_calls=cold.llm_calls if cold.ok else None,
-        warm_llm_calls=fmean(r.llm_calls for r in warm_ok) if warm_ok else None,
-        call_reduction=call_reduction(
-            cold.llm_calls if cold.ok else None,
-            fmean(r.llm_calls for r in warm_ok) if warm_ok else None,
-        ),
-        cold_usd=cold.usd if cold.ok else None,
+        cold_llm_calls=cold.llm_calls if counted_cold else None,
+        warm_llm_calls=warm_calls,
+        call_reduction=call_reduction(cold.llm_calls if counted_cold else None, warm_calls),
+        cold_usd=cold.usd if counted_cold else None,
         warm_usd=fmean(r.usd for r in warm_ok) if warm_ok else None,
-        warm_failures=sum(1 for r in warm if not r.ok),
+        warm_failures=len(warm_failed),
         warm_explored=sum(1 for r in warm if not r.used_library),
+        warm_failed_ms=fmean(r.wall_ms for r in warm_failed) if warm_failed else None,
+        warm_failed_llm_calls=fmean(r.llm_calls for r in warm_failed) if warm_failed else None,
+        warm_failures_from_library=sum(1 for r in warm_failed if r.used_library),
+        unverified_runs=sum(1 for r in ordered if not r.verified),
         comparable=factor is not None,
-        note=_why_incomparable(cold, warm, warm_ok, cold_ms, warm_ms, factor),
+    )
+    return replace(computed, note=_note_for(computed, cold, warm, warm_ok, cold_ms, warm_ms))
+
+
+def _note_for(
+    computed: TaskMetrics,
+    cold: RunPoint,
+    warm: Sequence[RunPoint],
+    warm_ok: Sequence[RunPoint],
+    cold_ms: float | None,
+    warm_ms: float | None,
+) -> str:
+    """The sentence the markdown summary prints beside this task's speedup.
+
+    Two jobs, in this order. When there is no speedup it says why - that is the old
+    behaviour and the more urgent message. When there IS one it says what the number
+    left out, because a figure computed from three of five runs and presented like a
+    figure computed from five is the quiet half of the same problem. A task whose
+    excluded runs were FASTER than the ones that counted gets told so in as many
+    words, since that is the reading under which the exclusion is what saved the
+    report.
+    """
+    parts = [
+        _why_incomparable(cold, warm, warm_ok, cold_ms, warm_ms, computed.speedup),
+        _what_was_left_out(computed),
+    ]
+    return "; ".join(part for part in parts if part)
+
+
+def _what_was_left_out(computed: TaskMetrics) -> str:
+    """What the numbers above exclude, or ``""`` when they exclude nothing.
+
+    Silent on a task where nothing failed, so the note column stays empty on a
+    healthy task and every word in it means something.
+    """
+    failed = computed.warm_failures
+    if not failed:
+        return "" if not computed.unverified_runs else _unverified(computed)
+    total = max(computed.runs - 1, failed)
+    said = (
+        f"{failed} of {total} warm run(s) failed ground truth and are excluded from "
+        "every figure here"
+    )
+    if computed.warm_failures_from_library:
+        said += f" ({computed.warm_failures_from_library} carried by a stored skill)"
+    if computed.flattered_by_failures:
+        reference = computed.warm_ms if computed.warm_ms is not None else computed.cold_ms
+        kind = "warm" if computed.warm_ms is not None else "cold"
+        said += (
+            f" - they averaged {computed.warm_failed_ms:,.0f}ms against "
+            f"{reference:,.0f}ms for the {kind} run(s) that counted, so counting them "
+            "would have flattered this task"
+        )
+    extra = _unverified(computed)
+    return f"{said}; {extra}" if extra else said
+
+
+def _unverified(computed: TaskMetrics) -> str:
+    """The note for runs whose verdict arrived without the referee's checks."""
+    if not computed.unverified_runs:
+        return ""
+    return (
+        f"{computed.unverified_runs} run(s) carried no referee checks, so their "
+        "verdict is taken on trust"
     )
 
 
@@ -373,6 +550,16 @@ class SuiteMetrics:
             library, and every speedup below is noise. :attr:`library_was_used` says
             so in one boolean.
         warm_runs: How many warm runs the suite recorded in total.
+        warm_runs_excluded: Warm runs across the suite that failed ground truth and
+            are therefore in none of the figures above. The difference between this
+            and :attr:`warm_runs` is what the speedup is actually an average of.
+        wrong_skill_runs: Excluded runs that a STORED SKILL carried. The library did
+            not decline, it answered, and it was wrong - the failure mode a
+            wall-clock table rewards.
+        flattered_tasks: Tasks whose excluded runs were faster than the runs that
+            counted. Every one of these would have raised the headline had ground
+            truth not been consulted, which is what makes the list worth printing.
+        unverified_runs: Runs whose verdict arrived without the referee's checks.
     """
 
     tasks: tuple[TaskMetrics, ...] = ()
@@ -388,6 +575,10 @@ class SuiteMetrics:
     cold_failures: tuple[str, ...] = ()
     warm_runs_that_explored: int = 0
     warm_runs: int = 0
+    warm_runs_excluded: int = 0
+    wrong_skill_runs: int = 0
+    flattered_tasks: tuple[str, ...] = ()
+    unverified_runs: int = 0
 
     @property
     def warm_call_mean(self) -> float | None:
@@ -429,6 +620,10 @@ class SuiteMetrics:
             "cold_failures": list(self.cold_failures),
             "warm_runs": self.warm_runs,
             "warm_runs_that_explored": self.warm_runs_that_explored,
+            "warm_runs_excluded": self.warm_runs_excluded,
+            "wrong_skill_runs": self.wrong_skill_runs,
+            "flattered_tasks": list(self.flattered_tasks),
+            "unverified_runs": self.unverified_runs,
             "library_was_used": self.library_was_used,
             "tasks": [t.to_json() for t in self.tasks],
         }
@@ -469,6 +664,10 @@ def suite_metrics(tasks: Iterable[TaskMetrics]) -> SuiteMetrics:
         cold_failures=tuple(t.task_id for t in ordered if t.cold_ok is False),
         warm_runs_that_explored=sum(t.warm_explored for t in ordered),
         warm_runs=sum(max(t.runs - 1, 0) for t in ordered),
+        warm_runs_excluded=sum(t.warm_failures for t in ordered),
+        wrong_skill_runs=sum(t.warm_failures_from_library for t in ordered),
+        flattered_tasks=tuple(t.task_id for t in ordered if t.flattered_by_failures),
+        unverified_runs=sum(t.unverified_runs for t in ordered),
     )
 
 

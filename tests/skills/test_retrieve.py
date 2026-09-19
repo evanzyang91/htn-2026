@@ -14,7 +14,12 @@ import pytest
 from skillweaver.contracts import Candidate, Provenance, Skill
 from skillweaver.contracts import SkillRetriever as RetrieverProtocol
 from skillweaver.errors import ProviderError, SkillWeaverError
-from skillweaver.skills.retrieve import SkillRetriever, tokenize
+from skillweaver.skills.retrieve import (
+    SkillRetriever,
+    accounted_for,
+    tokenize,
+    unaddressed,
+)
 from skillweaver.skills.store import FileSkillStore
 from tests.fakes import FakeEmbedder, InMemorySkillStore
 
@@ -328,3 +333,85 @@ def test_the_learned_sentence_does_not_make_an_unrelated_task_match() -> None:
         store.put(skill)
 
     assert SkillRetriever(store).search("recalibrate the telescope mirror") == []
+
+
+# --------------------------------------------------------------------------------------
+# What a ranking cannot answer: is any of the request left over?
+# --------------------------------------------------------------------------------------
+#
+# `search` always has a winner, because "closest" always has a winner. These two
+# functions answer the other question - whether the winner has any account of the
+# errand at all - and the planner uses them to decide whether to spend actions on it.
+
+
+OPEN_TAB = make(
+    "open_top_nav_tab",
+    "example.com",
+    "Open a tab in the top navigation bar.",
+    "Clicks a tab in the top navigation bar and leaves that tab's screen up.",
+    params={"tab": {"type": "string"}},
+)
+"""The shape of the 2026-09-19 finding: a short generic navigation skill that ranked
+first for a composite ordering task and did none of it."""
+
+
+def test_the_words_a_skill_has_no_account_of_are_named() -> None:
+    left = unaddressed("Export the address book as a CSV file", OPEN_TAB)
+    assert left == ["export", "address", "book", "csv", "file"]
+    assert accounted_for("Export the address book as a CSV file", OPEN_TAB) == 0.0
+
+
+def test_a_skill_that_speaks_to_the_whole_task_leaves_nothing_over() -> None:
+    assert unaddressed("Open the navigation tab", OPEN_TAB) == []
+    assert accounted_for("Open the navigation tab", OPEN_TAB) == 1.0
+
+
+def test_an_argument_value_accounts_for_the_words_the_skill_cannot_know() -> None:
+    """The false positive this would be useless without.
+
+    ``search_invoice`` was written about invoices and companies in general and has
+    never heard of Initech. Searching for Initech's invoice is exactly what it is for,
+    and the word arrives as its argument, so nothing is left unexplained.
+    """
+    task = "Search the invoices for Initech"
+    assert unaddressed(task, SEARCH_INVOICE) == ["initech"]
+    assert unaddressed(task, SEARCH_INVOICE, {"company": "Initech"}) == []
+
+
+def test_the_arguments_do_not_rescue_a_skill_that_is_simply_wrong() -> None:
+    """An argument covers the words it supplies and no others, so handing
+    ``tab="Orders"`` to a navigation skill does not make it an ordering skill."""
+    task = "Order two Vegetable Rolls from Sakura Counter and confirm it in the Orders tab"
+    left = unaddressed(task, OPEN_TAB, {"tab": "Orders"})
+
+    assert "vegetable" in left and "sakura" in left and "confirm" in left
+    assert "orders" not in left, "the argument does account for the tab it opens"
+    assert accounted_for(task, OPEN_TAB, {"tab": "Orders"}) < 0.5
+
+
+def test_an_empty_task_leaves_nothing_unaccounted_for() -> None:
+    assert unaddressed("", OPEN_TAB) == []
+    assert accounted_for("", OPEN_TAB) == 1.0
+
+
+def test_a_plural_is_not_a_missing_promise() -> None:
+    """The stemmer is blunt and not symmetric - ``invoices`` reduces to ``invoic``
+    while ``invoice`` does not - so a near miss has to count as an account here. It
+    costs a ranking a little score; it would cost this check a working skill."""
+    assert unaddressed("Search the invoices", SEARCH_INVOICE) == []
+    # Generous about endings, not about meaning: a word the skill never uses in any
+    # form is still unaccounted for.
+    assert unaddressed("Search the telescopes", SEARCH_INVOICE) == ["telescopes"]
+
+
+def test_why_says_what_the_skill_has_no_account_of() -> None:
+    """A score on its own reads as agreement. The leftovers are what tell a reader -
+    and the composer's prompt - that the best candidate is not a good one."""
+    store = InMemorySkillStore()
+    store.put(OPEN_TAB)
+
+    task = "Open the tab and export the address book"
+    hit = SkillRetriever(store).search(task, domain="example.com")[0]
+
+    assert hit.skill.name == "open_top_nav_tab"
+    assert "no account of 'export', 'address', 'book'" in hit.why

@@ -89,6 +89,17 @@ and `tests/perception/fixtures/README.md` is where the detector's numbers and it
 remaining blind spots are written down. Quote that file rather than guessing, and
 remeasure with `--bench` rather than assuming a retrain helped.
 
+The cheapest answer this architecture can give is a WRONG one, so no efficiency number
+may be computed without ground truth beside it. A stored skill that does the wrong
+thing runs in seconds and costs nothing, which improves every speedup, saving and
+call-count the project reports. Two rules follow, and both are already load-bearing:
+`_measured` in `src/skillweaver/eval/metrics.py` is the ONLY door a run reaches a
+timing or a saving through, and the failures it excludes are named in the report
+rather than dropped; and retrieval RANKS while the planner DECIDES - a ranking has a
+winner even when nothing fits, so closest is not runnable until it has an account of
+the whole request (`MIN_ACCOUNTED_FOR` in `src/skillweaver/agent/planner.py`, which
+carries the measurements it was calibrated from).
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

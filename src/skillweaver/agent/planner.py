@@ -56,6 +56,25 @@ of starting the task cold::
     if outcome is None:
         outcome = explorer.explore(task, controller, budget)  # with planner.last_failure
 
+Ranking picks a winner; this decides whether to run one
+-------------------------------------------------------
+
+Retrieval answers "which stored skill is closest to this request?", and that question
+has an answer even when the honest answer is "none of them". On 2026-09-19 the
+ordering suite asked for *order two Vegetable Rolls from Sakura Counter, then open the
+Orders tab and confirm the order is listed there* and the closest skill in the library
+was a navigation skill that opens a tab. It bound, it routed, it ran in four seconds,
+it consulted no model, and it got the task wrong every time - the cheapest possible
+way to be wrong, and the one a wall-clock table rewards.
+
+So a candidate now has to pass one more test before any action is spent on it: every
+word of the request must be accounted for, either by the skill's own text or by the
+arguments it is about to be handed (:data:`MIN_ACCOUNTED_FOR`). A skill whose
+declared end state has no account of *Vegetable Rolls*, *Sakura Counter* or
+*confirm* is not what was asked for, whatever it ranked. Rejected candidates are
+recorded as rejections and the task falls through to the composer and then
+to exploration, which is what happens for any other task the library cannot do.
+
 What demotion means
 -------------------
 
@@ -113,6 +132,7 @@ from skillweaver.errors import ControllerError, PerceptionError, SkillNotFound
 from skillweaver.graph.route import VERIFIED_ONLY, RoutingPolicy, find_route
 from skillweaver.logging_ import get_logger
 from skillweaver.skills.api import LimitExceeded
+from skillweaver.skills.retrieve import accounted_for, unaddressed
 
 __all__ = ["FRAME_WORDS", "FailureStage", "PlanFailure", "Planner", "Rejection"]
 
@@ -121,6 +141,7 @@ log = get_logger(__name__)
 FailureStage = Literal[
     "no_candidates",
     "unbindable_args",
+    "unaccounted",
     "no_route",
     "no_decomposition",
     "vanished",
@@ -128,10 +149,45 @@ FailureStage = Literal[
     "skill_failed",
     "rejected",
 ]
-"""Where the fast path gave up. The first four happen before anything is performed."""
+"""Where the fast path gave up. The first five happen before anything is performed."""
 
-_PERFORMED_NOTHING = frozenset({"no_candidates", "unbindable_args", "no_route", "no_decomposition"})
+_PERFORMED_NOTHING = frozenset(
+    {"no_candidates", "unbindable_args", "unaccounted", "no_route", "no_decomposition"}
+)
 """Stages that are reached while planning, so the screen is untouched."""
+
+MIN_ACCOUNTED_FOR = 0.75
+"""How much of the request a single skill must have an account of to be run.
+
+Retrieval ranks, and a ranking always has a winner. This is the planner's own
+question, and it is a different one: *does the winner have any account of the whole
+errand?* :func:`~skillweaver.skills.retrieve.accounted_for` answers it without a
+model - every word of the task must appear either in the skill's own text or in the
+arguments it is about to be handed - and a candidate below this line is passed over
+instead of performed.
+
+Calibrated 2026-09-19 against the ordering suite's own library, over all twelve tasks
+in both binding shapes. Only candidates that BIND are measured, because the others
+never reach this check. The number sits in a gap rather than on top of the one case
+that prompted it:
+
+    the right skill, where the library had one     0.90 to 1.00 (0.90 exactly once,
+                                                   on `place_an_order`, whose skill
+                                                   really does leave "place" undone)
+    the best WRONG skill that also bound           0.60 at its worst, and 0.42 on
+                                                   `order_appears_in_history`, 0.24
+                                                   on `order_with_address_and_tip`
+
+Both failing cases are the same trivial navigation skill, which binds because its one
+parameter has a default, and therefore falls out as the first usable candidate
+whenever nothing better binds. 0.75 leaves 0.15 of margin on each side. The table is
+pinned by ``test_the_calibration_gap_this_line_sits_in`` in
+``tests/agent/test_planner.py``.
+
+Which way to be wrong is not symmetric. A skill declined here falls through to the
+composer and then to exploration, and the task still gets done a little slower; a
+skill wrongly run reports a fast, free success that was not one, and every efficiency
+figure in the project improves because of it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +423,26 @@ class Planner:
                 )
                 reasons.append(reason)
                 looked_at.append(Rejection(skill.name, candidate.score, "unbindable_args", reason))
+                continue
+            if accounted_for(task.text, skill, args) < MIN_ACCOUNTED_FOR:
+                # Only now is it worth naming the words: the happy path pays for the
+                # ratio and nothing else.
+                missing = unaddressed(task.text, skill, args)
+                stage = "unaccounted"
+                reason = (
+                    f"{skill.name}: nothing in it or its arguments accounts for "
+                    + ", ".join(f"{word!r}" for word in missing[:6])
+                    + f", so its end state cannot be what {task.text!r} asks for"
+                )
+                reasons.append(reason)
+                looked_at.append(Rejection(skill.name, candidate.score, "unaccounted", reason))
+                log.info(
+                    "planner.unaccounted",
+                    task=task.text,
+                    skill=skill.name,
+                    score=round(candidate.score, 3),
+                    unaccounted=", ".join(missing),
+                )
                 continue
             route = self._route_to(observation.fingerprint, skill.precondition)
             if route is None:

@@ -25,8 +25,26 @@ because the cheap signal is a good sanity check on the expensive one: a skill th
 embedder likes but that shares no word with the task is usually a near-miss.
 
 Every :class:`~skillweaver.contracts.Candidate` carries a ``why`` built from what
-actually matched - the shared words, the cosine, the name hit - because the planner
-puts it in a prompt and a human reads it over the demo's shoulder.
+actually matched - the shared words, the cosine, the name hit - and ends with what the
+skill has NO account of, because a score on its own reads as agreement.
+
+A ranking has a winner even when nothing fits
+---------------------------------------------
+
+One measured property of the name term, because it is not obvious and it has already
+cost a suite its most dangerous wrong answer. ``name_hit`` is divided by the length of
+the SKILL'S name, so a short generic name is easy to match completely. On 2026-09-19
+``open_order_screen`` - three stems, all of which appear in any sentence about the
+Order screen - topped a composite ordering task at 0.618 with ``name_hit`` of 1.00,
+while its coverage of that task was 0.364, the LOWEST of any candidate. The skills
+that could actually do the errand carry long specific names (five stems for
+``add_two_dishes_then_remove_one``, of which the task matched one) and scored 0.20 to
+0.33 on the same term.
+
+The ranking is left as it is: it is calibrated against the live Wikipedia suite above,
+and being closest is all it claims. What that measurement argues is that CLOSEST must
+not be read as GOOD ENOUGH TO RUN, which is a decision and belongs to the planner -
+see :data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR` and :func:`unaddressed`.
 """
 
 from __future__ import annotations
@@ -34,14 +52,15 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 from skillweaver.contracts import Candidate, Embedder, Skill, SkillStore
 from skillweaver.errors import ProviderError, SkillWeaverError
 from skillweaver.logging_ import get_logger
 from skillweaver.skills.model import signature
 
-__all__ = ["STOPWORDS", "SkillRetriever", "tokenize"]
+__all__ = ["STOPWORDS", "SkillRetriever", "accounted_for", "tokenize", "unaddressed"]
 
 log = get_logger(__name__)
 
@@ -94,6 +113,76 @@ def searchable_text(skill: Skill) -> str:
     parameter names count - then the sentence it was learned from, its summary and
     its docstring."""
     return f"{signature(skill)}\n{skill.provenance.task_text}\n{skill.summary}\n{skill.docstring}"
+
+
+def unaddressed(task: str, skill: Skill, args: Mapping[str, Any] | None = None) -> list[str]:
+    """The words of ``task`` that ``skill`` neither talks about nor was handed.
+
+    Ranking answers "which of these is closest?", which always has a winner. This
+    answers the other question, the one a closest-match ranking cannot: *is there
+    anything in the request this skill has no account of at all?*
+
+    A word is accounted for when it appears in the skill's own text - its name,
+    summary, docstring, parameter names and the sentence it was learned from - or in
+    the VALUES it is about to be called with. The second half is what keeps this from
+    rejecting correct reuse: a skill learned from *order two Vegetable Rolls from
+    Sakura Counter* says nothing about falafel, and ordering a falafel wrap through it
+    is exactly what it is for, because "falafel" arrives as an argument.
+
+    What is left over is the part of the errand nobody has promised to do.
+
+    Args:
+        task: The request, in the words it was asked in.
+        skill: The candidate.
+        args: The arguments the skill would be called with, if they are known.
+            ``None`` means judge the skill's text alone, which is stricter.
+
+    Returns:
+        The unaccounted words, in the order the task used them and without
+        duplicates. Empty means every word of the request is spoken for.
+    """
+    known = _stems(tokenize(searchable_text(skill)))
+    if args:
+        for value in args.values():
+            known |= _stems(tokenize(str(value)))
+    return [word for word in tokenize(task) if not _has_account(_stem(word), known)]
+
+
+def _has_account(stem: str, known: set[str]) -> bool:
+    """Whether ``stem`` is spoken for by anything in ``known``, near misses included.
+
+    :func:`_stem` is deliberately blunt and, as a result, not symmetric: ``invoices``
+    becomes ``invoic`` while ``invoice`` is left alone, so the two do not compare
+    equal. Ranking survives that - a near miss only costs a skill some score - but
+    here it would be the difference between "spoken for" and "nobody has promised to
+    do this", and a plural is not a missing promise.
+
+    So a stem also counts as accounted for when a known one extends it by at most two
+    characters. Generosity is the safe direction for THIS question: the check exists
+    to catch words with no account at all, and being wrong here means declining a
+    skill that would have worked.
+    """
+    if stem in known:
+        return True
+    return any(_a_near_miss(stem, other) for other in known)
+
+
+def _a_near_miss(left: str, right: str) -> bool:
+    """Whether two stems are the same word bar an ending: one starts the other, the
+    shorter is long enough not to be a coincidence, and at most two characters
+    separate them. ``invoic``/``invoice`` yes; ``cart``/``carton`` no."""
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    return len(short) >= 4 and len(long) - len(short) <= 2 and long.startswith(short)
+
+
+def accounted_for(task: str, skill: Skill, args: Mapping[str, Any] | None = None) -> float:
+    """What fraction of ``task``'s words :func:`unaddressed` finds an account of, in
+    ``0.0..1.0``. ``1.0`` means nothing in the request is unexplained; an empty task
+    scores ``1.0``, there being nothing left over."""
+    words = tokenize(task)
+    if not words:
+        return 1.0
+    return 1.0 - len(unaddressed(task, skill, args)) / len(words)
 
 
 class SkillRetriever:
@@ -208,8 +297,18 @@ class SkillRetriever:
         skill: Skill,
         *,
         verbatim: bool = False,
+        missing: Sequence[str] = (),
     ) -> str:
-        """The sentence a human reads next to the candidate."""
+        """The sentence a human reads next to the candidate.
+
+        It ends with what the skill has NO account of, when there is anything, because
+        a score alone reads as agreement. Measured on 2026-09-19: the trivial
+        ``open_order_screen`` topped a composite ordering task at 0.618 on a perfect
+        name hit - every stem of its three-word name appears in any sentence about the
+        Order screen - while speaking to 4 of the task's 11 meaning-words. The score
+        said "best"; the leftovers said "vegetable, rolls, sakura, counter, confirm",
+        which is the sentence a reader needed.
+        """
         parts: list[str] = []
         if verbatim:
             parts.append("the exact sentence this skill was learned from")
@@ -225,6 +324,8 @@ class SkillRetriever:
             parts.append(f"name '{skill.name}' matches " + ", ".join(f"'{w}'" for w in on_name[:3]))
         if skill.stats.runs:
             parts.append(f"{skill.stats.successes}/{skill.stats.runs} runs succeeded")
+        if missing:
+            parts.append("no account of " + ", ".join(f"'{w}'" for w in missing[:5]))
         return "; ".join(parts)
 
     # -- the contract ------------------------------------------------------------
@@ -265,7 +366,14 @@ class SkillRetriever:
                 Candidate(
                     skill=skill,
                     score=round(score, 6),
-                    why=self._why(cosine, shared, on_name, skill, verbatim=verbatim),
+                    why=self._why(
+                        cosine,
+                        shared,
+                        on_name,
+                        skill,
+                        verbatim=verbatim,
+                        missing=unaddressed(task, skill),
+                    ),
                 )
             )
 
