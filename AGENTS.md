@@ -17,6 +17,28 @@ assembling a planner and an explorer by hand.
 
 Test without a browser, a model or a network by using the doubles in `tests/fakes/` (fixtures in `tests/conftest.py`; `tests/fakes/scenario.py` is a small fake app to drive).
 
+## Measure it before you believe it
+
+`uv run python scripts/bench_all.py --model-latency-ms 2500` runs all three suites
+against all three applications through a real Chromium and prints one table. It is the
+only thing here that exercises perception, the sandbox, the graph, the admission gate
+and the cold-versus-warm decision at once, and every defect worth fixing in this
+project so far has been found by running it rather than by reading code. A change that
+looks right and moves those numbers the wrong way is wrong.
+
+The model is stood in for by `scripts/scripted_operator.py`, which sees the prompt a
+model would see and nothing else; `--model-latency-ms 0` therefore measures the system
+with the model removed, which makes the COLD side cheaper than it really is and the
+speedup a lower bound. Read that module's header before quoting any number from it.
+
+Per-application knowledge lives in `scripts/playbooks_<app>.py`; anything shared
+belongs in `scripts/playbooks_common.py`. If a new application needs new machinery in
+the common module, the machinery is what is being tested rather than the agent.
+
+Debugging a failing task means looking at what the agent SAW, not at the markup:
+`--dump-prompt FILE` writes every prompt, and `scripts/_probe_site.py` prints the
+merged elements for any screen.
+
 Two live-API facts that no test can teach you, both already paid for in lost runs.
 `claude-opus-5` **refuses an assistant prefill** - a conversation ending on an assistant
 turn is a 400 - so JSON is obtained by asking tolerantly and re-asking, not by prefilling;
@@ -28,6 +50,23 @@ Anything the agent learns must be RE-RUN before it is stored, so a task that cha
 state cannot be learned unless something can change it back: pass `--reset-url`
 (`learn --help`), and see `WorldReset` in `src/skillweaver/orchestrator.py`. The sandbox
 site's `GET /__reset` is one instance of it.
+
+Four things about driving a real page that cost whole task suites before they were
+understood, all of them now written up where they bite:
+
+- A page is `readyState: complete` long before it has DRAWN anything, and an agent that
+  reads it then sees a blank screen and never reads it again. `_settle` in
+  `controllers/browser.py` waits for the document to go quiet, and `RE_OBSERVE_AFTER`
+  in `agent/explorer.py` is the way back when it still goes wrong.
+- A dropdown is drawn by the operating system, so it is in NO screenshot and cannot be
+  clicked at. Type enough of the option's label into the focused control and press
+  Enter; see `pick` in `scripts/playbooks_common.py`.
+- What an element SAYS never identifies which one it is in a grid or a list - twenty
+  cards all say "Add to cart". Where it is does: see `owned_by`, same file.
+- "The screen did not change" means indistinguishable, not "still the same screen".
+  Typing into a form leaves you on the same page; `UNCHANGED_SIMILARITY` in
+  `agent/checks.py` is the line between them and conflating them calls every form fill
+  a failure.
 
 `ultralytics` is a noisy import; three of its side effects have already cost time here.
 

@@ -329,10 +329,10 @@ _ALL: tuple[Playbook, ...] = (
             "    ctx.ctl.click(titled(ctx, title, title))\n"
             "    # The panel's only dropdown: its caption is small, grey and not\n"
             "    # always read, while there is never more than one of these.\n"
-            "    fields = [e for e in fields(ctx) if e.box.x > 880]\n"
-            '    ctx.expect(bool(fields), "no dropdown in the detail panel")\n'
-            "    best = fields[0]\n"
-            "    for element in fields:\n"
+            "    boxes = [e for e in fields(ctx) if e.box.x > 880]\n"
+            '    ctx.expect(bool(boxes), "no dropdown in the detail panel")\n'
+            "    best = boxes[0]\n"
+            "    for element in boxes:\n"
             "        if element.box.y < best.box.y:\n"
             "            best = element\n"
             "    pick(ctx, best, assignee)\n"
@@ -442,9 +442,16 @@ _ALL: tuple[Playbook, ...] = (
                 "priority": "High",
             },
             '    ctx.ctl.click(only(ctx, controls(ctx, "New ticket"), "the new ticket button"))\n'
-            '    fill_in(ctx, under(ctx, "Title", 70, 90), title)\n'
-            '    pick(ctx, under(ctx, "Assignee", 70, 90), assignee)\n'
-            '    pick(ctx, under(ctx, "Priority", 70, 90), priority)\n'
+            "    # The dialog's two dropdowns do not come back from perception at all,\n"
+            "    # so there is nothing on screen to click at: tab to them from the box\n"
+            "    # that IS visible and choose each by typing its name.\n"
+            '    box = only(ctx, ctx.see.find_text("What needs doing"), "the title box")\n'
+            "    fill_in(ctx, box, title)\n"
+            '    ctx.ctl.press("Tab")\n'
+            '    ctx.ctl.press("Tab")\n'
+            "    ctx.ctl.type_text(assignee)\n"
+            '    ctx.ctl.press("Tab")\n'
+            "    ctx.ctl.type_text(priority)\n"
             '    ctx.ctl.click(only(ctx, controls(ctx, "Create"), "the create button"))\n'
             "    return True\n",
             sees("Created"),
