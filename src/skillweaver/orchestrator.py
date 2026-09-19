@@ -105,6 +105,7 @@ from skillweaver.perception.ocr import (
     PerceptionCounters,
     PerceptionCounts,
 )
+from skillweaver.render_mode import crossing, mode_name, mode_of
 from skillweaver.skills.retrieve import SkillRetriever, accounted_for
 from skillweaver.skills.sandbox import SkillRunner
 from skillweaver.skills.store import FileSkillStore
@@ -224,6 +225,11 @@ class AttemptRecord:
             ``llm_calls`` and ``usd`` because it is the same kind of fact: the cost
             of the attempt, stated as a count so it means the same thing on a busy
             machine as on an idle one.
+        cross_mode: When this attempt lost the screen and the library was recorded in
+            the OTHER render mode, the sentence saying so; ``None`` otherwise. Its own
+            field rather than a ``stage``, because ``stage`` must keep saying where the
+            attempt actually stopped - ``no_route`` - while this says what most likely
+            put it there. See :mod:`skillweaver.render_mode`.
         demoted: The skill retired because it ran and failed, or ``None``.
         performed_nothing: Whether the screen is untouched, so the next path may
             start from it as it stands.
@@ -242,6 +248,7 @@ class AttemptRecord:
     usd: float = 0.0
     seconds: float = 0.0
     perception: PerceptionCounts = PerceptionCounts()
+    cross_mode: str | None = None
     demoted: str | None = None
     performed_nothing: bool = True
     run_id: str | None = None
@@ -252,7 +259,10 @@ class AttemptRecord:
         where = f" at {self.stage}" if self.stage else ""
         chain = f" [{' -> '.join(self.skills_used)}]" if self.skills_used else ""
         eyes = f", {self.perception}" if self.perception else ""
-        return f"{head}{where}{chain} ({self.llm_calls} model call(s){eyes}) - {self.reason}"
+        crossed = f" [{self.cross_mode}]" if self.cross_mode else ""
+        return (
+            f"{head}{where}{chain} ({self.llm_calls} model call(s){eyes}) - {self.reason}{crossed}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -657,7 +667,8 @@ class Agent:
         Nothing is performed when the library holds nothing for the domain, so that
         case is answered without even reading the screen.
         """
-        if not self._store.list(domain=task.domain):
+        stored = self._store.list(domain=task.domain)
+        if not stored:
             return (
                 AttemptRecord(
                     path="warm",
@@ -706,7 +717,7 @@ class Agent:
             )
 
         failure = self._planner.last_failure
-        return self._warm_failure(task, failure), None
+        return self._explained(self._warm_failure(task, failure), stored, task.domain), None
 
     def _held_elsewhere(self, domain: str) -> str:
         """What the library holds under OTHER domains, as a clause to append.
@@ -747,6 +758,52 @@ class Agent:
             performed_nothing=failure.performed_nothing,
             trace=failure.trace,
         )
+
+    _LOST_THE_SCREEN = frozenset({"no_route"})
+    """Warm failure stages a render-mode crossing can explain.
+
+    Only one, and deliberately. ``no_route`` is the planner saying it cannot get from
+    the screen in front of it to the screen a skill remembers, which is precisely the
+    question two renderers disagree about; ``find_route`` settles "am I already there?"
+    by similarity, so a cross-mode observation lands here. Every other stage is about
+    something else - ``unaccounted`` and ``no_candidates`` are judgments about words,
+    ``vanished`` is about the library, ``route_failed`` is a broken controller, and
+    ``skill_failed`` means the screens matched well enough to run. Offering the mode as
+    an explanation for those would be a confident falsehood in the one place a user is
+    already confused.
+    """
+
+    def _explained(
+        self, record: AttemptRecord, stored: Sequence[Skill], domain: str
+    ) -> AttemptRecord:
+        """``record`` with the render-mode crossing attached, when one explains it.
+
+        Unchanged unless the attempt lost the screen AND every skill the library offers
+        for ``domain`` recorded its own starting screen in the other mode. That second
+        condition is deliberately strict: one skill recorded in this mode, or one that
+        never said which mode it was recorded in, means the library is not uniformly
+        unreadable and the crossing is not the explanation.
+
+        Nothing is refused here, only explained, because the gap is not a constant - see
+        :mod:`skillweaver.render_mode` for the page that survived it.
+        """
+        if record.stage not in self._LOST_THE_SCREEN:
+            return record
+        current = mode_of(self._controller)
+        if current is None:  # a desktop, or a controller with no opinion - no claim
+            return record
+        recorded = getattr(self._store, "recorded_render_modes", None)
+        if recorded is None:  # a store that does not keep the answer
+            return record
+        claimed = recorded(domain)
+        names = sorted(skill.name for skill in stored)
+        if not all(claimed.get(name, current) != current for name in names):
+            return record
+        sentence = crossing(claimed[names[0]], current)
+        if sentence is None:  # unreachable while there are two modes; stay honest
+            return record
+        log.info("agent.warm.cross_mode", domain=domain, stage=record.stage, why=sentence)
+        return replace(record, cross_mode=sentence)
 
     # -- the cold path -----------------------------------------------------------------
 
@@ -1918,7 +1975,11 @@ def build_workbench(config: Settings | None = None) -> Workbench:
         config: Resolved settings. ``None`` uses :func:`skillweaver.config.settings`.
     """
     resolved = config if config is not None else settings()
-    store = FileSkillStore(resolved.skills_dir)
+    # The mode is stamped on everything this workbench STORES, because a stored screen
+    # outlives the window that rendered it: see skillweaver.render_mode. A command that
+    # never opens a world (`skills ls`) writes no skill either, so claiming the
+    # configured mode here cannot put a mode on something that was not rendered in it.
+    store = FileSkillStore(resolved.skills_dir, render_mode=mode_name(resolved.headless))
     graph = InMemorySiteGraph(store=JSONGraphStore(resolved.graphs_dir))
     trajectories = TrajectoryFileStore(resolved.trajectories_dir)
 
@@ -1996,7 +2057,9 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
     else:
         from skillweaver.controllers.browser import BrowserController
 
-        controller = BrowserController(headless=False, start_url=task.params.get("start_url"))
+        controller = BrowserController(
+            headless=config.headless, start_url=task.params.get("start_url")
+        )
     # Not ``default_weights_path()``: that reads the process-wide settings, which a
     # --data-dir on this invocation has already overridden.
     detector = YoloDetector(config.models_dir / DEFAULT_WEIGHTS_NAME)

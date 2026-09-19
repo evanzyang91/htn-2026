@@ -72,11 +72,15 @@ nothing and aborts nothing. Force the appeal with `?banner=<name>&force=1` to ch
 of this again without waiting for it.
 
 Use **headless** against a REAL site, on both sides of anything that will be compared.
-Headed and headless are different screens and are meant to be: two fresh browsers of
-opposite modes on one page score 0.13 (Wikipedia Main Page) and 0.42 (`json.html`), both
-at or below the same-state cut, while headless against headless scores 1.000. Note that
-`orchestrator._open_world` opens the CLI's browser HEADED, so a skill learned through the
-CLI does not match one replayed headless. What else a live-site run needs is in
+Headed and headless are different screens and are meant to be, and HOW different is the
+page's business, not a constant: two fresh browsers of opposite modes score 0.13
+(Wikipedia Main Page) and 0.42 (`json.html`) - below the same-state cut - but 0.82 on the
+sandbox app, above it. So the crossing is explained where it bites rather than refused up
+front, which would break the small clean page to protect the real one;
+`skillweaver.render_mode` carries the measurements and the rule. The mode is a setting
+(`SKILLWEAVER_HEADLESS`, `--headless`/`--headed` before the subcommand) and stays HEADED
+by default because the demo is watched; every shipped command gets it through the one
+`BrowserController` in `orchestrator._open_world`. What else a live-site run needs is in
 `eval/wikipedia.yaml`.
 
 Perception is dominated by OCR - 84-97% of every observation's time on real pages -

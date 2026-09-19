@@ -27,6 +27,18 @@ yet. A caller can tell "it failed" from "it could not even try".
 Configuration comes from :mod:`skillweaver.config` - the environment and ``.env`` -
 and flags override it per invocation. There is no second configuration mechanism and
 no flag silently resets a configured limit to a default.
+
+``--data-dir``, ``--log-level`` and ``--headless`` are properties of the WHOLE
+invocation rather than of one subcommand - which memories, how loud, which browser -
+so they are written before the subcommand, and one of them therefore covers ``learn``,
+``run`` and ``eval run`` alike::
+
+    skillweaver --headless eval run --suite eval/order.yaml
+
+Headed is the default, and ``--headless`` is measurement's flag; see
+:data:`skillweaver.config.DEFAULT_HEADLESS` for why that way round and
+:mod:`skillweaver.render_mode` for what happens to a skill learned in one mode and
+replayed in the other.
 """
 
 from __future__ import annotations
@@ -115,6 +127,19 @@ def root(
             show_default=False,
         ),
     ] = None,
+    headless: Annotated[
+        bool | None,
+        typer.Option(
+            "--headless/--headed",
+            help="Run the browser without a visible window. Applies to learn, run and "
+            "eval run. The default is HEADED, because a browser you can watch is what "
+            "makes the agent legible; --headless is what a suite, CI or an SSH session "
+            "wants. Overrides SKILLWEAVER_HEADLESS. NOTE: the two modes render one page "
+            "differently enough that a skill learned in one cannot match a screen in "
+            "the other - a run that crosses them says so rather than failing quietly.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Open the memories every subcommand reads from.
 
@@ -124,13 +149,21 @@ def root(
     if ctx.obj is not None:  # a caller (a test, an embedder) supplied its own
         return
     try:
-        ctx.obj = build_workbench(_settings(data_dir, log_level))
+        ctx.obj = build_workbench(_settings(data_dir, log_level, headless))
     except ConfigError as exc:
         _die(f"configuration is invalid: {exc}")
 
 
-def _settings(data_dir: Path | None, log_level: str | None) -> Settings:
-    """Configuration, with the two global flags applied on top.
+def _settings(
+    data_dir: Path | None, log_level: str | None, headless: bool | None = None
+) -> Settings:
+    """Configuration, with the global flags applied on top.
+
+    Every one of them is tri-state on purpose: ``None`` means the flag was not written,
+    and the configured value stands. ``--headless/--headed`` is the interesting case -
+    a plain ``bool`` defaulting to ``False`` would make every invocation that says
+    nothing an invocation that says ``--headed``, quietly overriding a
+    ``SKILLWEAVER_HEADLESS=1`` that a CI file had set on purpose.
 
     Raises:
         ConfigError: if the environment or a flag holds an invalid value.
@@ -144,6 +177,8 @@ def _settings(data_dir: Path | None, log_level: str | None) -> Settings:
         if level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             raise ConfigError(f"--log-level {log_level!r} is not a log level")
         changes["log_level"] = level
+    if headless is not None:
+        changes["headless"] = bool(headless)
     return dataclasses.replace(resolved, **changes) if changes else resolved
 
 
@@ -415,6 +450,7 @@ def _do(
         _say_where(where)
     _emit(_report_json(report, where) if as_json else report.explain(), as_json)
     if not as_json:
+        _hint_at_cross_mode(report)
         _hint_at_reset(report, reset_url)
     raise typer.Exit(OK if report.ok else NO)
 
@@ -449,6 +485,21 @@ def _apply_skill_seconds(seconds: float | None) -> None:
         _die(f"--skill-max-seconds must be greater than zero, got {seconds!r}")
     os.environ["SKILLWEAVER_SKILL_MAX_SECONDS"] = repr(float(seconds))
     settings.cache_clear()
+
+
+def _hint_at_cross_mode(report: RunReport) -> None:
+    """Repeat the render-mode crossing on its own line, where a hint is looked for.
+
+    The attempt line already carries it in brackets, but that line is a dense one -
+    stage, chain, model calls, perception counts - and this is the rare finding a
+    reader must not scan past: the library is INTACT, and the run that just paid a
+    model for a task it already knew needs one word on the command line rather than a
+    relearn. It sits beside the ``--reset-url`` hint for the same reason.
+    """
+    warm = report.warm
+    if warm is None or warm.cross_mode is None:
+        return
+    typer.echo(f"\nhint: {warm.cross_mode}", err=True)
 
 
 def _hint_at_reset(report: RunReport, reset_url: str | None) -> None:
@@ -487,6 +538,20 @@ def _params(pairs: Sequence[str] | None) -> dict[str, Any]:
         except json.JSONDecodeError:
             out[key.strip()] = value
     return out
+
+
+def _recorded_in(bench: Workbench, skill: Skill) -> str:
+    """``" (recorded headless)"`` when the library knows, else the empty string.
+
+    Printed against "starts on" rather than on a line of its own because it qualifies
+    exactly that screen: the identity is only comparable to a screen the same renderer
+    drew. A skill stored before the mode was recorded says nothing, which is the truth.
+    """
+    recorded = getattr(bench.store, "recorded_render_mode", None)
+    if recorded is None:
+        return ""
+    mode = recorded(skill.name, skill.domain, skill.version)
+    return f"  (recorded {mode})" if mode else ""
 
 
 def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[str, Any]:
@@ -533,6 +598,7 @@ def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[s
                 "steps": a.steps,
                 "llm_calls": a.llm_calls,
                 "usd": round(a.usd, 6),
+                "cross_mode": a.cross_mode,
                 "demoted": a.demoted,
             }
             for a in report.attempts
@@ -637,7 +703,8 @@ def skills_show(
         "",
         f"  runs        {skill.stats.successes} ok of {skill.stats.runs}"
         f"  (mean {_ms(skill.stats.mean_ms)})",
-        f"  starts on   {skill.precondition.value[:16] if skill.precondition else 'any screen'}",
+        f"  starts on   {skill.precondition.value[:16] if skill.precondition else 'any screen'}"
+        f"{_recorded_in(bench, skill)}",
         f"  parameters  {', '.join(skill.params) or '(none)'}",
         f"  requires    {', '.join(skill.requires) or '(nothing)'}",
         f"  verifier    {'yes' if skill.verifier_code else 'no'}",

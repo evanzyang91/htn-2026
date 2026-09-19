@@ -8,6 +8,7 @@ Recognized variables::
 
     SKILLWEAVER_DATA_DIR        data directory                  (default: data)
     SKILLWEAVER_TARGET          "browser" or "desktop"          (default: browser)
+    SKILLWEAVER_HEADLESS        run the browser without a window (default: false)
     SKILLWEAVER_LOG_LEVEL       DEBUG/INFO/WARNING/ERROR        (default: INFO)
     SKILLWEAVER_CLAUDE_MODEL    Claude model id                 (default: claude-opus-5)
     SKILLWEAVER_GEMINI_MODEL    Gemini computer-use model id
@@ -47,8 +48,29 @@ skill for the time it sits blocked on a screenshot or on OCR. Forty-five seconds
 long enough that no honest procedure on a real, slow page reaches it and short enough
 that ``while True`` is a pause rather than a hang."""
 
+DEFAULT_HEADLESS = False
+"""Whether the browser this project opens runs without a visible window.
+
+Headed by DEFAULT, and that is a product decision rather than an oversight. A visible
+window is what makes the agent legible - a person watching it work is the whole reason
+a computer-use agent is convincing - so the mode a plain command opens is the one a
+person can see.
+
+Headless is what MEASUREMENT wants, and it is one flag away: a suite of tasks run four
+times each has no audience, and a browser window stealing focus on a laptop, in CI or
+over SSH is a cost with no benefit. See ``--headless`` in :mod:`skillweaver.cli`.
+
+The two modes are not interchangeable, which is why this is recorded rather than merely
+chosen: two fresh browsers of opposite modes on ONE page fingerprint 0.126 and 0.421
+apart, both at or below :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`,
+so a skill learned in one mode can never match a screen rendered in the other. See
+:mod:`skillweaver.render_mode`, which names that mismatch instead of letting it show up
+as a mysteriously low similarity."""
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _TARGETS = ("browser", "desktop")
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +81,7 @@ class Settings:
     data_dir: Path = Path("data")
     default_target: Literal["browser", "desktop"] = "browser"
     log_level: str = "INFO"
+    headless: bool = DEFAULT_HEADLESS
     claude_model: str = DEFAULT_CLAUDE_MODEL
     gemini_model: str = DEFAULT_GEMINI_MODEL
     skill_max_seconds: float = DEFAULT_SKILL_MAX_SECONDS
@@ -123,6 +146,28 @@ def _number[T: (int, float)](env: Mapping[str, str], key: str, default: T, cast:
     return value
 
 
+def _flag(env: Mapping[str, str], key: str, default: bool) -> bool:
+    """A boolean setting, spelled any of the ways a shell or a CI file spells one.
+
+    ``1/true/yes/on`` and ``0/false/no/off``, in any case. An unset or empty value
+    means ``default``, so a variable that is merely present-but-blank does not flip
+    a mode nobody asked to flip.
+
+    Raises:
+        ConfigError: on anything else - a mode silently misread is worse than a
+            command that refuses to start.
+    """
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    text = raw.strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    raise ConfigError(f"{key}={raw!r} is not a boolean: use one of {_TRUE} or one of {_FALSE}")
+
+
 def load_settings(
     env: Mapping[str, str] | None = None, env_file: Path | str | None = Path(".env")
 ) -> Settings:
@@ -159,6 +204,7 @@ def load_settings(
         data_dir=Path(merged.get("SKILLWEAVER_DATA_DIR") or "data"),
         default_target=target,  # type: ignore[arg-type]
         log_level=log_level,
+        headless=_flag(merged, "SKILLWEAVER_HEADLESS", DEFAULT_HEADLESS),
         claude_model=merged.get("SKILLWEAVER_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
         gemini_model=merged.get("SKILLWEAVER_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
         skill_max_seconds=_number(

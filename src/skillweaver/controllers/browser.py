@@ -295,6 +295,19 @@ class BrowserController:
 
     # -- context manager ---------------------------------------------------------------
 
+    @property
+    def headless(self) -> bool:
+        """Whether this browser runs without a visible window.
+
+        Readable because the answer OUTLIVES the browser: a screen recorded here is
+        stored and compared later, and the two modes render one page differently
+        enough that a cross-mode comparison cannot succeed. ``describe()`` says the
+        same thing in prose for a prompt; this says it as a fact for
+        :func:`skillweaver.render_mode.mode_of` to read, so nothing has to parse a
+        sentence written for a human.
+        """
+        return self._headless
+
     def __enter__(self) -> BrowserController:
         return self
 

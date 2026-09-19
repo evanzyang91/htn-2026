@@ -5,6 +5,7 @@ Layout, rooted at :attr:`~skillweaver.config.Settings.skills_dir`::
     <data>/skills/manifest.json                       index: latest version per skill
     <data>/skills/<domain>/<name>/v1/skill.py         the source, byte for byte
     <data>/skills/<domain>/<name>/v1/meta.json        everything else
+    <data>/skills/<domain>/<name>/v1/recorded-in      the render mode, when known
     <data>/skills/<domain>/<name>/v2/...              the next version; v1 stays
 
 Three properties make this safe to grow into:
@@ -24,6 +25,21 @@ it from the directories, which are the real record.
 ``record_run`` rewrites only ``meta.json`` - the code file is never touched by
 statistics - and ``demote`` writes a reason that keeps the skill out of listing and
 retrieval while leaving every byte of it on disk.
+
+Why ``recorded-in`` is a file of its own
+----------------------------------------
+
+It answers "which renderer produced the screen this skill starts on", which decides
+whether a later run can compare against that screen at all - see
+:mod:`skillweaver.render_mode`. It is deliberately NOT a key in ``meta.json``, for two
+reasons. ``meta.json`` is regenerated wholesale from ``skills.model.to_dict`` on every
+``record_run`` and every ``demote``, and ``to_dict`` serializes a
+:class:`~skillweaver.contracts.Skill`, which has no field for the mode and cannot grow
+one here: ``contracts`` is shared surface. A key written beside that output would
+therefore survive the ``put`` and vanish on the skill's first recorded run, which is a
+worse record than none. So the mode lives beside ``skill.py`` as its own small file,
+written once when the version is claimed and never rewritten - the same shape, and for
+the same reason, as the source it describes.
 """
 
 from __future__ import annotations
@@ -39,15 +55,23 @@ from skillweaver.config import settings
 from skillweaver.contracts import Skill, SkillStats, utcnow
 from skillweaver.errors import SkillNotFound, SkillWeaverError
 from skillweaver.logging_ import get_logger
+from skillweaver.render_mode import MODES
 from skillweaver.skills.model import from_dict, to_dict, validate_identity
 
-__all__ = ["CODE_FILE", "MANIFEST_FILE", "META_FILE", "FileSkillStore"]
+__all__ = [
+    "CODE_FILE",
+    "MANIFEST_FILE",
+    "META_FILE",
+    "RENDER_MODE_FILE",
+    "FileSkillStore",
+]
 
 log = get_logger(__name__)
 
 CODE_FILE = "skill.py"
 META_FILE = "meta.json"
 MANIFEST_FILE = "manifest.json"
+RENDER_MODE_FILE = "recorded-in"
 MANIFEST_VERSION = 1
 
 _VERIFIER_FILE = "verify.py"
@@ -96,10 +120,23 @@ class FileSkillStore:
     Args:
         root: the skills directory. ``None`` means
             :attr:`~skillweaver.config.Settings.skills_dir`, so nothing is hardcoded.
+        render_mode: the mode the browser of THIS process renders in
+            (:data:`~skillweaver.render_mode.HEADED` or
+            :data:`~skillweaver.render_mode.HEADLESS`), stamped on every version this
+            store writes. ``None`` means "no claim" and writes nothing, which is the
+            honest answer for a store opened by a command that never opens a world -
+            ``skills ls`` must not assert a mode it did not render in.
+
+    Raises:
+        SkillWeaverError: if ``render_mode`` is not one of the known modes. A mode
+            misspelled here would be written to every skill stored afterwards.
     """
 
-    def __init__(self, root: Path | str | None = None) -> None:
+    def __init__(self, root: Path | str | None = None, *, render_mode: str | None = None) -> None:
+        if render_mode is not None and render_mode not in MODES:
+            raise SkillWeaverError(f"render_mode must be one of {MODES}, got {render_mode!r}")
         self.root = Path(root) if root is not None else settings().skills_dir
+        self._render_mode = render_mode
         self._manifest: dict[tuple[str, str], dict[str, Any]] | None = None
 
     # -- layout ------------------------------------------------------------------
@@ -111,6 +148,11 @@ class FileSkillStore:
     def version_dir(self, name: str, domain: str, version: int) -> Path:
         """Where one version lives: ``<root>/<domain>/<name>/v<N>``."""
         return self.skill_dir(name, domain) / f"v{version}"
+
+    @property
+    def render_mode(self) -> str | None:
+        """The mode this store stamps on what it writes, or ``None`` for no claim."""
+        return self._render_mode
 
     # -- manifest ----------------------------------------------------------------
 
@@ -230,6 +272,50 @@ class FileSkillStore:
         the skill is unknown."""
         return sorted(self._versions_on_disk(self.skill_dir(name, domain)))
 
+    def recorded_render_mode(
+        self, name: str, domain: str, version: int | None = None
+    ) -> str | None:
+        """The mode this version's screens were rendered in, or ``None`` when unknown.
+
+        ``None`` covers every honest way the answer can be missing and they are all the
+        same answer to a caller: a version stored before this was recorded, a store that
+        was opened with no claim, a file that says something this build does not
+        recognize. Never raises and never guesses - a wrong mode in a report is worse
+        than an absent one, because it accuses a working library of a mismatch it does
+        not have.
+
+        ``version=None`` means the latest, and an unknown skill is ``None`` rather than
+        :exc:`~skillweaver.errors.SkillNotFound`: this is a question asked while
+        deciding whether to bother comparing, not a read of the library.
+        """
+        try:
+            resolved = self._latest_version(name, domain) if version is None else int(version)
+        except SkillNotFound:
+            return None
+        path = self.version_dir(name, domain, resolved) / RENDER_MODE_FILE
+        try:
+            found = path.read_bytes().decode("utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        return found if found in MODES else None
+
+    def recorded_render_modes(self, domain: str | None = None) -> dict[str, str]:
+        """``{skill name: mode}`` for the latest version of every skill that says.
+
+        Skills whose mode is unknown are LEFT OUT rather than mapped to ``None``, so a
+        caller can ask "did anything here claim a mode?" by looking at the mapping and
+        "do they all disagree with me?" without filtering first. ``domain=None`` spans
+        the library; a name appears once, because only latest versions are consulted.
+        """
+        found: dict[str, str] = {}
+        for (name, entry_domain), _entry in self._entries().items():
+            if domain is not None and entry_domain != domain:
+                continue
+            mode = self.recorded_render_mode(name, entry_domain)
+            if mode is not None:
+                found[name] = mode
+        return found
+
     def list(self, domain: str | None = None, *, include_demoted: bool = False) -> list[Skill]:
         """The latest version of every skill, optionally restricted to one domain,
         sorted by ``(domain, name)``. Demoted skills are omitted unless asked for."""
@@ -269,6 +355,8 @@ class FileSkillStore:
         if stored.verifier_code is not None:
             _write_atomic(directory / _VERIFIER_FILE, stored.verifier_code.encode("utf-8"))
         _write_atomic(directory / META_FILE, _dump_json(to_dict(stored, include_code=False)))
+        if self._render_mode is not None:
+            _write_atomic(directory / RENDER_MODE_FILE, f"{self._render_mode}\n".encode())
 
         self._entries()[(stored.name, stored.domain)] = {
             "name": stored.name,
@@ -278,7 +366,13 @@ class FileSkillStore:
             "demoted_reason": stored.demoted_reason,
         }
         self._save_manifest()
-        log.info("skills.put", name=stored.name, domain=stored.domain, version=version)
+        log.info(
+            "skills.put",
+            name=stored.name,
+            domain=stored.domain,
+            version=version,
+            recorded_in=self._render_mode,
+        )
         return stored
 
     def _claim_version_dir(self, name: str, domain: str, start: int) -> Path:
@@ -363,4 +457,5 @@ class FileSkillStore:
         return updated
 
     def __repr__(self) -> str:
-        return f"FileSkillStore(root={str(self.root)!r})"
+        mode = "" if self._render_mode is None else f", render_mode={self._render_mode!r}"
+        return f"FileSkillStore(root={str(self.root)!r}{mode})"

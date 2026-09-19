@@ -193,25 +193,29 @@ Headed and headless are NOT made comparable
 
 Two FRESH browsers on one page, one visible and one headless, score 0.126 (Wikipedia
 Main Page) and 0.421 (``docs.python.org/3/library/json.html``) - straddling the cut, and
-the Main Page decisively below it. Two headless browsers on the same page score 1.000.
-The recorded precondition still does not record which mode produced it, for three
-reasons.
+the Main Page decisively below it; the same comparison on the sandbox ordering app scores
+0.819, above it. Two browsers of the same mode score 1.000 anywhere. The recorded
+:class:`~skillweaver.contracts.Fingerprint` still carries no mode, for three reasons.
 
 The gate never compares across modes. ``orchestrator._open_world`` builds ONE controller
 and ``navigating_environment`` re-navigates in THAT controller, so the recording and the
 re-run are always the same window. The gap is real and is simply not on this path.
 
-Where it IS real - a stored skill replayed later by another process in another mode -
-the precondition is the wrong place to carry the answer. ``Controller.describe()``
-already reports ``headed``, so a caller that wants to refuse a cross-mode replay can
-compare two strings without every stored skill in the library growing a field, and
-``Fingerprint`` is shared surface besides.
+Where it IS real - a stored skill replayed later by another process in another mode - the
+precondition is the wrong place to carry the answer, and it does not: the mode is
+recorded beside the skill by :mod:`skillweaver.skills.store` and read back by
+``Agent._explained``, which names the crossing on a warm attempt that lost its screen.
+Two strings are compared, and no stored screen identity grew a field for it -
+``Fingerprint`` is shared surface besides. See :mod:`skillweaver.render_mode`, which also
+says why that is an explanation rather than a refusal: 0.819 means the crossing is
+survivable on a small clean page, and a gate tuned against the sandbox is the kind that
+looks green until it meets a website.
 
 And it would make the identity worse. A screen is the same screen whoever rendered it;
 these scores are the fingerprinter correctly reporting that two renderers produce
 measurably different pixels. The answer is to run one renderer - ``eval/wikipedia.yaml``
-already says headless, for exactly this reason - not to teach the identity to ignore a
-difference it was right to notice.
+already says headless, for exactly this reason, and ``--headless`` is now how a run says
+so - not to teach the identity to ignore a difference it was right to notice.
 """
 
 

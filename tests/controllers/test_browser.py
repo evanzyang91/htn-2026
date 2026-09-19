@@ -603,13 +603,21 @@ class TestGroundTruth:
 
     def test_the_controller_never_hands_one_out(self) -> None:
         """It is an offline teacher. If a controller could produce one, an agent
-        on the action path could reach it by accident."""
+        on the action path could reach it by accident.
+
+        ``headless`` is on the list and is not a way out: it reports which renderer
+        this browser is, which is a fact about the WINDOW and says nothing about the
+        page inside it. It is public because a screen recorded here outlives the
+        browser and the two modes are not comparable - see
+        ``skillweaver.render_mode``.
+        """
         surface = {name for name in dir(BrowserController) if not name.startswith("_")}
         assert surface == {
             "blocked",  # URL patterns it refuses - configuration, not a reading of the page
             "capture",
             "close",
             "describe",
+            "headless",
             "perform",
             "supports",
             "url",
