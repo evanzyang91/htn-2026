@@ -1,0 +1,133 @@
+{
+  "interactions": [
+    {
+      "digest": "0927563b0b2c7fb5626895c42d223facaa928928e7da7fd2f04b9011021ab3aa",
+      "request": {
+        "max_tokens": 256,
+        "messages": [
+          {
+            "images": [],
+            "role": "user",
+            "text": "Reply with exactly one word: ready",
+            "tool_call_id": null,
+            "tool_calls": []
+          }
+        ],
+        "model": "claude-opus-5",
+        "system": "You are a terse test fixture. Answer in as few words as possible.",
+        "temperature": null,
+        "tools": null
+      },
+      "response": {
+        "stop_reason": "end",
+        "text": "ready",
+        "tool_calls": [],
+        "usage": {
+          "calls": 1,
+          "cost_usd": 0.00021,
+          "input_tokens": 27,
+          "output_tokens": 3
+        }
+      }
+    },
+    {
+      "digest": "3a6bc7be8702d9bf6b2a196263d08d878586a267e519179f6b4cdb5cfe7d3f1c",
+      "request": {
+        "max_tokens": 256,
+        "messages": [
+          {
+            "images": [
+              {
+                "bytes": 1147,
+                "sha256": "c13e23d884d266be6684bddbbb0f467e4bee2e7191a6a6d5e2e10dac504b4127"
+              }
+            ],
+            "role": "user",
+            "text": "This is a screenshot. Name the single word written on it, nothing else.",
+            "tool_call_id": null,
+            "tool_calls": []
+          }
+        ],
+        "model": "claude-opus-5",
+        "system": "You are a terse test fixture. Answer in as few words as possible.",
+        "temperature": null,
+        "tools": null
+      },
+      "response": {
+        "stop_reason": "end",
+        "text": "Submit",
+        "tool_calls": [],
+        "usage": {
+          "calls": 1,
+          "cost_usd": 0.00166,
+          "input_tokens": 312,
+          "output_tokens": 4
+        }
+      }
+    },
+    {
+      "digest": "d855c9d685fc1a5ae218e0b42b8000ec05d0c1b1bd5c9e4ec70101295e0b1f65",
+      "request": {
+        "max_tokens": 256,
+        "messages": [
+          {
+            "images": [],
+            "role": "user",
+            "text": "Click the Submit button. It is at x=120, y=240 in logical pixels. Use the click tool.",
+            "tool_call_id": null,
+            "tool_calls": []
+          }
+        ],
+        "model": "claude-opus-5",
+        "system": "You drive a computer with the tools you are given. Prefer a tool over prose.",
+        "temperature": null,
+        "tools": [
+          {
+            "description": "Click the mouse at a point, in logical pixels from the top-left of the viewport.",
+            "input_schema": {
+              "additionalProperties": false,
+              "properties": {
+                "x": {
+                  "description": "Logical pixels from the left edge.",
+                  "type": "integer"
+                },
+                "y": {
+                  "description": "Logical pixels from the top edge.",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "type": "object"
+            },
+            "name": "click"
+          }
+        ]
+      },
+      "response": {
+        "stop_reason": "tool_use",
+        "text": "",
+        "tool_calls": [
+          {
+            "args": {
+              "x": 120,
+              "y": 240
+            },
+            "id": "call_fixture_1",
+            "name": "click"
+          }
+        ],
+        "usage": {
+          "calls": 1,
+          "cost_usd": 0.003025,
+          "input_tokens": 415,
+          "output_tokens": 38
+        }
+      }
+    }
+  ],
+  "model": "claude-opus-5",
+  "version": 1
+}
