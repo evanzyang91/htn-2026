@@ -18,10 +18,13 @@ Headed on purpose: you asked to watch. Be aware that headed Chromium does not
 paint what the detector was trained on, so the agent perceives slightly less here
 than it would headless - see ``WATCH_PARAM`` in ``skillweaver/orchestrator.py``.
 
-Nothing is bought. There is no reset URL for a real shop, so the admission gate
-cannot put the world back and will refuse to store whatever is learned; that is
-the correct answer rather than a failure, and the run still shows what the agent
-can and cannot do on the page.
+Nothing is bought.
+
+Whether the run makes the site FASTER next time is decided by ``--reset-url``. The
+admission gate stores nothing it has not re-run and proved, and it cannot re-run a
+task that changed the world unless something can change it back. Without the flag
+the gate reports what it learned as unproved and the next run is just as slow.
+Every Shopify shop already has the URL: ``https://<shop>/cart/clear``.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ from skillweaver.orchestrator import (  # noqa: E402
     build_agent,
     navigating_environment,
     task_spec,
+    world_reset_from_url,
 )
 from skillweaver.perception.detect_yolo import DEFAULT_WEIGHTS_NAME, YoloDetector  # noqa: E402
 from skillweaver.perception.ocr import RapidOcrReader  # noqa: E402
@@ -61,6 +65,14 @@ def main() -> int:
     parser.add_argument("--url", required=True, help="page to open and hand over")
     parser.add_argument("--data-dir", type=Path, default=REPO / "data" / "live")
     parser.add_argument("--domain", default=None)
+    parser.add_argument(
+        "--reset-url",
+        default=None,
+        help="a URL that puts the site back where the run started, so the admission "
+        "gate can re-run what it wrote and prove it. Every Shopify shop has one: "
+        "https://<shop>/cart/clear. WITHOUT IT NOTHING IS EVER STORED, because a "
+        "skill that has not been re-run has proved nothing.",
+    )
     parser.add_argument("--max-steps", type=int, default=40)
     parser.add_argument("--max-seconds", type=float, default=900.0)
     parser.add_argument("--max-usd", type=float, default=5.0)
@@ -121,9 +133,15 @@ def main() -> int:
             graph=graph,
             trajectories=trajectories,
             recorder=Recorder(config.trajectories_dir),
-            # No reset URL for a real shop: the gate will say it could not prove
-            # whatever it learned, which is the honest answer.
-            environment=navigating_environment(controller, perceiver, graph=graph, restore=None),
+            # With no --reset-url the gate cannot put the world back, so it reports
+            # whatever it learned as unproved and stores nothing. That is the honest
+            # answer rather than a failure.
+            environment=navigating_environment(
+                controller,
+                perceiver,
+                graph=graph,
+                restore=world_reset_from_url(args.reset_url) if args.reset_url else None,
+            ),
             budget=budget_from(
                 config,
                 max_steps=args.max_steps,
