@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from skillweaver.agent.planner import PlanFailure
+from skillweaver.config import Settings
 from skillweaver.contracts import (
     Budget,
     Controller,
@@ -45,6 +46,7 @@ from skillweaver.orchestrator import (
     ResetOutcome,
     ResetRefused,
     RunReport,
+    build_retriever,
     navigating_environment,
     perception_counts,
     recall,
@@ -847,3 +849,27 @@ class _Trajectorying:
             spend=Spend(),
             note="explored",
         )
+
+
+# --------------------------------------------------------------------------------------
+# Which ranking the shipped commands get
+# --------------------------------------------------------------------------------------
+#
+# `build_retriever` is the ONE place an Embedder would be constructed, so `learn`, `run`
+# and `eval run` cannot disagree about how skills are ranked. What it builds today is
+# keyword ranking, because the model is off by default - see DEFAULT_EMBEDDER_ENABLED,
+# whose docstring carries the measurement that decided it.
+
+
+class TestTheShippedRetriever:
+    def test_it_ranks_on_keywords_and_says_why(self) -> None:
+        retriever = build_retriever(InMemorySkillStore(), Settings())
+
+        assert retriever.ranked_by == "keywords"
+        assert retriever.fallback_reason, "a keyword-ranked run says which of the reasons it is"
+
+    def test_a_backend_that_breaks_costs_the_ranking_a_signal_not_the_library(self) -> None:
+        """On a live run losing the embedder must be a worse ranking, never an empty
+        candidate list: `_safe_search` turns a ProviderError into no skills at all,
+        which is the cold path for a library that had the answer."""
+        assert build_retriever(InMemorySkillStore(), Settings()).degrade_on_error is True

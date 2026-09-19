@@ -40,7 +40,7 @@ from skillweaver.contracts import (
 from skillweaver.contracts import (
     Planner as PlannerProtocol,
 )
-from skillweaver.skills.retrieve import SkillRetriever
+from skillweaver.skills.retrieve import SkillRetriever, accounted_for, unaddressed
 from skillweaver.skills.sandbox import SkillRunner
 from tests.fakes import (
     FakeCritic,
@@ -1600,3 +1600,41 @@ def test_the_calibration_gap_this_line_sits_in() -> None:
     assert max(wrong_but_bindable) < MIN_ACCOUNTED_FOR < min(right_and_bindable)
     assert MIN_ACCOUNTED_FOR - max(wrong_but_bindable) >= 0.1, "too close to the wrong answers"
     assert min(right_and_bindable) - MIN_ACCOUNTED_FOR >= 0.1, "too close to the right ones"
+
+
+def test_the_ordering_miss_of_2026_09_19_was_the_gate_and_not_the_ranking() -> None:
+    """Why a better RANKING could not have rescued ``add_dish_with_option``.
+
+    That task fell through to full exploration - 86.9 s and 14.5 model calls against
+    4.3 to 5.7 s for the three tasks that hit - and the retrieval log is usually read
+    as the reason::
+
+        planner.miss ... offered="open_restaurant_menu_by_cuisine=0.460, ..."
+          rejected="open_restaurant_menu_by_cuisine (score 0.460) -> unaccounted"
+          why="... no embedder: keyword and token overlap only; shares 'order',
+               'screen', 'open', 'copper', 'kettle'; ... no account of 'add',
+               'large', 'pad', 'cart'"
+
+    ``no embedder`` is in that line, so it reads as the cause. It is not. The stage is
+    ``unaccounted``: the candidate was declined by THIS gate, which counts words and
+    never looks at the score. The library held no skill that adds anything to a cart,
+    four of the ten meaning-words of the request had no account anywhere, and a cosine
+    of 1.00 would have changed the order of the candidates and nothing else.
+
+    Reconstructed from the words that log line names, because that run's library was
+    never committed. Pinned so the next person to reach for retrieval starts where the
+    decision is actually made.
+    """
+    task = "On the Order screen, open Copper Kettle and add a Large Pad Thai to the cart"
+    shares = "order screen open copper kettle thai"
+    candidate = plant(
+        "open_restaurant_menu_by_cuisine",
+        f"Open a restaurant's menu from the {shares} listing.",
+        "def run(ctx):\n    pass\n",
+        precondition=None,
+        docstring=f"Filters the {shares} listing and opens one restaurant's menu.",
+    )
+
+    assert unaddressed(task, candidate) == ["add", "large", "pad", "cart"]
+    assert accounted_for(task, candidate) == pytest.approx(0.6)
+    assert accounted_for(task, candidate) < MIN_ACCOUNTED_FOR

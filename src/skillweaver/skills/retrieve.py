@@ -24,6 +24,23 @@ They are blended (``lexical_weight``, 0.3 by default) rather than switched betwe
 because the cheap signal is a good sanity check on the expensive one: a skill the
 embedder likes but that shares no word with the task is usually a near-miss.
 
+Which of the two actually ranked is always stated
+-------------------------------------------------
+
+An embedder can be absent (nobody fetched the weights, someone turned it off) or break
+mid-run, and in both cases this class keeps working on token overlap alone. That is the
+right behaviour and a silent version of it would be a defect: every measurement of what
+the embedder is worth compares two runs whose ONLY difference is supposed to be the
+embedder, and a run that quietly fell back is indistinguishable from one that never had
+one. So ``why`` names the state in words - ``cosine 0.62 ...``, ``no embedder (<why
+not>): keyword and token overlap only`` - and ``ranked_by`` says the same thing to code.
+
+A failing embedder is a fall-back only when the caller asked for one
+(``degrade_on_error``). Injected directly it still raises
+:class:`~skillweaver.errors.ProviderError`, which is what
+:class:`~skillweaver.contracts.SkillRetriever` promises and what a test that hands in a
+broken backend is entitled to see.
+
 Every :class:`~skillweaver.contracts.Candidate` carries a ``why`` built from what
 actually matched - the shared words, the cosine, the name hit - and ends with what the
 skill has NO account of, because a score on its own reads as agreement.
@@ -198,6 +215,16 @@ class SkillRetriever:
             embedder is present, in ``0.0..1.0``.
         min_score: candidates at or below this are dropped, so "nothing is relevant"
             comes back as an empty list rather than a page of noise.
+        unavailable_reason: why ``embedder`` is ``None``, in a few words, when
+            something tried to build one and could not. It is quoted in every
+            candidate's ``why``, so a keyword-ranked run says whether the model was
+            turned off, never fetched, or simply not asked for.
+        degrade_on_error: whether an embedder that FAILS disables itself and lets the
+            search finish on token overlap. ``False`` - the default, and what the
+            :class:`~skillweaver.contracts.SkillRetriever` protocol documents - lets
+            the :class:`~skillweaver.errors.ProviderError` out. The orchestrator asks
+            for ``True``: on a live run a broken backend should cost the ranking its
+            second signal, not cost the agent its whole library.
     """
 
     def __init__(
@@ -207,6 +234,8 @@ class SkillRetriever:
         *,
         lexical_weight: float = 0.3,
         min_score: float = 0.0,
+        unavailable_reason: str = "",
+        degrade_on_error: bool = False,
     ) -> None:
         if not 0.0 <= lexical_weight <= 1.0:
             raise SkillWeaverError(f"lexical_weight must be in 0.0..1.0, got {lexical_weight}")
@@ -214,7 +243,21 @@ class SkillRetriever:
         self.embedder = embedder
         self.lexical_weight = lexical_weight
         self.min_score = min_score
+        self.degrade_on_error = degrade_on_error
+        self._absent = unavailable_reason
         self._vectors: dict[str, list[float]] = {}
+
+    @property
+    def ranked_by(self) -> str:
+        """``"embedder"`` or ``"keywords"``: which signal this retriever is ranking
+        with RIGHT NOW, after any fall-back. What the measurement reads."""
+        return "embedder" if self.embedder is not None else "keywords"
+
+    @property
+    def fallback_reason(self) -> str:
+        """Why there is no embedder, or ``""`` when there is one. Set at construction
+        or, after a backend fails under ``degrade_on_error``, to that failure."""
+        return "" if self.embedder is not None else self._absent
 
     # -- scoring -----------------------------------------------------------------
 
@@ -255,6 +298,26 @@ class SkillRetriever:
         """
         if self.embedder is None:
             return None
+        try:
+            return self._cosines(task, skills)
+        except ProviderError as exc:
+            if not self.degrade_on_error:
+                raise
+            # Once, and then never again this run: a backend that failed on one batch
+            # of short strings is not going to succeed on the next, and a retriever
+            # that retried it would pay the timeout on every task.
+            self.embedder = None
+            self._absent = f"embedder failed and was dropped: {exc}"
+            log.warning("skills.embedder_dropped", error=str(exc))
+            return None
+
+    def _cosines(self, task: str, skills: Sequence[Skill]) -> list[float]:
+        """:meth:`_embed_all` with the embedder known to be present.
+
+        Raises:
+            ProviderError: if the embedding backend fails.
+        """
+        assert self.embedder is not None
         texts = [task] + [searchable_text(s) for s in skills]
         keys = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in texts]
         missing = [t for t, k in zip(texts, keys, strict=True) if k not in self._vectors]
@@ -298,6 +361,7 @@ class SkillRetriever:
         *,
         verbatim: bool = False,
         missing: Sequence[str] = (),
+        absent: str = "",
     ) -> str:
         """The sentence a human reads next to the candidate.
 
@@ -313,7 +377,8 @@ class SkillRetriever:
         if verbatim:
             parts.append("the exact sentence this skill was learned from")
         if cosine is None:
-            parts.append("no embedder: keyword and token overlap only")
+            because = f" ({absent})" if absent else ""
+            parts.append(f"no embedder{because}: keyword and token overlap only")
         else:
             parts.append(f"cosine {cosine:.2f} on the skill's searchable text")
         if shared:
@@ -373,6 +438,7 @@ class SkillRetriever:
                         skill,
                         verbatim=verbatim,
                         missing=unaddressed(task, skill),
+                        absent=self._absent,
                     ),
                 )
             )
@@ -389,6 +455,8 @@ class SkillRetriever:
             scores=", ".join(f"{c.skill.name}={c.score:.3f}" for c in scored),
             below_min=", ".join(below),
             embedder=type(self.embedder).__name__ if self.embedder else "none",
+            ranked_by=self.ranked_by,
+            fallback=self.fallback_reason,
         )
         return top
 

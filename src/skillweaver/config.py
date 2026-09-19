@@ -19,6 +19,10 @@ Recognized variables::
     SKILLWEAVER_MAX_LLM_CALLS   default Budget.max_llm_calls    (default: 60)
     SKILLWEAVER_SKILL_MAX_SECONDS
                                 default SkillLimits.max_seconds (default: 45)
+    SKILLWEAVER_EMBEDDER        rank skills with the local embedding model when its
+                                weights are present                (default: true)
+    SKILLWEAVER_EMBEDDER_DIR    where those weights live
+                                (default: <data_dir>/models/text_embedder)
     ANTHROPIC_API_KEY           Claude credentials (optional: the SDK also resolves
                                 its own credentials when this is unset)
     GEMINI_API_KEY              Gemini credentials (GOOGLE_API_KEY also accepted)
@@ -39,6 +43,9 @@ from skillweaver.errors import ConfigError
 DEFAULT_CLAUDE_MODEL = "claude-opus-5"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-computer-use-preview-10-2025"
 
+EMBEDDER_DIRNAME = "text_embedder"
+"""The directory under ``models_dir`` that holds the retrieval embedding model."""
+
 DEFAULT_SKILL_MAX_SECONDS = 45.0
 """Wall-clock seconds one stored skill may spend running its OWN code.
 
@@ -48,6 +55,25 @@ allowance - see :class:`~skillweaver.skills.api.SkillLimits`, which does not cha
 skill for the time it sits blocked on a screenshot or on OCR. Forty-five seconds is
 long enough that no honest procedure on a real, slow page reaches it and short enough
 that ``while True`` is a pause rather than a hang."""
+
+DEFAULT_EMBEDDER_ENABLED = False
+"""Whether retrieval ranks with the local embedding model when its weights are there.
+
+OFF, and that is a MEASURED decision rather than caution. Ranking by meaning does what
+it was built to do - it finds a stored skill asked for in other words, lifting top-1
+recall from 18/24 to 21/24 over the two libraries in this repository - and not one of
+those extra hits turns into a warm run, because what stops them is downstream of the
+ranking and is counted in words:
+:func:`~skillweaver.agent.planner.bind_args` first, then
+:data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR`. Runnable candidates: 3/24 both
+ways when a person types the request, 9/24 both ways when a suite supplies its values.
+Meanwhile retrieval's precision gets WORSE - a cosine is almost never zero, so five of
+six irrelevant requests come back with a candidate instead of one - and no cut-off
+separates the two populations, so there is nothing to tune either.
+
+Turn it on with ``SKILLWEAVER_EMBEDDER=true`` to re-measure (``make embedder``, then
+``scripts/bench_retrieval.py``), and flip this line when the number that matters moves.
+"""
 
 DEFAULT_HEADLESS = False
 """Whether the browser this project opens runs without a visible window.
@@ -101,6 +127,8 @@ class Settings:
     claude_model: str = DEFAULT_CLAUDE_MODEL
     gemini_model: str = DEFAULT_GEMINI_MODEL
     skill_max_seconds: float = DEFAULT_SKILL_MAX_SECONDS
+    embedder_enabled: bool = DEFAULT_EMBEDDER_ENABLED
+    embedder_dir_override: Path | None = None
     anthropic_api_key: str | None = field(default=None, repr=False)
     gemini_api_key: str | None = field(default=None, repr=False)
     default_budget: Budget = field(default_factory=Budget)
@@ -124,6 +152,17 @@ class Settings:
     def models_dir(self) -> Path:
         """Where detector weights and datasets live: ``<data_dir>/models``."""
         return self.data_dir / "models"
+
+    @property
+    def embedder_dir(self) -> Path:
+        """Where the retrieval embedding model's weights live.
+
+        ``<models_dir>/text_embedder`` unless ``SKILLWEAVER_EMBEDDER_DIR`` names
+        somewhere else, so several worktrees can share one 90 MB download.
+        """
+        if self.embedder_dir_override is not None:
+            return self.embedder_dir_override
+        return self.models_dir / EMBEDDER_DIRNAME
 
     @property
     def eval_dir(self) -> Path:
@@ -236,6 +275,12 @@ def load_settings(
         gemini_model=merged.get("SKILLWEAVER_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
         skill_max_seconds=_number(
             merged, "SKILLWEAVER_SKILL_MAX_SECONDS", DEFAULT_SKILL_MAX_SECONDS, float
+        ),
+        embedder_enabled=_flag(merged, "SKILLWEAVER_EMBEDDER", DEFAULT_EMBEDDER_ENABLED),
+        embedder_dir_override=(
+            Path(merged["SKILLWEAVER_EMBEDDER_DIR"])
+            if merged.get("SKILLWEAVER_EMBEDDER_DIR")
+            else None
         ),
         anthropic_api_key=merged.get("ANTHROPIC_API_KEY") or None,
         gemini_api_key=merged.get("GEMINI_API_KEY") or merged.get("GOOGLE_API_KEY") or None,

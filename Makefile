@@ -1,8 +1,12 @@
-.PHONY: install test lint fmt
+.PHONY: install test lint fmt embedder
 
 install:  ## create .venv from uv.lock and fetch the Playwright browser
 	uv sync
 	uv run playwright install chromium
+
+embedder:  ## fetch the retrieval embedding model (~90 MB, optional, off by default)
+	uv run python scripts/fetch_embedder.py
+	@echo 'now: SKILLWEAVER_EMBEDDER=true uv run python scripts/bench_retrieval.py'
 
 test:  ## run the test suite
 	uv run pytest

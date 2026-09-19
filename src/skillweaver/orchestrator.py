@@ -114,6 +114,7 @@ from skillweaver.reset_actions import (
     reset_steps_from,
     world_reset_from_actions,
 )
+from skillweaver.skills.embed import embedder_for, load_embedder
 from skillweaver.skills.retrieve import SkillRetriever, accounted_for
 from skillweaver.skills.sandbox import SkillRunner
 from skillweaver.skills.store import FileSkillStore
@@ -148,6 +149,7 @@ __all__ = [
     "WorldReset",
     "build_agent",
     "budget_from",
+    "build_retriever",
     "build_workbench",
     "navigating_environment",
     "perception_counts",
@@ -1857,7 +1859,7 @@ def build_agent(
         max_repairs: How many times the gate may ask for the code to be rewritten.
         top_k: Retrieval breadth.
     """
-    retriever = retriever if retriever is not None else SkillRetriever(store)
+    retriever = retriever if retriever is not None else build_retriever(store)
     graph = graph if graph is not None else InMemorySiteGraph()
     runner = SkillRunner(store)
 
@@ -1954,6 +1956,32 @@ def _warm_critic(llm: LLMClient, recalled: Recollection) -> TieredCritic:
     return TieredCritic(llm, expected_state=recalled.state)
 
 
+def build_retriever(store: SkillStore, config: Settings | None = None) -> SkillRetriever:
+    """The retriever every shipped command ranks with: token overlap, plus the local
+    embedding model when this machine has its weights.
+
+    The one place an :class:`~skillweaver.contracts.Embedder` is constructed, so
+    ``learn``, ``run`` and ``eval run`` all get the same ranking and a test that
+    injects its own retriever still bypasses it. :func:`~skillweaver.skills.embed.
+    load_embedder` answers in two ``exists`` calls and loads no model, so a command
+    that never searches pays nothing for this.
+
+    When there is no embedder the REASON travels with the retriever into every
+    candidate's ``why``, and a backend that breaks mid-run is dropped rather than
+    taking the library down with it - see ``degrade_on_error`` in
+    :class:`~skillweaver.skills.retrieve.SkillRetriever`.
+
+    Args:
+        store: the library to rank.
+        config: settings to read the embedder's state from. ``None`` - what every
+            shipped command passes - uses the process-wide ones, resolved once.
+    """
+    embedder, reason = load_embedder() if config is None else embedder_for(config)
+    if reason:
+        log.info("skills.retriever.keywords_only", reason=reason)
+    return SkillRetriever(store, embedder, unavailable_reason=reason, degrade_on_error=True)
+
+
 def _safe_search(retriever: SkillRetriever, task: TaskSpec, top_k: int) -> tuple[Candidate, ...]:
     try:
         return tuple(retriever.search(task.text, domain=task.domain, k=top_k))
@@ -2027,7 +2055,7 @@ def build_workbench(config: Settings | None = None) -> Workbench:
                 perceiver=perceiver,
                 llm=_open_model(resolved),
                 store=store,
-                retriever=SkillRetriever(store),
+                retriever=build_retriever(store),
                 graph=graph,
                 trajectories=trajectories,
                 recorder=Recorder(resolved.trajectories_dir),
@@ -2046,7 +2074,7 @@ def build_workbench(config: Settings | None = None) -> Workbench:
     return Workbench(
         settings=resolved,
         store=store,
-        retriever=SkillRetriever(store),
+        retriever=build_retriever(store),
         graph=graph,
         trajectories=trajectories,
         session=session,

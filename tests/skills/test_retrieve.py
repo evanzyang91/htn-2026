@@ -237,6 +237,74 @@ def test_vectors_are_cached_so_a_stable_library_costs_one_embedding(
     assert fake_embedder.calls == after_first
 
 
+# -- degrading honestly ------------------------------------------------------------------
+#
+# A fall-back that says nothing makes the whole feature unmeasurable: a run ranked on
+# keywords because somebody turned the model off looks exactly like a run ranked on
+# keywords because the model died halfway through. So the reason is carried, and these
+# are the three ways there is no embedder.
+
+
+def test_a_failing_embedder_can_be_dropped_instead_of_taking_the_search_down(
+    library: InMemorySkillStore,
+) -> None:
+    """What a live run asks for: losing the second signal is a worse ranking, losing
+    the search is a warm path that cannot fire at all."""
+    retriever = SkillRetriever(library, BrokenEmbedder(), degrade_on_error=True)  # type: ignore[arg-type]
+
+    hits = retriever.search("search the invoice list for Acme")
+
+    assert hits[0].skill.name == "search_invoice", "token overlap carried the ranking"
+    assert retriever.ranked_by == "keywords"
+    assert "connection reset" in hits[0].why
+    assert "keyword and token overlap only" in hits[0].why
+
+
+def test_a_dropped_embedder_is_not_asked_again(library: InMemorySkillStore) -> None:
+    """A backend that failed on one batch of short strings will fail on the next, and
+    a retriever that kept trying would pay its timeout on every task of the run."""
+
+    class CountingBroken:
+        calls = 0
+
+        def embed(self, texts):  # noqa: ANN001, ANN201
+            CountingBroken.calls += 1
+            raise RuntimeError("connection reset by peer")
+
+    retriever = SkillRetriever(library, CountingBroken(), degrade_on_error=True)  # type: ignore[arg-type]
+    retriever.search("invoice")
+    retriever.search("payment")
+    retriever.search("export")
+
+    assert CountingBroken.calls == 1
+
+
+def test_an_absent_embedder_says_WHY_it_is_absent(library: InMemorySkillStore) -> None:
+    retriever = SkillRetriever(library, unavailable_reason="no local weights: model.onnx")
+
+    hit = retriever.search("search the invoice list")[0]
+
+    assert "no embedder (no local weights: model.onnx): keyword and token overlap only" in hit.why
+    assert retriever.fallback_reason == "no local weights: model.onnx"
+
+
+def test_with_no_reason_given_the_old_sentence_is_unchanged(library: InMemorySkillStore) -> None:
+    """Nobody tried to build one, so there is nothing to explain."""
+    assert (
+        "no embedder: keyword and token overlap only"
+        in SkillRetriever(library).search("search the invoice list")[0].why
+    )
+
+
+def test_a_working_embedder_reports_no_fallback(
+    library: InMemorySkillStore, fake_embedder: FakeEmbedder
+) -> None:
+    retriever = SkillRetriever(library, fake_embedder, unavailable_reason="stale")
+    assert retriever.ranked_by == "embedder"
+    assert retriever.fallback_reason == ""
+    assert "cosine" in retriever.search("search the invoice list")[0].why
+
+
 def test_a_nonsense_lexical_weight_is_refused(library: InMemorySkillStore) -> None:
     with pytest.raises(SkillWeaverError, match="lexical_weight"):
         SkillRetriever(library, lexical_weight=1.5)

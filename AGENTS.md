@@ -231,6 +231,21 @@ the text the synthesizer is shown. A rejected move there fell short of what it C
 measured on one whose action the task still needed - so it is marked as suspect and
 never dropped.
 
+A better RANKING buys nothing while the two checks after it count WORDS. Retrieval
+can now rank by meaning - a local MiniLM through onnxruntime, no new dependency, no
+network at run time (`skills/embed.py`, `make embedder`) - and measured over both
+libraries this repository carries it lifts top-1 recall from 18/24 to 21/24 and moves
+the number that matters, runnable candidates, by ZERO: 3/24 both ways when a person
+types the request, 9/24 both ways when a suite supplies its values. What stops them is
+`bind_args` and then `MIN_ACCOUNTED_FOR`, both of which are counted in words, so a
+request worded differently fails them for the same reason it ranked badly. Precision
+also gets worse, because a cosine is almost never zero. So it ships OFF
+(`DEFAULT_EMBEDDER_ENABLED`), `scripts/bench_retrieval.py` is how to re-measure, and
+warm-path reuse is improved by working on BINDING, not on retrieval. The ordering
+suite's famous miss says `no embedder` in its log line and was not caused by it - its
+stage is `unaccounted`; `test_the_ordering_miss_of_2026_09_19_was_the_gate_and_not_the_ranking`
+holds the arithmetic.
+
 And a fall-through is not a success. A warm attempt that missed and was rescued by
 exploration reports the miss in its headline (`RunReport.warm_missed` and `rescued`,
 `orchestrator.py`); `SOLVED by the cold path` on its own is the sentence that hid the
