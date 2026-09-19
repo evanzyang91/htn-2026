@@ -15,6 +15,8 @@ from skillweaver.graph.route import (
     VERIFIED_ONLY,
     RoutingPolicy,
     edge_cost,
+    explain_edge,
+    explain_route,
     find_route,
     is_verified,
     require_route,
@@ -323,3 +325,74 @@ def test_a_nonsensical_policy_is_rejected(kwargs, message):
 
 def test_the_default_policy_is_the_contract_behavior():
     assert VERIFIED_ONLY.allow_unverified is False
+
+
+# -- why an edge was preferred --------------------------------------------------------
+#
+# A replayed route runs fast, free and confident whether or not the numbers under it
+# mean anything, so the numbers have to be askable. These pin the explanation to the
+# same decision ``edge_cost`` makes rather than to a re-reading of it.
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        edge(A, B, attempts=4, successes=4, mean_ms=200.0),
+        edge(A, B, attempts=4, successes=1, mean_ms=200.0),
+        edge(A, B, attempts=5, successes=0, mean_ms=0.0, day=None),
+        edge(A, B, attempts=1, successes=0, mean_ms=0.0, day=None),
+    ],
+)
+@pytest.mark.parametrize("policy", [VERIFIED_ONLY, EXPLORATORY])
+def test_the_explanation_carries_the_cost_the_router_uses(candidate, policy):
+    assert explain_edge(candidate, policy).cost == edge_cost(candidate, policy)
+
+
+def test_a_priced_edge_names_the_counts_it_was_priced_on():
+    verdict = explain_edge(edge(A, B, attempts=4, successes=2, mean_ms=200.0))
+
+    assert verdict.cost == pytest.approx(400.0), "200ms over a 50% rate"
+    assert "2 successful of 4 attempts" in verdict.reason
+    assert "50%" in verdict.reason
+
+
+def test_a_refusal_for_hopelessness_names_the_floor_it_missed():
+    verdict = explain_edge(edge(A, B, attempts=10, successes=1, mean_ms=100.0))
+
+    assert verdict.cost is None
+    assert "1/10" in verdict.reason and "20%" in verdict.reason
+
+
+def test_a_refusal_for_being_unproven_says_so():
+    verdict = explain_edge(edge(A, B, attempts=2, successes=0, mean_ms=0.0, day=None))
+
+    assert verdict.cost is None
+    assert "never verified" in verdict.reason
+
+
+def test_an_unverified_edge_under_an_exploratory_policy_shows_its_prior():
+    verdict = explain_edge(edge(A, B, attempts=1, successes=0, mean_ms=0.0, day=None), EXPLORATORY)
+
+    assert verdict.cost == pytest.approx(3000.0)
+    assert "never verified" in verdict.reason and "x3" in verdict.reason
+
+
+def test_a_route_is_explained_hop_by_hop_in_the_order_it_is_walked():
+    first = edge(A, B, attempts=2, successes=2, mean_ms=100.0)
+    second = edge(B, C, attempts=4, successes=2, mean_ms=200.0)
+    route = find_route(A, C, outgoing_from(first, second), VERIFIED_ONLY)
+
+    verdicts = explain_route(route)
+
+    assert [(v.edge.src.value, v.edge.dst.value) for v in verdicts] == [("a", "b"), ("b", "c")]
+    assert sum(v.cost for v in verdicts) == pytest.approx(route.cost)
+
+
+def test_being_already_there_rests_on_no_edge_statistics():
+    assert explain_route(Route((), 0.0, ())) == ()
+
+
+def test_a_verdict_prints_the_hop_and_the_reason():
+    line = str(explain_edge(edge(A, B, attempts=2, successes=2, mean_ms=100.0)))
+
+    assert line.startswith("a -> b: ")

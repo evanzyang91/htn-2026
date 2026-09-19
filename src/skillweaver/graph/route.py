@@ -59,6 +59,19 @@ hops in between are matched exactly on ``Fingerprint.value``, because those valu
 node ids and a node id is never a drifted observation. A caller holding a live
 fingerprint that should be resolved onto a known node passes ``resolve``.
 
+Why an edge was preferred
+-------------------------
+
+Every number above comes off a stored edge, and a route replayed from stored edges
+runs fast, free and confident whether or not those numbers mean anything - the graph
+once carried 262144 successes on an edge walked a few dozen times. So the pricing
+decision is available with its reasons attached: :func:`explain_edge` gives one edge's
+cost and the counts it rests on, :func:`explain_route` gives that hop by hop for a
+whole route. Both come through the same :func:`_price` as :func:`edge_cost`, so the
+explanation is the decision rather than a second opinion about it. The string it
+builds costs nothing worth counting here: a graph has tens of edges and a route is
+computed once per warm attempt, against a perception step that dominates every run.
+
 Failure behavior
 ----------------
 
@@ -164,16 +177,77 @@ def edge_cost(edge: Transition, policy: RoutingPolicy = VERIFIED_ONLY) -> float 
 
     ``None`` means the router must not use this edge at all: either it is hopeless
     under the policy's cap, or it is unverified and the policy does not allow that.
-    Never raises.
+    Never raises. :func:`explain_edge` is the same decision with its reasons kept.
+    """
+    return _price(edge, policy)[0]
+
+
+def _price(edge: Transition, policy: RoutingPolicy) -> tuple[float | None, str]:
+    """The cost decision and the sentence that justifies it, from ONE place.
+
+    :func:`edge_cost` and :func:`explain_edge` both come through here, so the number
+    the router uses and the reason a person is shown can never drift apart. That
+    matters more here than the duplication it saves: an agent replaying a stored
+    route runs fast, free and confident, and the only way to catch it doing that on
+    a number that means nothing is to be able to ask why.
     """
     rate = success_rate(edge)
     if edge.attempts >= policy.min_attempts_for_cap and rate < policy.min_success_rate:
-        return None
+        return None, (
+            f"refused: {edge.successes}/{edge.attempts} is a {rate:.0%} success rate, "
+            f"under the {policy.min_success_rate:.0%} floor, over at least "
+            f"{policy.min_attempts_for_cap} attempts"
+        )
     if not is_verified(edge):
         if not policy.allow_unverified:
-            return None
-        return policy.unverified_ms * policy.unverified_penalty
-    return edge.mean_ms / rate
+            return None, f"refused: never verified in {edge.attempts} attempts"
+        cost = policy.unverified_ms * policy.unverified_penalty
+        return cost, (
+            f"{cost:.0f}ms assumed: never verified in {edge.attempts} attempts, priced at "
+            f"{policy.unverified_ms:.0f}ms x{policy.unverified_penalty:g}"
+        )
+    return edge.mean_ms / rate, (
+        f"{edge.mean_ms / rate:.0f}ms expected: {edge.mean_ms:.0f}ms over "
+        f"{edge.successes} successful of {edge.attempts} attempts ({rate:.0%})"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeVerdict:
+    """Why the router priced one edge the way it did.
+
+    Attributes:
+        edge: The edge judged.
+        cost: Its expected milliseconds, or ``None`` when the policy refuses it.
+        reason: One line naming the statistics the decision rests on.
+    """
+
+    edge: Transition
+    cost: float | None
+    reason: str
+
+    def __str__(self) -> str:
+        return f"{self.edge.src.value[:12]} -> {self.edge.dst.value[:12]}: {self.reason}"
+
+
+def explain_edge(edge: Transition, policy: RoutingPolicy = VERIFIED_ONLY) -> EdgeVerdict:
+    """:func:`edge_cost`, with the counts the answer rests on kept alongside it.
+
+    The counts are load-bearing - an edge is preferred for its success RATE and its
+    measured latency - so a route that looks wrong has to be answerable with the
+    numbers that chose it rather than with a re-reading of this module. Never raises.
+    """
+    cost, reason = _price(edge, policy)
+    return EdgeVerdict(edge=edge, cost=cost, reason=reason)
+
+
+def explain_route(route: Route, policy: RoutingPolicy = VERIFIED_ONLY) -> tuple[EdgeVerdict, ...]:
+    """One :class:`EdgeVerdict` per hop of ``route``, in the order it is walked.
+
+    The empty tuple for a zero-hop route - being already there costs nothing and
+    rests on no edge statistics at all.
+    """
+    return tuple(explain_edge(edge, policy) for edge in route.edges)
 
 
 def same_state(

@@ -13,6 +13,7 @@ from skillweaver.graph.model import (
     GraphSnapshot,
     InMemorySiteGraph,
     merge_transitions,
+    subtract_transitions,
 )
 from skillweaver.graph.route import EXPLORATORY
 from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
@@ -521,3 +522,100 @@ def test_transitions_are_plain_contract_transitions(graph):
     graph.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=10.0)
 
     assert isinstance(graph.transitions()[0], Transition)
+
+
+# -- what a save owes the store -------------------------------------------------------
+#
+# ``merge_transitions`` SUMS, which is right for two runs that observed independently
+# and wrong for a graph handing back what it loaded. ``subtract_transitions`` is the
+# inverse that keeps the two apart; see ``InMemorySiteGraph.unsaved``.
+
+
+def test_an_edge_the_other_side_has_never_seen_is_passed_whole():
+    fresh = edge(LIST, DETAIL, attempts=3, successes=2, mean_ms=100.0)
+
+    assert subtract_transitions(fresh, None) is fresh
+
+
+def test_an_edge_with_nothing_new_to_say_is_left_out():
+    same = edge(LIST, DETAIL, attempts=3, successes=2, mean_ms=100.0)
+
+    assert subtract_transitions(same, same) is None
+
+
+def test_the_delta_counts_only_the_attempts_that_are_new():
+    already = edge(LIST, DETAIL, attempts=3, successes=2, mean_ms=100.0)
+    now = edge(LIST, DETAIL, attempts=5, successes=3, mean_ms=200.0)
+
+    delta = subtract_transitions(now, already)
+
+    assert (delta.attempts, delta.successes) == (2, 1)
+
+
+def test_the_deltas_mean_averages_only_the_new_successes():
+    """400 = the one new success, since 100*2 + 400*1 over 3 is the 200 now recorded."""
+    already = edge(LIST, DETAIL, attempts=2, successes=2, mean_ms=100.0)
+    now = edge(LIST, DETAIL, attempts=3, successes=3, mean_ms=200.0)
+
+    delta = subtract_transitions(now, already)
+
+    assert delta.mean_ms == pytest.approx(400.0)
+
+
+def test_merging_the_delta_back_reproduces_the_edge():
+    already = edge(LIST, DETAIL, attempts=2, successes=2, mean_ms=100.0)
+    now = edge(LIST, DETAIL, attempts=5, successes=4, mean_ms=325.0)
+
+    restored = merge_transitions(already, subtract_transitions(now, already))
+
+    assert (restored.attempts, restored.successes) == (now.attempts, now.successes)
+    assert restored.mean_ms == pytest.approx(now.mean_ms)
+
+
+def test_a_delta_of_pure_failures_verifies_nothing():
+    already = edge(LIST, DETAIL, attempts=1, successes=1, mean_ms=100.0)
+    now = edge(LIST, DETAIL, attempts=4, successes=1, mean_ms=100.0)
+
+    delta = subtract_transitions(now, already)
+
+    assert (delta.attempts, delta.successes) == (3, 0)
+    assert delta.last_verified is None
+    assert delta.mean_ms == 0.0
+
+
+def test_a_statistic_that_went_backwards_is_clamped_rather_than_trusted():
+    already = edge(LIST, DETAIL, attempts=9, successes=9, mean_ms=100.0)
+    now = edge(LIST, DETAIL, attempts=2, successes=2, mean_ms=100.0)
+
+    assert subtract_transitions(now, already) is None
+
+
+def test_unsaved_sends_every_state_but_only_the_edges_that_moved(graph):
+    graph.upsert_state(state(LIST))
+    graph.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=10.0)
+    graph._mark_exchanged(DOMAIN)
+    graph.observe_transition(DETAIL, (click(2, 2),), EDIT, ok=True, ms=10.0)
+
+    unsaved = graph.unsaved(DOMAIN)
+
+    assert len(unsaved.states) == 3, "states carry no summed statistics, so all of them"
+    assert [(t.src.value, t.dst.value) for t in unsaved.transitions] == [("detail", "edit")]
+
+
+def test_a_domain_never_loaded_is_persisted_whole(graph):
+    graph.upsert_state(state(LIST))
+    graph.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=10.0)
+
+    assert graph.unsaved(DOMAIN).transitions[0].attempts == 1
+
+
+def test_forgetting_a_domain_drops_what_it_had_exchanged(graph):
+    graph.upsert_state(state(LIST))
+    graph.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=10.0)
+    graph._mark_exchanged(DOMAIN)
+
+    graph.forget(DOMAIN)
+    graph.upsert_state(state(LIST))
+    graph.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=10.0)
+
+    assert graph.unsaved(DOMAIN).transitions[0].attempts == 1, "a relearned edge is new"

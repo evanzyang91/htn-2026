@@ -136,6 +136,7 @@ class InMemorySiteGraph:
         self.store = store
         self._states: dict[str, UIState] = {}
         self._edges: dict[_EdgeKey, Transition] = {}
+        self._exchanged: dict[str, dict[_EdgeKey, Transition]] = {}
 
     # -- node identity -----------------------------------------------------------
 
@@ -344,12 +345,51 @@ class InMemorySiteGraph:
                 incoming if existing is None else merge_transitions(existing, incoming)
             )
 
+    def unsaved(self, domain: str) -> GraphSnapshot:
+        """What this graph has OBSERVED of ``domain`` since it last met the store.
+
+        The snapshot :meth:`save` hands over, and the reason a count means what it
+        says. The store SUMS statistics, because its job is to combine observations
+        that two runs made independently - so handing it the whole in-memory graph
+        hands it back the counts it just supplied through :meth:`load`, and every
+        save doubles them. A graph loaded and saved ten times reported 1023 attempts
+        on an edge walked ten times, and routing then preferred whichever edges had
+        been PERSISTED most often.
+
+        So the edges here carry DIFFERENCES: attempts and successes minus what was
+        already exchanged, and a ``mean_ms`` over only the new successful traversals,
+        which is exactly the inverse of :func:`merge_transitions`'s weighting. An
+        edge with nothing new to say is left out entirely; an edge the store has
+        never seen is passed whole. States are always sent in full - they hold no
+        summed statistics, so merging one twice changes nothing.
+
+        The baseline is per domain, and is set by :meth:`load` and by :meth:`save`.
+        A domain this graph never loaded has an empty one, so its first save
+        persists everything.
+        """
+        already = self._exchanged.get(domain, {})
+        states = self.states(domain)
+        nodes = {s.fingerprint.value for s in states}
+        edges = [
+            delta
+            for key, edge in self._edges.items()
+            if key[0] in nodes
+            and (delta := subtract_transitions(edge, already.get(key))) is not None
+        ]
+        return GraphSnapshot(domain=domain, states=tuple(states), transitions=tuple(edges))
+
     def save(self) -> None:
         """Persist every loaded domain, merging with what is already stored.
 
         A no-op when this graph has no store. Merging rather than overwriting is
         the point: several runs write the same domain concurrently, and
-        last-write-wins would silently drop the other run's observations.
+        last-write-wins would silently drop the other run's observations. What is
+        handed over is :meth:`unsaved`, not the whole graph - see there for why the
+        difference is the whole difference between a count and a doubling.
+
+        Saving twice with nothing observed in between is therefore a no-op on the
+        numbers, which is what lets a run persist at every exit without inflating
+        anything.
 
         Raises:
             SkillWeaverError: if the data directory cannot be written.
@@ -357,7 +397,8 @@ class InMemorySiteGraph:
         if self.store is None:
             return
         for domain in self.domains():
-            self.store.save_merged(self.snapshot(domain))
+            self.store.save_merged(self.unsaved(domain))
+            self._mark_exchanged(domain)
 
     def load(self, domain: str) -> None:
         """Load ``domain`` from storage, replacing what is in memory for it.
@@ -369,9 +410,11 @@ class InMemorySiteGraph:
         if self.store is None:
             return
         self.absorb(self.store.load(domain))
+        self._mark_exchanged(domain)
 
     def forget(self, domain: str) -> None:
         """Drop every state of ``domain`` and every edge touching one. In-memory only."""
+        self._exchanged.pop(domain, None)
         doomed = {s.fingerprint.value for s in self._states.values() if s.domain == domain}
         if not doomed:
             return
@@ -384,6 +427,19 @@ class InMemorySiteGraph:
 
     def _outgoing(self, value: str) -> Iterable[Transition]:
         return [e for e in self._edges.values() if e.src.value == value]
+
+    def _mark_exchanged(self, domain: str) -> None:
+        """Record this domain's edges as the baseline :meth:`unsaved` measures against.
+
+        Called after a load and after a save, which are the two moments at which
+        what is in memory and what is on disk are known to agree about what THIS
+        graph has contributed. A later writer's additions are not in the baseline
+        and are not meant to be: the next :meth:`load` is where they arrive.
+        """
+        nodes = {s.fingerprint.value for s in self.states(domain)}
+        self._exchanged[domain] = {
+            key: edge for key, edge in self._edges.items() if key[0] in nodes
+        }
 
     def __repr__(self) -> str:
         return (
@@ -434,6 +490,45 @@ def merge_states(left: UIState, right: UIState) -> UIState:
         url_pattern=left.url_pattern or right.url_pattern,
         thumbnail=left.thumbnail if left.thumbnail is not None else right.thumbnail,
         first_seen=min(left.first_seen, right.first_seen),
+    )
+
+
+def subtract_transitions(edge: Transition, already: Transition | None) -> Transition | None:
+    """What ``edge`` has to say beyond ``already``, or ``None`` when it says nothing.
+
+    The inverse of :func:`merge_transitions`: attempts and successes are the
+    differences, and ``mean_ms`` averages only the successes that are new, so that
+    merging the result back onto ``already`` reproduces ``edge`` exactly.
+    ``last_verified`` is carried only when there IS a new success - a delta of pure
+    failures has verified nothing.
+
+    ``already`` of ``None`` means the other side has never seen this edge, so the
+    whole edge is new and is returned unchanged. A delta of zero attempts and zero
+    successes is ``None``: there is nothing to merge and nothing to write.
+
+    Negative differences cannot arise from :meth:`InMemorySiteGraph.save`, whose
+    baseline is always a past state of the same graph, and are clamped to zero
+    rather than trusted, because a statistic that can go backwards is worse than a
+    statistic that stalls.
+    """
+    if already is None:
+        return edge
+    attempts = max(edge.attempts - already.attempts, 0)
+    successes = max(edge.successes - already.successes, 0)
+    if not attempts and not successes:
+        return None
+    if successes:
+        mean_ms = max(
+            (edge.mean_ms * edge.successes - already.mean_ms * already.successes) / successes, 0.0
+        )
+    else:
+        mean_ms = 0.0
+    return replace(
+        edge,
+        attempts=attempts,
+        successes=successes,
+        mean_ms=mean_ms,
+        last_verified=edge.last_verified if successes else None,
     )
 
 

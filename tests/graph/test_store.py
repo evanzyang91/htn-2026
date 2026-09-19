@@ -475,3 +475,124 @@ def test_an_unwritable_destination_raises_a_skillweaver_error(tmp_path):
 
     with pytest.raises(SkillWeaverError, match="cannot write site graph"):
         atomic_write(blocked / "graph.json", "{}")
+
+
+# -- a count that means traversals ----------------------------------------------------
+#
+# The defect these cover shipped because every test above observes into a graph that
+# was never LOADED. A load is what puts the store's own counts into memory, and a save
+# that then hands the whole graph back to a store whose job is to SUM hands back the
+# counts it was just given. See ``InMemorySiteGraph.unsaved``.
+
+
+def test_loading_then_saving_does_not_double_a_stored_count(store):
+    first = InMemorySiteGraph(store=store)
+    first.upsert_state(state(LIST))
+    first.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+    first.save()
+
+    second = InMemorySiteGraph(store=store)
+    second.load(DOMAIN)
+    second.save()
+
+    stored = store.load(DOMAIN).transitions[0]
+    assert (stored.attempts, stored.successes) == (1, 1), "one traversal, one attempt"
+
+
+def test_ten_load_save_cycles_store_the_ten_traversals_performed(store):
+    """The shape that gave the bug away: powers of two, not a count of anything."""
+    for _ in range(10):
+        run = InMemorySiteGraph(store=store)
+        run.load(DOMAIN)
+        run.upsert_state(state(LIST))
+        run.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+        run.save()
+
+    stored = store.load(DOMAIN).transitions[0]
+    assert (stored.attempts, stored.successes) == (10, 10), "not 1023, which is 2**10 - 1"
+
+
+def test_saving_twice_without_observing_anything_changes_no_count(store):
+    """A run persists at several exits (see ``Agent._persist``), and must be able to."""
+    run = InMemorySiteGraph(store=store)
+    run.upsert_state(state(LIST))
+    run.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+
+    run.save()
+    run.save()
+
+    stored = store.load(DOMAIN).transitions[0]
+    assert (stored.attempts, stored.successes) == (1, 1)
+
+
+def test_a_save_after_a_load_still_carries_what_this_run_observed(store):
+    seed = InMemorySiteGraph(store=store)
+    seed.upsert_state(state(LIST))
+    seed.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+    seed.save()
+
+    run = InMemorySiteGraph(store=store)
+    run.load(DOMAIN)
+    run.observe_transition(LIST, (click(1, 1),), DETAIL, ok=False, ms=0.0)
+    run.save()
+
+    stored = store.load(DOMAIN).transitions[0]
+    assert (stored.attempts, stored.successes) == (2, 1), "the failure is recorded once"
+
+
+def test_a_concurrent_runs_observations_survive_a_load_and_save(store):
+    """What the summing merge exists for, and what the delta must not cost.
+
+    While one run holds a loaded graph, another writes the same domain. The first
+    run's save must add its own observation without erasing the other's.
+    """
+    seed = InMemorySiteGraph(store=store)
+    seed.upsert_state(state(LIST))
+    seed.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+    seed.save()
+
+    slow = InMemorySiteGraph(store=store)
+    slow.load(DOMAIN)
+
+    other = InMemorySiteGraph(store=store)
+    other.load(DOMAIN)
+    other.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+    other.save()
+
+    slow.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+    slow.save()
+
+    stored = store.load(DOMAIN).transitions[0]
+    assert (stored.attempts, stored.successes) == (3, 3), "one seeded plus one each"
+
+
+def test_the_stored_mean_still_averages_every_successful_traversal(store):
+    """``mean_ms`` has to survive the delta, which averages only the NEW successes."""
+    seed = InMemorySiteGraph(store=store)
+    seed.upsert_state(state(LIST))
+    seed.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+    seed.save()
+
+    run = InMemorySiteGraph(store=store)
+    run.load(DOMAIN)
+    run.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=400.0)
+    run.save()
+
+    stored = store.load(DOMAIN).transitions[0]
+    assert stored.mean_ms == pytest.approx(250.0), "the mean of 100 and 400"
+
+
+def test_an_edge_learned_after_a_load_is_stored_whole(store):
+    seed = InMemorySiteGraph(store=store)
+    seed.upsert_state(state(LIST))
+    seed.observe_transition(LIST, (click(1, 1),), DETAIL, ok=True, ms=100.0)
+    seed.save()
+
+    run = InMemorySiteGraph(store=store)
+    run.load(DOMAIN)
+    run.observe_transition(DETAIL, (click(2, 2),), EDIT, ok=True, ms=50.0)
+    run.save()
+
+    fresh = {(t.src.value, t.dst.value): t for t in store.load(DOMAIN).transitions}
+    assert (fresh["detail", "edit"].attempts, fresh["detail", "edit"].successes) == (1, 1)
+    assert fresh["detail", "edit"].mean_ms == pytest.approx(50.0)

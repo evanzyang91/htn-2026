@@ -37,6 +37,18 @@ holds the rule that picks one. A read-only live task needs no reset and should s
 (`read_only`, `ResetOutcome` in the same file); a `403` from a real site means the
 endpoint is not a reset hook, not that the world could not be put back.
 
+A statistic that SUMS when two records are merged must be handed a DELTA, never the
+whole record. The site graph loaded a domain, observed a few traversals and handed the
+store back everything it had - including the counts the store had just supplied - so
+every save doubled them: ten traversals stored as 1023, and 262144 on the live
+Wikipedia graph. Worse than the number is what it freezes, because new evidence is
+then outweighed by a history that doubles: an edge measured at 5 successes and then
+failing 200 runs straight was still priced and still preferred. `InMemorySiteGraph.unsaved`
+and `subtract_transitions` in `graph/model.py` carry the rule and its inverse-of-merge
+arithmetic. A test that observes into a graph it never LOADED cannot see any of this,
+which is how it survived a full suite; `explain_edge` in `graph/route.py` is how a
+preferred edge is asked which counts chose it.
+
 An attempt's cost is read from the model client's own `total_usage` across it
 (`Agent._charge_model`), never from what the path reports about itself: a call the
 composer spent on a plan that was then discarded, and a critic escalation the planner
