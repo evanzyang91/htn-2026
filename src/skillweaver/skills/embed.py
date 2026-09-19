@@ -48,10 +48,24 @@ first. Not one of them becomes a warm run. A candidate still has to BIND
 in words, so a request worded differently fails them for the same reason it ranked
 badly. Better ranking arrives at a door that is locked in the same language.
 
-So :data:`~skillweaver.config.DEFAULT_EMBEDDER_ENABLED` is ``False``. This module is
-kept, not deleted, because the finding is about where the bottleneck IS: the next
-person to work on warm-path reuse should spend it on binding and on the content gate,
-and re-run the bench with ``SKILLWEAVER_EMBEDDER=true`` once either has moved.
+And the third column is the one to weigh against the first, because it moved in the
+wrong direction: five of six requests that NOTHING in the library can do came back
+with a candidate anyway, against one of six on keywords. A cosine is almost never
+zero, so "nothing is relevant" stops being expressible as an empty list. Raising
+``min_score`` is the obvious answer and does not work: on these corpora the best
+irrelevant request scores 0.198 while two correct paraphrases score 0.191 and 0.198,
+so no cut-off separates the populations and tuning one would be fitting the cut to
+this bench. Nothing downstream ran a wrong skill - the content gate refused all of
+them, which is the same gate that refuses the gains - but that is the gate's credit,
+not the ranking's.
+
+So :data:`~skillweaver.config.DEFAULT_EMBEDDER_ENABLED` is ``False``, and only that
+switch can change it: the weights being on disk is deliberately NOT an implicit yes,
+because a laptop that ran ``make embedder`` once must not quietly rank differently
+from a clean clone. This module is kept, not deleted, because the finding is about
+where the bottleneck IS: the next person to work on warm-path reuse should spend it on
+binding and on the content gate, and re-run the bench with ``SKILLWEAVER_EMBEDDER=true``
+once either has moved.
 
 What is deliberately NOT here
 -----------------------------

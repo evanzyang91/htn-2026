@@ -231,20 +231,44 @@ the text the synthesizer is shown. A rejected move there fell short of what it C
 measured on one whose action the task still needed - so it is marked as suspect and
 never dropped.
 
-A better RANKING buys nothing while the two checks after it count WORDS. Retrieval
-can now rank by meaning - a local MiniLM through onnxruntime, no new dependency, no
-network at run time (`skills/embed.py`, `make embedder`) - and measured over both
-libraries this repository carries it lifts top-1 recall from 18/24 to 21/24 and moves
-the number that matters, runnable candidates, by ZERO: 3/24 both ways when a person
-types the request, 9/24 both ways when a suite supplies its values. What stops them is
-`bind_args` and then `MIN_ACCOUNTED_FOR`, both of which are counted in words, so a
-request worded differently fails them for the same reason it ranked badly. Precision
-also gets worse, because a cosine is almost never zero. So it ships OFF
-(`DEFAULT_EMBEDDER_ENABLED`), `scripts/bench_retrieval.py` is how to re-measure, and
-warm-path reuse is improved by working on BINDING, not on retrieval. The ordering
-suite's famous miss says `no embedder` in its log line and was not caused by it - its
-stage is `unaccounted`; `test_the_ordering_miss_of_2026_09_19_was_the_gate_and_not_the_ranking`
-holds the arithmetic.
+A better RANKING buys nothing while the two checks after it count WORDS. This is a
+MEASURED NEGATIVE RESULT, not an unfinished feature: retrieval CAN rank by meaning -
+a local MiniLM through onnxruntime, no new dependency and no network at run time
+(`skills/embed.py`, `make embedder`) - and it is OFF because it was measured and did
+not pay. Do not "finish" it by turning it on.
+
+What the measurement said, over both libraries this repository carries
+(`scripts/bench_retrieval.py`, 48 requests, re-runnable in a minute):
+
+  * recall improved, which is what an embedder is for: top-1 18/24 -> 21/24.
+  * RUNNABLE candidates did not move AT ALL: 3/24 both ways when a person types the
+    request, 9/24 both ways when a suite supplies its values. That is the number that
+    decides whether the fast path fires, and it is the only one worth reading.
+  * precision got WORSE, and this matters as much as the recall gain: irrelevant
+    requests answered went 1/6 -> 5/6, because a cosine is almost never zero. No
+    cut-off separates the two populations either, so there is nothing to tune - which
+    is the argument against ever switching this on without re-measuring.
+
+WHY it does not pay: a candidate that ranks first still has to bind (`bind_args`) and
+then account for the request (`MIN_ACCOUNTED_FOR`), and BOTH of those count words. A
+request worded differently fails them for exactly the reason it ranked badly, so a
+better score arrives at a door locked in the same language. The word-counting gates,
+not the similarity score, decide whether a stored skill can run.
+
+WHAT WOULD HAVE TO CHANGE for it to be worth enabling: those two gates, not this
+module. When binding can take an argument out of a sentence that does not quote it,
+or when the content gate judges coverage by something other than word overlap, re-run
+the bench and read `runnable`. Turning the model on before then buys three ranking
+positions and four extra wrong answers. It is reachable ONLY through
+`SKILLWEAVER_EMBEDDER` (`DEFAULT_EMBEDDER_ENABLED` is False): fetched weights sitting
+on disk do not enable it and are not meant to.
+
+And the case that prompted all of this was never a retrieval miss. The ordering
+suite's `add_dish_with_option` log line says `no embedder`, but its stage is
+`unaccounted` - the gate never sees a retrieval score at all, and a cosine of 1.00
+would have changed the order of the candidates and nothing else.
+`test_the_ordering_miss_of_2026_09_19_was_the_gate_and_not_the_ranking` holds the
+arithmetic.
 
 And a fall-through is not a success. A warm attempt that missed and was rescued by
 exploration reports the miss in its headline (`RunReport.warm_missed` and `rescued`,

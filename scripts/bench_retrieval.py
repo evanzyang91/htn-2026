@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -271,8 +272,12 @@ def main() -> int:
 
     # SKILLWEAVER_EMBEDDER decides what the SHIPPED commands do; this script exists to
     # measure both rankings whatever that is set to, so it asks for one regardless.
+    # `load_settings` ignores os.environ entirely once it is handed a mapping, so the
+    # environment is merged in by hand here - otherwise a SKILLWEAVER_EMBEDDER_DIR
+    # naming a shared download would be silently dropped and the bench would report
+    # weights it can see as missing.
     embedder, reason = embedder_for(
-        load_settings({"SKILLWEAVER_EMBEDDER": "true"}, env_file=".env")
+        load_settings({**os.environ, "SKILLWEAVER_EMBEDDER": "true"}, env_file=".env")
     )
     if embedder is None:
         print(f"no embedder: {reason}")

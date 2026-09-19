@@ -208,6 +208,35 @@ def test_off_is_the_shipped_default(tmp_path: Path) -> None:
     assert "turned off" in reason
 
 
+def test_weights_on_disk_do_not_switch_it_on_by_themselves(weights: Path) -> None:
+    """The one way to enable this is the explicit switch, and fetching the model is
+    NOT that way.
+
+    It matters because the weights are ~90 MB that somebody downloads once and then
+    forgets about, possibly for the bench and possibly for a different worktree
+    sharing the same directory. If their presence enabled ranking by meaning, a
+    machine that had run `make embedder` months ago would quietly rank differently
+    from a clean clone - and the measurement says that ranking answers five of six
+    irrelevant requests instead of one. So the check order in `embedder_for` is
+    load-bearing: the switch is read BEFORE the disk is looked at.
+    """
+    config = load_settings({"SKILLWEAVER_EMBEDDER_DIR": str(weights)}, env_file=None)
+    embedder, reason = embedder_for(config)
+
+    assert embedder is None, "present weights must not be an implicit yes"
+    assert "turned off" in reason
+
+
+def test_naming_the_weights_directory_is_not_a_way_to_turn_it_on(weights: Path) -> None:
+    """SKILLWEAVER_EMBEDDER_DIR exists so several worktrees can share one download.
+    Setting it for that purpose must not also flip the ranking."""
+    config = load_settings(
+        {"SKILLWEAVER_EMBEDDER_DIR": str(weights), "SKILLWEAVER_EMBEDDER": "false"},
+        env_file=None,
+    )
+    assert embedder_for(config)[0] is None
+
+
 def test_weights_present_and_asked_for_gives_one(weights: Path) -> None:
     config = load_settings(
         {"SKILLWEAVER_EMBEDDER": "true", "SKILLWEAVER_EMBEDDER_DIR": str(weights)},
