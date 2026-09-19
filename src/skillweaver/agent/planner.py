@@ -27,6 +27,23 @@ needs to know where the agent is. Route actions are replayed straight from the s
 graph. Retrieval may embed the task text if an embedder is configured - that is a
 retrieval cost, paid once, before the loop, and it is not a call in the action loop.
 
+Plain English, still model-free
+-------------------------------
+
+A caller who supplies ``TaskSpec.params`` hands the planner its arguments and nothing
+has to be worked out. A caller who just says what they want - "Search Wikipedia for
+machine learning" - used to cost one model call, because the composer was the only
+thing here that could read a sentence.
+
+It no longer does, for the one case that is not a guess. A stored skill remembers the
+sentence it was learned from, so when the new task is that sentence with one thing
+changed, the change is the argument (:func:`_bind_from_text`). That path declines
+loudly more often than it binds - see its guards - and every binding it does make is
+logged as ``planner.bound_from_text`` with both sentences and the values derived, so
+an argument this code invented is findable in one look. Everything downstream is
+unchanged: a skill bound this way is routed to, run and verified exactly like one the
+caller supplied arguments for.
+
 Failing usefully
 ----------------
 
@@ -59,8 +76,9 @@ controller are not evidence against a skill either.
 
 from __future__ import annotations
 
+import re
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -95,7 +113,7 @@ from skillweaver.graph.route import VERIFIED_ONLY, RoutingPolicy, find_route
 from skillweaver.logging_ import get_logger
 from skillweaver.skills.api import LimitExceeded
 
-__all__ = ["FailureStage", "PlanFailure", "Planner"]
+__all__ = ["FRAME_WORDS", "FailureStage", "PlanFailure", "Planner"]
 
 log = get_logger(__name__)
 
@@ -317,8 +335,13 @@ class Planner:
             skill = candidate.skill
             args = _bind_args(skill, task)
             if args is None:
+                args = _bind_from_text(skill, task)
+            if args is None:
                 stage = "unbindable_args"
-                reasons.append(f"{skill.name}: task supplies no value for a required parameter")
+                reasons.append(
+                    f"{skill.name}: task supplies no value for a required parameter, and its "
+                    f"wording does not line up with {skill.provenance.task_text!r}"
+                )
                 continue
             route = self._route_to(observation.fingerprint, skill.precondition)
             if route is None:
@@ -585,19 +608,231 @@ def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     This is the model-free half of "what do I pass?". A ``TaskSpec`` carries the
     concrete values for the errand (``{"company": "Acme Corp"}``) and a stored skill
     declares the names it wants; when they line up there is nothing to reason about.
-    A required parameter the task has no value for means this candidate cannot be
-    invoked warm, so the planner tries the next one - and eventually the composer,
-    which can read the task text.
+    A required parameter the task has no value for means the task did not supply its
+    arguments; :func:`_bind_from_text` gets a chance to read them out of the task's
+    wording before the candidate is given up on.
     """
     args: dict[str, Any] = {}
     for name, schema in skill.params.items():
         if name in task.params:
             args[name] = task.params[name]
-        elif isinstance(schema, Mapping) and "default" in schema:
+        elif _has_default(schema):
             continue
         else:
             return None
     return args
+
+
+# -- binding a plain-English repeat ------------------------------------------------------
+
+
+FRAME_WORDS = frozenset(
+    """
+    a about after against all an and any around as at be been before being between both but by
+    called did do does entitled every for from had has have how in into is it its me my named
+    named of off on onto or our out over please should the their then this through titled to up
+    upon us via was were what when where which while who whose why will with within without
+    would you your
+    """.split()
+)
+"""Words a value may sit next to without the alignment being in doubt.
+
+A parameter's value is only read out of a sentence when the words that FRAME it are
+words like these - or punctuation, or the edge of the sentence. The rule exists
+because a maximal common prefix happily eats a word that belongs to the value:
+``"search for computer vision"`` against ``"search for computer graphics"`` agrees on
+``"search for computer"``, and the span that is left is ``"graphics"`` - which is not
+the argument. ``"computer"`` is not a framing word, so that alignment is refused and
+the composer, which can actually read the sentence, gets the job instead.
+"""
+
+_TOKEN = re.compile(r"\w+|[^\w\s]")
+"""One word or one punctuation mark. Whitespace is not a token, so a value's own
+spacing survives being sliced back out of the original text."""
+
+_MAX_VALUE_CHARS = 120
+"""A bound argument longer than this is a sentence, not a value."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Token:
+    key: str
+    start: int
+    end: int
+    word: bool
+
+
+def _tokens(text: str) -> list[_Token]:
+    return [
+        _Token(
+            m.group(0).casefold(),
+            m.start(),
+            m.end(),
+            m.group(0)[0].isalnum() or m.group(0)[0] == "_",
+        )
+        for m in _TOKEN.finditer(text)
+    ]
+
+
+def _bind_from_text(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
+    """The skill's arguments read out of the task TEXT, or ``None`` to decline.
+
+    This is what makes a plain-English repeat of a known task cost nothing. A stored
+    skill remembers the exact sentence the run it was synthesized from was solving
+    (:attr:`~skillweaver.contracts.Provenance.task_text`). When the new task is the
+    same sentence with one thing changed, that change IS the argument::
+
+        learned: "Search Wikipedia for computer vision"
+        asked:   "Search Wikipedia for machine learning"
+                                      ^^^^^^^^^^^^^^^^  -> query="machine learning"
+
+    Without this the candidate is rejected as ``unbindable_args`` and the planner
+    falls through to the composer, which spends one model call to read a sentence it
+    has already seen the shape of.
+
+    It declines far more often than it binds, deliberately: a wrong argument is much
+    worse than a model call, because it runs real actions on a real screen behind the
+    same preconditions and verifier as a correct one. It refuses unless
+
+    * exactly ONE required parameter is missing (several missing means several spans
+      to attribute, which is a guess). A parameter with a declared default is never
+      bound here - omitting it already works;
+    * the two sentences agree everywhere except one contiguous span, both sides of
+      which are non-empty - so a sentence that merely ADDS words is not an argument;
+    * at least two tokens are shared, and the span is framed by :data:`FRAME_WORDS`,
+      punctuation or the sentence edge on both sides;
+    * the two spans share no word, which is how two separate differences pretending
+      to be one are caught (``"cats on Monday"`` vs ``"dogs on Tuesday"``);
+    * the new span is not much longer than the learned one, and can actually be the
+      parameter's declared type.
+
+    Returns:
+        The full argument dict, or ``None`` to leave the candidate unbindable.
+    """
+    missing = [
+        name
+        for name, schema in skill.params.items()
+        if name not in task.params and not _has_default(schema)
+    ]
+    if len(missing) != 1:
+        return None
+
+    learned = skill.provenance.task_text or ""
+    span = _differing_span(learned, task.text)
+    if span is None:
+        return None
+
+    name = missing[0]
+    value = _as_declared(span, skill.params[name])
+    if value is _REFUSED:
+        return None
+
+    args: dict[str, Any] = {k: task.params[k] for k in skill.params if k in task.params}
+    args[name] = value
+    log.info(
+        "planner.bound_from_text",
+        skill=skill.name,
+        domain=skill.domain,
+        param=name,
+        value=value,
+        learned=learned,
+        task=task.text,
+        args=args,
+    )
+    return args
+
+
+def _differing_span(learned: str, asked: str) -> str | None:
+    """The one span of ``asked`` that ``learned`` does not have, or ``None``.
+
+    The two sentences are aligned from both ends; what is left in the middle is the
+    difference. Every guard described in :func:`_bind_from_text` is applied here, and
+    the returned text is sliced out of ``asked`` verbatim, so the value keeps its own
+    capitalisation, spacing and internal punctuation.
+    """
+    lhs, rhs = _tokens(learned), _tokens(asked)
+    if not lhs or not rhs:
+        return None
+
+    limit = min(len(lhs), len(rhs))
+    head = 0
+    while head < limit and lhs[head].key == rhs[head].key:
+        head += 1
+    tail = 0
+    while tail < limit - head and lhs[-1 - tail].key == rhs[-1 - tail].key:
+        tail += 1
+
+    learned_mid = lhs[head : len(lhs) - tail]
+    asked_mid = rhs[head : len(rhs) - tail]
+    if not _is_a_value(learned_mid) or not _is_a_value(asked_mid):
+        return None
+    if head + tail < 2:
+        return None  # two sentences that barely agree are not the same sentence
+    if _words(learned_mid) & _words(asked_mid):
+        return None  # a shared word inside the span means this is two differences
+    if not _framed(rhs, head, tail):
+        return None
+    if len(_words(asked_mid)) > max(3, len(_words(learned_mid)) + 2):
+        return None  # the new span grew into something bigger than an argument
+
+    value = asked[asked_mid[0].start : asked_mid[-1].end]
+    return value if 0 < len(value) <= _MAX_VALUE_CHARS else None
+
+
+def _framed(tokens: Sequence[_Token], head: int, tail: int) -> bool:
+    """Whether the span sits between words that cannot themselves belong to it."""
+    before = tokens[head - 1] if head else None
+    after = tokens[len(tokens) - tail] if tail else None
+    return all(edge is None or not edge.word or edge.key in FRAME_WORDS for edge in (before, after))
+
+
+def _is_a_value(span: Sequence[_Token]) -> bool:
+    """A span is a candidate value only if it has at least one word in it."""
+    return any(token.word for token in span)
+
+
+def _words(span: Sequence[_Token]) -> set[str]:
+    return {token.key for token in span if token.word}
+
+
+_REFUSED = object()
+"""Sentinel: this span cannot be the parameter's declared type."""
+
+_INTEGER = re.compile(r"[+-]?\d+$")
+_NUMBER = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _as_declared(span: str, schema: Any) -> Any:
+    """``span`` as the parameter's declared type, or :data:`_REFUSED`.
+
+    A span of prose is a string and nothing else unless it plainly reads as the
+    declared type. Anything with structure - an array, an object, a boolean - is
+    refused rather than parsed out of English, because there is no reading of a
+    phrase as ``True`` that is safer than asking the model.
+    """
+    text = span.strip()
+    if not text:
+        return _REFUSED
+    if not isinstance(schema, Mapping):
+        return text
+
+    choices = schema.get("enum")
+    if isinstance(choices, Sequence) and not isinstance(choices, str):
+        matches = [c for c in choices if isinstance(c, str) and c.casefold() == text.casefold()]
+        return matches[0] if len(matches) == 1 else _REFUSED
+
+    declared = schema.get("type")
+    if declared in (None, "string"):
+        return text
+    if declared == "integer" and _INTEGER.match(text):
+        return int(text)
+    if declared == "number" and _NUMBER.match(text):
+        return float(text)
+    return _REFUSED
+
+
+def _has_default(schema: Any) -> bool:
+    return isinstance(schema, Mapping) and "default" in schema
 
 
 def _joined(reasons: list[str]) -> str:

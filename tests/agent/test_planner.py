@@ -14,6 +14,8 @@ scripts it, so an unexpected model call is not a subtle accounting error: it rai
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -685,3 +687,344 @@ def test_a_repaired_version_makes_the_warm_path_work_again(
     assert store.get("pay_invoice", DOMAIN).demoted_reason is None
     assert scenario.solved
     assert fake_llm.calls == 0
+
+
+# -- a plain-English repeat, still at zero model calls -------------------------------------------
+#
+# The warm path costs nothing when the caller supplies ``TaskSpec.params``. Asked in
+# plain English it used to cost one model call, because reading a sentence was the
+# composer's job. These tests cover the narrow case where the sentence does not have
+# to be reasoned about: the skill remembers the sentence it was LEARNED from, and the
+# new task is that sentence with one thing changed.
+#
+# Most of them are about declining. A wrong argument is far worse than a model call -
+# it runs real clicks on a real screen - so every test below that asserts ``None`` is
+# asserting that the planner preferred to pay rather than guess.
+
+
+def learned_from(skill: Skill, sentence: str) -> Skill:
+    """``skill`` as if it had been synthesized from the run that solved ``sentence``."""
+    return replace(skill, provenance=replace(PROVENANCE, task_text=sentence))
+
+
+PAY_GLOBEX = learned_from(PAY_INVOICE, "Pay the invoice for Globex Industries")
+"""``pay_invoice`` as the library would hold it after learning it on another company."""
+
+PAY_ACME_IN_ENGLISH = TaskSpec(text="Pay the invoice for Acme Corp", domain=DOMAIN)
+"""The same errand, asked in words, for a DIFFERENT company, with no params at all."""
+
+
+def test_a_plain_english_repeat_with_a_new_value_costs_zero_model_calls(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """THE RESULT THIS PATH EXISTS FOR.
+
+    The library learned this errand for Globex; it is now asked for Acme, in a
+    sentence, with no parameters supplied. The two sentences differ in exactly one
+    place and that place is the argument, so the whole run happens with the composer
+    wired in and never called: the model's count is EXACTLY ZERO, the same as if the
+    caller had passed ``company="Acme Corp"`` themselves.
+    """
+    store.put(PAY_GLOBEX)
+    planner = build(scenario, store, graph, fake_llm, compose=True)
+
+    outcome = planner.attempt(PAY_ACME_IN_ENGLISH, look(scenario))
+
+    assert outcome is not None and outcome.ok
+    assert scenario.solved, "the fake app did not actually reach the confirmation page"
+    assert fake_llm.calls == 0
+    assert outcome.spend.llm_calls == 0
+    assert outcome.skill_used == "pay_invoice"
+    # The value really came from the sentence: Acme was typed, not the learned Globex.
+    assert performed(scenario) == [TYPE_ACME, CLICK_ROW, CLICK_CONFIRM]
+
+
+def test_the_argument_is_the_span_the_two_sentences_disagree_on(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The plan names the bound value, and building it performs nothing."""
+    store.put(PAY_GLOBEX)
+    planner = build(scenario, store, graph, fake_llm, compose=True)
+
+    plan = planner.plan(PAY_ACME_IN_ENGLISH, look(scenario))
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("pay_invoice", DOMAIN, {"company": "Acme Corp"}),)
+    assert fake_llm.calls == 0
+    assert performed(scenario) == []
+
+
+def test_every_binding_taken_from_a_sentence_is_logged_with_both_sentences(
+    scenario: Scenario,
+    store: InMemorySkillStore,
+    graph: InMemorySiteGraph,
+    fake_llm: FakeLLM,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An argument this code invented has to be findable in one look.
+
+    The log line carries the sentence the skill was learned from, the sentence that
+    was asked, and the value derived - which is everything needed to see that a
+    binding was wrong, without reproducing the run.
+    """
+    store.put(PAY_GLOBEX)
+    planner = build(scenario, store, graph, fake_llm)
+
+    with caplog.at_level(logging.INFO, logger="skillweaver.agent.planner"):
+        planner.plan(PAY_ACME_IN_ENGLISH, look(scenario))
+
+    lines = [r.getMessage() for r in caplog.records if "planner.bound_from_text" in r.getMessage()]
+    assert len(lines) == 1
+    assert 'learned="Pay the invoice for Globex Industries"' in lines[0]
+    assert 'task="Pay the invoice for Acme Corp"' in lines[0]
+    assert 'value="Acme Corp"' in lines[0]
+    assert "param=company" in lines[0]
+
+
+def test_a_text_bound_skill_runs_behind_the_same_checks_as_any_other(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Binding from a sentence removes a model call, not a guarantee.
+
+    The skill is the broken one, reached by a plain-English task whose argument had to
+    be read out of the wording. It is still routed to its precondition, still run in
+    the sandbox, still fails its own ``ctx.expect`` - and is still demoted with the
+    reason, exactly as when the caller supplied the arguments.
+    """
+    store.put(learned_from(BROKEN_PAY, "Pay the invoice for Globex Industries"))
+    planner = build(scenario, store, graph, fake_llm)
+
+    assert planner.attempt(PAY_ACME_IN_ENGLISH, look(scenario)) is None
+
+    demoted = store.get("pay_invoice", DOMAIN)
+    assert demoted.demoted_reason is not None
+    assert "the confirmation dialog never appeared" in demoted.demoted_reason
+    failure = planner.last_failure
+    assert failure is not None and failure.stage == "skill_failed" and failure.demoted
+    assert fake_llm.calls == 0
+
+
+# -- the cases it refuses ---------------------------------------------------------------------
+
+
+def declines(
+    scenario: Scenario,
+    store: InMemorySkillStore,
+    graph: InMemorySiteGraph,
+    fake_llm: FakeLLM,
+    skill: Skill,
+    text: str,
+) -> PlanFailure:
+    """Plan ``text`` against ``skill`` with NO composer, and assert it was declined.
+
+    With no composer the planner cannot reach a model even in principle, so ``None``
+    here can only mean the sentence alignment refused to bind.
+    """
+    store.put(skill)
+    planner = build(scenario, store, graph, fake_llm, compose=False)
+
+    assert planner.plan(TaskSpec(text=text, domain=DOMAIN), look(scenario)) is None
+    assert performed(scenario) == []
+    assert fake_llm.calls == 0
+    failure = planner.last_failure
+    assert failure is not None and failure.performed_nothing
+    return failure
+
+
+def test_a_span_whose_neighbour_is_an_ordinary_word_is_refused(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """THE CASE THAT MAKES A NAIVE ALIGNMENT WRONG.
+
+    "Pay the Globex Corp invoice" against the learned "Pay the Acme Corp invoice"
+    agrees on the trailing "Corp invoice", so the span left over is "Globex" - and
+    the company is "Globex Corp". The alignment is refused because "Corp" is an
+    ordinary word that could just as well belong to the value, and a sentence this
+    code cannot take apart unambiguously is a sentence for the composer to read.
+    """
+    failure = declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(PAY_INVOICE, "Pay the Acme Corp invoice"),
+        "Pay the Globex Corp invoice",
+    )
+    assert failure.stage == "unbindable_args"
+    assert "Pay the Acme Corp invoice" in failure.reason, "the reason names the learned sentence"
+
+
+def test_two_differing_spans_are_not_one_argument(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The sentences differ in two places, and the alignment sees one contiguous
+    span holding both. The shared word inside it gives the pretence away."""
+    failure = declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(PAY_INVOICE, "Pay the invoice for Acme on Monday"),
+        "Pay the invoice for Globex on Tuesday",
+    )
+    assert failure.stage == "unbindable_args"
+
+
+def test_a_sentence_that_only_adds_words_supplies_no_argument(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Nothing was substituted - the new task asks for MORE. That is a different
+    errand, not a new value, and the empty span on the learned side says so."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(PAY_INVOICE, "Pay the invoice for Acme Corp"),
+        "Pay the invoice for Acme Corp and archive it",
+    )
+
+
+def test_the_identical_sentence_supplies_no_argument(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The value is in there somewhere and there is no way to tell which words it is."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(PAY_INVOICE, "Pay the invoice for Acme Corp"),
+        "Pay the invoice for Acme Corp",
+    )
+
+
+def test_a_sentence_of_a_different_shape_is_refused(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Two sentences that barely agree are not the same sentence with one edit -
+    whether this skill fits at all is retrieval's question and the composer's, and
+    answering it here would be this code deciding something it cannot see."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(PAY_INVOICE, "Pay the invoice for Acme Corp"),
+        "Settle up with Globex Industries",
+    )
+
+
+TWO_PARAMS = plant(
+    "pay_invoice",
+    "Confirm payment of a company's invoice from the invoice list.",
+    """
+def run(ctx, company, reference):
+    ctx.ctl.type_text(company)
+    return reference
+""",
+    precondition=LIST,
+    params={"company": {"type": "string"}, "reference": {"type": "string"}},
+    docstring="Searches the invoice list for the company and confirms the referenced invoice.",
+)
+
+
+def test_two_missing_parameters_are_never_split_out_of_one_span(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """One difference cannot be two arguments, and deciding which part is which is
+    exactly the reasoning this path exists to avoid."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(TWO_PARAMS, "Pay the invoice for Acme Corp"),
+        "Pay the invoice for Globex Industries",
+    )
+
+
+WITH_DEFAULT = plant(
+    "pay_invoice",
+    "Confirm payment of a company's invoice from the invoice list.",
+    """
+def run(ctx, company, note="paid"):
+    ctx.ctl.type_text(company)
+    return note
+""",
+    precondition=LIST,
+    params={"company": {"type": "string"}, "note": {"type": "string", "default": "paid"}},
+    docstring="Searches the invoice list for the company, opens its invoice and confirms payment.",
+)
+
+
+def test_a_parameter_with_a_default_is_left_alone(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """A defaulted parameter is not missing - omitting it already works - so it is
+    neither counted as a second unbound parameter nor filled in from the sentence."""
+    store.put(learned_from(WITH_DEFAULT, "Pay the invoice for Globex Industries"))
+    planner = build(scenario, store, graph, fake_llm)
+
+    plan = planner.plan(PAY_ACME_IN_ENGLISH, look(scenario))
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("pay_invoice", DOMAIN, {"company": "Acme Corp"}),)
+
+
+SET_QUANTITY = plant(
+    "set_quantity",
+    "Set the quantity on the invoice list.",
+    """
+def run(ctx, quantity):
+    return quantity
+""",
+    precondition=LIST,
+    params={"quantity": {"type": "integer"}},
+    docstring="Sets the quantity field on the invoice list to the given whole number.",
+)
+
+
+def test_a_span_is_bound_as_the_type_the_skill_declares(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """A declared ``integer`` arrives as an ``int``, not as the text ``"12"``."""
+    store.put(learned_from(SET_QUANTITY, "Set the quantity to 3"))
+    planner = build(scenario, store, graph, fake_llm)
+
+    plan = planner.plan(TaskSpec(text="Set the quantity to 12", domain=DOMAIN), look(scenario))
+
+    assert plan is not None
+    assert plan.steps == (SkillCall("set_quantity", DOMAIN, {"quantity": 12}),)
+
+
+def test_a_span_that_cannot_be_the_declared_type_is_not_a_binding(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """The sentences line up perfectly and the span is still not an integer."""
+    declines(
+        scenario,
+        store,
+        graph,
+        fake_llm,
+        learned_from(SET_QUANTITY, "Set the quantity to 3"),
+        "Set the quantity to twelve",
+    )
+
+
+def test_the_composer_still_gets_the_sentences_this_path_declines(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph
+) -> None:
+    """Declining is a fall-through, not a failure: the composer reads the sentence
+    and the run still happens, at the one model call it always cost."""
+    store.put(learned_from(PAY_INVOICE, "Pay the Acme Corp invoice"))
+    llm = FakeLLM([_chain(("pay_invoice", {"company": "Acme Corp"}))])
+    planner = build(scenario, store, graph, llm, compose=True)
+
+    outcome = planner.attempt(
+        TaskSpec(text="Pay the Globex Corp invoice", domain=DOMAIN), look(scenario)
+    )
+
+    assert outcome is not None and outcome.ok
+    assert llm.calls == 1
+    assert outcome.spend.llm_calls == 1
