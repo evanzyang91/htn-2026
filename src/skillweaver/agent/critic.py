@@ -31,10 +31,29 @@ conclusion:
    could establish success - either no evidence check was configured, or one of them
    returned ``unknown``.
 
-Evidence checks and vetoes
---------------------------
+Evidence, corroboration and vetoes
+----------------------------------
 
-The two roles are not symmetric, and conflating them is how a critic starts lying.
+The three roles are not symmetric, and conflating them is how a critic starts lying.
+
+A **corroboration** check can prove success and can NEVER prove failure. There is one
+of them and it is the recalled end screen: where the last run of this task finished.
+Matching it is decisive proof the task got done; NOT matching it proves nothing at
+all, because that screen is where ONE run ended with the arguments IT was given.
+
+Handing it over as evidence instead - which is what a mismatch vetoing the run means -
+rejects correct work in two measured ways. A skill learned from "computer vision" and
+replayed for "photosynthesis" lands on a different article and was refused at
+similarity 0.120 on live Wikipedia. And a recording is only a snapshot: a live shop
+listing that was still lazy-loading when the run ended recorded 33 elements where a
+settled load has 50, so the correct replay was refused at 0.400 against a page it had
+actually reached. In both cases the skill had already passed its own verifier in the
+sandbox, which is the question a skill can answer for itself.
+
+So a mismatch escalates rather than refuses: the vision model is shown both screens
+and asked whether the job got done. That costs a call, and the call is the point -
+it is what the recalled screen was being used to avoid paying for, and avoiding it
+by guessing "no" is not a saving.
 
 An **evidence** check can prove success: ``matches_state(the fingerprint this skill is
 supposed to end on)``, ``element_present("Payment confirmed")``, whatever the caller
@@ -199,6 +218,7 @@ class TieredCritic:
         *,
         evidence: Sequence[Check] = (),
         expected_state: Fingerprint | None = None,
+        corroborating_state: Fingerprint | None = None,
         require_change: bool = True,
         check_errors: bool = True,
         vetoes: Sequence[Check] = (),
@@ -209,11 +229,15 @@ class TieredCritic:
         self._require_change = require_change
         self._check_errors = check_errors
         self._expected_state = expected_state
+        self._corroborating_state = corroborating_state
         self._extra_evidence: tuple[Check, ...] = tuple(evidence)
         derived: list[Check] = []
         if expected_state is not None:
             derived.append(matches_state_check(expected_state))
         self._evidence: tuple[Check, ...] = (*derived, *evidence)
+        self._corroboration: tuple[Check, ...] = (
+            (matches_state_check(corroborating_state),) if corroborating_state is not None else ()
+        )
         built: list[Check] = []
         if require_change:
             built.append(state_changed_check())
@@ -221,20 +245,27 @@ class TieredCritic:
             built.append(no_error_state())
         self._vetoes: tuple[Check, ...] = (*built, *vetoes)
 
-    def for_end_state(self, expected_state: Fingerprint | None) -> TieredCritic:
-        """A copy of this critic expecting a DIFFERENT screen. Shares the model.
+    def for_end_state(self, end_state: Fingerprint | None) -> TieredCritic:
+        """A copy of this critic recalling a DIFFERENT finishing screen. Shares the model.
 
         Not :meth:`expecting`, which adds evidence and keeps what was already there.
-        This REPLACES the expected screen, which is what a caller needs once it knows
+        This REPLACES the recalled screen, which is what a caller needs once it knows
         something the critic was built too early to know - most of all which stored
         skill a warm run actually ran, and therefore where that run should finish.
         Keeping both screens would demand the run end in two places at once, and it
         would fail every time.
+
+        The screen is installed as CORROBORATION, not as evidence: a recalled ending
+        can say yes and must never say no. See the module docstring.
         """
         clone = TieredCritic(
             self._llm,
             evidence=self._extra_evidence,
-            expected_state=expected_state,
+            # Cleared, not kept: an earlier guess at the finishing screen is exactly
+            # what this call exists to overrule, and keeping it would demand the run
+            # end in two places at once.
+            expected_state=None,
+            corroborating_state=end_state,
             require_change=self._require_change,
             check_errors=self._check_errors,
             max_tokens=self._max_tokens,
@@ -286,10 +317,13 @@ class TieredCritic:
             ProviderError: if a model was needed and the call failed.
         """
         evidence = run_all(self._evidence, before, after)
+        corroboration = run_all(self._corroboration, before, after)
         vetoes = run_all(self._vetoes, before, after)
-        results = tuple(evidence + vetoes)
+        results = tuple(evidence + corroboration + vetoes)
 
-        failures = [r for r in results if r.outcome is Outcome.failed]
+        # Corroboration is excluded here on purpose: it can prove success and must
+        # never prove failure. See the class docstring.
+        failures = [r for r in (*evidence, *vetoes) if r.outcome is Outcome.failed]
         if failures:
             return CriticVerdict(
                 ok=False,
@@ -298,6 +332,19 @@ class TieredCritic:
                 source="programmatic",
                 escalated=False,
                 policy="check-failed",
+                checks=results,
+            )
+
+        if any(r.outcome is Outcome.passed for r in corroboration):
+            return CriticVerdict(
+                ok=True,
+                reason="; ".join(
+                    f"{r.name}: {r.reason}" for r in corroboration if r.outcome is Outcome.passed
+                ),
+                confidence=max(r.confidence for r in corroboration if r.outcome is Outcome.passed),
+                source="programmatic",
+                escalated=False,
+                policy="corroborated",
                 checks=results,
             )
 

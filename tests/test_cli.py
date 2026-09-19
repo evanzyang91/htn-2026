@@ -128,6 +128,23 @@ run on a screen that merely changed, so it asks the model - once per move, plus 
 more for the final 'is the task done?'. Those calls are what make exploration the
 expensive path, and they are in the script rather than hidden behind a fake critic."""
 
+NOT_DONE = json.dumps(
+    {
+        "ok": False,
+        "evidence": "the invoice list is still filtered and no confirmation is shown",
+        "reason": "the errand was not finished",
+        "confidence": 0.9,
+    }
+)
+"""A critic escalation answering no.
+
+A warm attempt that lands somewhere other than where the learned run ended no longer
+fails for free. The recalled screen is CORROBORATION - it can say yes and never no -
+so a mismatch buys a look from the model instead of an automatic rejection. That costs
+one call on the failure path, and it is what stops a correct replay with a new
+argument from being thrown away; see the module docstring of ``agent/critic.py``.
+"""
+
 SKILL_CODE = (
     "def run(ctx, company):\n"
     '    ctx.ctl.type_text("acme")\n'
@@ -413,7 +430,7 @@ def test_a_warm_attempt_that_fails_verification_falls_through_to_cold(world: Wor
     set: the library was WRONG about this task, which is information, not a detail.
     """
     _plant_half_done_skill(world)
-    world.script(SOLVE_FROM_SEARCHED)
+    world.script((NOT_DONE, *SOLVE_FROM_SEARCHED))
 
     report = world.json("run", TASK, "--domain", DOMAIN, "-p", COMPANY, "--no-learn")
 
@@ -429,7 +446,7 @@ def test_a_warm_attempt_that_fails_verification_falls_through_to_cold(world: Wor
 def test_the_prose_report_names_the_rescue_too(world: World) -> None:
     """The same finding has to survive into what a human reads, not only the JSON."""
     _plant_half_done_skill(world)
-    world.script(SOLVE_FROM_SEARCHED)
+    world.script((NOT_DONE, *SOLVE_FROM_SEARCHED))
 
     result = world.invoke("run", TASK, "--domain", DOMAIN, "-p", COMPANY, "--no-learn")
 
@@ -451,7 +468,7 @@ def test_a_rescued_run_is_not_admitted_when_it_cannot_be_replayed(world: World) 
     to the URL the RUN started on, which is reachable.
     """
     _plant_half_done_skill(world)
-    world.script((*SOLVE_FROM_SEARCHED, skill_reply(), skill_reply(), skill_reply()))
+    world.script((NOT_DONE, *SOLVE_FROM_SEARCHED, skill_reply(), skill_reply(), skill_reply()))
 
     report = world.json("run", TASK, "--domain", DOMAIN, "-p", COMPANY)
 
@@ -471,7 +488,7 @@ def test_a_rejected_candidate_leaves_its_code_beside_the_run(world: World, tmp_p
     """
     world.trajectories = TrajectoryFileStore(tmp_path / "recorded")
     _plant_half_done_skill(world)
-    world.script((*SOLVE_FROM_SEARCHED, skill_reply(), skill_reply(), skill_reply()))
+    world.script((NOT_DONE, *SOLVE_FROM_SEARCHED, skill_reply(), skill_reply(), skill_reply()))
 
     report = world.json("run", TASK, "--domain", DOMAIN, "-p", COMPANY)
     assert report["learned"] is None, "this run is only interesting because it was rejected"
@@ -519,7 +536,7 @@ def test_a_skill_that_fails_outright_is_demoted_and_reported(world: World) -> No
         )
     )
     world.scenario.controller.reset()
-    world.script(SOLVE_FROM_SEARCHED)
+    world.script((NOT_DONE, *SOLVE_FROM_SEARCHED))
 
     report = world.json("run", TASK, "--domain", DOMAIN, "-p", COMPANY, "--no-learn")
 

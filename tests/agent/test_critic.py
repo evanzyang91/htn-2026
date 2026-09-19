@@ -490,6 +490,43 @@ class TestCostPolicy:
         assert verdict.policy == "evidence-passed"
         assert verdict.confidence == 1.0
 
+    def test_a_corroborating_match_is_decisive_and_free(
+        self, scenario: Scenario, fake_llm: FakeLLM
+    ) -> None:
+        """A recalled ending that MATCHES still settles it without paying anyone."""
+        before, after = observe(scenario, "selected"), observe(scenario, "done")
+        critic = TieredCritic(fake_llm, corroborating_state=after.fingerprint)
+
+        verdict = critic.judge("confirm the Acme payment", before, after)
+
+        assert fake_llm.calls == 0, "a fingerprint match must never cost a model call"
+        assert verdict.ok is True
+        assert verdict.escalated is False
+        assert verdict.policy == "corroborated"
+
+    def test_a_corroborating_mismatch_asks_rather_than_refuses(self, scenario: Scenario) -> None:
+        """The whole point of the third role: a recalled ending may never say no.
+
+        Where the LAST run of this task ended is not where this one must end - it is
+        where one run ended with the arguments it was given. Measured twice live: a
+        Wikipedia skill replayed for a new query landed on the right article and was
+        refused at similarity 0.120, and a shop listing recorded mid-lazy-load was
+        refused at 0.400 against the page the replay had genuinely reached. As
+        evidence this screen rejects correct work; as corroboration it buys a look.
+        """
+        before, after = observe(scenario, "selected"), observe(scenario, "done")
+        elsewhere = observe(scenario, "list").fingerprint
+        fake_llm = FakeLLM(
+            ['{"ok": true, "evidence": "the receipt is on screen", "confidence": 1.0}']
+        )
+        critic = TieredCritic(fake_llm, corroborating_state=elsewhere)
+
+        verdict = critic.judge("confirm the Acme payment", before, after)
+
+        assert verdict.escalated is True, "a mismatch must ask, never refuse outright"
+        assert fake_llm.calls == 1
+        assert verdict.source == "model"
+
     def test_a_decisive_negative_makes_no_model_call(
         self, scenario: Scenario, fake_llm: FakeLLM
     ) -> None:

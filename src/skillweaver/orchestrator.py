@@ -1120,7 +1120,7 @@ def build_agent(
         retriever=retriever,
         graph=graph,
         runner=runner,
-        critic=TieredCritic(llm, expected_state=expected),
+        critic=TieredCritic(llm, corroborating_state=expected),
         controller=controller,
         perceiver=perceiver,
         composer=Composer(llm, store, graph=graph) if compose else None,
@@ -1146,7 +1146,7 @@ def build_agent(
             return Synthesizer(
                 llm,
                 store,
-                TieredCritic(llm, expected_state=end),
+                TieredCritic(llm, corroborating_state=end),
                 max_repairs=max_repairs,
             )
 
