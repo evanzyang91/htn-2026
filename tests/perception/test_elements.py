@@ -22,6 +22,7 @@ from skillweaver.errors import PerceptionError
 from skillweaver.perception import crop as cropping
 from skillweaver.perception import screenshot as shots
 from skillweaver.perception.elements import (
+    MERGED_TEXT_LIMIT,
     STABLE_ID_GRID,
     ElementIndex,
     build_index,
@@ -466,6 +467,68 @@ def test_merge_collapses_a_near_duplicate_box_by_iou() -> None:
     assert len(merged) == 1
     assert merged[0].confidence == pytest.approx(0.9)
     assert merged[0].source is ElementSource.merged
+
+
+def test_a_fused_row_says_every_line_printed_inside_it() -> None:
+    """A list row is several lines and any of them is how a person would name it.
+
+    Keeping only the longest would leave a message row saying its body preview and
+    nothing else, so "the message from Billing titled 'Invoice 4471 is ready'" could
+    match neither the sender nor the subject that are plainly on screen.
+    """
+    row = _element(Box(250, 300, 950, 80), ElementKind.button, "", 0.8, ElementSource.yolo)
+    sender = _element(Box(258, 306, 90, 18), ElementKind.text, "Billing", 0.95, ElementSource.ocr)
+    subject = _element(
+        Box(258, 326, 300, 20), ElementKind.text, "Invoice 4471 is ready", 0.95, ElementSource.ocr
+    )
+    preview = _element(
+        Box(258, 350, 600, 18),
+        ElementKind.text,
+        "Invoice 4471 for the March hosting term is available.",
+        0.9,
+        ElementSource.ocr,
+    )
+
+    merged = merge_elements([row], [sender, subject, preview])
+
+    assert len(merged) == 1
+    only = merged[0]
+    assert only.kind is ElementKind.button and only.box == row.box, "the click target is the row"
+    assert only.text == (
+        "Billing Invoice 4471 is ready Invoice 4471 for the March hosting term is available."
+    )
+    index = ElementIndex(merged)
+    assert index.find_text("Billing"), "the sender is findable"
+    assert index.find_text("Invoice 4471 is ready"), "the subject is findable"
+
+
+def test_a_fused_control_does_not_repeat_a_line_it_reads_twice() -> None:
+    button = _element(Box(40, 40, 120, 40), ElementKind.button, "", 0.8, ElementSource.yolo)
+    once = _element(Box(48, 50, 60, 18), ElementKind.text, "Save", 0.9, ElementSource.ocr)
+    again = _element(Box(50, 52, 58, 16), ElementKind.text, " save ", 0.8, ElementSource.ocr)
+    assert merge_elements([button], [once, again])[0].text == "Save"
+
+
+def test_ground_truth_text_is_not_padded_out_with_ocrs_guess_at_the_same_words() -> None:
+    """Only the most trusted source present contributes, so a control never says its
+    own label twice."""
+    button = _element(Box(40, 40, 120, 40), ElementKind.button, "Sign In", 0.9, ElementSource.dom)
+    guess = _element(Box(48, 50, 60, 18), ElementKind.text, "SignIn", 0.7, ElementSource.ocr)
+    assert merge_elements([button], [guess])[0].text == "Sign In"
+
+
+def test_a_very_wordy_control_is_cut_after_the_identifying_lines() -> None:
+    """Reading order puts the short identifying lines first, so a cut loses the tail
+    of the body copy rather than the sender."""
+    row = _element(Box(0, 0, 900, 80), ElementKind.row, "", 0.8, ElementSource.yolo)
+    who = _element(Box(8, 4, 80, 16), ElementKind.text, "Northwind IT", 0.9, ElementSource.ocr)
+    body = _element(Box(8, 40, 860, 18), ElementKind.text, "word " * 60, 0.9, ElementSource.ocr)
+
+    text = merge_elements([row], [who, body])[0].text
+
+    assert text.startswith("Northwind IT ")
+    assert len(text) <= MERGED_TEXT_LIMIT
+    assert text.endswith("…")
 
 
 def test_merge_keeps_two_genuinely_separate_elements() -> None:

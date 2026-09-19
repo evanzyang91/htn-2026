@@ -575,6 +575,15 @@ _TEXT_TRUST: dict[ElementSource, int] = {
     ElementSource.yolo: 0,
 }
 
+MERGED_TEXT_LIMIT = 160
+"""Characters kept when a fused control's lines are joined; see :func:`_fused_text`.
+
+Long enough for the identifying part of a list row - who it is from, what it is
+about - and short enough that a screen of sixteen such rows does not fill a prompt
+with body copy. Reading order puts the identifying lines first, so what a truncation
+drops is the tail of the longest line.
+"""
+
 
 def overlap_ratio(a: Box, b: Box) -> float:
     """Intersection area over the SMALLER box's area, in ``0.0..1.0``.
@@ -662,20 +671,51 @@ def merge_elements(
             )
             continue
         seed = cluster[0]
-        texted = [e for e in cluster if normalize_text(e.text)]
-        text = seed.text
-        if texted:
-            text = max(
-                texted,
-                key=lambda e: (_TEXT_TRUST[e.source], len(normalize_text(e.text)), e.confidence),
-            ).text
         fused = Element(
             box=seed.box,
             kind=seed.kind,
-            text=text,
+            text=_fused_text(cluster, seed.text),
             confidence=max(e.confidence for e in cluster),
             stable_id=None,
             source=ElementSource.merged,
         )
         merged.append(dataclasses.replace(fused, stable_id=stable_id(fused)))
     return reading_order(merged)
+
+
+def _fused_text(cluster: Sequence[Element], fallback: str) -> str:
+    """Everything a fused control says, in reading order, from its best source.
+
+    A control in a real application is usually several lines: a message row prints a
+    sender, a subject and a preview, a card prints a title and a caption. Each arrives
+    as its own OCR line and they all fuse into the one control the user clicks, so the
+    question is which of them the merged element should say.
+
+    Keeping only the longest - which is what this did first - throws the other lines
+    away, and the ones thrown away are the identifying ones: the longest line in a
+    message row is the body preview, so an agent asked to open "the message from
+    Billing titled 'Invoice 4471 is ready'" could search the screen and find neither
+    the sender nor the subject, because only the preview survived. Every line is on
+    screen and every line is something a person would name the control by, so the
+    merged element says all of them, in the order they are read.
+
+    Only the most trusted source present contributes: with DOM ground truth there is
+    no reason to append OCR's guess at the same words, and mixing the two would make
+    every control read its own label twice.
+    """
+    texted = [e for e in cluster if normalize_text(e.text)]
+    if not texted:
+        return fallback
+    best = max(_TEXT_TRUST[e.source] for e in texted)
+    lines: list[str] = []
+    seen: set[str] = set()
+    for element in reading_order([e for e in texted if _TEXT_TRUST[e.source] == best]):
+        normalized = normalize_text(element.text)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        lines.append(element.text.strip())
+    joined = " ".join(line for line in lines if line)
+    if len(joined) <= MERGED_TEXT_LIMIT:
+        return joined
+    return joined[: MERGED_TEXT_LIMIT - 1].rstrip() + "…"
