@@ -40,7 +40,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
-from typing import Literal
+from typing import Any, Literal
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, Playwright, Route, sync_playwright
@@ -555,6 +555,41 @@ class BrowserController:
     def blocked(self) -> tuple[str | re.Pattern[str], ...]:
         """The URL patterns this controller aborts. See :data:`SOMETIMES_ONLY_OVERLAYS`."""
         return self._blocked
+
+    def evaluate(self, script: str) -> Any:
+        """Run ``script`` in the page and return its JSON-able result. READ-ONLY.
+
+        The one hook the DOM perception path needs
+        (:class:`~skillweaver.perception.dom.DomPerceiver`), and deliberately the only
+        thing that path adds to this class. It is not an action plane and must not
+        become one: a click still goes through :meth:`perform` as a
+        :class:`~skillweaver.contracts.Click` at a point, so Playwright, the launch path
+        and every stored skill are untouched by the choice of eyes. See ``AGENTS.md``
+        for the standing rule this serves and how far it is relaxed.
+
+        It is not on the :class:`~skillweaver.contracts.Controller` Protocol - that is
+        shared surface, and a desktop controller has no page to evaluate anything in -
+        so callers duck-type on its presence and say so when it is absent.
+
+        A document that is mid-navigation destroys the execution context under the
+        script. That is a moment rather than a broken page, so the new document is
+        waited for and the script asked once more, exactly as
+        :class:`BrowserGroundTruth` does; a second failure is real.
+
+        Raises:
+            ControllerError: if the script cannot be run, or fails twice.
+        """
+        page = self._live_page()
+        try:
+            return page.evaluate(script)
+        except PlaywrightError as exc:
+            if "context was destroyed" not in str(exc) and "navigating" not in str(exc):
+                raise ControllerError(f"could not evaluate page script: {_brief(exc)}") from exc
+        try:
+            page.wait_for_load_state("load", timeout=self._navigation_timeout_ms)
+            return page.evaluate(script)
+        except PlaywrightError as exc:
+            raise ControllerError(f"could not evaluate page script: {_brief(exc)}") from exc
 
     def describe(self) -> str:
         """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``.

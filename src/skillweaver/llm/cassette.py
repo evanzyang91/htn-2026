@@ -69,6 +69,11 @@ _SECRET_ENV_VARS = (
     "ANTHROPIC_AUTH_TOKEN",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    # The Jev policy and the text model it is paired with; see skillweaver.llm.jev_.
+    # TYPESAFE_API_KEY has no recognisable shape, so the literal value is the only
+    # thing that can redact it and this is where that value is named.
+    "TYPESAFE_API_KEY",
+    "TEXT_MODEL_API_KEY",
 )
 
 _extra_secrets: set[str] = set()

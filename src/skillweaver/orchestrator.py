@@ -65,7 +65,7 @@ from typing import Any, Literal
 
 from skillweaver.agent.compose import Composer
 from skillweaver.agent.critic import TieredCritic
-from skillweaver.agent.explorer import Explorer
+from skillweaver.agent.explorer import ActingPolicy, Explorer
 from skillweaver.agent.planner import MIN_ACCOUNTED_FOR, PlanFailure, Planner, bind_args
 from skillweaver.config import Settings, settings
 from skillweaver.contracts import (
@@ -93,7 +93,7 @@ from skillweaver.contracts import (
     Usage,
     utcnow,
 )
-from skillweaver.errors import BudgetExceeded, SkillWeaverError
+from skillweaver.errors import BudgetExceeded, ConfigError, SkillWeaverError
 from skillweaver.graph.model import InMemorySiteGraph
 from skillweaver.graph.store import JSONGraphStore
 from skillweaver.logging_ import get_logger
@@ -105,6 +105,7 @@ from skillweaver.perception.ocr import (
     PerceptionCounters,
     PerceptionCounts,
 )
+from skillweaver.perception_mode import DOM, PIXELS, namespace, path_of
 from skillweaver.render_mode import crossing, mode_name, mode_of
 from skillweaver.reset_actions import (
     RESET_ACTIONS_PARAM,
@@ -1345,6 +1346,7 @@ def resolve_domain(
     params: Mapping[str, Any] | None = None,
     retriever: SkillRetriever | None = None,
     graph: SiteGraph | None = None,
+    path: str = PIXELS,
     k: int = 10,
 ) -> DomainChoice:
     """Which library namespace ``text`` means, when the caller did not say.
@@ -1411,6 +1413,11 @@ def resolve_domain(
             which leaves the old fallback and is what a caller with no library wants.
         graph: The site graph, consulted only to find where the winning skill's start
             screen lives. ``None`` means the caller gets a domain and no URL.
+        path: Which perception path this run will use. Every namespace this returns
+            belongs to it, and a cross-domain search considers only candidates filed
+            under it - see :mod:`skillweaver.perception_mode` for why a DOM run must
+            never be handed a skill a pixel run stored, and why the fingerprint will
+            not catch that on its own.
         k: How many candidates to consider.
 
     Returns:
@@ -1419,13 +1426,23 @@ def resolve_domain(
         refuse to run.
     """
     if domain:
-        return DomainChoice(domain=domain, start_url=url, source="named", why="named with --domain")
+        return DomainChoice(
+            domain=namespace(domain, path),
+            start_url=url,
+            source="named",
+            why="named with --domain",
+        )
     host = _host(url) if target == "browser" else None
     if host:
-        return DomainChoice(domain=host, start_url=url, source="url", why="the host of --url")
+        return DomainChoice(
+            domain=namespace(host, path),
+            start_url=url,
+            source="url",
+            why="the host of --url",
+        )
     if target != "browser" or retriever is None:
         return DomainChoice(
-            domain=target,
+            domain=namespace(target, path),
             start_url=url,
             source="target",
             why="nothing named a domain, so the target's own name is used",
@@ -1437,7 +1454,7 @@ def resolve_domain(
     except SkillWeaverError as exc:
         log.warning("domain.lookup.failed", task=text, error=str(exc))
         return DomainChoice(
-            domain=target,
+            domain=namespace(target, path),
             start_url=url,
             source="target",
             why=f"the library could not be searched ({exc})",
@@ -1446,6 +1463,11 @@ def resolve_domain(
     passed_over: list[str] = []
     for candidate in candidates:
         skill = candidate.skill
+        # A skill from the OTHER perception path is not a weaker answer, it is a wrong
+        # one: its code was written against element text a different reader produced.
+        # It is skipped before it is scored, so it can never name the domain.
+        if path_of(skill.domain) != path:
+            continue
         # The planner's own question, never asked more loosely than the planner asks
         # it: the arguments when they bind for free, and the skill's bare text when
         # they do not - because what binds them there is the composer, which costs a
@@ -1483,7 +1505,7 @@ def resolve_domain(
         passed_over=", ".join(passed_over) or "(none)",
     )
     return DomainChoice(
-        domain=target,
+        domain=namespace(target, path),
         start_url=url,
         source="target",
         why=(
@@ -1810,6 +1832,7 @@ def build_agent(
     trajectories: TrajectoryStore | None = None,
     recorder: TrajectoryRecorder | None = None,
     environment: EnvironmentFor | None = None,
+    policy: ActingPolicy | None = None,
     budget: Budget | None = None,
     compose: bool = True,
     learn: bool = True,
@@ -1851,6 +1874,12 @@ def build_agent(
         environment: Resets the world for the admission gate, per trajectory.
             ``None`` means this agent cannot learn, and it reports that rather than
             skipping quietly.
+        policy: Who decides each exploratory move. ``None`` - the DEFAULT - is ``llm``
+            through the acting prompt. See
+            :class:`~skillweaver.agent.explorer.ActingPolicy`: a policy replaces that
+            one step, and the planner, the critics, the gate and the store are the
+            same objects either way, which is the whole reason the skills layer needs
+            no changes to sit on top of a new acting path.
         budget: Limits for one run.
         compose: Whether the planner may spend one model call chaining known skills
             for a task no single skill covers. ``False`` keeps it strictly
@@ -1896,6 +1925,7 @@ def build_agent(
         recorder=recorder,
         retriever=retriever,
         runner=runner,
+        policy=policy,
     )
 
     synthesis: SynthesisFactory | None = None
@@ -2049,11 +2079,13 @@ def build_workbench(config: Settings | None = None) -> Workbench:
         controller, perceiver = _open_world(resolved, task)
         try:
             graph.load(task.domain)
+            llm = _open_model(resolved)
             yield build_agent(
                 task,
                 controller=controller,
                 perceiver=perceiver,
-                llm=_open_model(resolved),
+                llm=llm,
+                policy=_open_policy(resolved, perceiver, llm),
                 store=store,
                 retriever=build_retriever(store),
                 graph=graph,
@@ -2139,19 +2171,26 @@ def _is_read_only(task: TaskSpec) -> bool:
 
 
 def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver]:
-    """Open the controller the task asks for, and eyes to go with it.
+    """Open the controller the task asks for, and the eyes it was configured with.
 
     Imported here rather than at module scope: Playwright, ultralytics and RapidOCR
     are all slow to import, and ``skillweaver skills ls`` has no business paying for
-    any of them.
-    """
-    from skillweaver.perception.detect_yolo import DEFAULT_WEIGHTS_NAME, YoloDetector
-    from skillweaver.perception.ocr import RapidOcrReader
+    any of them. The DOM path skips the last two entirely, which is most of why it is
+    quick to start as well as quick to run.
 
+    Raises:
+        ConfigError: if ``--perception dom`` is asked for on a desktop target. A
+            desktop has no DOM, and failing here is failing before anything opens.
+    """
     controller: Controller
     if task.target == "desktop":
         from skillweaver.controllers.desktop import DesktopController
 
+        if config.perception == DOM:
+            raise ConfigError(
+                "--perception dom is browser-only: a desktop target has no page to ask. "
+                "Use --perception pixels, which is the default."
+            )
         controller = DesktopController()
     else:
         from skillweaver.controllers.browser import BrowserController
@@ -2162,17 +2201,62 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
             user_data_dir=config.chrome_profile,
             attach=config.chrome_attach,
         )
+    return controller, _open_eyes(config)
+
+
+def _open_eyes(config: Settings) -> Perceiver:
+    """The perceiver this invocation was configured with. See
+    :mod:`skillweaver.perception_mode` for why the two keep separate libraries."""
+    if config.perception == DOM:
+        from skillweaver.perception.dom import DomPerceiver
+
+        return DomPerceiver()
+    from skillweaver.perception.detect_yolo import DEFAULT_WEIGHTS_NAME, YoloDetector
+    from skillweaver.perception.ocr import RapidOcrReader
+
     # Not ``default_weights_path()``: that reads the process-wide settings, which a
     # --data-dir on this invocation has already overridden.
     detector = YoloDetector(config.models_dir / DEFAULT_WEIGHTS_NAME)
-    return controller, ComposedPerceiver(detector, RapidOcrReader())
+    return ComposedPerceiver(detector, RapidOcrReader())
 
 
 def _open_model(config: Settings) -> LLMClient:
-    """The computer-use model. Claude is primary; Gemini is the alternative."""
+    """The computer-use model. Claude is primary; Gemini is the alternative.
+
+    This stays Claude whichever acting policy is selected, because a policy replaces
+    only the MOVE decision: the critic that judges each move, the synthesizer that
+    compiles a trajectory into a skill, the composer and the Jev path's own text
+    helper are all this client. See :func:`_open_policy`.
+    """
     from skillweaver.llm.anthropic_ import AnthropicClient
 
     return AnthropicClient(model=config.claude_model, computer_use=True)
+
+
+def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any | None:
+    """The acting policy, or ``None`` for the default - Claude through the prompt.
+
+    Raises:
+        ConfigError: if ``--policy jev`` was asked for without ``--perception dom``.
+            Jev answers with an index into a table of named controls, and the pixel
+            path does not produce one: OCR gives a detected box some text was near,
+            not a control with a role and a value. Pairing them would mean inventing
+            the table, and a policy aimed at an invented target is a policy aimed at
+            nothing.
+        ProviderError: if the Jev credential is missing - before a browser opens.
+    """
+    if config.policy != "jev":
+        return None
+    from skillweaver.agent.jev_driver import JevDriver
+    from skillweaver.llm.jev_ import JevPolicy, LLMTextWriter
+    from skillweaver.perception.dom import DomPerceiver
+
+    if not isinstance(perceiver, DomPerceiver):
+        raise ConfigError(
+            "--policy jev needs --perception dom: the policy chooses an index into the "
+            "page's own list of named controls, which only the DOM path produces."
+        )
+    return JevDriver(JevPolicy(LLMTextWriter(llm)), perceiver)
 
 
 def budget_from(

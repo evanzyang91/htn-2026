@@ -54,7 +54,7 @@ from typing import Annotated, Any
 
 import typer
 
-from skillweaver.config import Settings, check_settings, load_settings, settings
+from skillweaver.config import POLICIES, Settings, check_settings, load_settings, settings
 from skillweaver.contracts import Skill, Transition, UIState, action_to_dict
 from skillweaver.errors import ConfigError, SkillNotFound, SkillWeaverError
 from skillweaver.orchestrator import (
@@ -66,6 +66,7 @@ from skillweaver.orchestrator import (
     resolve_domain,
     task_spec,
 )
+from skillweaver.perception_mode import PATHS
 
 __all__ = ["app", "main"]
 
@@ -175,6 +176,34 @@ def root(
             show_default=False,
         ),
     ] = None,
+    perception: Annotated[
+        str | None,
+        typer.Option(
+            "--perception",
+            help="Which eyes to use: 'pixels' (a YOLO detector plus OCR over a "
+            "screenshot - the DEFAULT, and what every stored skill was learned "
+            "against) or 'dom' (the page's own list of named controls, browser only). "
+            "The DOM path runs no OCR, which is 84-97% of a pixel observation, and it "
+            "sees nothing the page declines to name - text in an image, a canvas, a "
+            "cross-origin frame. THE TWO KEEP SEPARATE SKILL LIBRARIES: a skill stored "
+            "by one is never offered to the other, because its code was written against "
+            "element text a different reader produced. Overrides SKILLWEAVER_PERCEPTION.",
+            show_default=False,
+        ),
+    ] = None,
+    policy: Annotated[
+        str | None,
+        typer.Option(
+            "--policy",
+            help="Who chooses each exploratory move: 'claude' (the acting prompt - the "
+            "DEFAULT) or 'jev' (TypeSafe's Jev, one request per step that picks both "
+            "the operation and its target). 'jev' requires --perception dom and "
+            "TYPESAFE_API_KEY. It replaces the move decision ONLY: the critic, the "
+            "admission gate, the synthesizer and every stored skill are unchanged. "
+            "Overrides SKILLWEAVER_POLICY.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Open the memories every subcommand reads from.
 
@@ -185,7 +214,15 @@ def root(
         return
     try:
         ctx.obj = build_workbench(
-            _settings(data_dir, log_level, headless, chrome_profile, chrome_attach)
+            _settings(
+                data_dir,
+                log_level,
+                headless,
+                chrome_profile,
+                chrome_attach,
+                perception,
+                policy,
+            )
         )
     except ConfigError as exc:
         _die(f"configuration is invalid: {exc}")
@@ -197,6 +234,8 @@ def _settings(
     headless: bool | None = None,
     chrome_profile: Path | None = None,
     chrome_attach: bool | None = None,
+    perception: str | None = None,
+    policy: str | None = None,
 ) -> Settings:
     """Configuration, with the global flags applied on top.
 
@@ -224,6 +263,16 @@ def _settings(
         changes["chrome_profile"] = Path(chrome_profile).expanduser()
     if chrome_attach is not None:
         changes["chrome_attach"] = bool(chrome_attach)
+    if perception is not None:
+        chosen = perception.lower()
+        if chosen not in PATHS:
+            raise ConfigError(f"--perception {perception!r} must be one of {PATHS}")
+        changes["perception"] = chosen
+    if policy is not None:
+        chosen = policy.lower()
+        if chosen not in POLICIES:
+            raise ConfigError(f"--policy {policy!r} must be one of {POLICIES}")
+        changes["policy"] = chosen
     if not changes:
         return resolved
     # Checked again after the flags land: --chrome-attach and the directory it needs can
@@ -511,6 +560,7 @@ def _do(
         params=params,
         retriever=bench.retriever if warm else None,
         graph=bench.graph if warm else None,
+        path=bench.settings.perception,
     )
     try:
         spec = task_spec(

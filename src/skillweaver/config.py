@@ -10,6 +10,8 @@ Recognized variables::
     SKILLWEAVER_TARGET          "browser" or "desktop"          (default: browser)
     SKILLWEAVER_HEADLESS        run the browser without a window (default: false)
     SKILLWEAVER_CHROME_PROFILE  persistent real-Chrome profile dir (default: unset)
+    SKILLWEAVER_PERCEPTION      "pixels" or "dom"               (default: pixels)
+    SKILLWEAVER_POLICY          "claude" or "jev"               (default: claude)
     SKILLWEAVER_LOG_LEVEL       DEBUG/INFO/WARNING/ERROR        (default: INFO)
     SKILLWEAVER_CLAUDE_MODEL    Claude model id                 (default: claude-opus-5)
     SKILLWEAVER_GEMINI_MODEL    Gemini computer-use model id
@@ -26,6 +28,9 @@ Recognized variables::
     ANTHROPIC_API_KEY           Claude credentials (optional: the SDK also resolves
                                 its own credentials when this is unset)
     GEMINI_API_KEY              Gemini credentials (GOOGLE_API_KEY also accepted)
+    TYPESAFE_API_KEY            Jev policy credentials, read by skillweaver.llm.jev_
+                                itself rather than through Settings, so no credential
+                                is copied into a value this module puts in a repr
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ from typing import Literal
 
 from skillweaver.contracts import Budget
 from skillweaver.errors import ConfigError
+from skillweaver.perception_mode import PATHS, PIXELS
 
 DEFAULT_CLAUDE_MODEL = "claude-opus-5"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-computer-use-preview-10-2025"
@@ -120,6 +126,25 @@ against live doordash.com, at ``PLAINLY_LAUNCHED`` in
 :mod:`skillweaver.controllers.chrome_launch`, which also carries what this mode must
 never be extended into: it does not defeat, mask or retry past a human-verification page,
 and a challenge fails the run for a person to clear by hand."""
+DEFAULT_PERCEPTION = PIXELS
+"""Which eyes a run opens with. PIXELS, and that is the point of the default.
+
+The pixel path is what every stored skill was learned against, what both landed
+speedups were measured on, and what the project's claim to be a computer-use agent
+rests on. The DOM path (``--perception dom``) is opt-in for browser use only; see
+:mod:`skillweaver.perception_mode` and ``AGENTS.md`` for the invariant it relaxes.
+"""
+
+DEFAULT_POLICY = "claude"
+"""Who chooses each move. Claude through the acting prompt, unchanged.
+
+``jev`` swaps in :class:`~skillweaver.llm.jev_.JevPolicy` and requires
+``--perception dom``, because a policy that acts on an indexed control table needs a
+perceiver that produces one.
+"""
+
+POLICIES = ("claude", "jev")
+"""Every acting policy, for validating a flag or a setting."""
 
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _TARGETS = ("browser", "desktop")
@@ -138,6 +163,8 @@ class Settings:
     headless: bool = DEFAULT_HEADLESS
     chrome_profile: Path | None = DEFAULT_CHROME_PROFILE
     chrome_attach: bool = DEFAULT_CHROME_ATTACH
+    perception: str = DEFAULT_PERCEPTION
+    policy: str = DEFAULT_POLICY
     claude_model: str = DEFAULT_CLAUDE_MODEL
     gemini_model: str = DEFAULT_GEMINI_MODEL
     skill_max_seconds: float = DEFAULT_SKILL_MAX_SECONDS
@@ -272,6 +299,13 @@ def load_settings(
     if log_level not in _LOG_LEVELS:
         raise ConfigError(f"SKILLWEAVER_LOG_LEVEL={log_level!r} must be one of {_LOG_LEVELS}")
 
+    perception = (merged.get("SKILLWEAVER_PERCEPTION") or DEFAULT_PERCEPTION).lower()
+    if perception not in PATHS:
+        raise ConfigError(f"SKILLWEAVER_PERCEPTION={perception!r} must be one of {PATHS}")
+    policy = (merged.get("SKILLWEAVER_POLICY") or DEFAULT_POLICY).lower()
+    if policy not in POLICIES:
+        raise ConfigError(f"SKILLWEAVER_POLICY={policy!r} must be one of {POLICIES}")
+
     defaults = Budget()
     budget = Budget(
         max_steps=_number(merged, "SKILLWEAVER_MAX_STEPS", defaults.max_steps, int),
@@ -286,6 +320,8 @@ def load_settings(
         headless=_flag(merged, "SKILLWEAVER_HEADLESS", DEFAULT_HEADLESS),
         chrome_profile=_path(merged, "SKILLWEAVER_CHROME_PROFILE", DEFAULT_CHROME_PROFILE),
         chrome_attach=_flag(merged, "SKILLWEAVER_CHROME_ATTACH", DEFAULT_CHROME_ATTACH),
+        perception=perception,
+        policy=policy,
         claude_model=merged.get("SKILLWEAVER_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
         gemini_model=merged.get("SKILLWEAVER_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
         skill_max_seconds=_number(

@@ -9,11 +9,19 @@ The loop is six steps, bounded four ways::
 
     observe -> prompt -> ask the model -> ground and perform -> judge -> continue?
 
-**Observe.** One :class:`~skillweaver.contracts.Perceiver` call. The action path of this
-module sees the screenshot, the detected elements and the fingerprint, and nothing else.
-There is deliberately no route from here to a DOM or any other ground truth: that exists
-in this project solely as an offline teacher for labelling and scoring, and reaching it
-from the acting loop would make every number the project reports meaningless.
+**Observe.** One :class:`~skillweaver.contracts.Perceiver` call. This module sees exactly
+what the perceiver it was handed returns - a screenshot, elements and a fingerprint - and
+never reaches past it for anything else. It does not know or care which eyes produced
+those elements, and it must not learn: it has no route to
+:class:`~skillweaver.controllers.browser.BrowserGroundTruth`, whose whole job is to know
+what the agent is supposed to work out, and reaching THAT from here would make every
+number the project reports meaningless.
+
+Which perceiver arrives is the caller's decision and is now two:
+:class:`~skillweaver.orchestrator.ComposedPerceiver` (YOLO and OCR over the screenshot,
+the DEFAULT) or :class:`~skillweaver.perception.dom.DomPerceiver` (the page's own control
+list, browser only, opt-in). ``AGENTS.md`` carries the standing rule and how far it is
+relaxed; :mod:`skillweaver.perception_mode` carries why the two keep separate libraries.
 
 **Prompt.** :class:`ElementCatalog` gives every element on the current screen a short id,
 and the model is required to act by id. Around that go the goal, the graph neighbourhood
@@ -77,7 +85,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from skillweaver.agent.critic import TieredCritic
 from skillweaver.contracts import (
@@ -127,6 +135,7 @@ from skillweaver.skills.sandbox import SkillRunner
 __all__ = [
     "MAX_BLOCK_ACTIONS",
     "PROMPT_PATH",
+    "ActingPolicy",
     "Attempt",
     "Diagnosis",
     "ElementCatalog",
@@ -134,7 +143,9 @@ __all__ = [
     "Explorer",
     "FailureMemory",
     "Move",
+    "PolicyBlocked",
     "load_prompt",
+    "signature_target",
 ]
 
 log = get_logger(__name__)
@@ -171,6 +182,90 @@ def load_prompt() -> str:
         OSError: if the prompt file is missing from the installed package.
     """
     return PROMPT_PATH.read_text(encoding="utf-8")
+
+
+class PolicyBlocked(Exception):
+    """An :class:`ActingPolicy` reporting that nothing on this screen can make progress.
+
+    Not a failure of the loop and not an error: it is the policy's own ``BLOCKED``
+    answer, which upstream Jev treats as a terminal state. The loop stops and the run is
+    diagnosed as blocked at the screen it was on, which is more useful than burning the
+    remaining budget asking the same question of the same page.
+    """
+
+
+# --------------------------------------------------------------------------------------
+# Who decides the next move
+# --------------------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ActingPolicy(Protocol):
+    """Whatever decides the next move, when it is not this module's own model call.
+
+    The DEFAULT is ``None`` and the default path is unchanged: :meth:`Explorer._ask`
+    composes a prompt, sends it with the screenshot and returns the reply. A policy
+    replaces that one step and NOTHING else - the failure memory, the grounding, the
+    taped controller, the critic, the graph writing, the trajectory and all four budget
+    limits are the same code either way, which is why a stored skill learned through a
+    policy is an ordinary stored skill.
+
+    The return value is the explorer's ANSWER PROTOCOL: the same JSON object
+    :meth:`Explorer._ground` parses out of a model reply - ``thought``, ``expect``,
+    ``done``, and one of ``action`` or ``code``. A policy writes that object directly
+    rather than a model writing it in prose, and the docstring says so plainly because
+    it looks like a fiction and is not one: grounding is where an element id is checked
+    against the screen in front of it, and a policy that skipped it would be a policy
+    nothing checks.
+
+    Raises:
+        PolicyBlocked: when the policy reports no supported operation can progress.
+        ProviderError: on a provider failure, which the loop records as a step failure.
+    """
+
+    def propose(
+        self,
+        task: TaskSpec,
+        observation: Observation,
+        catalog: ElementCatalog,
+        history: Sequence[str],
+        dead_ends: Sequence[Attempt],
+        rejection: str | None,
+    ) -> str:
+        """The next move, as an answer object.
+
+        Args:
+            task: What is being attempted, in the words it was asked in.
+            observation: The screen in front of the policy.
+            catalog: That screen's elements under the ids an answer must name.
+            history: One line per move so far, oldest first.
+            dead_ends: What has already been tried ON THIS SCREEN and did not work.
+                A policy that re-proposes one of these is refused by
+                :meth:`Explorer._refuse_repeat` and asked again, so honouring them is
+                how a policy avoids paying for the same answer twice;
+                :func:`signature_target` reads the element id back out of one.
+            rejection: Why the previous answer was refused, when it was.
+        """
+        ...
+
+    def name(self) -> str:
+        """The policy identifier, for logs and provenance."""
+        ...
+
+
+def signature_target(signature: str) -> str | None:
+    """The element id a :attr:`Move.signature` aims at, or ``None`` when it aims at none.
+
+    Signatures are built in :func:`_resolve`, one place, in the form
+    ``<kind>:<element_id>[:...]``. This function is where that format is READ, so a
+    caller outside this module - an :class:`ActingPolicy` pruning targets it already
+    knows are dead - does not have to know how it is spelled.
+    """
+    kind, _, rest = signature.partition(":")
+    if kind in _TARGETLESS or kind in ("code", "done", "malformed") or not rest:
+        return None
+    target = rest.partition(":")[0]
+    return target or None
 
 
 class _Invalid(Exception):
@@ -580,6 +675,10 @@ class Explorer:
             the model. ``None`` skips it.
         runner: The sandbox code blocks execute in. ``None`` builds one with no skill
             store, so a block can act but cannot call a stored skill.
+        policy: Who decides the next move. ``None`` - the DEFAULT - is ``llm``, asked
+            with the acting prompt and the screenshot, which is the path every stored
+            skill in this project was learned on. An :class:`ActingPolicy` replaces that
+            one step; see that Protocol for what it does NOT replace.
         max_tokens: Cap on each acting reply.
         max_block_actions: Actions one code block may perform.
 
@@ -596,6 +695,7 @@ class Explorer:
         recorder: TrajectoryRecorder | None = None,
         retriever: SkillRetriever | None = None,
         runner: SkillRunner | None = None,
+        policy: ActingPolicy | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_block_actions: int = MAX_BLOCK_ACTIONS,
     ) -> None:
@@ -605,12 +705,14 @@ class Explorer:
         self._graph = graph
         self._retriever = retriever
         self._runner = runner if runner is not None else SkillRunner(None)
+        self._policy = policy
         self._max_tokens = max_tokens
         self._max_block_actions = max_block_actions
         self._recorder = recorder if recorder is not None else _default_recorder()
 
     def __repr__(self) -> str:
-        return f"Explorer(model={self._llm.name()!r}, graph={self._graph is not None})"
+        decides = self._policy.name() if self._policy is not None else self._llm.name()
+        return f"Explorer(decides={decides!r}, graph={self._graph is not None})"
 
     # -- the Protocol ------------------------------------------------------------------
 
@@ -631,7 +733,7 @@ class Explorer:
             task=task,
             spend=spend,
             memory=FailureMemory(),
-            usage_mark=self._llm.total_usage(),
+            usage_mark=self._spent(),
             first=observation,
             current=observation,
         )
@@ -640,6 +742,13 @@ class Explorer:
         except ControllerError:
             self._recorder.finish(False, "the controller broke mid-run")
             raise
+        except PolicyBlocked as exc:
+            # The policy's own terminal answer, not a limit and not a fault. It is
+            # recorded as where the run stopped so the diagnosis names the screen, which
+            # is the thing a person re-running this needs.
+            run.stopped_by = "blocked"
+            run.detail = str(exc) or "the policy reported no supported operation could progress"
+            log.info("explore.blocked", task=task.text, detail=run.detail)
         except BudgetExceeded as exc:
             run.stopped_by, run.limit, run.detail = "budget", _limit_of(exc), str(exc)
         except SkillWeaverError as exc:
@@ -734,6 +843,29 @@ class Explorer:
     # -- asking the model --------------------------------------------------------------
 
     def _ask(self, task: TaskSpec, run: _Run, catalog: ElementCatalog) -> str:
+        """The next move, as an answer object: from the policy, or from the model.
+
+        One step, two implementations, and everything downstream is shared - see
+        :class:`ActingPolicy`. The policy branch is charged exactly as the model branch
+        is (:meth:`_charge` with ``at_least=1``), so a Jev step counts against
+        ``max_llm_calls`` and against the dollar budget on the same terms a Claude step
+        does. A policy whose provider under-reports still cannot make the call limit
+        unenforceable.
+        """
+        if self._policy is not None:
+            answer = self._policy.propose(
+                task,
+                run.current,
+                catalog,
+                run.history,
+                run.memory.at(run.current.fingerprint.value),
+                run.rejection,
+            )
+            self._charge(run, at_least=1)
+            return answer
+        return self._ask_model(task, run, catalog)
+
+    def _ask_model(self, task: TaskSpec, run: _Run, catalog: ElementCatalog) -> str:
         """One model call: the whole situation in one user turn, plus the screenshot.
 
         The conversation is rebuilt each time rather than grown. What has been tried is
@@ -1038,15 +1170,36 @@ class Explorer:
             return True
         return False
 
+    def _spent(self) -> Usage:
+        """Everything every model behind this loop has been asked for so far.
+
+        The sum of the :class:`~skillweaver.contracts.LLMClient` and, when there is one,
+        the :class:`ActingPolicy` - which is a SECOND provider with its own meter, and a
+        run that counted only the first would report a Jev step as free. Reading the
+        meters rather than the answers is the standing rule here: a call the critic made
+        on the same client, or one a policy's text helper made, is charged to the run
+        that caused it whether or not that run knows the call happened.
+        """
+        total = self._llm.total_usage()
+        policy_usage = getattr(self._policy, "total_usage", None)
+        if policy_usage is None:
+            return total
+        try:
+            reported = policy_usage()
+        except Exception:  # noqa: BLE001 - a broken meter must not fail a run
+            log.warning("explore.policy.usage_unreadable", policy=type(self._policy).__name__)
+            return total
+        return total + reported if isinstance(reported, Usage) else total
+
     def _charge(self, run: _Run, *, at_least: int) -> None:
         """Charge model spend since the last charge against the run's budget.
 
-        Taken as the difference in the client's own running total rather than from one
+        Taken as the difference in the clients' own running totals rather than from one
         response, so a model call the critic made on the same client is charged here too -
         it was made because of this run. ``at_least`` floors the call count, so a client
         that does not report ``calls`` still cannot make ``max_llm_calls`` unenforceable.
         """
-        total = self._llm.total_usage()
+        total = self._spent()
         mark = run.usage_mark
         run.usage_mark = total
         run.spend.add_usage(
