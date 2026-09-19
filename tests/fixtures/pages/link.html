@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>skillweaver navigation fixture</title>
+<!--
+  One link at a known box, pointing at another fixture page. Clicking it by
+  coordinate must leave the controller on a fully loaded elements.html, which is
+  how the settle-after-navigation behaviour gets tested without the network.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  body { font: 16px/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  #go { position: absolute; left: 60px; top: 60px; width: 220px; height: 30px;
+        box-sizing: border-box; display: block; }
+</style>
+<a id="go" href="elements.html">Go to elements</a>

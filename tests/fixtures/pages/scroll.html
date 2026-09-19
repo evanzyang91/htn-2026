@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>skillweaver scroll fixture</title>
+<!--
+  A page three viewports tall with markers at known document offsets, so a test can
+  scroll by a known number of logical pixels and check that what is on screen moved
+  by the same amount. #position is fixed, so it stays visible as proof of how far
+  the page has travelled.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  body { font: 16px/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif; height: 2400px; }
+  .marker { position: absolute; left: 40px; width: 320px; height: 60px; box-sizing: border-box;
+            border: 2px solid #333; padding: 8px; background: #f6f8fb; }
+  #top    { top: 20px; }
+  #middle { top: 400px; }
+  #deep   { top: 1800px; }
+  #position { position: fixed; left: 420px; top: 20px; font-family: ui-monospace, Menlo, monospace; }
+</style>
+
+<div class="marker" id="top">Top marker</div>
+<div class="marker" id="middle">Middle marker</div>
+<div class="marker" id="deep">Deep marker</div>
+<div id="position">scrollY: 0</div>
+
+<script>
+  const position = document.getElementById('position');
+  const show = () => { position.textContent = `scrollY: ${Math.round(window.scrollY)}`; };
+  window.addEventListener('scroll', show, { passive: true });
+  show();
+</script>

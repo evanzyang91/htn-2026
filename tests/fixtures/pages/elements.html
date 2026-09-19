@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>skillweaver ground truth fixture</title>
+<!--
+  One planted element per ElementKind that a DOM teacher should be able to name,
+  each at a box this file states outright, plus three elements it must NOT report:
+  a display:none control, a visibility:hidden control, and one parked below the
+  viewport. Every box below is in LOGICAL pixels.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  body { font: 14px/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  .at { position: absolute; box-sizing: border-box; margin: 0; }
+  #heading  { left: 20px; top: 20px;  width: 300px; height: 40px; font-size: 24px; }
+  #btn      { left: 20px; top: 80px;  width: 140px; height: 40px; }
+  #txt      { left: 20px; top: 140px; width: 240px; height: 36px; }
+  #chk      { left: 20px; top: 200px; width: 24px;  height: 24px; }
+  #rad      { left: 80px; top: 200px; width: 24px;  height: 24px; }
+  #lnk      { left: 20px; top: 250px; width: 180px; height: 24px; }
+  #sel      { left: 20px; top: 300px; width: 180px; height: 32px; }
+  #tab      { left: 20px; top: 350px; width: 120px; height: 36px; border: 1px solid #888; padding: 6px; }
+  #pic      { left: 20px; top: 400px; width: 100px; height: 60px; }
+  #ghost    { left: 20px; top: 480px; width: 120px; height: 30px; display: none; }
+  #invisible{ left: 20px; top: 480px; width: 120px; height: 30px; visibility: hidden; }
+  #below    { left: 20px; top: 2000px; width: 200px; height: 40px; }
+</style>
+
+<h1 class="at" id="heading">Invoices</h1>
+<button class="at" id="btn">Create invoice</button>
+<input class="at" id="txt" type="text" placeholder="Search invoices">
+<input class="at" id="chk" type="checkbox" aria-label="Only unpaid">
+<input class="at" id="rad" type="radio" name="period" aria-label="This month">
+<a class="at" id="lnk" href="https://example.invalid/help">Billing help</a>
+<select class="at" id="sel" aria-label="Currency">
+  <option>CAD</option>
+  <option>USD</option>
+</select>
+<div class="at" id="tab" role="tab">Overdue</div>
+<!-- A 1x1 transparent PNG stretched to a known box: no network, deterministic size. -->
+<img class="at" id="pic" alt="Company logo"
+     src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==">
+
+<button class="at" id="ghost">Never rendered</button>
+<button class="at" id="invisible">Hidden from view</button>
+<button class="at" id="below">Below the fold</button>
