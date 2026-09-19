@@ -9,6 +9,12 @@ Two rules the code cannot tell you, because this repository is built by many wor
   Create and edit only the files your task names.
   If you need a change in a file you do not own, report it instead of editing it.
 
+The command line is the way to drive all of this: `uv run python -m skillweaver.cli --help`.
+There is no `skillweaver` console script - `pyproject.toml` has no `[project.scripts]`, and
+that file is shared surface. `src/skillweaver/orchestrator.py` holds the cold-versus-warm
+decision and `build_agent`, the one place the real agent is wired; build on that rather than
+assembling a planner and an explorer by hand.
+
 Test without a browser, a model or a network by using the doubles in `tests/fakes/` (fixtures in `tests/conftest.py`; `tests/fakes/scenario.py` is a small fake app to drive).
 
 `ultralytics` is a noisy import; three of its side effects have already cost time here.
