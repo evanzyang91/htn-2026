@@ -39,7 +39,11 @@ The gate, in order, for every attempt:
 4. **Execution.** The skill is RE-RUN through
    :class:`~skillweaver.skills.sandbox.SkillRunner` against that environment with the
    model's own example arguments, verifier included.
-5. **The critic.** :class:`~skillweaver.contracts.Critic` judges the screen before
+5. **Discrimination.** The verifier that just said yes is replayed against the screen
+   the skill STARTED from, held in :class:`_StartScreen`. A verifier that also says
+   yes there cannot tell the finished job from the unfinished one, and is refused:
+   see :data:`_INDISCRIMINATE`.
+6. **The critic.** :class:`~skillweaver.contracts.Critic` judges the screen before
    against the screen after, for the task the trajectory was solving.
 
 Only then is it stored. A failure at any stage is fed back to the model - the error
@@ -72,19 +76,25 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from importlib import resources
 from typing import Any, Literal
 
 from skillweaver.contracts import (
+    Action,
+    ActionKind,
+    ActionResult,
+    Box,
     Controller,
     Critic,
     GraphView,
     LLMClient,
     LLMMessage,
+    Observation,
     Perceiver,
     Provenance,
+    Screenshot,
     Skill,
     SkillResult,
     SkillStore,
@@ -121,7 +131,14 @@ PROMPT = "synthesize.md"
 forbids imports, and demands a verifier; :func:`load_prompt` reads it."""
 
 Stage = Literal[
-    "generation", "structure", "sandbox", "reset", "precondition", "execution", "critic"
+    "generation",
+    "structure",
+    "sandbox",
+    "reset",
+    "precondition",
+    "execution",
+    "discrimination",
+    "critic",
 ]
 """Where an attempt stopped. Everything before ``reset`` is decided without touching
 the environment at all.
@@ -130,7 +147,12 @@ the environment at all.
 starting screen, and they are not the same finding. ``"precondition"`` is a verdict
 on the SKILL: the world was genuinely put back and the screen still does not match.
 ``"reset"`` is a verdict on the HARNESS: nothing put the world back, so the candidate
-was neither proved nor disproved and no amount of rewriting it would help."""
+was neither proved nor disproved and no amount of rewriting it would help.
+
+``"discrimination"`` is a verdict on the VERIFIER rather than on the code: the skill
+ran and its verifier said yes, and the same verifier also says yes to the screen the
+skill STARTED from, so its yes carries no information. See
+:class:`_StartScreen`."""
 
 _MAX_REPLY_TOKENS = 16000
 """Ceiling on the token cap a re-ask may escalate to.
@@ -410,6 +432,9 @@ def _repair_brief(attempt: Attempt) -> str:
     if attempt.stage == "execution" and not removed:
         lines.append("")
         lines.append(_SLOWER_THAN_THE_RECORDING)
+    if attempt.stage == "discrimination":
+        lines.append("")
+        lines.append(_A_VERIFIER_MUST_BE_ABLE_TO_FAIL)
     lines.append("")
     lines.append(
         "Fix exactly this and return the same JSON object shape again. "
@@ -452,6 +477,163 @@ pass is just as fast as the first.
 It is NOT offered when the hardening pass removed a wait: that case has its own and
 more specific message directly above, and two paragraphs about waiting would make the
 more precise one easier to miss.
+"""
+
+
+# --------------------------------------------------------------------------------------
+# Is the verifier worth storing?
+# --------------------------------------------------------------------------------------
+#
+# A verifier is only worth storing if it can FAIL on a screen the skill might
+# plausibly land on. That is the whole property, and it is not what "the verifier
+# passed" measures: a check that matches SITE CHROME - the top nav, the footer, the
+# logo, a category word that every page of the site carries - passes on the finished
+# job and on every unfinished one alike, so its yes says nothing.
+#
+# Measured on live splitkb.com on 2026-09-19. A synthesized add-to-cart skill was
+# given a verifier matching the word "Keycaps", which that shop's top navigation
+# shows on EVERY page. It passed 8 of 8 replays whose carts were empty all 8 times
+# by the site's own ``/cart.js`` (``item_count=0``), and ``SkillStats`` for that
+# skill read 14 runs, 14 successes. Nothing downstream can notice this: the store is
+# told ``ok`` by the sandbox, and the sandbox is told ``ok`` by the verifier. Only
+# the warm critic caught it, every time, which is the system working - but a
+# verifier that passes on the wrong screen is worse than no verifier at all, because
+# it is what turns a skill that did nothing into a STORED one, and then into a
+# statistic.
+#
+# The gate already re-runs a candidate SKILL from its recorded start screen before
+# admitting it. This is the same move for the verifier, and it costs nothing: the
+# start screen has ALREADY been observed by this attempt - it is the ``before`` the
+# precondition was measured against - so replaying the verifier over it is a
+# dictionary lookup and a function call. No capture, no detector, no OCR, no second
+# browser, and the live page is never touched.
+
+
+class _StartScreen:
+    """One already-captured :class:`~skillweaver.contracts.Observation` dressed as a
+    :class:`~skillweaver.contracts.Controller` and a
+    :class:`~skillweaver.contracts.Perceiver`, so a verifier can be asked about the
+    screen the skill started from without going back to it.
+
+    Going back to it is the alternative, and it is the wrong one twice over: it costs
+    a second reset and a second full perception pass per attempt, and on a live site
+    the screen it returned to would not be the screen the precondition was measured
+    against anyway. The observation this attempt already took IS that screen.
+
+    Every action is REFUSED rather than performed. A verifier is a read-only question
+    about the end state; one that clicks would be mutating the world from inside the
+    gate, and here there is no world to mutate - only a frozen frame. The refusal
+    surfaces to skill code as the ordinary ``ControllerError`` that
+    :class:`~skillweaver.skills.api.ActionView` raises for any refused action, which
+    makes the probe inconclusive, and an inconclusive probe ADMITS (see
+    :meth:`Synthesizer._passes_on_the_start_screen`).
+    """
+
+    __slots__ = ("_observation",)
+
+    def __init__(self, observation: Observation) -> None:
+        self._observation = observation
+
+    def __repr__(self) -> str:
+        return f"_StartScreen(url={self._observation.url!r})"
+
+    # -- Perceiver -------------------------------------------------------------------
+
+    def observe(self, controller: Controller) -> Observation:
+        """The captured screen, every time. ``controller`` is ignored: there is
+        nothing to capture and nothing that could have changed."""
+        return self._observation
+
+    # -- Controller ------------------------------------------------------------------
+
+    def capture(self) -> Screenshot:
+        return self._observation.screenshot
+
+    def perform(self, action: Action) -> ActionResult:
+        return ActionResult(
+            ok=False,
+            error=(
+                "a verifier may not act: it is being replayed against a screen that "
+                "was captured before the skill ran"
+            ),
+        )
+
+    def viewport(self) -> Box:
+        shot = self._observation.screenshot
+        return Box(0, 0, shot.width, shot.height)
+
+    def supports(self, action_kind: ActionKind) -> bool:
+        return False
+
+    def url(self) -> str | None:
+        return self._observation.url
+
+    def describe(self) -> str:
+        return f"the recorded starting screen ({self._observation.url or 'no url'})"
+
+    def close(self) -> None:
+        """Nothing to release: this holds a frame, not a browser."""
+
+
+_PROBE_SUFFIX = "__on_the_start_screen"
+"""Appended to the candidate's name for the probe run.
+
+The probe must not land in the library's statistics. A candidate is not in the store
+during admission, so ``SkillRunner._record`` finds nothing to write and says so - but
+a RELEARN of a skill that is already stored would be recorded, and a probe run is not
+a run of the skill. A name no store holds is the whole mechanism."""
+
+_PROBE_CODE = "def run(ctx, result):\n    return result\n"
+"""The probe's ``run``: it performs nothing and hands the real run's return value
+straight to the verifier.
+
+The verifier is ``verify(ctx, result)`` and a real one may read ``result``, so the
+probe has to be able to supply it. Passing it as an argument is the only way in - a
+skill's source is text, and a Python value cannot be written into it."""
+
+_INDISCRIMINATE = (
+    "the verifier for {name!r} ALSO passes on the screen the skill started from, so "
+    "it cannot tell the finished task from the unstarted one. It would say yes to a "
+    "run that did nothing."
+)
+"""The rejection, in the words the model is shown."""
+
+_A_VERIFIER_MUST_BE_ABLE_TO_FAIL = (
+    "A verifier is only worth storing if it can FAIL on a screen this skill might "
+    "plausibly land on - above all the screen it STARTS on, which is exactly where "
+    "yours was just re-run and passed. Site chrome is what usually does this: the "
+    "top navigation, the footer, the logo, a category or section word the site shows "
+    "on every one of its pages. Those words are on the end screen, so matching one "
+    "looks like a check and is not one.\n"
+    "\n"
+    "Key on something that CHANGED because your skill ran, and prefer these in order:\n"
+    "  1. A count or a quantity that moved - a cart badge, 'N items', a result "
+    "count, a total or a price that is only shown once there is something to total.\n"
+    "  2. A row, card or line that is NEWLY present and names the thing your "
+    "parameters chose - the article title that was searched for, the product that was "
+    "added. Prefer the parameter's own value over a fixed string: it is what makes "
+    "the check specific to THIS run.\n"
+    "  3. A URL that differs from the starting one - read it with ctx.see only if it "
+    "is on screen; otherwise use 1 or 2.\n"
+    "  4. Text that exists ONLY in the finished state - a confirmation heading, an "
+    "'added to your cart' line, an empty-state message that has gone away.\n"
+    "\n"
+    "Then check your new verifier against the start screen yourself before you send "
+    "it: if every string it looks for was already on screen before your skill acted, "
+    "it will be rejected again for the same reason. Change the VERIFIER, not the "
+    "code - the code ran and did the job."
+)
+"""What a skill rejected at ``"discrimination"`` is told, on top of its error.
+
+Ordered deliberately, and the order is the fix rather than the paragraph. A longer
+lecture about rigour produces a longer verifier over the same words; naming the
+SIGNALS - a count, a newly present row carrying the parameter's own value, a changed
+URL, text that exists only when the job is done - moves the check onto something the
+starting screen does not have. Each of those is a thing the ACTION changed, which is
+the only class of evidence that can distinguish the two screens at all.
+
+It also says which half to rewrite. A model told only "rejected" rewrites the code,
+because that is what a rejection has always meant here, and the code was fine.
 """
 
 
@@ -787,9 +969,10 @@ class Synthesizer:
 
         The candidate is hardened, structurally validated, statically scanned,
         re-executed through the sandbox against a fresh ``environment`` standing at
-        the recorded starting screen, and judged by the critic. A rejection is fed
-        back to the model with its error and trace and the skill is rewritten, up to
-        ``max_repairs`` times.
+        the recorded starting screen, asked to prove its VERIFIER discriminates - see
+        :meth:`_passes_on_the_start_screen` - and judged by the critic. A rejection is
+        fed back to the model with its error and trace and the skill is rewritten, up
+        to ``max_repairs`` times.
 
         An attempt that stops at ``"reset"`` ends the loop at once: the world could
         not be put back, so nothing was learned about the candidate and rewriting it
@@ -999,6 +1182,18 @@ class Synthesizer:
                 hardening=hardening,
             )
 
+        if self._passes_on_the_start_screen(runner, candidate, before, result.value, env.graph):
+            return Attempt(
+                index,
+                "discrimination",
+                False,
+                skill=candidate,
+                error=_INDISCRIMINATE.format(name=candidate.name),
+                trace=result.trace,
+                result=result,
+                hardening=hardening,
+            )
+
         after = env.perceiver.observe(env.controller)
         verdict = self._critic.judge(trajectory.task, before, after, candidate.docstring)
         if not verdict.ok:
@@ -1023,6 +1218,81 @@ class Synthesizer:
             verdict=verdict,
             hardening=hardening,
         )
+
+    # -- is the verifier worth storing? ----------------------------------------------------
+
+    def _passes_on_the_start_screen(
+        self,
+        runner: SkillRunner,
+        candidate: Skill,
+        before: Observation,
+        value: Any,
+        graph: GraphView | None,
+    ) -> bool:
+        """Whether ``candidate``'s verifier ALSO says yes to the screen the skill
+        started from - in which case its yes about the end screen means nothing.
+
+        The verifier is replayed exactly as the runner replays it, through the same
+        ``SkillRunner.run``, so what is probed is what will be stored. Only two things
+        differ: the world is :class:`_StartScreen`, the observation this attempt
+        already took, and ``run`` is :data:`_PROBE_CODE`, which performs nothing and
+        hands ``value`` - the real run's return value - to ``verify``.
+
+        Args:
+            runner: The runner the candidate was just executed through.
+            candidate: The skill whose verifier is in question.
+            before: The screen the skill started on, already observed by the gate.
+            value: What ``run`` returned on the real screen, so a verifier that reads
+                ``result`` is asked the same question it was asked for real.
+            graph: The environment's site graph, so a verifier that consults it can.
+
+        Returns:
+            ``True`` only when the verifier ran to completion on the starting screen
+            and returned a truthy value. Anything else - it returned false, it raised,
+            it tried to ACT and the frozen controller refused, the probe blew a limit -
+            is INCONCLUSIVE and answers ``False``, which admits.
+
+            That asymmetry is the whole design. A false accept here costs what it
+            always cost: the critic still has to agree before anything is stored. A
+            false REJECT would destroy a correct skill over a verifier this probe
+            could not run, which is the more expensive mistake and the one this
+            project has already made once, with ``min_similarity`` at ``1.0``.
+        """
+        if not candidate.verifier_code:
+            return False
+        screen = _StartScreen(before)
+        probe = replace(
+            candidate,
+            name=f"{candidate.name}{_PROBE_SUFFIX}",
+            code=_PROBE_CODE,
+            params={},
+            requires=(),
+        )
+        try:
+            result = runner.run(
+                probe,
+                {"result": value},
+                runner.context(
+                    screen,
+                    screen,
+                    graph=graph,
+                    domain=candidate.domain,
+                    limits=self._limits,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - an unrunnable probe proves nothing
+            # Including BudgetExceeded, which SkillRunner.run re-raises. The probe has
+            # its own fresh ledger, so one here is about the probe and not about the
+            # agent's remaining budget; aborting a whole run over it would be wrong.
+            log.info("skill.admit.discrimination.unrunnable", name=candidate.name, why=str(exc))
+            return False
+        log.info(
+            "skill.admit.discrimination",
+            name=candidate.name,
+            passes_on_start=result.ok,
+            why=result.error,
+        )
+        return result.ok
 
     # -- building a candidate --------------------------------------------------------------
 

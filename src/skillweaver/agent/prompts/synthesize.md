@@ -220,9 +220,62 @@ running long, the skill is too big, not the reply.
   useful when there is something to return, otherwise `True`.
 - `verifier_code` - **required**, never null: a module defining
   `def verify(ctx, result)` returning a bool. It runs after `run` and looks at the
-  screen with `ctx.see` to confirm the end state was actually reached. Check for
-  something that is only true when the task is DONE - the confirmation heading, the
-  new row, the emptied cart - not something that was already on screen before.
+  screen with `ctx.see` to confirm the end state was actually reached. See the rule
+  below - it is checked, and it is the most common reason a skill is handed back.
+
+## Your verifier must be able to FAIL
+
+A verifier is only worth storing if it can say NO to a screen your skill might
+plausibly land on - above all the screen it STARTS on. After your skill runs, your
+verifier is re-run against that starting screen. **If it passes there too, your skill
+is rejected**, because a check that is true before and after proves nothing: it would
+say yes to a run that did nothing at all.
+
+What usually goes wrong is SITE CHROME. The top navigation, the footer, the logo, a
+category or section word the site puts on every one of its pages - all of those are
+on your end screen, so matching one looks like a check and is not one. A real skill
+was once given `ctx.see.find_text("Keycaps")` on a keyboard shop whose top nav says
+"Keycaps" on every page; it passed eight replays of an empty cart.
+
+So key on something that CHANGED because your skill ran, in this order of preference:
+
+1. **A count or a quantity that moved.** A cart badge, "3 items", a result count, a
+   total or a price that only appears once there is something to total.
+2. **A row, card or line that is NEWLY present and names what your parameters
+   chose** - the article you searched for, the product you added. Prefer the
+   parameter's own value over a fixed string; it is what makes the check specific to
+   this run rather than to this site.
+3. **A URL that differs from the starting one**, when it is readable on screen.
+4. **Text that exists ONLY in the finished state** - a confirmation heading, an
+   "added to your cart" line, an empty-state message that has now gone away.
+
+`verify` receives only `ctx` and `result`, so a verifier that needs a parameter's
+value has to be handed it: **return it from `run`** and read it off `result`. That is
+what `result` is for.
+
+```python
+# NO - "Keycaps" is in the top nav of every page, including the one we started on
+def verify(ctx, result):
+    return bool(ctx.see.find_text("Keycaps"))
+
+
+# YES - run hands the verifier what it chose...
+def run(ctx, product):
+    ...
+    return product
+
+
+# ...and the check is then specific to THIS run: the product name is in the cart
+# only once it has been added, and the cart shows a subtotal only when it holds
+# something
+def verify(ctx, result):
+    named = ctx.see.find_text(str(result))
+    subtotal = ctx.see.find_text("Subtotal")
+    return bool(named) and bool(subtotal)
+```
+
+Before you send it, read your verifier against the recorded FIRST screen above: if
+every string it looks for was already there, rewrite it.
 
 ## Repairs
 

@@ -352,6 +352,21 @@ working exactly as `RunReport.warm_missed` intends - so read the critic's verdic
 site, never `SkillStats` and never the skill's own say-so, when you are asking whether a
 replay did the job.
 
+The gate now REFUSES that verifier rather than leaving the critic to catch it, and it does
+so by the same move the gate already makes for the code: re-run it where the skill STARTED.
+`_StartScreen` in `skills/synthesize.py` dresses the observation the precondition was
+measured against as a frozen controller and perceiver, so the verifier is asked about the
+start screen with no capture, no OCR and no second browser - and one that says yes there
+stops at stage `discrimination`, because a check that was true before and after proves
+nothing. A probe that cannot RUN admits, deliberately: a false accept still faces the
+critic, a false reject destroys a correct skill. Measured on live splitkb.com against
+`/cart.js`, empty cart -> filled cart: the verifier synthesized after this said False then
+True, `find_text("Keycaps")` said True both times. Telling the model only "rejected" buys a
+longer verifier over the same chrome words, so `_A_VERIFIER_MUST_BE_ABLE_TO_FAIL` and the
+`verifier_code` section of `agent/prompts/synthesize.md` NAME the signals instead - a count
+that moved, a row carrying the parameter's own value, a changed URL - and say that `verify`
+sees only `ctx` and `result`, so a parameter reaches it by being RETURNED from `run`.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
