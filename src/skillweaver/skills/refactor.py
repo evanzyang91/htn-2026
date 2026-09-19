@@ -12,7 +12,18 @@ trajectory it was written from, BEFORE the admission gate in
     hardened.changes          # one readable line per rewrite, for the run log
     hardened.added_params     # params to merge into the skill's schema
 
-Five rewrites, applied in this order:
+Six rewrites, applied in this order:
+
+*Fixed sleeps are removed.* ``ctx.ctl.press("Enter")`` followed by
+``ctx.ctl.wait(2000)`` does not wait for the page: every action is SETTLED by the
+controller before it returns - ``BrowserController._settle`` pauses and then waits for
+the page to finish loading - so the wait sleeps on top of a wait that has already
+happened. Measured on live Wikipedia, three such sleeps were 38% of a stored skill's
+whole run time, and removing them halved warm replay while changing nothing else (the
+measurement is in ``AGENTS.md``). The capability is not removed, only the reflex: a
+wait for something no load event covers - an animation, a debounce, a spinner - is KEPT
+when an adjacent ``ctx.log`` NAMES that thing, which is the same bargain a positional
+lookup gets below. See :func:`reflex_waits`, which is the detector on its own.
 
 *Hardcoded navigation is lifted out.* A ``run`` that begins by typing a URL, or by
 performing a ``Navigate``, is a skill that insists on arriving its own way. The
@@ -86,9 +97,11 @@ __all__ = [
     "COORDINATE_METHODS",
     "Hardening",
     "PositionalLookup",
+    "ReflexWait",
     "element_at",
     "harden",
     "positional_lookups",
+    "reflex_waits",
     "typed_texts",
 ]
 
@@ -147,6 +160,25 @@ _ANNOUNCES_POSITION = re.compile(
 announced. The archive skill's own "sender name not readable" line matches, so a model
 that owned up to its fallback is not made to own up twice."""
 
+_NOT_AN_ACTION = frozenset({"wait", "supports"})
+"""``ctx.ctl`` members that settle nothing. ``supports`` asks a question and touches no
+page; ``wait`` is its own settle - ``BrowserController._deliver`` returns early on one
+rather than settling after it - so a wait does not cover the wait that follows it."""
+
+_ANNOUNCES_WAIT = re.compile(
+    r"animat|transition|debounce|throttl|spinner|fade|slide|carousel|countdown|"
+    r"typeahead|autocomplete|suggestion|toast|re-?render|poll",
+    re.IGNORECASE,
+)
+"""What an adjacent ``ctx.log`` has to NAME for a fixed wait to survive this pass.
+
+Every one of these is something the load event does not cover, which is the whole
+question: the page arriving is already waited for, a menu finishing its slide is not.
+Deliberately absent are "load", "navigate" and "page" - a wait explained by the thing
+that has demonstrably already happened is the reflex this pass exists to remove, not an
+exception to it."""
+
+
 _ANCHOR_REACH = 240
 """How far, in LOGICAL pixels, a textless element may sit from the labelled thing used
 to find it. Past that they are not the same row and the anchor would be a guess."""
@@ -177,6 +209,10 @@ class Hardening:
             which were KEPT and made to announce themselves with a ``ctx.log`` line.
             A non-empty tuple is not a failure; it is the skill saying where it is
             thin, and :attr:`positions_unanchored` counts it.
+        waits_removed: Fixed sleeps dropped because the action before them had
+            already been settled. A caller that reports a rejection to the model must
+            report these too: the model cannot see the code that was run, and a wait
+            it needs and never learns was deleted is a repair loop with no exit.
     """
 
     code: str
@@ -188,6 +224,7 @@ class Hardening:
     renamed: Mapping[str, str] = field(default_factory=dict, hash=False)
     positions_anchored: int = 0
     positions_announced: tuple[str, ...] = ()
+    waits_removed: tuple[ReflexWait, ...] = ()
 
     @property
     def positions_unanchored(self) -> int:
@@ -244,6 +281,26 @@ class PositionalLookup:
         if self.via:
             return f"{self.via}[{self.index}], from {self.call}"
         return f"{self.call}[{self.index}]"
+
+
+@dataclass(frozen=True, slots=True)
+class ReflexWait:
+    """One fixed sleep a skill takes for something it has already been given.
+
+    Attributes:
+        ms: The literal duration, in milliseconds.
+        after: The ``ctx.ctl`` action the wait follows, whose settle already waited
+            for the page. This is what makes the wait redundant rather than merely
+            long, and it is what the model is told when a repair is asked for.
+        line: Line number in the source it was found at, 1-based.
+    """
+
+    ms: int
+    after: str
+    line: int = 0
+
+    def __str__(self) -> str:
+        return f"ctx.ctl.wait({self.ms}) after {self.after}()"
 
 
 # --------------------------------------------------------------------------------------
@@ -658,6 +715,144 @@ def positional_lookups(code: str) -> tuple[PositionalLookup, ...]:
 
 
 # --------------------------------------------------------------------------------------
+# Reading the draft: sleeps
+# --------------------------------------------------------------------------------------
+
+
+def _settling_action(statement: ast.stmt) -> str | None:
+    """The ``ctx.ctl`` action ``statement`` performs, or ``None``.
+
+    An action is anything the controller delivers and then SETTLES: a click, a type,
+    a press, a scroll, a navigate. The settle is what makes the wait after it
+    redundant, so ``wait`` and ``supports`` do not count (:data:`_NOT_AN_ACTION`),
+    and neither does an action buried in a larger statement - a result that was
+    assigned or tested is a shape this pass declines to reason about.
+    """
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+        return None
+    method = _ctl_method(statement.value.func)
+    if method is None or method in _NOT_AN_ACTION:
+        return None
+    return method
+
+
+def _wait_ms(statement: ast.stmt) -> int | None:
+    """The duration of ``ctx.ctl.wait(<literal>)`` in milliseconds, or ``None``.
+
+    A wait whose duration is COMPUTED is not a literal and is left alone: a number
+    the skill worked out is a decision, and this pass only removes reflexes.
+    """
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+        return None
+    call = statement.value
+    if _ctl_method(call.func) != "wait":
+        return None
+    if len(call.args) == 1 and not call.keywords:
+        duration = _number(call.args[0])
+    elif not call.args and len(call.keywords) == 1 and call.keywords[0].arg == "ms":
+        duration = _number(call.keywords[0].value)
+    else:
+        return None
+    return duration if duration is not None and duration >= 0 else None
+
+
+def _announces_wait(statement: ast.stmt) -> bool:
+    """Whether ``statement`` is a ``ctx.log`` that names what a wait is FOR.
+
+    The message is searched whole, so a line built from pieces
+    (``ctx.log("waiting for the " + name + " animation")``) counts. What has to be
+    in it is :data:`_ANNOUNCES_WAIT`.
+    """
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+        return False
+    match statement.value.func:
+        case ast.Attribute(value=ast.Name(id="ctx"), attr="log"):
+            pass
+        case _:
+            return False
+    for node in ast.walk(statement.value):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _ANNOUNCES_WAIT.search(node.value):
+                return True
+    return False
+
+
+def _page_neutral(statement: ast.stmt) -> bool:
+    """Whether the settle of the action before ``statement`` still stands after it.
+
+    Reading the screen, checking a condition and writing the trace all leave the page
+    exactly where the last action left it, so a wait further down is still a wait for
+    something that has already been waited for. Anything that reaches the page -
+    ``ctx.ctl`` in any form, ``ctx.call`` running another skill - and any compound
+    statement, whose branches this pass does not follow, ends that.
+    """
+    if not isinstance(statement, ast.Expr | ast.Assign | ast.AnnAssign | ast.AugAssign | ast.Pass):
+        return False
+    for node in ast.walk(statement):
+        match node:
+            case ast.Attribute(value=ast.Name(id="ctx"), attr="ctl" | "call"):
+                return False
+    return True
+
+
+def _reflex_waits_in(body: Sequence[ast.stmt]) -> dict[int, ReflexWait]:
+    """Which statements of ONE block are reflex waits, keyed by index in that block.
+
+    A block is walked in order carrying the last action the controller settled.
+    :func:`_page_neutral` statements are crossed without losing it; anything else
+    clears it, and a block starts with nothing settled - a wait first inside an
+    ``if`` is judged on its own branch, not on what ran before the branch was taken.
+    A wait a neighbouring ``ctx.log`` explains is never a reflex, wherever it sits.
+    """
+    found: dict[int, ReflexWait] = {}
+    settled: str | None = None
+    for position, statement in enumerate(body):
+        duration = _wait_ms(statement)
+        if duration is not None:
+            announced = (position > 0 and _announces_wait(body[position - 1])) or (
+                position + 1 < len(body) and _announces_wait(body[position + 1])
+            )
+            if settled is not None and not announced:
+                found[position] = ReflexWait(duration, settled, getattr(statement, "lineno", 0))
+            continue
+        action = _settling_action(statement)
+        if action is not None:
+            settled = action
+        elif not _page_neutral(statement):
+            settled = None
+    return found
+
+
+def reflex_waits(code: str) -> tuple[ReflexWait, ...]:
+    """Every fixed sleep in ``code``'s ``run`` that an action's settle already covers.
+
+    This is the detector on its own, with no trajectory and no rewriting, so a test -
+    or a reviewer - can ask one question of a skill: does it sleep for time the
+    browser has already spent? An empty tuple is the answer that matters, and it is
+    also the answer for a wait that was explained, which is a wait this project wants
+    skills to keep. Source that does not parse, or that defines no ``run``, has no
+    waits to report rather than being an error.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ()
+    fn = _run_function(tree)
+    if fn is None:
+        return ()
+    found: list[ReflexWait] = []
+
+    def descend(body: Sequence[ast.stmt]) -> None:
+        found.extend(_reflex_waits_in(body).values())
+        for statement in body:
+            for _, _, block in _blocks(statement):
+                descend(block)
+
+    descend(fn.body)
+    return tuple(sorted(found, key=lambda wait: wait.line))
+
+
+# --------------------------------------------------------------------------------------
 # Building the replacement code
 # --------------------------------------------------------------------------------------
 
@@ -817,6 +1012,32 @@ class _Hardener:
         self.anchored = 0
         self.announced: list[str] = []
         self.owned_up = False
+        self.waits: list[ReflexWait] = []
+
+    # -- sleeps -------------------------------------------------------------------------
+
+    def strip_reflex_waits(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        """Drop every fixed sleep the action before it had already been settled for.
+
+        Runs FIRST, before navigation is lifted, for two reasons. A wait between a
+        typed URL and the Enter that submitted it would otherwise hide that pair from
+        :meth:`strip_navigation`, which reads them as adjacent. And a wait after a
+        lifted navigation would, once the navigation is gone, look like the first
+        statement of the block and be kept - a sleep for a page the skill no longer
+        loads is the emptiest one there is.
+        """
+        for statement in body:
+            for owner, name, block in _blocks(statement):
+                setattr(owner, name, self.strip_reflex_waits(block))
+        reflexes = _reflex_waits_in(body)
+        for wait in reflexes.values():
+            self.waits.append(wait)
+            self.changes.append(
+                f"dropped ctx.ctl.wait({wait.ms}) after {wait.after}(): the controller "
+                f"settles every action and waits for the page to load, so those {wait.ms}ms "
+                "were spent on top of a wait that had already happened"
+            )
+        return [statement for position, statement in enumerate(body) if position not in reflexes]
 
     # -- navigation ---------------------------------------------------------------------
 
@@ -1116,7 +1337,8 @@ def harden(
 
     pass_ = _Hardener(trajectory, params or {})
     pass_.taken |= _bound_names(fn)
-    body = pass_.strip_navigation(fn.body)
+    body = pass_.strip_reflex_waits(fn.body)
+    body = pass_.strip_navigation(body)
     rewritten: list[ast.stmt] = []
     for statement in body:
         rewritten.extend(pass_.replace_coordinates(statement))
@@ -1136,6 +1358,7 @@ def harden(
         renamed=dict(pass_.renamed),
         positions_anchored=pass_.anchored,
         positions_announced=tuple(pass_.announced),
+        waits_removed=tuple(pass_.waits),
     )
     log.info(
         "skill.harden",
@@ -1145,5 +1368,7 @@ def harden(
         lookups=hardened.lookups_added,
         anchored=hardened.positions_anchored,
         positional=hardened.positions_unanchored,
+        waits=len(hardened.waits_removed),
+        slept_ms=sum(wait.ms for wait in hardened.waits_removed),
     )
     return hardened

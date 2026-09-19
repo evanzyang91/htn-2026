@@ -372,7 +372,15 @@ class _Draft:
 
 
 def _repair_brief(attempt: Attempt) -> str:
-    """What the model is shown after a rejection: the stage, the error, the trace."""
+    """What the model is shown after a rejection: the stage, the error, the trace.
+
+    Rewrites the hardening pass made are normally left unsaid - the model is being
+    asked about the defect, not about the polish. Removed sleeps are the exception,
+    and deliberately so: the model cannot see the code that was actually run, so a
+    wait it genuinely needed and is never told was deleted is a repair loop with no
+    exit. It would write the same wait again, the pass would remove it again, and the
+    gate would reject it again until the attempts ran out.
+    """
     lines = [
         "Your skill was REJECTED and has not been stored.",
         f"Stage: {attempt.stage}",
@@ -385,6 +393,20 @@ def _repair_brief(attempt: Attempt) -> str:
     if attempt.verdict is not None and not attempt.verdict.ok:
         lines.append("")
         lines.append(f"The critic said: {attempt.verdict.reason}")
+    removed = attempt.hardening.waits_removed if attempt.hardening is not None else ()
+    if removed:
+        lines.append("")
+        lines.append(
+            "Before this run, "
+            + ", ".join(str(wait) for wait in removed)
+            + (" was removed" if len(removed) == 1 else " were removed")
+            + ": every ctx.ctl action is already followed by a settle that waits for "
+            "the page to finish loading, so a fixed wait after one sleeps on top of a "
+            "wait that has already happened. If this run failed because something the "
+            "page load does NOT cover needed the time - an animation, a debounce, a "
+            "spinner - write the wait again with a ctx.log on the line before it "
+            "naming that thing, and it will be kept exactly as you wrote it."
+        )
     lines.append("")
     lines.append(
         "Fix exactly this and return the same JSON object shape again. "

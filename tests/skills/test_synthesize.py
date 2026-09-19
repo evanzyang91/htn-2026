@@ -27,7 +27,7 @@ from skillweaver.contracts import Fingerprint, LLMResponse, Trajectory, Verdict
 from skillweaver.errors import SkillNotFound
 from skillweaver.llm.cassette import CassetteClient
 from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
-from skillweaver.skills.refactor import harden, positional_lookups
+from skillweaver.skills.refactor import harden, positional_lookups, reflex_waits
 from skillweaver.skills.synthesize import (
     MIN_PRECONDITION_SIMILARITY,
     ReplayEnvironment,
@@ -69,6 +69,32 @@ BROKEN_CODE = (
 )
 
 VERIFIER = 'def verify(ctx, result):\n    return bool(ctx.see.find_text("Payment confirmed"))\n'
+
+# The same draft with the reflex every model has: a fixed sleep after an action the
+# controller has already settled. Three of these were 38% of a live Wikipedia skill's
+# run time (see ``AGENTS.md``); the hardening pass removes them before the gate runs.
+SLEEPY_CODE = (
+    "def run(ctx, company):\n"
+    '    ctx.ctl.type_text("https://fake.test/invoices")\n'
+    '    ctx.ctl.press("Enter")\n'
+    "    ctx.ctl.wait(2000)\n"
+    '    ctx.ctl.type_text("acme")\n'
+    "    ctx.ctl.wait(1000)\n"
+    "    ctx.ctl.click(Point(400, 140))\n"
+    "    ctx.ctl.click(Point(100, 140))\n"
+    "    ctx.ctl.wait(1500)\n"
+    "    return True\n"
+)
+
+SLEEPY_BROKEN_CODE = (
+    "def run(ctx, company):\n"
+    '    ctx.ctl.type_text("acme")\n'
+    "    ctx.ctl.wait(2000)\n"
+    '    rows = ctx.see.find_text("Globex INV-9999", "row")\n'
+    '    ctx.expect(bool(rows), "no Globex row on the filtered list")\n'
+    "    ctx.ctl.click(rows[0])\n"
+    "    return True\n"
+)
 
 
 def reply(code: str = GOOD_CODE, **overrides: Any) -> str:
@@ -274,6 +300,47 @@ def test_a_failed_attempt_is_repaired_with_the_sandboxs_own_error_trace(
     assert "Globex INV-9999" in llm.requests[1].messages[-2].text
 
     assert skill_store.get("confirm_invoice_payment", DOMAIN).version == 1
+
+
+def test_a_rejected_attempt_is_told_which_sleeps_were_removed_before_it_ran(
+    trajectory, environment, critic, skill_store
+):
+    """A repair loop with an exit.
+
+    The model never sees the code that was run, only its own draft and the error. If
+    a wait it needed were removed silently, it would write the same wait again, the
+    hardening pass would remove it again, and the gate would reject it again until the
+    budget ran out. So the brief names what went and how to keep one that is real.
+    """
+    llm = FakeLLM([reply(SLEEPY_BROKEN_CODE), reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=2).admit(trajectory, environment)
+
+    assert admission.ok, admission.reason
+    hardening = admission.attempts[0].hardening
+    assert hardening is not None
+    assert [str(w) for w in hardening.waits_removed] == ["ctx.ctl.wait(2000) after type_text()"]
+
+    repair = llm.requests[1].messages[-1].text
+    assert "ctx.ctl.wait(2000) after type_text()" in repair
+    # And the way back: an animation or a debounce is real, and a ctx.log keeps it.
+    assert "ctx.log" in repair
+    assert "debounce" in repair
+
+
+def test_an_admitted_skill_does_not_sleep_for_a_page_that_had_already_arrived(
+    trajectory, environment, critic, skill_store
+):
+    """The stored skill is the one that replays on every warm run, so this is the
+    number a demo feels: three sleeps written, three sleeps gone, and the gate ran
+    what is left three times before storing it."""
+    llm = FakeLLM([reply(SLEEPY_CODE)])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(trajectory, environment)
+
+    assert admission.ok, admission.reason
+    stored = skill_store.get("confirm_invoice_payment", DOMAIN)
+    assert "ctx.ctl.wait" not in stored.code
+    assert reflex_waits(stored.code) == ()
+    assert sum(w.ms for w in admission.attempts[-1].hardening.waits_removed) == 4500
 
 
 def test_repairs_are_bounded_and_exhausting_them_is_a_clean_failure(

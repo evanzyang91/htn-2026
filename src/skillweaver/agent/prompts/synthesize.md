@@ -23,9 +23,14 @@ ctx.ctl.click(target, button="left", clicks=1)  # target: an Element, or a Box
 ctx.ctl.type_text("text")  # types into whatever has focus
 ctx.ctl.press("Enter")  # a chord: press("Meta", "a")
 ctx.ctl.scroll(target, dx=0, dy=0)  # positive dy scrolls DOWN
-ctx.ctl.wait(250)  # milliseconds
+ctx.ctl.wait(250)  # milliseconds - rarely what you want; see rule 10
 ctx.ctl.supports("navigate")  # -> bool
 ```
+
+Every one of these RETURNS ONLY ONCE THE PAGE HAS SETTLED: the controller pauses,
+then waits for the page to finish loading, up to three seconds. A click that starts a
+navigation has already arrived by the time `click` returns. You never have to wait for
+that yourself, and rule 10 is what follows from it.
 
 A failed action raises; you never have to check a result. `click` takes an element
 you just found - NOT coordinates (see "Never write coordinates" below).
@@ -142,6 +147,38 @@ followed by `[0]` is an `IndexError` and tells whoever reads the trace nothing.
 9. **Keep it short and straight.** No classes, no decorators, no helper functions
    unless the body genuinely repeats. A skill is one short procedure; if it needs
    forty actions it is not a skill yet.
+10. **Never sleep for the page.** `ctx.ctl.wait(...)` after an action does not wait
+    for the page - the settle above already did - it sleeps on top of a wait that has
+    already happened. Measured on live Wikipedia, three such sleeps were 38% of one
+    stored skill's whole run time; removing them halved its replay and it passed every
+    run. A fixed wait after an action is REMOVED before your skill is ever run, so
+    writing one buys you nothing and costs the library a slower skill.
+
+    ```python
+    # NO - the page arrived before press() returned; this is two seconds of nothing
+    ctx.ctl.press("Enter")
+    ctx.ctl.wait(2000)
+    title = ctx.see.find_text(query)
+
+    # YES - act, then look
+    ctx.ctl.press("Enter")
+    title = ctx.see.find_text(query)
+    ```
+
+    Sometimes a wait is real, and then you must still be able to take it: an
+    animation, a menu sliding open, a search box that debounces before its
+    suggestions appear, a spinner - things no page load covers. Keep those, and NAME
+    what you are waiting for in a `ctx.log` on the line before, which is what marks
+    the wait as a decision rather than a reflex:
+
+    ```python
+    ctx.ctl.type_text(query)
+    ctx.log("waiting for the search box to debounce and show its suggestions")
+    ctx.ctl.wait(400)
+    ```
+
+    Announced like that, the wait stays exactly as you wrote it. Do not announce a
+    wait for the page to load: that is the reflex, and it is removed either way.
 
 ## What you must return
 

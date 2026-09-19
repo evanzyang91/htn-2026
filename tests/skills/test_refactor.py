@@ -1,5 +1,7 @@
-"""The hardening pass, and in particular the rule that decides whether a stored skill
-survives its second run: anchor on MEANING, never on position.
+"""The hardening pass: the rule that decides whether a stored skill survives its
+second run - anchor on MEANING, never on position - and the one that decides how long
+its every run takes, which is that a skill must not sleep for time the browser has
+already spent.
 
 ``ctx.see.by_kind("text")[1]`` is how a model writes "the search box" after watching
 one page. It is true of that page and of nothing else - an advert, a banner, one more
@@ -14,6 +16,10 @@ That last case is the one to be careful about. A skill that works positionally a
 says so is better than no skill, so nothing here may turn a brittle skill into a
 rejected one. The admission gate in ``test_synthesize.py`` is what decides whether a
 skill is any good; this pass only decides what it is asked to judge.
+
+The sleeps are the same shape of test in miniature: :func:`reflex_waits` is the
+detector and must not call a deliberate wait a reflex, and :func:`harden` is the
+repair. What decides between them is whether the skill can ACCOUNT for the wait.
 
 No browser, no model, no network: the fake invoicing app of ``tests/fakes/scenario.py``
 is the recording, and the elements with no text are built by hand, because that app
@@ -34,7 +40,13 @@ from skillweaver.contracts import (
     ElementSource,
     Trajectory,
 )
-from skillweaver.skills.refactor import PositionalLookup, harden, positional_lookups
+from skillweaver.skills.refactor import (
+    PositionalLookup,
+    ReflexWait,
+    harden,
+    positional_lookups,
+    reflex_waits,
+)
 from tests.fakes import InMemoryTrajectoryRecorder, Scenario, SimpleElementIndex
 
 DOMAIN = "fake.test"
@@ -334,3 +346,179 @@ def test_a_literal_coordinate_on_a_textless_element_is_anchored_too(inbox):
     assert "Point(" not in hardened.code
     assert positional_lookups(hardened.code) == ()
     assert "ctx.see.nearest(" in hardened.code
+
+
+# --------------------------------------------------------------------------------------
+# Sleeping for time the browser has already spent
+# --------------------------------------------------------------------------------------
+#
+# The stored ``search_and_open_wikipedia_article`` skill slept three seconds inside a
+# run of about eight - 38% of it - for a page that ``BrowserController._settle`` had
+# already waited for. Removing the sleeps halved warm replay at 48/48 successes; the
+# measurement is in ``AGENTS.md``. What is tested here is the two halves of that fix:
+# the reflex goes, and a wait the skill can ACCOUNT for stays.
+
+WIKIPEDIA_SKILL = (
+    "def run(ctx, query):\n"
+    "    field = ctx.see.find_text('Search Wikipedia')\n"
+    "    ctx.expect(bool(field), 'no Wikipedia search box on this page')\n"
+    "    ctx.ctl.click(field[0])\n"
+    "    ctx.ctl.type_text(query)\n"
+    "    ctx.ctl.wait(1000)\n"
+    "    ctx.log('typed the query into the Wikipedia search box')\n"
+    "    ctx.ctl.press('Enter')\n"
+    "    ctx.ctl.wait(2000)\n"
+    "    title = ctx.see.find_text(query)\n"
+    "    ctx.expect(bool(title), 'the article page did not open')\n"
+    "    return query\n"
+)
+
+
+def test_the_detector_spots_the_sleeps_the_wikipedia_skill_shipped():
+    assert reflex_waits(WIKIPEDIA_SKILL) == (
+        ReflexWait(1000, "type_text", line=6),
+        ReflexWait(2000, "press", line=9),
+    )
+
+
+def test_a_log_line_between_an_action_and_a_wait_does_not_hide_the_action():
+    """``ctx.log`` writes the trace and touches nothing. The settle of the action
+    before it still stands, so the wait after it is still a wait for a page that has
+    already arrived - which is why the 1000ms sleep above is found at all."""
+    code = (
+        "def run(ctx):\n"
+        "    ctx.ctl.press('Enter')\n"
+        "    found = ctx.see.find_text('Result')\n"
+        "    ctx.expect(bool(found), 'nothing found')\n"
+        "    ctx.ctl.wait(1500)\n"
+        "    return True\n"
+    )
+    assert reflex_waits(code) == (ReflexWait(1500, "press", line=5),)
+
+
+def test_a_wait_that_names_what_it_is_for_is_not_a_reflex():
+    """The capability survives: an animation and a debounce are real, and no load
+    event covers either. Naming one in a neighbouring ``ctx.log`` keeps the wait."""
+    code = (
+        "def run(ctx, query):\n"
+        "    ctx.ctl.type_text(query)\n"
+        "    ctx.log('waiting for the search box to debounce and show its suggestions')\n"
+        "    ctx.ctl.wait(400)\n"
+        "    ctx.ctl.click(ctx.see.find_text('Settings')[0])\n"
+        "    ctx.ctl.wait(250)\n"
+        "    ctx.log('let the menu finish its slide-open animation')\n"
+        "    return True\n"
+    )
+    assert reflex_waits(code) == ()
+
+
+def test_a_wait_announced_as_waiting_for_the_page_is_still_a_reflex():
+    """This is the escape hatch closed. "Waiting for the page to load" describes
+    exactly what the settle already did, so saying it does not buy the sleep."""
+    code = (
+        "def run(ctx):\n"
+        "    ctx.ctl.press('Enter')\n"
+        "    ctx.log('waiting for the page to load')\n"
+        "    ctx.ctl.wait(3000)\n"
+        "    return True\n"
+    )
+    assert reflex_waits(code) == (ReflexWait(3000, "press", line=4),)
+
+
+def test_a_wait_with_no_settled_action_before_it_is_left_alone():
+    """Nothing has been settled at the top of ``run``, and a branch is judged on its
+    own statements. Neither wait is claimed to be redundant, because neither can be
+    shown to be."""
+    code = (
+        "def run(ctx):\n"
+        "    ctx.ctl.wait(500)\n"
+        "    if ctx.see.find_text('Loading'):\n"
+        "        ctx.ctl.wait(1000)\n"
+        "    return True\n"
+    )
+    assert reflex_waits(code) == ()
+
+
+def test_a_wait_whose_duration_is_computed_is_a_decision_not_a_reflex():
+    code = (
+        "def run(ctx, pause):\n"
+        "    ctx.ctl.press('Enter')\n"
+        "    ctx.ctl.wait(pause)\n"
+        "    return True\n"
+    )
+    assert reflex_waits(code) == ()
+
+
+def test_the_detector_reads_a_wait_inside_a_branch_against_that_branch():
+    code = (
+        "def run(ctx):\n"
+        "    if ctx.see.find_text('Next'):\n"
+        "        ctx.ctl.click(ctx.see.find_text('Next')[0])\n"
+        "        ctx.ctl.wait(800)\n"
+        "    return True\n"
+    )
+    assert reflex_waits(code) == (ReflexWait(800, "click", line=4),)
+
+
+def test_hardening_removes_the_sleeps_and_says_what_it_removed(trajectory):
+    hardened = harden(WIKIPEDIA_SKILL, trajectory)
+
+    assert reflex_waits(hardened.code) == ()
+    assert "ctx.ctl.wait" not in hardened.code
+    assert hardened.waits_removed == (
+        ReflexWait(1000, "type_text", line=6),
+        ReflexWait(2000, "press", line=9),
+    )
+    assert any("dropped ctx.ctl.wait(2000) after press()" in c for c in hardened.changes)
+    # Everything the skill actually did is still there, in order.
+    assert "ctx.ctl.type_text(query)" in hardened.code
+    assert "ctx.ctl.press('Enter')" in hardened.code
+    assert "ctx.log(" in hardened.code
+
+
+def test_hardening_keeps_an_announced_wait_exactly_as_written(trajectory):
+    draft = (
+        "def run(ctx, query):\n"
+        "    ctx.ctl.type_text(query)\n"
+        "    ctx.log('waiting for the autocomplete suggestions to settle')\n"
+        "    ctx.ctl.wait(400)\n"
+        "    return True\n"
+    )
+    hardened = harden(draft, trajectory)
+
+    assert hardened.waits_removed == ()
+    assert "ctx.ctl.wait(400)" in hardened.code
+
+
+def test_a_sleep_between_a_typed_url_and_its_enter_no_longer_hides_the_pair(trajectory):
+    """Waits are stripped BEFORE navigation is lifted for this reason: the Enter that
+    submitted a lifted URL is recognized by sitting next to it, and a sleep in between
+    used to leave that Enter behind to submit whatever the caller had in the field."""
+    draft = (
+        "def run(ctx):\n"
+        "    ctx.ctl.type_text('https://example.test/invoices')\n"
+        "    ctx.ctl.wait(1000)\n"
+        "    ctx.ctl.press('Enter')\n"
+        "    ctx.ctl.wait(2000)\n"
+        "    return True\n"
+    )
+    hardened = harden(draft, trajectory)
+
+    assert hardened.navigation_lifted == ("https://example.test/invoices",)
+    assert "ctx.ctl.press" not in hardened.code
+    assert "ctx.ctl.wait" not in hardened.code
+    assert len(hardened.waits_removed) == 2
+
+
+def test_a_skill_that_never_slept_is_left_exactly_as_written(trajectory):
+    draft = (
+        "def run(ctx, company):\n"
+        "    rows = ctx.see.find_text(company, 'row')\n"
+        "    ctx.expect(bool(rows), 'no row for the company')\n"
+        "    ctx.ctl.click(rows[0])\n"
+        "    return True\n"
+    )
+    hardened = harden(draft, trajectory)
+
+    assert hardened.waits_removed == ()
+    assert not hardened.changed

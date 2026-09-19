@@ -177,6 +177,27 @@ and `tests/perception/fixtures/README.md` is where the detector's numbers and it
 remaining blind spots are written down. Quote that file rather than guessing, and
 remeasure with `--bench` rather than assuming a retrain helped.
 
+A skill must never sleep for time the browser has already spent, which was the
+largest single line item in warm replay. Every action is SETTLED before the controller
+returns - `_settle` in `controllers/browser.py` pauses and then waits for the page's
+load event - and `_deliver` returns EARLY on an explicit wait, so `ctx.ctl.wait(2000)`
+after a `press` settles nothing and sleeps two seconds on top of a wait that already
+happened. Measured on live Wikipedia against the stored
+`search_and_open_wikipedia_article`, whose three fixed sleeps were 38% of an
+eight-second run: with-sleeps median 6.42s / 6.39s against 3.26s / 3.17s without,
+48/48 successes in BOTH arms, reproduced across two independent interleaved sets (load
+4.4-5.9 and 4.0-5.5); and under slow-3G, with every navigation settle exhausting its
+full 3s budget, both arms still passed 6/6. So the sleeps are waste, not insurance.
+`strip_reflex_waits` in `skills/refactor.py` removes them BEFORE the admission gate,
+which then proves the sleepless skill by running it - the speedup is never bought by
+weakening the gate - and `reflex_waits` there is the detector alone. Removing the
+reflex is not removing the capability: a wait for what no load event covers, an
+animation or a debounce, survives when an adjacent `ctx.log` NAMES that thing
+(`_ANNOUNCES_WAIT`), and a rejected attempt is TOLD which sleeps went (`_repair_brief`
+in `skills/synthesize.py`), because a model that is not told writes the same wait
+again forever. Skills stored BEFORE this are untouched on purpose - re-hardening one
+would ship a rewrite the gate never ran - so they keep their sleeps until relearned.
+
 The cheapest answer this architecture can give is a WRONG one, so no efficiency number
 may be computed without ground truth beside it. A stored skill that does the wrong
 thing runs in seconds and costs nothing, which improves every speedup, saving and
