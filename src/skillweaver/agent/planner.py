@@ -369,10 +369,10 @@ class Planner:
                     f"to its start screen {skill.precondition.value!r}"  # type: ignore[union-attr]
                 )
                 continue
-            if ready is None:
+            # Best coverage wins, retrieval order breaks ties: a candidate only
+            # displaces one that consumes FEWER of the values the task supplied.
+            if ready is None or _covers(skill, task) > _covers(ready[0].skill, task):
                 ready = (candidate, args, route)
-            if not outranked:
-                break
 
         if ready is not None and not outranked:
             return self._single(task, *ready), Usage()
@@ -439,7 +439,9 @@ class Planner:
                 skill=result.steps[0].name,
             )
             return None, result.usage
-        route = self._route_to(observation.fingerprint, first.precondition, first.domain)
+        route = self._route_to(
+            observation.fingerprint, first.precondition, first.domain, by_url=True
+        )
         if route is None:
             self._last_failure = PlanFailure(
                 stage="no_route",
@@ -509,7 +511,9 @@ class Planner:
                 except (ControllerError, PerceptionError) as exc:
                     return used, PlanFailure("route_failed", f"could not read the screen: {exc}")
 
-            route = self._route_to(current.fingerprint, skill.precondition, skill.domain)
+            route = self._route_to(
+                current.fingerprint, skill.precondition, skill.domain, by_url=True
+            )
             if route is None:
                 return used, PlanFailure(
                     stage="no_route",
@@ -668,7 +672,12 @@ class Planner:
     # -- small helpers -------------------------------------------------------------------
 
     def _route_to(
-        self, src: Fingerprint, precondition: Fingerprint | None, domain: str
+        self,
+        src: Fingerprint,
+        precondition: Fingerprint | None,
+        domain: str,
+        *,
+        by_url: bool = False,
     ) -> Route | None:
         """The route to a skill's start screen, or ``None`` when none is known.
 
@@ -678,7 +687,9 @@ class Planner:
         if precondition is None:
             return Route((), 0.0, ())
         found = find_route(src, precondition, self._outgoing, self._policy)
-        return found if found is not None else self._route_by_url(precondition, domain)
+        if found is not None or not by_url:
+            return found
+        return self._route_by_url(precondition, domain)
 
     def _route_by_url(self, precondition: Fingerprint, domain: str) -> Route | None:
         """Go straight to the start screen's address, when the graph knows of none.
@@ -695,6 +706,15 @@ class Planner:
         A URL is an edge from ANYWHERE, which is what makes it worth trying when the
         walked ones run out. It is a fallback and not a preference: a known route is
         returned first, because it goes through screens the graph has actually seen.
+
+        Offered only to a CHAIN, never to candidate selection, and that limit was
+        measured rather than assumed. Making every candidate reachable changes which
+        one wins: "put two of the Brass Level 24 in the cart" went from
+        ``add_several_to_cart`` to ``add_product_to_cart``, which retrieval ranks
+        higher and which adds ONE - a skill that used to be skipped for having no
+        route, and that being unreachable was quietly doing the ranking's job. It cost
+        the shop suite a warm task. A chain has no such problem: the composer has
+        already decided which skills run, so reaching them can only help.
         """
         if not self._controller.supports("navigate"):
             return None
@@ -728,6 +748,23 @@ class Planner:
     def _mean_ms(self, call: SkillCall) -> float:
         skill = self._lookup(call)
         return skill.stats.mean_ms if skill is not None else 0.0
+
+
+def _covers(skill: Skill, task: TaskSpec) -> int:
+    """How many of the values the task supplied this skill actually takes.
+
+    The tie-break between two skills that can both be called. Binding asks "can this
+    run at all", and a skill that ignores half the errand answers yes: asked to put
+    TWO of something in the cart, ``add_product_to_cart`` binds happily from
+    ``{product, quantity}``, takes the product, drops the quantity and adds one. It
+    outranks ``add_several_to_cart`` in retrieval and used to be saved from itself by
+    being demoted first - which is not a ranking rule, it is luck, and it ran out the
+    moment demotion got less trigger-happy.
+
+    A value the task went to the trouble of supplying is a statement about what the
+    errand needs. The skill that consumes more of them is the better fit for it.
+    """
+    return sum(1 for name in skill.params if name in task.params)
 
 
 def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:

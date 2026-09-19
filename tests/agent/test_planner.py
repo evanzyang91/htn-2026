@@ -515,26 +515,29 @@ def test_the_start_screen_is_reached_by_its_url_when_the_graph_knows_no_way(
     can_navigate = dataclasses.replace(
         scenario, controller=controller, perceiver=FakePerceiver.for_controller(controller)
     )
+    store.put(SEARCH_INVOICE)
     store.put(CONFIRM_PAYMENT)
-    # The precondition screen is KNOWN, with an address - but no edge leads to it.
+    # Both screens are KNOWN, with addresses - but the graph holds no edge between
+    # them, exactly as a real site's graph is silent about the way back to a page it
+    # has only ever arrived at once.
     graph = InMemorySiteGraph()
     start = look(can_navigate)
-    graph.upsert_state(
-        UIState(
-            fingerprint=CONFIRM_PAYMENT.precondition,
-            domain=DOMAIN,
-            url_pattern="https://fake.test/invoices/1042",
-        )
-    )
+    for fingerprint, url in (
+        (start.fingerprint, "https://fake.test/invoices"),
+        (CONFIRM_PAYMENT.precondition, "https://fake.test/invoices/1042"),
+    ):
+        graph.upsert_state(UIState(fingerprint=fingerprint, domain=DOMAIN, url_pattern=url))
     assert start.fingerprint != CONFIRM_PAYMENT.precondition
-    planner = build(can_navigate, store, graph, fake_llm, compose=False)
+    llm = FakeLLM([_chain(("search_invoice", {"company": "Acme Corp"}), ("confirm_payment", {}))])
+    planner = build(can_navigate, store, graph, llm, compose=True)
 
-    plan = planner.plan(TaskSpec(text="Confirm the payment on this invoice.", domain=DOMAIN), start)
+    planner.attempt(COMPOSITE_TASK, start)
 
-    assert plan is not None, "a URL is a route when nothing has been walked"
-    navigations = [s for s in plan.steps if getattr(s, "kind", None) == "navigate"]
-    assert navigations, f"expected a navigate step, got {plan.steps}"
-    assert fake_llm.calls == 0, "routing by URL must not cost a model call"
+    # The fake app has no navigate transition, so the errand does not finish here.
+    # What is being proved is that the step between the two skills was ATTEMPTED at
+    # all: before this, the chain stopped dead at "no known route".
+    kinds = [a.kind for a in performed(can_navigate)]
+    assert "navigate" in kinds, f"expected the chain to route by URL, performed {kinds}"
 
 
 def test_an_unreliable_edge_is_refused_rather_than_replayed(
