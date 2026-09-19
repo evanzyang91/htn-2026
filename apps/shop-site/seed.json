@@ -1,0 +1,45 @@
+{
+  "meta": {
+    "appName": "Harbour Supply",
+    "tagline": "Chandlery and outfitters",
+    "today": "Mar 12",
+    "currency": "USD",
+    "shipping": [
+      { "id": "standard", "label": "Standard (5-7 days) - Free", "fee": 0 },
+      { "id": "express", "label": "Express (2 days) - $9.00", "fee": 900 },
+      { "id": "overnight", "label": "Overnight - $24.00", "fee": 2400 }
+    ]
+  },
+  "catalog": {
+    "products": [
+      { "id": "p01", "name": "Anchor Claw Hammer", "category": "Tools", "price": 1899, "rating": 4.6 },
+      { "id": "p02", "name": "Brass Level 24 in", "category": "Tools", "price": 3299, "rating": 4.3 },
+      { "id": "p03", "name": "Cobalt Drill Bit Set", "category": "Tools", "price": 5499, "rating": 4.8 },
+      { "id": "p04", "name": "Dockside Socket Wrench", "category": "Tools", "price": 2450, "rating": 4.1 },
+      { "id": "p05", "name": "Ebb Tide Hand Saw", "category": "Tools", "price": 2199, "rating": 3.9 },
+      { "id": "p06", "name": "Foghorn Impact Driver", "category": "Tools", "price": 12900, "rating": 4.7 },
+      { "id": "p07", "name": "Galley Camp Stove", "category": "Outdoor", "price": 8999, "rating": 4.4 },
+      { "id": "p08", "name": "Harbour Dry Bag 20 L", "category": "Outdoor", "price": 2999, "rating": 4.2 },
+      { "id": "p09", "name": "Inlet Folding Chair", "category": "Outdoor", "price": 4650, "rating": 3.8 },
+      { "id": "p10", "name": "Jetty Rope 30 m", "category": "Outdoor", "price": 1750, "rating": 4.0 },
+      { "id": "p11", "name": "Keel Cooler 24-Can", "category": "Outdoor", "price": 6800, "rating": 4.5 },
+      { "id": "p12", "name": "Lighthouse Tent 2P", "category": "Outdoor", "price": 15900, "rating": 4.6 },
+      { "id": "p13", "name": "Mainsail Chef Knife", "category": "Kitchen", "price": 7499, "rating": 4.9 },
+      { "id": "p14", "name": "Nautical Cutting Board", "category": "Kitchen", "price": 2399, "rating": 4.2 },
+      { "id": "p15", "name": "Oarlock Cast Iron Skillet", "category": "Kitchen", "price": 4199, "rating": 4.7 },
+      { "id": "p16", "name": "Portside French Press", "category": "Kitchen", "price": 3350, "rating": 4.1 },
+      { "id": "p17", "name": "Quarterdeck Mixing Bowls", "category": "Kitchen", "price": 2850, "rating": 3.7 },
+      { "id": "p18", "name": "Rudder Salt Grinder", "category": "Kitchen", "price": 1499, "rating": 3.5 },
+      { "id": "p19", "name": "Sextant Desk Lamp", "category": "Lighting", "price": 5899, "rating": 4.3 },
+      { "id": "p20", "name": "Tiller Lantern", "category": "Lighting", "price": 3499, "rating": 4.4 },
+      { "id": "p21", "name": "Undertow String Lights", "category": "Lighting", "price": 1999, "rating": 4.0 },
+      { "id": "p22", "name": "Vane Headlamp", "category": "Lighting", "price": 2650, "rating": 4.5 },
+      { "id": "p23", "name": "Wharf Floor Lamp", "category": "Lighting", "price": 11200, "rating": 4.2 },
+      { "id": "p24", "name": "Zenith Reading Light", "category": "Lighting", "price": 1299, "rating": 3.6 }
+    ]
+  },
+  "cart": {
+    "lines": []
+  },
+  "orders": []
+}

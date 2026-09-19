@@ -1,0 +1,211 @@
+{
+  "meta": {
+    "appName": "Lantern Board",
+    "today": "Mar 12",
+    "user": {
+      "name": "Rowan Ellery",
+      "email": "rowan.ellery@lantern.example"
+    }
+  },
+  "board": {
+    "columns": [
+      { "id": "backlog", "name": "Backlog" },
+      { "id": "inprogress", "name": "In progress" },
+      { "id": "review", "name": "Review" },
+      { "id": "done", "name": "Done" }
+    ],
+    "assignees": [
+      "Mira Solano",
+      "Felix Ostrowski",
+      "June Nakagawa",
+      "Theo Barros",
+      "Ada Lindgren"
+    ],
+    "priorities": ["High", "Medium", "Low"],
+    "counters": { "ticket": 14, "comment": 6 },
+    "tickets": [
+      {
+        "id": "t01",
+        "key": "LAN-1",
+        "title": "Set up nightly export of usage metrics",
+        "description": "Partners want a daily file of device counts and active hours. Land it in the shared bucket before the morning sync.",
+        "assignee": "Mira Solano",
+        "priority": "Medium",
+        "column": "backlog",
+        "comments": []
+      },
+      {
+        "id": "t02",
+        "key": "LAN-2",
+        "title": "Fix flicker when the gauge crosses zero",
+        "description": "The dashboard gauge repaints twice when a reading crosses zero, which reads as a flicker on slower machines.",
+        "assignee": "Felix Ostrowski",
+        "priority": "High",
+        "column": "inprogress",
+        "comments": [
+          {
+            "id": "c01",
+            "author": "Mira Solano",
+            "text": "Repro steps are in the shared notebook under gauge-flicker.",
+            "date": "Mar 10"
+          },
+          {
+            "id": "c02",
+            "author": "Felix Ostrowski",
+            "text": "Traced it to the easing table; a fix is in progress.",
+            "date": "Mar 11"
+          }
+        ]
+      },
+      {
+        "id": "t03",
+        "key": "LAN-3",
+        "title": "Rewrite onboarding copy for the pairing step",
+        "description": "First-run users stall on the pairing screen. The copy should lead with the button, not the background explanation.",
+        "assignee": "June Nakagawa",
+        "priority": "Medium",
+        "column": "review",
+        "comments": [
+          {
+            "id": "c03",
+            "author": "Ada Lindgren",
+            "text": "Second paragraph still reads too technical for a first run.",
+            "date": "Mar 9"
+          }
+        ]
+      },
+      {
+        "id": "t04",
+        "key": "LAN-4",
+        "title": "Add bulk import for device registries",
+        "description": "Support a CSV of up to five thousand devices with per-row validation errors reported back in one pass.",
+        "assignee": "Theo Barros",
+        "priority": "Low",
+        "column": "backlog",
+        "comments": []
+      },
+      {
+        "id": "t05",
+        "key": "LAN-5",
+        "title": "Cache the schedule preview per workspace",
+        "description": "The preview recomputes on every keystroke. Cache it per workspace and invalidate on schedule edits only.",
+        "assignee": "Ada Lindgren",
+        "priority": "High",
+        "column": "inprogress",
+        "comments": [
+          {
+            "id": "c04",
+            "author": "Theo Barros",
+            "text": "Cache key should include the workspace plan tier.",
+            "date": "Mar 8"
+          }
+        ]
+      },
+      {
+        "id": "t06",
+        "key": "LAN-6",
+        "title": "Retire the legacy webhook signer",
+        "description": "Every consumer has moved to v2 signatures. Remove the v1 signer and its key rotation cron.",
+        "assignee": "Mira Solano",
+        "priority": "Low",
+        "column": "done",
+        "comments": []
+      },
+      {
+        "id": "t07",
+        "key": "LAN-7",
+        "title": "Design empty state for the alerts page",
+        "description": "A fresh workspace sees a blank table. Show what alerts do and a single primary action to create the first rule.",
+        "assignee": "June Nakagawa",
+        "priority": "Low",
+        "column": "backlog",
+        "comments": []
+      },
+      {
+        "id": "t08",
+        "key": "LAN-8",
+        "title": "Instrument the firmware update funnel",
+        "description": "We cannot tell where updates stall. Emit an event per stage: offered, downloaded, applied, confirmed.",
+        "assignee": "Theo Barros",
+        "priority": "Medium",
+        "column": "inprogress",
+        "comments": []
+      },
+      {
+        "id": "t09",
+        "key": "LAN-9",
+        "title": "Harden session refresh against clock skew",
+        "description": "Refresh tokens are rejected when the device clock drifts. Accept a bounded skew window on the server side.",
+        "assignee": "Felix Ostrowski",
+        "priority": "High",
+        "column": "review",
+        "comments": [
+          {
+            "id": "c05",
+            "author": "June Nakagawa",
+            "text": "Please add a test for a clock that runs five minutes fast.",
+            "date": "Mar 11"
+          }
+        ]
+      },
+      {
+        "id": "t10",
+        "key": "LAN-10",
+        "title": "Document the rate limits for partners",
+        "description": "Publish the per-key limits, the burst allowance, and the retry headers in the partner handbook.",
+        "assignee": "Ada Lindgren",
+        "priority": "Medium",
+        "column": "backlog",
+        "comments": []
+      },
+      {
+        "id": "t11",
+        "key": "LAN-11",
+        "title": "Migrate audit log to the new schema",
+        "description": "Dual-write is on. Backfill the historical rows, then flip reads and drop the old table.",
+        "assignee": "Mira Solano",
+        "priority": "High",
+        "column": "inprogress",
+        "comments": [
+          {
+            "id": "c06",
+            "author": "Ada Lindgren",
+            "text": "The backfill script finished on the staging copy.",
+            "date": "Mar 7"
+          }
+        ]
+      },
+      {
+        "id": "t12",
+        "key": "LAN-12",
+        "title": "Ship the compact density option",
+        "description": "Add a compact row height to the device list and remember the choice per user.",
+        "assignee": "June Nakagawa",
+        "priority": "Medium",
+        "column": "done",
+        "comments": []
+      },
+      {
+        "id": "t13",
+        "key": "LAN-13",
+        "title": "Prototype offline mode for the mobile app",
+        "description": "Sketch a queue of pending commands that replays when the device reconnects. Prototype only, no persistence.",
+        "assignee": "Felix Ostrowski",
+        "priority": "Low",
+        "column": "backlog",
+        "comments": []
+      },
+      {
+        "id": "t14",
+        "key": "LAN-14",
+        "title": "Translate the billing emails to Spanish",
+        "description": "The invoice, receipt, and dunning templates need Spanish variants reviewed by the localization vendor.",
+        "assignee": "Theo Barros",
+        "priority": "Medium",
+        "column": "done",
+        "comments": []
+      }
+    ]
+  },
+  "archived": []
+}

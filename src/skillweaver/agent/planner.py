@@ -523,12 +523,22 @@ class Planner:
             current = None
             if not result.ok:
                 reason = result.error or "the skill failed without saying why"
-                self._demote(skill, f"failed on the warm path: {reason}")
+                retired = self._worth_demoting(skill)
+                if retired:
+                    self._demote(skill, f"failed on the warm path: {reason}")
+                else:
+                    log.info(
+                        "planner.spared",
+                        skill=skill.name,
+                        successes=skill.stats.successes,
+                        runs=skill.stats.runs,
+                        reason=reason,
+                    )
                 return used, PlanFailure(
                     stage="skill_failed",
                     reason=reason,
                     skill=skill.name,
-                    demoted=True,
+                    demoted=retired,
                     trace=result.trace,
                 )
             used.append(skill.name)
@@ -596,6 +606,28 @@ class Planner:
             confidence=round(verdict.confidence, 3),
         )
         return PlanFailure("rejected", reason, skill=" + ".join(used) or None)
+
+    @staticmethod
+    def _worth_demoting(skill: Skill) -> bool:
+        """Whether one failure is evidence the skill is broken, or only that it was
+        asked the wrong thing.
+
+        A failure means one of two things and they look identical from here: the skill
+        has stopped working, or it was called for a task it was never about. The second
+        really happens - retrieval ranks a skill that opens a message top for a task
+        that opens a message AND sends one, the arguments bind, and the skill goes
+        looking for a subject belonging to the other half of the sentence. Retiring it
+        for that loses a skill that works, and the next run of the task it IS about has
+        to learn it again.
+
+        So a skill that has a record of working is spared its first failures and the
+        failure is reported instead; one that fails more often than it works is not.
+        A skill that has never succeeded has nothing to weigh against the evidence.
+        """
+        stats = skill.stats
+        if stats.successes == 0:
+            return True
+        return stats.successes * 2 <= stats.runs
 
     def _demote(self, skill: Skill, reason: str) -> None:
         """Retire a skill from retrieval, tolerating one that has already gone."""

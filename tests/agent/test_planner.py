@@ -694,6 +694,49 @@ def test_a_skill_that_fails_on_the_warm_path_is_demoted_with_a_reason(
     assert fake_llm.calls == 0
 
 
+def test_a_skill_with_a_record_of_working_is_not_retired_for_one_failure(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """A failure means the skill broke OR that it was asked the wrong thing.
+
+    The second really happens: retrieval ranks a skill that opens a message top for a
+    task that opens a message AND sends one, its arguments bind, and it goes looking
+    for the other half of the sentence. Retiring it then throws away something that
+    works, and the task it IS about has to learn it again from scratch. A skill with a
+    record of succeeding is spared, and the failure is still reported in full.
+    """
+    store.put(BROKEN_PAY)
+    for _ in range(4):  # a history of working, before today
+        store.record_run("pay_invoice", DOMAIN, ok=True, ms=30.0)
+    planner = build(scenario, store, graph, fake_llm, compose=True)
+
+    assert planner.attempt(scenario.task, look(scenario)) is None
+
+    assert store.get("pay_invoice", DOMAIN).demoted_reason is None
+    assert [s.name for s in store.list(domain=DOMAIN)] == ["pay_invoice"]
+    failure = planner.last_failure
+    assert failure is not None and failure.stage == "skill_failed"
+    assert not failure.demoted, "reported, not retired"
+    assert failure.trace, "and the explorer still gets the trace"
+
+
+def test_a_skill_that_fails_more_often_than_it_works_is_retired(
+    scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
+) -> None:
+    """Sparing a skill is about weighing evidence, not about never retiring one: a
+    site that changed makes a skill fail every time, and the record says so."""
+    store.put(BROKEN_PAY)
+    store.record_run("pay_invoice", DOMAIN, ok=True, ms=30.0)
+    for _ in range(3):
+        store.record_run("pay_invoice", DOMAIN, ok=False, ms=30.0)
+    planner = build(scenario, store, graph, fake_llm, compose=True)
+
+    assert planner.attempt(scenario.task, look(scenario)) is None
+
+    assert store.get("pay_invoice", DOMAIN).demoted_reason is not None
+    assert store.list(domain=DOMAIN) == []
+
+
 def test_a_clean_run_the_critic_judges_incomplete_is_reported_but_not_demoted(
     scenario: Scenario, store: InMemorySkillStore, graph: InMemorySiteGraph, fake_llm: FakeLLM
 ) -> None:

@@ -158,6 +158,16 @@ def main() -> int:
     parser.add_argument("--headed", action="store_true", help="show the browser")
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument(
+        "--model-latency-ms",
+        type=float,
+        default=0.0,
+        help=(
+            "pretend a model call takes this long. 0 measures the system with the "
+            "model removed; a real computer-use model answers in seconds, and that "
+            "time is paid per call - which is the cost the warm path avoids."
+        ),
+    )
+    parser.add_argument(
         "--dump-prompt", type=Path, default=None, help="write the first prompt here"
     )
     args = parser.parse_args()
@@ -177,7 +187,7 @@ def main() -> int:
         print(f"no playbook for: {', '.join(missing)} - those tasks will fail to explore")
 
     data_dir = args.data_dir or (REPO / "data" / "bench-live")
-    operator = ScriptedOperator(playbooks=dict(PLAYBOOKS))
+    operator = ScriptedOperator(playbooks=dict(PLAYBOOKS), latency_ms=args.model_latency_ms)
     operator.debug_to = args.dump_prompt
     bench = LiveWorkbench(data_dir, operator, headless=not args.headed)
 
@@ -200,9 +210,11 @@ def main() -> int:
     print()
     print(f"wrote {path}")
     print(f"  suite wall clock      {elapsed:8.1f} s over {bench.observations} observation(s)")
-    print(f"  pooled speedup        {_fmt(metrics.get('pooled_speedup'))}x  (a LOWER bound:")
-    print("                                  the model was simulated, which only makes the")
-    print("                                  cold side cheaper than it really is)")
+    print(f"  model latency assumed {args.model_latency_ms:8.0f} ms per call")
+    print(f"  pooled speedup        {_fmt(metrics.get('pooled_speedup'))}x")
+    if args.model_latency_ms <= 0:
+        print("                                  (a LOWER bound: a model call cost nothing")
+        print("                                   here, which only makes COLD cheaper)")
     print(f"  cold success rate     {_pct(metrics.get('cold_success_rate'))}")
     print(f"  warm success rate     {_pct(metrics.get('warm_success_rate'))}")
     print(

@@ -151,16 +151,19 @@ progress bar, an animation - must not wedge the controller, so running out of ti
 means waiting is over, not that anything failed."""
 
 _PAINT_QUIET_JS = """
-([quietMs, deadlineMs]) => new Promise((resolve) => {
+([quietMs, graceMs, deadlineMs]) => new Promise((resolve) => {
   const start = performance.now();
-  let lastChange = start;
+  let lastChange = null;
   const observer = new MutationObserver(() => { lastChange = performance.now(); });
   observer.observe(document.documentElement, {
     childList: true, subtree: true, attributes: true, characterData: true,
   });
   const tick = () => {
     const now = performance.now();
-    if (now - lastChange >= quietMs || now - start >= deadlineMs) {
+    const settled = lastChange === null
+      ? now - start >= graceMs
+      : now - lastChange >= quietMs;
+    if (settled || now - start >= deadlineMs) {
       observer.disconnect();
       resolve(Math.round(now - start));
     } else {
@@ -169,6 +172,20 @@ _PAINT_QUIET_JS = """
   };
   setTimeout(tick, 16);
 })
+"""
+"""Wait until the page has reacted and then stopped reacting.
+
+Two clocks, because there are two things to be unsure about. Until anything has
+changed at all, the wait is for the reaction to START - an application that answers a
+click over the network has not failed to react, it has not reacted YET - and that is
+what ``graceMs`` bounds. Once something has moved, the wait is for movement to STOP,
+which is ``quietMs``.
+
+Written this way because the alternative is an unconditional sleep, and an
+unconditional sleep is wrong in both directions at once: too short for a slow page and
+pure waste on a fast one, which is most actions on most pages. An application that
+answers in ten milliseconds now costs ten plus the quiet window instead of the whole
+fixed pause, and that difference is paid on EVERY action of every run.
 """
 
 
@@ -189,7 +206,9 @@ class BrowserController:
             captures Retina-sharp at the same logical size; ``Screenshot.scale``
             will report it back.
         browser: Which Playwright engine to launch.
-        settle_ms: How long to wait after each action for the page to react.
+        settle_ms: How long to wait for the page to BEGIN reacting to an action
+            before concluding that it is not going to. Once it has begun, the wait
+            runs until it stops; see :data:`_PAINT_QUIET_JS`.
             Set to ``0`` for the fastest possible replay of a known-good script.
         type_delay_ms: Pause between characters in :class:`TypeText`. A few
             milliseconds is enough for input handlers that debounce keystrokes.
@@ -501,7 +520,10 @@ class BrowserController:
         ``MutationObserver`` should degrade to the old behaviour rather than break.
         """
         try:
-            page.evaluate(_PAINT_QUIET_JS, [_PAINT_QUIET_MS, _PAINT_QUIET_DEADLINE_MS])
+            page.evaluate(
+                _PAINT_QUIET_JS,
+                [_PAINT_QUIET_MS, self._settle_ms, _PAINT_QUIET_DEADLINE_MS],
+            )
         except PlaywrightError:
             return
 
@@ -524,10 +546,11 @@ class BrowserController:
         is an empty root element whose content appears when a fetch returns. So the
         wait ends on the document going quiet - see :data:`_PAINT_QUIET_JS` - rather
         than on it having loaded.
-        """
-        if self._settle_ms > 0:
-            page.wait_for_timeout(self._settle_ms)
 
+        ``settle_ms`` is how long to wait for a reaction to START rather than an
+        unconditional pause. A page that answers at once is then not waited on at all,
+        which matters because this is paid on every action of every run.
+        """
         deadline = time.monotonic() + self._settle_timeout_ms / 1000.0
         while True:
             try:

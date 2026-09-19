@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harbour Supply</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%23155e63'/></svg>">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<!-- icon sprite: every icon in the app is a hand-drawn inline SVG symbol -->
+<svg xmlns="http://www.w3.org/2000/svg" class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-cart" viewBox="0 0 24 24"><path d="M3 4h2.5l2.2 11.5A1.6 1.6 0 0 0 9.3 17h8.9a1.6 1.6 0 0 0 1.6-1.3L21.5 8H6"/><circle cx="10" cy="20.5" r="1.4"/><circle cx="17.5" cy="20.5" r="1.4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m20 20-4.5-4.5"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m4 12 5.5 6L20 6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2 20h20zM12 10v4M12 17h.01"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><path d="m12 2.5 8.5 4.5v10L12 21.5 3.5 17V7zM3.5 7 12 11.5 20.5 7M12 11.5v10"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 6h16M9 6V4h6v2M6.5 6l1 14h9l1-14M10 10v6M14 10v6"/></symbol>
+</svg>
+
+<header class="topbar">
+  <div class="topbar-brand">
+    <span class="brandmark" aria-hidden="true"></span>
+    <span class="brandname">Harbour&nbsp;Supply</span>
+    <span class="brandtag" id="tagline">&nbsp;</span>
+  </div>
+  <div class="topbar-controls" id="topbar-controls"></div>
+</header>
+
+<main id="screen" class="screen"></main>
+
+<div id="drawer-root" class="drawer-root"></div>
+<div id="overlay" class="overlay-root"></div>
+
+<script src="js/icons.js"></script>
+<script src="js/app.js"></script>
+<script src="js/shop.js"></script>
+<script src="js/cart.js"></script>
+<script src="js/checkout.js"></script>
+<script src="js/boot.js"></script>
+</body>
+</html>

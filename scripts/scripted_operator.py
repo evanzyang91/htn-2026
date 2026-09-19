@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -277,6 +278,16 @@ class ScriptedOperator:
     model: str = "scripted-operator"
     calls: dict[str, int] = field(default_factory=dict)
     unmatched: list[str] = field(default_factory=list)
+    latency_ms: float = 0.0
+    """Time to spend pretending to think, per call.
+
+    Zero measures the system with the model taken out of it, which is what the rest
+    of this module is for. A non-zero value puts a stated, uniform model latency back
+    in - every other cost in the run stays real - so the cold-versus-warm comparison
+    can be made at the speed a real computer-use model answers rather than at infinite
+    speed, which is the one assumption that flatters the COLD side.
+    """
+
     debug_to: Path | None = None
     """Write the next prompt here and then stop. For working out why a playbook did
     not fire, which is otherwise invisible: the operator only sees a string."""
@@ -309,6 +320,8 @@ class ScriptedOperator:
         if self.debug_to is not None:
             with self.debug_to.open("a", encoding="utf-8", errors="replace") as sink:
                 sink.write(f"\n=== call {sum(self.calls.values())} role={role} ===\n{prompt}\n")
+        if self.latency_ms > 0:
+            time.sleep(self.latency_ms / 1000.0)
         answer = {
             "explore": self._explore,
             "critic": self._judge,

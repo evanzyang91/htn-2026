@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lantern Board</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%23c2540a'/></svg>">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<!-- icon sprite: every icon in the app is a hand-drawn inline SVG symbol -->
+<svg xmlns="http://www.w3.org/2000/svg" class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m20 20-4.5-4.5"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m4 12 5.5 6L20 6"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24"><path d="M3 4h18v4H3zM5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2 20h20zM12 10v4M12 17h.01"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></symbol>
+  <symbol id="i-comment" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24"><path d="M5 9h14M5 15h14"/><path d="m15 5 4 4-4 4M9 11l-4 4 4 4"/></symbol>
+  <symbol id="i-board" viewBox="0 0 24 24"><rect x="3" y="4" width="5" height="16" rx="1"/><rect x="10" y="4" width="5" height="11" rx="1"/><rect x="17" y="4" width="4" height="7" rx="1"/></symbol>
+</svg>
+
+<header class="appbar">
+  <div class="appbar-brand">
+    <span class="brandmark" aria-hidden="true"></span>
+    <span class="brandname">Lantern&nbsp;Board</span>
+  </div>
+  <span class="appbar-spacer"></span>
+  <span class="userchip" id="userchip">
+    <svg class="icon" aria-hidden="true"><use href="#i-user"/></svg>
+    <span id="username">&nbsp;</span>
+  </span>
+</header>
+
+<main id="screen" class="screen"></main>
+
+<div id="overlay" class="overlay-root"></div>
+
+<script src="js/icons.js"></script>
+<script src="js/app.js"></script>
+<script src="js/board.js"></script>
+<script src="js/boot.js"></script>
+</body>
+</html>
