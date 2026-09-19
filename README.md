@@ -23,6 +23,23 @@ thirteen, and prints the Python it wrote for itself in between. About a minute.
 
 Drop `--watch` to run it headless in about thirty seconds.
 
+Or on a real website nobody here built:
+
+```sh
+uv run python scripts/demo_real_store.py --watch
+```
+
+Sauce Labs' public demo storefront, six screens end to end: sign in, find a named
+product among several, add it to the cart, open a cart whose icon has no text at all,
+fill in a three-field checkout, confirm. Sixteen actions, about ten seconds, no
+selectors and no DOM - every target found in the screenshot. The shop decides whether
+it worked, by landing on its own "Thank you for your order!".
+
+A real merchant would be the wrong place to prove this: it would spend someone's money
+and create an obligation that cannot be withdrawn. The interesting question - can it
+drive six screens of a site nobody built for it, from pixels - is answered without
+any of that.
+
 ## What it measures
 
 Three applications, one agent, nothing in it told which it is looking at. A mail

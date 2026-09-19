@@ -664,6 +664,10 @@ drops is the tail of the longest line.
 """
 
 
+_CARVEABLE = frozenset({ElementKind.text, ElementKind.row})
+"""Kinds whose box may be cut down to the words that matched. See :func:`narrow_to`."""
+
+
 def narrow_to(element: Element, query: str, text: str) -> Element:
     """The part of a line of text that answers the query, rather than the whole line.
 
@@ -677,11 +681,13 @@ def narrow_to(element: Element, query: str, text: str) -> Element:
     string, which is as good as it sounds for a single run of text at one size and far
     better than the alternative of aiming at the middle of everything.
 
-    Only for TEXT, and only for a line wider than it is tall. A button whose label
-    contains the query is a button: pressing its middle is right, and carving a
-    fraction out of it would be a way to miss it.
+    Only for the kinds that are a CONTAINER of words rather than a control: a line of
+    text, and a row. A button whose label contains the query is a button - pressing its
+    middle is right, and carving a fraction out of it would be a way to miss it - but a
+    row holding a field and the button that commits it is not one thing, and aiming at
+    the middle of it can only ever reach whichever half is in the middle.
     """
-    if element.kind is not ElementKind.text or not query or query == text:
+    if element.kind not in _CARVEABLE or not query or query == text:
         return element
     start = text.find(query)
     if start < 0 or not text or element.box.h >= element.box.w:

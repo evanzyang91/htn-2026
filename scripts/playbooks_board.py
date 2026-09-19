@@ -94,15 +94,25 @@ def titled(elements: Sequence[Element], title: str) -> Element | None:
 
 
 def panel_field(caption: str, value: str, button: str, *, done: bool = False):
-    """Replace a field in the detail panel and press the button that commits it."""
+    """Replace a field in the detail panel and press the button that commits it.
+
+    The button is looked up through ``ctx.see`` rather than by the id the prompt
+    listed, because a detector will sometimes draw ONE box around a field and the
+    button beside it. An id points at that whole box, whose middle is the field; a
+    text lookup points at the part of it that says what was asked for.
+    """
 
     def step(elements: Sequence[Element], failures: int) -> dict[str, Any] | None:
         box = _under(elements, caption)
-        commit = find(elements, button, within=PANEL)
-        if box is None or commit is None:
+        if box is None or find(elements, button, within=PANEL) is None:
             return None
         return {
-            "code": replace_text(box.id, value) + f'ctx.ctl.click(el["{commit.id}"])\n',
+            "code": (
+                replace_text(box.id, value)
+                + f"hits = ctx.see.find_text({button!r})\n"
+                + f'ctx.expect(bool(hits), "nothing saying {button}")\n'
+                + "ctx.ctl.click(hits[0])\n"
+            ),
             "done": done,
         }
 
@@ -364,7 +374,10 @@ _ALL: tuple[Playbook, ...] = (
             },
             "    ctx.ctl.click(titled(ctx, title, title))\n"
             '    fill_in(ctx, under(ctx, "Title", 70, 90), new_title)\n'
-            '    ctx.ctl.click(only(ctx, controls(ctx, "Save title"), "the save button"))\n'
+            "    # Not filtered to a control kind: a detector will sometimes draw one\n"
+            "    # box around the field and the button beside it, and calling that a\n"
+            "    # row does not stop the words on it leading to the right half.\n"
+            '    ctx.ctl.click(only(ctx, ctx.see.find_text("Save title"), "the save button"))\n'
             "    return True\n",
             sees("Renamed"),
         ),
@@ -470,7 +483,7 @@ _ALL: tuple[Playbook, ...] = (
         task="Archive everything in the Done column.",
         steps=(
             press("Archive done", within=TOOLBAR),
-            press("Archive", kind="button", within=MODAL, done=True),
+            press("Archive", control=True, within=MODAL, done=True),
         ),
         skill=skill(
             "archive_done",

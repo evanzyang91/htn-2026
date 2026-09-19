@@ -28,6 +28,7 @@ from scripted_operator import (  # type: ignore[import-not-found]
 )
 
 __all__ = [
+    "CLICKABLE",
     "HELPERS",
     "TOP_BAR",
     "below",
@@ -64,11 +65,34 @@ def go(label: str, *, done: bool = False):
     return step
 
 
-def press(label: str, *, kind: str | None = None, within=None, nth: int = 0, done: bool = False):
-    """Click the first thing whose text contains ``label``, optionally in a region."""
+CLICKABLE = ("button", "link", "menu", "tab")
+"""Kinds a detector uses for something meant to be pressed.
+
+Which of them it picks for any given control is not stable - the same confirm button
+came back as a ``button`` from one set of weights and a ``link`` from another - so a
+step that wants "the control, not the heading beside it" should ask for any of these
+rather than name one of them.
+"""
+
+
+def press(
+    label: str,
+    *,
+    kind: str | None = None,
+    control: bool = False,
+    within=None,
+    nth: int = 0,
+    done: bool = False,
+):
+    """Click the first thing whose text contains ``label``, optionally in a region.
+
+    ``control=True`` restricts the search to the clickable kinds, which is how a step
+    says "the button, not the heading that asks the same question".
+    """
 
     def step(elements: Sequence[Element], failures: int) -> dict[str, Any] | None:
-        target = find(elements, label, kind=kind, within=within, nth=nth)
+        pool = [e for e in elements if e.kind in CLICKABLE] if control else elements
+        target = find(pool, label, kind=kind, within=within, nth=nth)
         return None if target is None else click(target, done=done)
 
     return step
