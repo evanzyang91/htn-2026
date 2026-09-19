@@ -69,7 +69,8 @@ def test_inline_edit_can_be_cancelled(page, state):
     settle(page)
     page.click("[data-testid=edit-cancel]")
     settle(page)
-    assert [r for r in state()["records"]["rows"] if r["id"] == "r03"][0]["name"] == "Cinder Gateway"
+    row = next(r for r in state()["records"]["rows"] if r["id"] == "r03")
+    assert row["name"] == "Cinder Gateway"
 
 
 def test_bulk_status_across_the_selection(page, state):

@@ -89,13 +89,15 @@ def test_compose_and_send(page, state):
 
     s = state()
     assert s["ui"]["mail"]["compose"]["open"] is False
-    assert s["mail"]["sent"] == [{
-        "id": "s01",
-        "to": "dana.whitfield@northwind.example",
-        "subject": "Capacity plan approved",
-        "body": "Signed off on the west row move.",
-        "date": "Mar 12",
-    }]
+    assert s["mail"]["sent"] == [
+        {
+            "id": "s01",
+            "to": "dana.whitfield@northwind.example",
+            "subject": "Capacity plan approved",
+            "body": "Signed off on the west row move.",
+            "date": "Mar 12",
+        }
+    ]
 
     page.click("[data-testid=folder-sent]")
     settle(page)

@@ -27,17 +27,18 @@ def base_url():
     port = _free_port()
     proc = subprocess.Popen(
         [sys.executable, str(SERVE), "--port", str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
-    url = "http://127.0.0.1:%d" % port
+    url = f"http://127.0.0.1:{port}"
     deadline = time.time() + 15
     while time.time() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError("server exited: %s" % proc.stdout.read().decode())
+            raise RuntimeError(f"server exited: {proc.stdout.read().decode()}")
         try:
             urllib.request.urlopen(url + "/__state", timeout=0.5).read()
             break
-        except (urllib.error.URLError, socket.timeout, ConnectionError):
+        except (TimeoutError, urllib.error.URLError, ConnectionError):
             time.sleep(0.05)
     else:
         proc.kill()
@@ -73,12 +74,13 @@ def page(browser, base_url):
 @pytest.fixture
 def state(base_url):
     """Read the server's authoritative state, so assertions never read the screen."""
+
     def _read():
         return json.loads(urllib.request.urlopen(base_url + "/__state").read())
+
     return _read
 
 
 @pytest.fixture
 def seed():
     return json.loads((APP_DIR / "seed.json").read_text())
-

@@ -31,7 +31,7 @@ BULK_STATUSES = ("Active", "Paused", "Draft", "Archived")
 
 
 def load_seed():
-    with open(SEED_PATH, "r", encoding="utf-8") as fh:
+    with open(SEED_PATH, encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -78,8 +78,13 @@ def initial_ui(data):
 def fresh_state():
     seed = load_seed()
     data = copy.deepcopy(seed)
-    return {"meta": data["meta"], "mail": data["mail"], "records": data["records"],
-            "settings": data["settings"], "ui": initial_ui(data)}
+    return {
+        "meta": data["meta"],
+        "mail": data["mail"],
+        "records": data["records"],
+        "settings": data["settings"],
+        "ui": initial_ui(data),
+    }
 
 
 class Store:
@@ -105,6 +110,7 @@ class Store:
 # --------------------------------------------------------------------------
 # actions
 # --------------------------------------------------------------------------
+
 
 def _msg(state, mid):
     for m in state["mail"]["messages"]:
@@ -173,7 +179,7 @@ def apply_action(state, action, p):
                 mail["openId"] = None
         mail["selected"] = []
         mail["labelMenuOpen"] = False
-        mail["banner"] = "Archived %d conversation%s" % (n, "" if n == 1 else "s")
+        mail["banner"] = f"Archived {n} conversation{'' if n == 1 else 's'}"
     elif action == "mail.toggleLabelMenu":
         mail["labelMenuOpen"] = not mail["labelMenuOpen"]
     elif action == "mail.label":
@@ -187,7 +193,7 @@ def apply_action(state, action, p):
                     n += 1
         mail["labelMenuOpen"] = False
         mail["selected"] = []
-        mail["banner"] = "Labelled %d conversation%s as %s" % (n, "" if n == 1 else "s", label)
+        mail["banner"] = f"Labelled {n} conversation{'' if n == 1 else 's'} as {label}"
     elif action == "mail.dismissBanner":
         mail["banner"] = None
     elif action == "mail.composeOpen":
@@ -201,13 +207,15 @@ def apply_action(state, action, p):
     elif action == "mail.send":
         c = mail["compose"]
         if c["open"] and c["to"].strip():
-            state["mail"]["sent"].append({
-                "id": "s%02d" % (len(state["mail"]["sent"]) + 1),
-                "to": c["to"].strip(),
-                "subject": c["subject"].strip(),
-                "body": c["body"],
-                "date": state["meta"]["today"],
-            })
+            state["mail"]["sent"].append(
+                {
+                    "id": f"s{len(state['mail']['sent']) + 1:02d}",
+                    "to": c["to"].strip(),
+                    "subject": c["subject"].strip(),
+                    "body": c["body"],
+                    "date": state["meta"]["today"],
+                }
+            )
             mail["compose"] = {"open": False, "to": "", "subject": "", "body": ""}
             mail["banner"] = "Message sent"
 
@@ -242,7 +250,7 @@ def apply_action(state, action, p):
         value = rec["editValue"].strip()
         if r and value:
             r["name"] = value
-            rec["banner"] = "Renamed to %s" % value
+            rec["banner"] = f"Renamed to {value}"
         rec["editingId"] = None
         rec["editValue"] = ""
     elif action == "records.editCancel":
@@ -259,18 +267,20 @@ def apply_action(state, action, p):
                 if r and r["status"] != status:
                     r["status"] = status
                     n += 1
-            rec["banner"] = "Set %d record%s to %s" % (n, "" if n == 1 else "s", status)
+            rec["banner"] = f"Set {n} record{'' if n == 1 else 's'} to {status}"
         rec["bulkMenuOpen"] = False
         rec["selected"] = []
     elif action == "records.export":
         ids = list(p.get("ids") or [])
-        state["records"]["exports"].append({
-            "id": "e%02d" % (len(state["records"]["exports"]) + 1),
-            "rowIds": ids,
-            "count": len(ids),
-            "filter": rec["filter"],
-        })
-        rec["banner"] = "Exported %d row%s to CSV" % (len(ids), "" if len(ids) == 1 else "s")
+        state["records"]["exports"].append(
+            {
+                "id": f"e{len(state['records']['exports']) + 1:02d}",
+                "rowIds": ids,
+                "count": len(ids),
+                "filter": rec["filter"],
+            }
+        )
+        rec["banner"] = f"Exported {len(ids)} row{'' if len(ids) == 1 else 's'} to CSV"
     elif action == "records.dismissBanner":
         rec["banner"] = None
 
@@ -298,7 +308,7 @@ def apply_action(state, action, p):
     elif action == "settings.dismissSuccess":
         setg["success"] = False
     else:
-        raise ValueError("unknown action: %s" % action)
+        raise ValueError(f"unknown action: {action}")
 
 
 # --------------------------------------------------------------------------
@@ -384,7 +394,7 @@ def main():
     args = ap.parse_args()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
-    print("Northwind Console sandbox on http://%s:%d" % (args.host, args.port), flush=True)
+    print(f"Northwind Console sandbox on http://{args.host}:{args.port}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

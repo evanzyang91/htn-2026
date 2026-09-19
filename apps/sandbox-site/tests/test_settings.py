@@ -45,8 +45,7 @@ def test_save_opens_a_confirmation_dialog_listing_the_changes(page, state):
     assert page.locator("[data-testid=scrim]").is_visible()
     assert state()["ui"]["settings"]["dialogOpen"] is True
     items = [li.inner_text() for li in page.locator("[data-testid=confirm-list] li").all()]
-    assert items == ["Time zone: UTC → America/Toronto",
-                     "Desktop notifications: Off → On"]
+    assert items == ["Time zone: UTC → America/Toronto", "Desktop notifications: Off → On"]
 
 
 def test_cancel_branch_closes_the_dialog_and_saves_nothing(page, state, seed):

@@ -76,15 +76,16 @@ def test_state_endpoint_matches_the_seed_on_a_fresh_server(page, state, seed):
 def test_the_same_screen_screenshots_identically_twice(page):
     """No animation, no transition, no blinking caret, no drifting clock."""
     for testid in ("nav-mail", "nav-records", "nav-settings"):
-        page.click("[data-testid=%s]" % testid)
+        page.click(f"[data-testid={testid}]")
         settle(page)
         first = page.screenshot()
         second = page.screenshot()
-        assert first == second, "%s is not pixel-stable" % testid
+        assert first == second, f"{testid} is not pixel-stable"
 
 
 def test_reaching_a_screen_twice_produces_the_same_pixels(page, browser, base_url):
     """Reset, walk a flow, screenshot - then do it again and compare bytes."""
+
     def walk():
         urllib.request.urlopen(base_url + "/__reset").read()
         ctx = browser.new_context(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
@@ -106,7 +107,7 @@ def test_the_three_screens_do_not_look_alike(page):
     """A detector trained here needs screens that fingerprint differently."""
     shots = {}
     for name in ("mail", "records", "settings"):
-        page.click("[data-testid=nav-%s]" % name)
+        page.click(f"[data-testid=nav-{name}]")
         settle(page)
         shots[name] = page.screenshot()
     assert len(set(shots.values())) == 3
@@ -115,9 +116,10 @@ def test_the_three_screens_do_not_look_alike(page):
 def test_nothing_renders_a_live_clock(page):
     """Relative times and today's date would make two runs disagree."""
     import datetime
+
     today = datetime.date.today()
     for name in ("mail", "records", "settings"):
-        page.click("[data-testid=nav-%s]" % name)
+        page.click(f"[data-testid=nav-{name}]")
         settle(page)
         text = page.inner_text("body")
         assert "ago" not in text
