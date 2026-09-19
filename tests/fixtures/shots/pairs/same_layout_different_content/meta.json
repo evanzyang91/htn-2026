@@ -1,0 +1,279 @@
+{
+  "name": "same_layout_different_content",
+  "label": "different",
+  "why": "The invoice list for two different accounts: identical layout, every row different.",
+  "a": {
+    "png": "a.png",
+    "url": "https://invoices.test/invoices",
+    "width": 800,
+    "height": 600,
+    "scale": 1.0,
+    "elements": [
+      {
+        "x": 20,
+        "y": 12,
+        "w": 78,
+        "h": 28,
+        "kind": "text",
+        "text": "Invoices"
+      },
+      {
+        "x": 745,
+        "y": 16,
+        "w": 35,
+        "h": 20,
+        "kind": "text",
+        "text": "09:41"
+      },
+      {
+        "x": 20,
+        "y": 66,
+        "w": 400,
+        "h": 32,
+        "kind": "text_field",
+        "text": "Search invoices"
+      },
+      {
+        "x": 430,
+        "y": 66,
+        "w": 66,
+        "h": 32,
+        "kind": "button",
+        "text": "Clear"
+      },
+      {
+        "x": 717,
+        "y": 66,
+        "w": 63,
+        "h": 32,
+        "kind": "link",
+        "text": "Archive"
+      },
+      {
+        "x": 21,
+        "y": 119,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Globex INV-2041 \u00b7 $310.00"
+      },
+      {
+        "x": 21,
+        "y": 163,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Initech INV-2042 \u00b7 $1,204.50"
+      },
+      {
+        "x": 21,
+        "y": 207,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Umbrella Health INV-2043 \u00b7 $88.20"
+      },
+      {
+        "x": 21,
+        "y": 251,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Soylent Foods INV-2044 \u00b7 $2,750.00"
+      },
+      {
+        "x": 21,
+        "y": 295,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Stark Industries INV-2045 \u00b7 $19.99"
+      },
+      {
+        "x": 21,
+        "y": 339,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Wayne Logistics INV-2046 \u00b7 $640.00"
+      },
+      {
+        "x": 21,
+        "y": 383,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Cyberdyne INV-2047 \u00b7 $4,100.00"
+      },
+      {
+        "x": 21,
+        "y": 427,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Tyrell Corp INV-2048 \u00b7 $512.75"
+      },
+      {
+        "x": 21,
+        "y": 471,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Acme Corp INV-2049 \u00b7 $980.00"
+      },
+      {
+        "x": 21,
+        "y": 515,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Vandelay Imports INV-2050 \u00b7 $1,340.00"
+      },
+      {
+        "x": 21,
+        "y": 559,
+        "w": 758,
+        "h": 41,
+        "kind": "row",
+        "text": "Bluth Company INV-2051 \u00b7 $66.00"
+      }
+    ]
+  },
+  "b": {
+    "png": "b.png",
+    "url": "https://invoices.test/invoices",
+    "width": 800,
+    "height": 600,
+    "scale": 1.0,
+    "elements": [
+      {
+        "x": 20,
+        "y": 12,
+        "w": 78,
+        "h": 28,
+        "kind": "text",
+        "text": "Invoices"
+      },
+      {
+        "x": 745,
+        "y": 16,
+        "w": 35,
+        "h": 20,
+        "kind": "text",
+        "text": "09:41"
+      },
+      {
+        "x": 20,
+        "y": 66,
+        "w": 400,
+        "h": 32,
+        "kind": "text_field",
+        "text": "Search invoices"
+      },
+      {
+        "x": 430,
+        "y": 66,
+        "w": 66,
+        "h": 32,
+        "kind": "button",
+        "text": "Clear"
+      },
+      {
+        "x": 717,
+        "y": 66,
+        "w": 63,
+        "h": 32,
+        "kind": "link",
+        "text": "Archive"
+      },
+      {
+        "x": 21,
+        "y": 119,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Hooli INV-3311 \u00b7 $74.10"
+      },
+      {
+        "x": 21,
+        "y": 163,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Pied Piper INV-3312 \u00b7 $6,020.00"
+      },
+      {
+        "x": 21,
+        "y": 207,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Vehement Capital INV-3313 \u00b7 $455.00"
+      },
+      {
+        "x": 21,
+        "y": 251,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Massive Dynamic INV-3314 \u00b7 $128.40"
+      },
+      {
+        "x": 21,
+        "y": 295,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Gringotts Bank INV-3315 \u00b7 $3,300.00"
+      },
+      {
+        "x": 21,
+        "y": 339,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Duff Brewing INV-3316 \u00b7 $57.25"
+      },
+      {
+        "x": 21,
+        "y": 383,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Oceanic Air INV-3317 \u00b7 $902.00"
+      },
+      {
+        "x": 21,
+        "y": 427,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Nakatomi Trading INV-3318 \u00b7 $1,776.00"
+      },
+      {
+        "x": 21,
+        "y": 471,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Black Mesa INV-3319 \u00b7 $240.60"
+      },
+      {
+        "x": 21,
+        "y": 515,
+        "w": 758,
+        "h": 44,
+        "kind": "row",
+        "text": "Monarch Solar INV-3320 \u00b7 $205.40"
+      },
+      {
+        "x": 21,
+        "y": 559,
+        "w": 758,
+        "h": 41,
+        "kind": "row",
+        "text": "Trask Industries INV-3321 \u00b7 $3,088.00"
+      }
+    ]
+  }
+}
