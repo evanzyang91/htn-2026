@@ -526,6 +526,183 @@ class TestCostPolicy:
 
 
 # --------------------------------------------------------------------------------------
+# The critic: corroboration, which can say yes and cannot say no
+# --------------------------------------------------------------------------------------
+
+
+GOOD_JSON_FOR_ANOTHER_ARTICLE = (
+    '{"ok": true, "evidence": "the Machine learning article is open, with its '
+    'lead paragraph visible", "reason": "the search was run and the article opened", '
+    '"confidence": 0.9}'
+)
+
+
+class TestCorroboration:
+    """The role that exists because a recalled end screen was vetoing correct replays.
+
+    A warm replay is judged against the screen the ORIGINAL learned run ended on. For
+    any task whose end screen depends on its argument - search for X, open invoice N -
+    a correct replay ends somewhere else, and as decisive evidence that turned every
+    such success into a failure. As corroboration it is a free yes when it matches and
+    silent when it does not.
+    """
+
+    def test_a_corroborating_match_is_a_free_yes(
+        self, scenario: Scenario, fake_llm: FakeLLM
+    ) -> None:
+        """The zero-model-call claim survives: a replay that lands where it landed
+        before is still decided by arithmetic."""
+        before, after = observe(scenario, "selected"), observe(scenario, "done")
+        critic = TieredCritic(fake_llm, corroborating_state=after.fingerprint)
+
+        verdict = critic.judge("confirm the Acme payment", before, after)
+
+        assert fake_llm.calls == 0, "a fingerprint match must never cost a model call"
+        assert verdict.ok is True
+        assert verdict.source == "programmatic"
+        assert verdict.escalated is False
+        assert verdict.policy == "corroborated"
+        assert verdict.confidence == 1.0
+
+    def test_a_corroborating_miss_does_not_fail_the_run(self, scenario: Scenario) -> None:
+        """THE regression. The measured case: learned on one argument, replayed on
+        another, the screen legitimately elsewhere - and the verdict is a pass."""
+        llm = FakeLLM([GOOD_JSON_FOR_ANOTHER_ARTICLE])
+        before, after = observe(scenario, "list"), observe(scenario, "selected")
+        elsewhere = observe(scenario, "done").fingerprint
+        assert after.fingerprint != elsewhere
+
+        verdict = TieredCritic(llm, corroborating_state=elsewhere).judge(
+            "search for machine learning", before, after
+        )
+
+        assert verdict.ok is True
+        assert verdict.escalated is True and verdict.policy == "model"
+        assert llm.calls == 1
+
+    def test_the_same_miss_as_evidence_is_a_decisive_no(self, scenario: Scenario) -> None:
+        """The old behaviour, kept for a skill that cannot check its own work."""
+        before, after = observe(scenario, "list"), observe(scenario, "selected")
+        critic = TieredCritic(FakeLLM(), expected_state=observe(scenario, "done").fingerprint)
+
+        verdict = critic.judge("search for machine learning", before, after)
+
+        assert verdict.ok is False and verdict.policy == "check-failed"
+        assert verdict.escalated is False
+
+    def test_a_veto_still_fails_a_corroborated_critic_for_free(
+        self, scenario: Scenario, fake_llm: FakeLLM
+    ) -> None:
+        """Removing the veto from the end screen does not remove the other vetoes: a
+        replay that ends on an error page is a failure whatever it says about itself."""
+        critic = TieredCritic(fake_llm, corroborating_state=observe(scenario, "done").fingerprint)
+
+        verdict = critic.judge(
+            "confirm the Acme payment", observe(scenario, "selected"), make_obs((ERROR_BANNER,))
+        )
+
+        assert fake_llm.calls == 0, "an error on the screen never needs a model to see"
+        assert verdict.ok is False and verdict.policy == "check-failed"
+        assert "error text" in verdict.reason
+
+    def test_a_replay_that_moved_nothing_still_fails_for_free(
+        self, scenario: Scenario, fake_llm: FakeLLM
+    ) -> None:
+        stuck = observe(scenario, "list")
+        critic = TieredCritic(fake_llm, corroborating_state=observe(scenario, "done").fingerprint)
+
+        verdict = critic.judge("confirm the Acme payment", stuck, observe(scenario, "list"))
+
+        assert fake_llm.calls == 0
+        assert verdict.ok is False and verdict.policy == "check-failed"
+        assert "did not change" in verdict.reason
+
+    def test_evidence_outranks_corroboration_when_both_are_configured(
+        self, scenario: Scenario, fake_llm: FakeLLM
+    ) -> None:
+        after = observe(scenario, "done")
+        critic = TieredCritic(
+            fake_llm,
+            evidence=[C.text_appeared("Payment confirmed")],
+            corroborating_state=observe(scenario, "list").fingerprint,
+        )
+
+        verdict = critic.judge("confirm", observe(scenario, "selected"), after)
+
+        assert fake_llm.calls == 0
+        assert verdict.ok is True and verdict.policy == "evidence-passed"
+
+    def test_a_failing_evidence_check_beats_a_passing_corroboration(
+        self, scenario: Scenario, fake_llm: FakeLLM
+    ) -> None:
+        after = observe(scenario, "done")
+        critic = TieredCritic(
+            fake_llm,
+            evidence=[C.text_appeared("Archive is empty")],
+            corroborating_state=after.fingerprint,
+        )
+
+        verdict = critic.judge("confirm", observe(scenario, "selected"), after)
+
+        assert fake_llm.calls == 0
+        assert verdict.ok is False and verdict.policy == "check-failed"
+
+    def test_the_corroboration_is_in_the_trail_and_named_as_no_evidence_of_failure(
+        self, scenario: Scenario
+    ) -> None:
+        """What the model is told matters as much as what the critic decides.
+
+        Folding a failed ``matches_state`` into the deterministic trail hands the model
+        the line "the screen is not the expected state" and invites it to agree - the
+        veto laundered through the model rather than removed.
+        """
+        llm = FakeLLM([GOOD_JSON_FOR_ANOTHER_ARTICLE])
+        before, after = observe(scenario, "list"), observe(scenario, "selected")
+
+        TieredCritic(llm, corroborating_state=observe(scenario, "done").fingerprint).judge(
+            "search for machine learning", before, after
+        )
+
+        text = llm.requests[0].messages[0].text
+        deterministic = text.split("CORROBORATION")[0]
+        assert "matches_state" not in deterministic
+        assert "CORROBORATION" in text
+        assert "NOT evidence of failure" in text
+        assert "matches_state [failed]" in text.split("CORROBORATION")[1]
+
+    def test_the_verdict_carries_every_role_in_the_order_it_ran(self, scenario: Scenario) -> None:
+        after = observe(scenario, "done")
+        critic = TieredCritic(
+            evidence=[C.text_appeared("Payment confirmed")], corroborating_state=after.fingerprint
+        )
+        verdict = critic.judge("confirm", observe(scenario, "selected"), after)
+        assert [c.name for c in verdict.checks] == [
+            "text_appeared",
+            "matches_state",
+            "state_changed",
+            "no_error_state",
+        ]
+
+    def test_the_roles_are_readable_without_judging_anything(self, scenario: Scenario) -> None:
+        done = observe(scenario, "done").fingerprint
+        critic = TieredCritic(corroborating_state=done)
+        assert [c.name for c in critic.corroboration_checks] == ["matches_state"]
+        assert critic.evidence_checks == ()
+        assert [c.name for c in critic.veto_checks] == ["state_changed", "no_error_state"]
+
+    def test_expecting_carries_the_corroboration_through(self, scenario: Scenario) -> None:
+        after = observe(scenario, "done")
+        base = TieredCritic(corroborating_state=after.fingerprint)
+        step = base.expecting(corroboration=[C.text_appeared("nothing like this")])
+
+        assert len(step.corroboration_checks) == 2
+        verdict = step.judge("confirm", observe(scenario, "selected"), after)
+        # One corroboration passes and one fails, so the set does not corroborate; with
+        # no model, that is an honest "I do not know" rather than either verdict.
+        assert verdict.policy == "inconclusive-no-model"
+
+
+# --------------------------------------------------------------------------------------
 # The critic: the escalated path, driven through a cassette
 # --------------------------------------------------------------------------------------
 

@@ -29,6 +29,20 @@ state cannot be learned unless something can change it back: pass `--reset-url`
 (`learn --help`), and see `WorldReset` in `src/skillweaver/orchestrator.py`. The sandbox
 site's `GET /__reset` is one instance of it.
 
+"Where the last run of this task ended" is NOT where this run should end: a task that
+takes an argument ends somewhere the argument decides, so a recalled end screen can
+say yes and must never say no. `TieredCritic` has three check roles for that reason -
+evidence, corroboration, veto - and `_warm_critic` in `src/skillweaver/orchestrator.py`
+holds the rule that picks one. A read-only live task needs no reset and should say so
+(`read_only`, `ResetOutcome` in the same file); a `403` from a real site means the
+endpoint is not a reset hook, not that the world could not be put back.
+
+An attempt's cost is read from the model client's own `total_usage` across it
+(`Agent._charge_model`), never from what the path reports about itself: a call the
+composer spent on a plan that was then discarded, and a critic escalation the planner
+never charged itself for, both vanish otherwise - and a number that flatters us is the
+one kind of bug this project cannot ship.
+
 A live page never fingerprints identically twice, so nothing that compares two screens
 may ask it to: same-page-on-a-second-load bottoms out around 0.84 while a genuinely
 different screen tops out around 0.28. Both cuts that judge it - `SAME_STATE_THRESHOLD`

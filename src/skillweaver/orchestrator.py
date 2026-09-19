@@ -28,11 +28,20 @@ What "zero model calls" needs from this module
 
 The warm path is model-free in its action loop only if the critic that judges it is
 too, and :class:`~skillweaver.agent.critic.TieredCritic` is programmatic only when it
-has evidence to run. The evidence this module supplies is
-:func:`recall_end_state`: the screen the recorded run that TAUGHT the skill ended on,
-read back from the trajectory store. A warm run that lands there is a decisive,
-free yes. When no end state can be recalled the critic escalates to a model and pays
-for one call - that is visible in ``spend``, not swept under the rug.
+has something free to run. What this module supplies is :func:`recall_end_state`: the
+screen the recorded run that TAUGHT the skill ended on, read back from the trajectory
+store. A warm run that lands there is a decisive, free yes. It is handed over as
+*corroboration* and not as evidence, because a mismatch means "this replay was given
+a different argument" at least as often as it means "this replay failed" - see
+:func:`recall_end_state`. When it does not match, or cannot be recalled at all, the
+critic escalates to a model and pays for one call.
+
+And a cost that is not counted is a cost that gets claimed as a saving, so
+:class:`Agent` charges each attempt every model call made while it ran - read from
+the client's own ``total_usage`` across the attempt - rather than only the calls that
+survived into a returned outcome. A composer call spent on a plan that was then
+thrown away at routing used to vanish from the report, and a warm path that is
+cheaper on paper than in the bill is the one bug this project cannot ship.
 
 Budgets
 -------
@@ -47,6 +56,7 @@ always wrong.
 
 from __future__ import annotations
 
+import enum
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -80,6 +90,7 @@ from skillweaver.contracts import (
     Trajectory,
     TrajectoryRecorder,
     TrajectoryStore,
+    Usage,
     utcnow,
 )
 from skillweaver.errors import BudgetExceeded, SkillWeaverError
@@ -107,12 +118,18 @@ from skillweaver.trajectory.record import Recorder
 from skillweaver.trajectory.store import TrajectoryFileStore
 
 __all__ = [
+    "READ_ONLY_PARAM",
+    "RESET_URL_PARAM",
     "Agent",
     "AttemptRecord",
     "ComposedPerceiver",
     "EnvironmentFor",
+    "NavigatingEnvironment",
     "PerceptionCounts",
-    "RESET_URL_PARAM",
+    "Recollection",
+    "ResetOutcome",
+    "ResetRefused",
+    "ResetReport",
     "RunReport",
     "SynthesisFactory",
     "Workbench",
@@ -122,7 +139,9 @@ __all__ = [
     "build_workbench",
     "navigating_environment",
     "perception_counts",
+    "recall",
     "recall_end_state",
+    "reset_world",
     "task_spec",
     "world_reset_from_url",
 ]
@@ -165,6 +184,9 @@ replaced, a fresh profile. skillweaver does not care which - it only needs the c
 
 Raises (by contract): anything, and the caller treats a failure as "not restored"
 rather than as a crash; a gate that cannot reset still has a report to write.
+:class:`ResetRefused` is the one distinguished failure - "this endpoint is not a reset
+hook and never will be" as opposed to "it did not work this time" - and
+:class:`ResetReport` is how the difference reaches a human.
 """
 
 
@@ -189,8 +211,11 @@ class AttemptRecord:
         skills_used: The stored skills this attempt ran, in order.
         steps: Controller actions performed.
         llm_calls: Model calls this attempt was charged for. **Zero is the claim the
-            warm path exists to make.**
-        usd: Model spend charged to this attempt.
+            warm path exists to make**, which is exactly why it is read from the
+            model client across the attempt rather than from the plan the attempt
+            happened to return: a call spent on a plan that was discarded is still a
+            call, and leaving it out flatters every efficiency figure downstream.
+        usd: Model spend charged to this attempt, counted the same way.
         seconds: Wall-clock seconds the attempt was charged.
         perception: What the eyes did during this attempt - observations, captures,
             detections and, above all, OCR reads against cache hits. It sits beside
@@ -381,6 +406,11 @@ class Agent:
             reset to the screen that run STARTED on. ``None`` - or a call that
             returns ``None`` - disables learning for this run, because a skill that
             has not been re-run has not proved anything.
+        llm: The model client the planner, the explorer and the critics were wired
+            with. Never called here: it is read, through ``total_usage``, to charge
+            each attempt every call made while it ran. ``None`` falls back to what
+            each attempt reports about itself, which undercounts a plan that was
+            discarded after the composer had already paid for it.
         budget: Limits for one :meth:`run`.
         top_k: How many candidates to retrieve for the report.
     """
@@ -391,6 +421,7 @@ class Agent:
         "_environment",
         "_explorer",
         "_graph",
+        "_llm",
         "_perceiver",
         "_planner",
         "_retriever",
@@ -413,6 +444,7 @@ class Agent:
         trajectories: TrajectoryStore | None = None,
         synthesis: SynthesisFactory | None = None,
         environment: EnvironmentFor | None = None,
+        llm: LLMClient | None = None,
         budget: Budget | None = None,
         top_k: int = 5,
     ) -> None:
@@ -426,6 +458,7 @@ class Agent:
         self._trajectories = trajectories
         self._synthesis = synthesis
         self._environment = environment
+        self._llm = llm
         self._budget = budget if budget is not None else Budget()
         self._top_k = top_k
 
@@ -474,9 +507,9 @@ class Agent:
         attempts: list[AttemptRecord] = []
 
         if warm:
-            mark = perception_counts(self._perceiver)
+            mark, spent = perception_counts(self._perceiver), self._usage()
             record, outcome = self._try_warm(task)
-            record = self._charge_eyes(record, mark)
+            record = self._charge_model(self._charge_eyes(record, mark), spent)
             attempts.append(record)
             if record.ok and outcome is not None:
                 self._persist()
@@ -511,9 +544,9 @@ class Agent:
                 candidates=candidates,
             )
 
-        mark = perception_counts(self._perceiver)
+        mark, spent = perception_counts(self._perceiver), self._usage()
         record, outcome = self._try_cold(task)
-        record = self._charge_eyes(record, mark)
+        record = self._charge_model(self._charge_eyes(record, mark), spent)
         attempts.append(record)
         learned, admission, note = self._learn(task, outcome, enabled=learn)
         self._persist()
@@ -537,6 +570,38 @@ class Agent:
         for "what this attempt made the eyes do" is the attempt itself.
         """
         return replace(record, perception=perception_counts(self._perceiver) - mark)
+
+    def _charge_model(self, record: AttemptRecord, mark: Usage) -> AttemptRecord:
+        """Charge ``record`` every model call made since ``mark``.
+
+        The attempt's own number is kept when it is the larger one, so a path that
+        counts a call this meter cannot see - a second client, a model reached
+        through something other than ``llm`` - is never talked DOWN by this. The
+        meter's job is the opposite direction: a call that was made and then lost,
+        because the plan it bought was discarded at routing and its outcome thrown
+        away with it, is found again here. Undercounting is the only failure mode
+        that makes this project look better than it is.
+        """
+        spent = self._usage()
+        calls = max(record.llm_calls, spent.calls - mark.calls)
+        usd = max(record.usd, spent.cost_usd - mark.cost_usd)
+        return replace(record, llm_calls=calls, usd=usd)
+
+    def _usage(self) -> Usage:
+        """What the model client has been asked for so far, or an empty tally.
+
+        :class:`~skillweaver.contracts.LLMClient` does promise ``total_usage``, but a
+        stub wired in by a test need not, and a report is not worth an exception.
+        """
+        total = getattr(self._llm, "total_usage", None)
+        if total is None:
+            return Usage()
+        try:
+            result = total()
+        except Exception:  # noqa: BLE001 - a broken meter must not fail a run
+            log.warning("agent.usage.unreadable", llm=type(self._llm).__name__)
+            return Usage()
+        return result if isinstance(result, Usage) else Usage()
 
     # -- the warm path -----------------------------------------------------------------
 
@@ -687,7 +752,21 @@ class Agent:
                 version=admission.skill.version,
             )
             return admission.skill, admission, ""
-        return None, admission, admission.reason
+        return None, admission, self._with_reset_cause(admission.reason)
+
+    def _with_reset_cause(self, reason: str) -> str:
+        """Name what the reset actually did, when the environment kept a record.
+
+        The gate is handed one bool and so can only say "restored" or "not restored".
+        A reader chasing a failed learning step needs the other half: an endpoint that
+        refused the job is a wrong flag, a hook that timed out is a world having a bad
+        day, and nothing configured at all is a mutating task nobody gave a way back.
+        Those have three different fixes and the bool spells them the same way.
+        """
+        report = getattr(self._environment, "last_reset", None)
+        if not isinstance(report, ResetReport) or report.restored:
+            return reason
+        return f"{reason} [{report}]" if reason else str(report)
 
     # -- bookkeeping -------------------------------------------------------------------
 
@@ -725,6 +804,59 @@ class Agent:
 # --------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class Recollection:
+    """Where this task ended last time, and which stored skill remembered it.
+
+    The second half is what decides how much authority the first half gets. A skill
+    that carries a ``verifier_code`` has already answered "did I do my job?" in the
+    sandbox, before the critic is asked anything; its recalled end screen is a
+    shortcut to a free yes and nothing more. A skill with no verifier has answered
+    nothing, and then the recalled screen is the only evidence there is - so it keeps
+    its veto, and a stored skill that runs cleanly while finishing half the errand is
+    still caught for free.
+
+    Attributes:
+        state: The fingerprint of the screen the recorded run ended on.
+        source: The stored skill whose trajectory it was read back from.
+    """
+
+    state: Fingerprint | None = None
+    source: Skill | None = None
+
+    @property
+    def self_checking(self) -> bool:
+        """Whether the remembering skill can check its own work."""
+        return self.source is not None and bool(self.source.verifier_code)
+
+
+def recall(
+    store: SkillStore,
+    trajectories: TrajectoryStore | None,
+    task: TaskSpec,
+    candidates: Sequence[Candidate] = (),
+) -> Recollection:
+    """:func:`recall_end_state`, with the skill it came from kept.
+
+    Read that one first; this exists because the answer is only half useful without
+    knowing who remembered it. See :class:`Recollection`.
+    """
+    if trajectories is None:
+        return Recollection()
+    skills = [c.skill for c in candidates] or store.list(domain=task.domain)
+    for skill in skills:
+        run_id = skill.provenance.trajectory_id
+        if not run_id:
+            continue
+        try:
+            trajectory = _load_light(trajectories, run_id)
+        except SkillWeaverError:
+            continue
+        if trajectory.ok and trajectory.steps:
+            return Recollection(trajectory.steps[-1].after.fingerprint, skill)
+    return Recollection()
+
+
 def recall_end_state(
     store: SkillStore,
     trajectories: TrajectoryStore | None,
@@ -736,12 +868,23 @@ def recall_end_state(
     This is what lets the warm path be judged for free. A stored skill records the
     trajectory it was synthesized from; that trajectory's last screen is where the
     task finished when it demonstrably worked. Handing it to a
-    :class:`~skillweaver.agent.critic.TieredCritic` as ``expected_state`` turns "did
-    the task get done?" into a fingerprint comparison - decisive, and costing nothing.
+    :class:`~skillweaver.agent.critic.TieredCritic` as ``corroborating_state`` turns
+    "did the task get done?" into a fingerprint comparison - and a match is decisive,
+    and costs nothing.
+
+    A MISMATCH is not decisive, and that distinction is the whole of it. This screen
+    is where ONE run of this task ended, with the arguments that run was given. A
+    skill learned from "Search Wikipedia for computer vision" and replayed for
+    "machine learning" correctly ends on a different article; handing this fingerprint
+    over as ``expected_state`` made that correct replay a failure, at similarity
+    0.120, twice, measured on live Wikipedia. So it is offered as corroboration: a
+    shortcut to a free yes with no power to say no.
 
     Without it the critic has no evidence to run and escalates to a model, so a warm
     run would still work but would no longer be model-free. That is a real cost and
-    it is reported in ``spend`` rather than hidden.
+    it is reported in ``spend`` rather than hidden - see :class:`Agent`, which charges
+    an attempt every model call made while it ran, not only the ones a plan survived
+    to report.
 
     Args:
         store: The library, searched when ``candidates`` is empty.
@@ -753,20 +896,7 @@ def recall_end_state(
     Returns:
         The recalled fingerprint, or ``None`` when nothing could be read back.
     """
-    if trajectories is None:
-        return None
-    skills = [c.skill for c in candidates] or store.list(domain=task.domain)
-    for skill in skills:
-        run_id = skill.provenance.trajectory_id
-        if not run_id:
-            continue
-        try:
-            trajectory = _load_light(trajectories, run_id)
-        except SkillWeaverError:
-            continue
-        if trajectory.ok and trajectory.steps:
-            return trajectory.steps[-1].after.fingerprint
-    return None
+    return recall(store, trajectories, task, candidates).state
 
 
 def _load_light(trajectories: TrajectoryStore, run_id: str) -> Trajectory:
@@ -947,6 +1077,21 @@ harness, a test - keeps working unchanged and gains the hook by naming it.
 """
 
 
+READ_ONLY_PARAM = "read_only"
+"""The task parameter declaring that this task changes nothing.
+
+It rides in ``TaskSpec.params`` beside ``start_url`` for the same reason
+:data:`RESET_URL_PARAM` does, and because that makes it reachable from the command
+line that already exists: ``-p read_only=true``.
+
+A task that only reads and navigates needs no way back - re-opening the page IS the
+way back - and saying so is what stops the admission gate reporting a precondition it
+missed for some other reason as a world it could not restore. Live sites are the
+whole case: Wikipedia has no reset endpoint, and pointing ``--reset-url`` at one
+answers ``403``.
+"""
+
+
 def task_spec(
     text: str,
     *,
@@ -954,6 +1099,7 @@ def task_spec(
     target: Literal["browser", "desktop"] = "browser",
     url: str | None = None,
     reset_url: str | None = None,
+    read_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> TaskSpec:
     """Build a :class:`~skillweaver.contracts.TaskSpec` the way the command line does.
@@ -965,13 +1111,17 @@ def task_spec(
 
     ``reset_url`` is how this world is put back before the admission gate re-runs a
     candidate; see :data:`WorldReset` for why a task that changes anything cannot be
-    learned without one.
+    learned without one. ``read_only`` is the other answer to the same question - this
+    task changes nothing, so there is nothing to put back - and see
+    :data:`READ_ONLY_PARAM` for when that is the true one.
     """
     merged: dict[str, Any] = dict(params or {})
     if url:
         merged.setdefault("start_url", url)
     if reset_url:
         merged.setdefault(RESET_URL_PARAM, reset_url)
+    if read_only:
+        merged.setdefault(READ_ONLY_PARAM, True)
     resolved = domain or (_host(url) if target == "browser" else None) or target
     return TaskSpec(text=text, domain=resolved, target=target, params=merged)
 
@@ -984,6 +1134,81 @@ def _host(url: str | None) -> str | None:
 
     parsed = urlparse(url if "//" in url else f"//{url}")
     return parsed.hostname or None
+
+
+class ResetRefused(OSError):
+    """The endpoint answered, and its answer was "I am not a reset hook".
+
+    An ``OSError`` so that every existing caller of a :data:`WorldReset` - the
+    evaluation harness translates one into its own error, the admission gate treats
+    one as "not restored" - keeps working unchanged, and a subclass so that the one
+    caller who wants to tell the two apart can.
+
+    The distinction is not academic. Live Wikipedia answers ``403`` to the URL a
+    ``--reset-url`` pointed at it, and reporting that as "the world was not restored"
+    sent a day of debugging after a mutating task that did not exist. ``403`` means
+    the flag was wrong; a timeout means the endpoint was down.
+    """
+
+
+_REFUSALS = frozenset({401, 403, 404, 405, 410, 451, 501})
+"""HTTP statuses that mean this URL will never act as a reset hook.
+
+Authentication, absence and method refusals are all permanent for a GET that asks an
+application to restore itself: retrying cannot change any of them, and neither can
+running the task again. Everything else - a timeout, a connection refused, a ``5xx`` -
+is the endpoint having a bad day and is reported as a plain failure.
+"""
+
+
+class ResetOutcome(enum.StrEnum):
+    """What became of the attempt to put the world back.
+
+    ``restored`` and ``unnecessary`` both mean the world is fit to judge a candidate
+    in; the other three mean it is not, and they differ in whose problem that is.
+    """
+
+    restored = "restored"
+    """Something actually put the world back."""
+
+    unnecessary = "unnecessary"
+    """Nothing needed putting back: the task only reads and navigates."""
+
+    absent = "absent"
+    """No way back was configured, and the task did not say it needs none."""
+
+    refused = "refused"
+    """The endpoint answered and refused the job - it is not a reset hook."""
+
+    failed = "failed"
+    """A real way back was tried and did not work this time."""
+
+
+@dataclass(frozen=True, slots=True)
+class ResetReport:
+    """The outcome of one reset attempt, and the sentence a human should read.
+
+    :attr:`restored` is what :class:`~skillweaver.skills.synthesize.ReplayEnvironment`
+    takes, a bool because that is what it takes; :attr:`outcome` is what a report
+    should quote, because "this endpoint refuses to be a reset hook" and "this task
+    changed something nothing can undo" are opposite problems that the bool spells
+    the same way.
+    """
+
+    outcome: ResetOutcome
+    detail: str = ""
+
+    @property
+    def restored(self) -> bool:
+        """Whether the world is standing where the recording started."""
+        return self.outcome in (ResetOutcome.restored, ResetOutcome.unnecessary)
+
+    def __str__(self) -> str:
+        return (
+            f"reset {self.outcome.value}: {self.detail}"
+            if self.detail
+            else (f"reset {self.outcome.value}")
+        )
 
 
 def world_reset_from_url(url: str, *, timeout: float = 10.0) -> WorldReset:
@@ -1001,27 +1226,93 @@ def world_reset_from_url(url: str, *, timeout: float = 10.0) -> WorldReset:
     Returns:
         The callable. It raises ``OSError`` (``URLError`` and ``HTTPError`` are both
         that) when the endpoint cannot be reached, which the caller reads as "the
-        world was not restored".
+        world was not restored" - except for the statuses in :data:`_REFUSALS`, which
+        raise :class:`ResetRefused` and mean "there is no reset here to fail".
     """
 
     def reset() -> None:
+        import urllib.error
         import urllib.request
 
-        with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
-            response.read()
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
+                response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in _REFUSALS:
+                raise ResetRefused(
+                    f"{url} answered HTTP {exc.code}: it is not a reset endpoint, so "
+                    "there is nothing here that could have put the world back. Point "
+                    "--reset-url at an endpoint that restores this site, or leave it "
+                    "off for a task that changes nothing."
+                ) from exc
+            raise
         log.info("agent.world_reset", url=url)
 
     return reset
 
 
-def navigating_environment(
-    controller: Controller,
-    perceiver: Perceiver,
-    *,
-    graph: SiteGraph | None = None,
-    restore: WorldReset | None = None,
-) -> EnvironmentFor:
+def reset_world(restore: WorldReset | None, *, read_only: bool = False) -> ResetReport:
+    """Call ``restore`` if there is one, and say honestly what happened.
+
+    Never raises: the run whose learning this precedes has already succeeded, and
+    losing it to a traceback out of a reset hook would throw away the expensive half
+    of the work.
+
+    ``read_only`` is the task saying it changed nothing, which makes the answer
+    ``unnecessary`` whatever the hook did - re-opening a page you only read IS the
+    way back, and reporting that as a failed reset is how a read-only navigation task
+    gets blamed for a mutation it never made.
+    """
+    detail = ""
+    if restore is not None:
+        try:
+            restore()
+        except ResetRefused as exc:
+            log.warning("agent.world_reset.refused", error=str(exc))
+            if not read_only:
+                return ResetReport(ResetOutcome.refused, str(exc))
+            detail = f"the reset endpoint refused the job ({exc}), and nothing needed it"
+        except (OSError, SkillWeaverError) as exc:
+            log.warning("agent.world_reset.failed", error=f"{type(exc).__name__}: {exc}")
+            if not read_only:
+                return ResetReport(
+                    ResetOutcome.failed,
+                    f"the reset hook did not work this time: {type(exc).__name__}: {exc}",
+                )
+            detail = (
+                f"the reset hook did not work ({type(exc).__name__}: {exc}), and nothing needed it"
+            )
+        else:
+            if not read_only:
+                return ResetReport(ResetOutcome.restored, "the world was put back")
+            detail = "the world was put back, though this task changed nothing"
+    if read_only:
+        return ResetReport(
+            ResetOutcome.unnecessary,
+            detail
+            or (
+                "this task only reads and navigates, so re-opening the screen it "
+                "started on is a complete way back"
+            ),
+        )
+    return ResetReport(
+        ResetOutcome.absent,
+        "no way to put this world back was configured, so a task that changed "
+        "anything cannot be proved here",
+    )
+
+
+class NavigatingEnvironment:
     """Put the world back, then open the screen the recorded run started on.
+
+    An :data:`EnvironmentFor` - it is called with a trajectory and hands back a
+    factory, exactly as the plain function it replaced did - that additionally
+    remembers what the last reset attempt came to, in :attr:`last_reset`. The gate
+    only gets a bool, and a bool cannot tell "this endpoint is not a reset hook"
+    from "this task changed something nothing can undo"; those are opposite problems
+    with opposite fixes, and a run that reports the wrong one sends whoever reads it
+    after the wrong cause. That happened, on live Wikipedia, and it is the reason
+    this is a class.
 
     Two separate jobs, and only the second one is navigation. ``restore`` undoes what
     the run CHANGED; navigating then returns to where it started. A browser can
@@ -1039,38 +1330,80 @@ def navigating_environment(
     with ``restored=False`` and the gate says the world could not be put back, which
     is a truer answer than a traceback out of a learning step.
 
-    The returned callable declines - ``None`` - for a controller that cannot navigate
-    (every desktop one) or a run whose first screen had no URL. Nothing is then
-    admitted, and the report says so.
+    The call declines - ``None`` - for a controller that cannot navigate (every
+    desktop one) or a run whose first screen had no URL. Nothing is then admitted,
+    and the report says so.
 
     Args:
         controller / perceiver: The world the candidate is re-run in.
         graph: The site graph the candidate may read.
         restore: How to put this world back. ``None`` means nothing can, and a
             mutating task will be reported as unproved rather than as rejected.
+        read_only: The task saying it changes nothing, so re-opening the screen it
+            started on IS the way back. The gate then judges the candidate instead of
+            reporting a reset that was never needed - which is what a search-and-read
+            task on a live site needs, since no such site has a reset endpoint and
+            pointing ``--reset-url`` at one only earns a ``403``.
     """
 
-    def environment_for(trajectory: Trajectory) -> EnvironmentFactory | None:
-        if not trajectory.steps or not controller.supports("navigate"):
+    __slots__ = ("_controller", "_graph", "_last_reset", "_perceiver", "_read_only", "_restore")
+
+    def __init__(
+        self,
+        controller: Controller,
+        perceiver: Perceiver,
+        *,
+        graph: SiteGraph | None = None,
+        restore: WorldReset | None = None,
+        read_only: bool = False,
+    ) -> None:
+        self._controller = controller
+        self._perceiver = perceiver
+        self._graph = graph
+        self._restore = restore
+        self._read_only = read_only
+        self._last_reset: ResetReport | None = None
+
+    def __repr__(self) -> str:
+        how = "read-only" if self._read_only else ("reset" if self._restore else "navigate only")
+        return f"NavigatingEnvironment({how}, last={self._last_reset})"
+
+    @property
+    def last_reset(self) -> ResetReport | None:
+        """What the most recent attempt to put the world back came to, or ``None``
+        when no candidate has been stood up yet."""
+        return self._last_reset
+
+    def __call__(self, trajectory: Trajectory) -> EnvironmentFactory | None:
+        if not trajectory.steps or not self._controller.supports("navigate"):
             return None
         url = trajectory.steps[0].before.url
         if not url:
             return None
 
         def factory() -> ReplayEnvironment:
-            restored = False
-            if restore is not None:
-                try:
-                    restore()
-                    restored = True
-                except (OSError, SkillWeaverError) as exc:
-                    log.warning("agent.world_reset.failed", error=f"{type(exc).__name__}: {exc}")
-            controller.perform(Navigate(url))
-            return ReplayEnvironment(controller, perceiver, graph, restored=restored)
+            report = reset_world(self._restore, read_only=self._read_only)
+            self._last_reset = report
+            self._controller.perform(Navigate(url))
+            return ReplayEnvironment(
+                self._controller, self._perceiver, self._graph, restored=report.restored
+            )
 
         return factory
 
-    return environment_for
+
+def navigating_environment(
+    controller: Controller,
+    perceiver: Perceiver,
+    *,
+    graph: SiteGraph | None = None,
+    restore: WorldReset | None = None,
+    read_only: bool = False,
+) -> NavigatingEnvironment:
+    """Build a :class:`NavigatingEnvironment`. See it for what the arguments mean."""
+    return NavigatingEnvironment(
+        controller, perceiver, graph=graph, restore=restore, read_only=read_only
+    )
 
 
 def build_agent(
@@ -1097,15 +1430,19 @@ def build_agent(
     the leaves exercises the same wiring the command line runs. The two critics
     differ on purpose:
 
-    * The **warm** critic gets :func:`recall_end_state` as evidence, so a warm run
-      that lands where the recorded run landed is judged programmatically and the
-      action loop stays model-free.
+    * The **warm** critic gets :func:`recall` - the recorded end screen AND the skill
+      that remembered it - and :func:`_warm_critic` decides from the second how much
+      the first is allowed to say. Either way a warm run that lands where the recorded
+      run landed is judged programmatically and the action loop stays model-free.
     * The **cold** critic is a plain :class:`~skillweaver.agent.critic.TieredCritic`
       over ``llm``: exploration has no recorded end state to compare against, and
       paying for a verdict is the cheapest part of a run that is already paying for
       every move.
-    * The **admission** critic, built per trajectory, demands that the replayed
-      candidate reach the same screen the recording reached. Also free.
+    * The **admission** critic, built per trajectory, demands as decisive evidence
+      that the replayed candidate reach the same screen the recording reached. That
+      is right HERE and wrong on the warm path, and the difference is the arguments:
+      the gate re-runs the recorded run with the recorded values, so one end screen
+      is the only correct answer. Also free.
 
     Args:
         task: What the agent will be asked to do; used to recall the end state.
@@ -1135,16 +1472,24 @@ def build_agent(
     runner = SkillRunner(store)
 
     candidates = _safe_search(retriever, task, top_k)
-    expected = recall_end_state(store, trajectories, task, candidates)
-    if expected is None:
+    recalled = recall(store, trajectories, task, candidates)
+    if recalled.state is None:
         log.info("agent.warm.no_end_state", task=task.text, domain=task.domain)
+    else:
+        log.info(
+            "agent.warm.end_state",
+            task=task.text,
+            domain=task.domain,
+            skill=recalled.source.name if recalled.source else "",
+            role="corroboration" if recalled.self_checking else "evidence",
+        )
 
     planner = Planner(
         store=store,
         retriever=retriever,
         graph=graph,
         runner=runner,
-        critic=TieredCritic(llm, expected_state=expected),
+        critic=_warm_critic(llm, recalled),
         controller=controller,
         perceiver=perceiver,
         composer=Composer(llm, store, graph=graph) if compose else None,
@@ -1184,9 +1529,39 @@ def build_agent(
         trajectories=trajectories,
         synthesis=synthesis,
         environment=environment,
+        llm=llm,
         budget=budget,
         top_k=top_k,
     )
+
+
+def _warm_critic(llm: LLMClient, recalled: Recollection) -> TieredCritic:
+    """The critic that judges a warm replay, and how much the recalled screen may say.
+
+    One decision, and it is the difference between a library that improves and one
+    that eats itself.
+
+    * A skill that **carries a verifier** has already proved it did its own job before
+      the critic is consulted: the sandbox ran that verifier and a failure there would
+      have failed the run. The recalled screen is then :data:`corroboration` - a free
+      yes when it matches, and silent when it does not. It has to be, because it is
+      the screen ONE run ended on with ONE set of arguments: a skill learned from
+      "Search Wikipedia for computer vision" and replayed for "machine learning"
+      correctly ends somewhere else, and holding it to the recorded screen rejected
+      that correct replay at similarity 0.120, twice, on live Wikipedia.
+    * A skill with **no verifier** has proved nothing, and the recalled screen is the
+      only free evidence there is, so it keeps its veto. That is what catches the
+      stored skill which runs without error and finishes half the errand.
+
+    What can still fail a warm run either way: any veto -
+    :func:`~skillweaver.agent.checks.state_changed` on a replay that did nothing and
+    :func:`~skillweaver.agent.checks.no_error_state` on one that ended on an error
+    page - and, when the corroboration misses, the model that is then asked and paid
+    for. A skill's own say-so is never enough on its own.
+    """
+    if recalled.self_checking:
+        return TieredCritic(llm, corroborating_state=recalled.state)
+    return TieredCritic(llm, expected_state=recalled.state)
 
 
 def _safe_search(retriever: SkillRetriever, task: TaskSpec, top_k: int) -> tuple[Candidate, ...]:
@@ -1263,7 +1638,11 @@ def build_workbench(config: Settings | None = None) -> Workbench:
                 trajectories=trajectories,
                 recorder=Recorder(resolved.trajectories_dir),
                 environment=navigating_environment(
-                    controller, perceiver, graph=graph, restore=_reset_for(task)
+                    controller,
+                    perceiver,
+                    graph=graph,
+                    restore=_reset_for(task),
+                    read_only=_is_read_only(task),
                 ),
                 budget=budget,
             )
@@ -1288,6 +1667,15 @@ def _reset_for(task: TaskSpec) -> WorldReset | None:
     """
     url = task.params.get(RESET_URL_PARAM)
     return world_reset_from_url(str(url)) if url else None
+
+
+def _is_read_only(task: TaskSpec) -> bool:
+    """Whether the task declared that it changes nothing. See :data:`READ_ONLY_PARAM`.
+
+    Anything truthy counts, and ``-p read_only=false`` parses to the JSON ``False``
+    the command line intends, so the flag reads the way it is written.
+    """
+    return bool(task.params.get(READ_ONLY_PARAM, False))
 
 
 def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver]:
