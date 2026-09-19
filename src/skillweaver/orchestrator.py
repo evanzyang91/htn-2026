@@ -106,6 +106,14 @@ from skillweaver.perception.ocr import (
     PerceptionCounts,
 )
 from skillweaver.render_mode import crossing, mode_name, mode_of
+from skillweaver.reset_actions import (
+    RESET_ACTIONS_PARAM,
+    ResetStep,
+    chain_resets,
+    reset_step_to_dict,
+    reset_steps_from,
+    world_reset_from_actions,
+)
 from skillweaver.skills.retrieve import SkillRetriever, accounted_for
 from skillweaver.skills.sandbox import SkillRunner
 from skillweaver.skills.store import FileSkillStore
@@ -120,6 +128,7 @@ from skillweaver.trajectory.store import TrajectoryFileStore
 
 __all__ = [
     "READ_ONLY_PARAM",
+    "RESET_ACTIONS_PARAM",
     "RESET_URL_PARAM",
     "Agent",
     "AttemptRecord",
@@ -132,6 +141,7 @@ __all__ = [
     "ResetOutcome",
     "ResetRefused",
     "ResetReport",
+    "ResetStep",
     "RunReport",
     "SynthesisFactory",
     "Workbench",
@@ -143,9 +153,11 @@ __all__ = [
     "perception_counts",
     "recall",
     "recall_end_state",
+    "reset_steps_from",
     "reset_world",
     "resolve_domain",
     "task_spec",
+    "world_reset_from_actions",
     "world_reset_from_url",
 ]
 
@@ -1198,6 +1210,12 @@ RESET_URL_PARAM = "reset_url"
 It rides in ``TaskSpec.params`` beside ``start_url`` rather than in a new argument
 to the session factory, so a caller that already builds a workbench - the evaluation
 harness, a test - keeps working unchanged and gains the hook by naming it.
+
+One GET is the whole undo, which is the shape a demo app with a seed-restoring
+endpoint has and almost nothing else does. The other shape - an undo PERFORMED on the
+screen, "go to the cart and remove every line until it is empty" - is
+:data:`~skillweaver.reset_actions.RESET_ACTIONS_PARAM`. They coexist and compose: a
+task naming both gets the endpoint first and the steps afterwards.
 """
 
 
@@ -1223,6 +1241,7 @@ def task_spec(
     target: Literal["browser", "desktop"] = "browser",
     url: str | None = None,
     reset_url: str | None = None,
+    reset_steps: Any = None,
     read_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> TaskSpec:
@@ -1235,15 +1254,29 @@ def task_spec(
 
     ``reset_url`` is how this world is put back before the admission gate re-runs a
     candidate; see :data:`WorldReset` for why a task that changes anything cannot be
-    learned without one. ``read_only`` is the other answer to the same question - this
-    task changes nothing, so there is nothing to put back - and see
+    learned without one. ``reset_steps`` is the same job done with hands instead of an
+    endpoint, for the sites that have no such endpoint and never will - anything
+    :func:`~skillweaver.reset_actions.reset_steps_from` accepts, normalized here so a
+    malformed list is rejected while it is still a command-line argument rather than
+    halfway through a paid run. ``read_only`` is the other answer to the same question
+    - this task changes nothing, so there is nothing to put back - and see
     :data:`READ_ONLY_PARAM` for when that is the true one.
+
+    Raises:
+        ValueError: if ``reset_steps`` does not parse.
     """
     merged: dict[str, Any] = dict(params or {})
     if url:
         merged.setdefault("start_url", url)
     if reset_url:
         merged.setdefault(RESET_URL_PARAM, reset_url)
+    given = reset_steps if reset_steps is not None else merged.get(RESET_ACTIONS_PARAM)
+    if given is not None:
+        parsed = reset_steps_from(given)
+        if parsed:
+            merged[RESET_ACTIONS_PARAM] = [reset_step_to_dict(step) for step in parsed]
+        else:
+            merged.pop(RESET_ACTIONS_PARAM, None)
     if read_only:
         merged.setdefault(READ_ONLY_PARAM, True)
     resolved = domain or (_host(url) if target == "browser" else None) or target
@@ -2002,7 +2035,7 @@ def build_workbench(config: Settings | None = None) -> Workbench:
                     controller,
                     perceiver,
                     graph=graph,
-                    restore=_reset_for(task),
+                    restore=_reset_for(task, controller, perceiver),
                     read_only=_is_read_only(task),
                 ),
                 budget=budget,
@@ -2020,14 +2053,52 @@ def build_workbench(config: Settings | None = None) -> Workbench:
     )
 
 
-def _reset_for(task: TaskSpec) -> WorldReset | None:
+def _reset_for(task: TaskSpec, controller: Controller, perceiver: Perceiver) -> WorldReset | None:
     """How to put this task's world back, if the task said.
+
+    Two kinds, and a task may name both: an endpoint that restores the application
+    (:data:`RESET_URL_PARAM`) and a sequence of actions performed on the screen
+    (:data:`~skillweaver.reset_actions.RESET_ACTIONS_PARAM`). Both because they answer
+    different worlds - the sandbox has a real ``/__reset`` and should keep using it,
+    while a live cart has nothing of the kind and can only be emptied by emptying it -
+    and in that order because the coarse restore should land before the fine tidying
+    reads the screen it left.
 
     ``None`` is a real answer and not a failure: the gate then reports that a
     mutating task could not be proved, which is what is true.
     """
     url = task.params.get(RESET_URL_PARAM)
-    return world_reset_from_url(str(url)) if url else None
+    steps = reset_steps_from(task.params.get(RESET_ACTIONS_PARAM) or ())
+    return chain_resets(
+        world_reset_from_url(str(url)) if url else None,
+        world_reset_from_actions(
+            steps, controller=controller, perceiver=perceiver, truth=_dom_of(controller)
+        )
+        if steps
+        else None,
+    )
+
+
+def _dom_of(controller: Controller) -> Any:
+    """A DOM reader for a reset step that asks for one, or ``None``.
+
+    :class:`~skillweaver.controllers.browser.BrowserGroundTruth` is documented as an
+    offline teacher the AGENT must never see, and this respects that: it is handed to
+    a world reset, which is scaffolding rather than the agent - the peer of the HTTP
+    GET behind ``--reset-url`` - and it reaches nothing else from here. It is built at
+    this one call site precisely so the dependency is visible, which is what that
+    Protocol asks of code that legitimately needs it.
+
+    It exists because a real site names its controls where no camera can read them:
+    DoorDash's quick-add and its header cart are icon-only buttons whose only name is
+    an ``aria-label``, and a search of that page's visible text finds nothing at all.
+    A reset that must work EVERY time cannot be aimed by guessing at an unlabelled
+    glyph. ``None`` for a desktop controller, which has no DOM; a step that asked for
+    one then fails saying so.
+    """
+    from skillweaver.controllers.browser import BrowserController, BrowserGroundTruth
+
+    return BrowserGroundTruth(controller) if isinstance(controller, BrowserController) else None
 
 
 def _is_read_only(task: TaskSpec) -> bool:

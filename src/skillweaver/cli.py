@@ -213,6 +213,24 @@ ResetUrlOpt = Annotated[
         show_default=False,
     ),
 ]
+ResetStepsOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--reset-steps",
+        help="An undo PERFORMED on the screen, for a site that has no reset endpoint "
+        "and never will: a JSON array of steps, or a path to a .json file holding "
+        "one. Each step is an ordinary action - the same vocabulary a skill uses - "
+        "plus 'find' to aim it at whatever the page SAYS rather than at a pixel, and "
+        "'until_gone' to repeat it until that text is off the screen. That loop is "
+        "what makes an undo safe to run between the gate's re-runs: on an already "
+        "clean world it performs nothing, and a loop that cannot converge reports a "
+        "FAILED reset rather than handing the gate a dirty screen. Combines with "
+        "--reset-url; the endpoint runs first. Example: empty a cart with "
+        '\'[{"kind": "click", "find": "cart"}, {"kind": "click", '
+        '"find": "$ each", "dx": 660, "until_gone": "each"}]\'.',
+        show_default=False,
+    ),
+]
 DomainOpt = Annotated[
     str | None,
     typer.Option(
@@ -276,6 +294,7 @@ def learn_command(
     url: UrlOpt = None,
     domain: DomainOpt = None,
     reset_url: ResetUrlOpt = None,
+    reset_steps: ResetStepsOpt = None,
     param: ParamOpt = None,
     warm_first: Annotated[
         bool,
@@ -302,14 +321,21 @@ def learn_command(
     lucky run.
 
     Re-running it needs the starting screen back. If the task CHANGES anything - and
-    most worth learning do - pass `--reset-url`, or the gate will report that it
-    could not prove the skill and store nothing.
+    most worth learning do - say how to undo it, or the gate will report that it
+    could not prove the skill and store nothing. `--reset-url` is one GET that
+    restores the application, which a demo app has; `--reset-steps` is the undo
+    PERFORMED on the screen, which is the only kind a real site offers - "open the
+    cart, and remove lines until none are left". A task that only reads and
+    navigates needs neither and should say so with `-p read_only=true`.
 
     Afterwards, `skillweaver run` on the same task takes the warm path instead.
 
         skillweaver learn "Confirm payment of the Acme Corp invoice" \\
             --url https://acme.test/invoices --reset-url https://acme.test/__reset \\
             -p company="Acme Corp"
+
+        skillweaver learn "Order a Pad Thai from Copper Kettle" \\
+            --url https://food.test/ --reset-steps undo/empty-cart.json
     """
     _do(
         ctx,
@@ -318,6 +344,7 @@ def learn_command(
         url=url,
         domain=domain,
         reset_url=reset_url,
+        reset_steps=reset_steps,
         param=param,
         warm=warm_first,
         cold=True,
@@ -336,6 +363,7 @@ def run_command(
     url: UrlOpt = None,
     domain: DomainOpt = None,
     reset_url: ResetUrlOpt = None,
+    reset_steps: ResetStepsOpt = None,
     param: ParamOpt = None,
     library_only: Annotated[
         bool,
@@ -384,6 +412,7 @@ def run_command(
         url=url,
         domain=domain,
         reset_url=reset_url,
+        reset_steps=reset_steps,
         param=param,
         warm=True,
         cold=not library_only,
@@ -402,6 +431,7 @@ def _do(
     url: str | None,
     domain: str | None,
     reset_url: str | None,
+    reset_steps: str | None,
     param: Sequence[str] | None,
     warm: bool,
     cold: bool,
@@ -433,14 +463,21 @@ def _do(
         retriever=bench.retriever if warm else None,
         graph=bench.graph if warm else None,
     )
-    spec = task_spec(
-        text,
-        domain=where.domain,
-        target=target,  # type: ignore[arg-type]
-        url=where.start_url,
-        reset_url=reset_url,
-        params=params,
-    )
+    try:
+        spec = task_spec(
+            text,
+            domain=where.domain,
+            target=target,  # type: ignore[arg-type]
+            url=where.start_url,
+            reset_url=reset_url,
+            reset_steps=_reset_steps(reset_steps),
+            params=params,
+        )
+    except ValueError as exc:
+        # Before a browser opens and before a model is paid: a malformed undo is a
+        # typo in an argument, and finding out at the admission gate would cost the
+        # whole run to learn it.
+        _die(f"--reset-steps: {exc}")
     try:
         with bench.session(spec, budget) as agent:
             report = agent.run(spec, learn=learn, warm=warm, cold=cold)
@@ -451,7 +488,7 @@ def _do(
     _emit(_report_json(report, where) if as_json else report.explain(), as_json)
     if not as_json:
         _hint_at_cross_mode(report)
-        _hint_at_reset(report, reset_url)
+        _hint_at_reset(report, reset_url or reset_steps)
     raise typer.Exit(OK if report.ok else NO)
 
 
@@ -502,7 +539,7 @@ def _hint_at_cross_mode(report: RunReport) -> None:
     typer.echo(f"\nhint: {warm.cross_mode}", err=True)
 
 
-def _hint_at_reset(report: RunReport, reset_url: str | None) -> None:
+def _hint_at_reset(report: RunReport, undo: str | None) -> None:
     """Say what to do when the task was done but could not be learned.
 
     A run that solved the task and stored nothing looks like a failure of the model.
@@ -512,14 +549,41 @@ def _hint_at_reset(report: RunReport, reset_url: str | None) -> None:
     the moment to say so.
     """
     admission = report.admission
-    if admission is None or not admission.unproved or reset_url:
+    if admission is None or not admission.unproved or undo:
         return
     typer.echo(
         "\nhint: this task changes something, so the admission gate could not put the "
         "site back to re-run the skill it wrote. Pass --reset-url with an endpoint "
-        "that restores this site (the sandbox site has /__reset) and learn it again.",
+        "that restores this site (the sandbox site has /__reset); on a site that has "
+        "no such endpoint, pass --reset-steps with the actions that undo it - "
+        "'until_gone' makes those steps safe to run between the gate's re-runs. Then "
+        "learn it again.",
         err=True,
     )
+
+
+def _reset_steps(given: str | None) -> Any:
+    """``--reset-steps`` as something :func:`task_spec` can parse: JSON, or a file.
+
+    A step list long enough to be interesting is long enough to be unpleasant to
+    quote on one command line, and it is the kind of thing that belongs beside a
+    task rather than retyped per invocation - so a value naming a readable file is
+    read from it. Anything else is passed through as written and parsed there, which
+    keeps ONE place deciding what a reset step is.
+    """
+    if given is None:
+        return None
+    text = given.strip()
+    if text.startswith(("[", "{")):
+        return text
+    path = Path(text).expanduser()
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _die(
+            f"--reset-steps is a JSON array or a path to a file holding one, and "
+            f"{text!r} is neither: {exc}"
+        )
 
 
 def _params(pairs: Sequence[str] | None) -> dict[str, Any]:

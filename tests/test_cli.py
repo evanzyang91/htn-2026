@@ -36,7 +36,7 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from skillweaver import cli, config
-from skillweaver.cli import app, main
+from skillweaver.cli import CANNOT, _reset_steps, app, main
 from skillweaver.config import DEFAULT_SKILL_MAX_SECONDS, Settings, load_settings
 from skillweaver.contracts import (
     Box,
@@ -51,6 +51,7 @@ from skillweaver.contracts import (
 from skillweaver.errors import SkillWeaverError
 from skillweaver.graph.model import InMemorySiteGraph
 from skillweaver.orchestrator import (
+    RESET_ACTIONS_PARAM,
     RESET_URL_PARAM,
     Agent,
     AttemptRecord,
@@ -847,6 +848,88 @@ def test_learn_offers_reset_url_and_says_what_it_is_for() -> None:
     """A flag nobody knows about fixes nothing."""
     help_text = runner.invoke(app, ["learn", "--help"]).output
     assert "--reset-url" in help_text
+
+
+# --------------------------------------------------------------------------------------
+# --reset-steps: an undo performed in the world rather than fetched from it
+# --------------------------------------------------------------------------------------
+#
+# A real site has no endpoint that empties a cart, so the only expressible undo used
+# to be one a demo app has. These are about the command-line end: that a step list
+# survives into the spec the session reads, that a malformed one is refused before a
+# browser opens, and that the two kinds of undo coexist rather than replace each other.
+
+EMPTY_CART = (
+    '[{"kind": "click", "find": "Cart", "anchor_kind": "button"},'
+    ' {"kind": "click", "find": "Remove ", "via": "dom",'
+    '  "until_seen": "Your cart is empty"}]'
+)
+
+
+def test_both_commands_offer_the_action_reset_and_say_what_it_is_for() -> None:
+    for command in ("learn", "run"):
+        help_text = runner.invoke(app, [command, "--help"]).output
+        assert "--reset-steps" in help_text, command
+
+
+def test_a_step_list_reaches_the_gate_through_the_task() -> None:
+    """The whole path between a person typing it and the gate having a way back."""
+    spec = task_spec("Order a Pad Thai", url=INBOX_URL, reset_steps=EMPTY_CART)
+    steps = spec.params[RESET_ACTIONS_PARAM]
+    assert [step["find"] for step in steps] == ["Cart", "Remove "]
+    assert steps[1]["until_seen"] == "Your cart is empty"
+
+    assert RESET_ACTIONS_PARAM not in task_spec("no undo here", url=INBOX_URL).params
+
+
+def test_a_step_list_is_normalized_onto_the_task_rather_than_left_as_typed() -> None:
+    """What rides on ``params`` is JSON, not dataclasses.
+
+    ``TaskSpec.params`` is rendered into the composer's and the explorer's prompts as
+    text, and a page of reprs there is tokens paid for nothing. It also has to survive
+    ``json.dumps``, which a ``ResetStep`` would not.
+    """
+    spec = task_spec("Order a Pad Thai", url=INBOX_URL, reset_steps=EMPTY_CART)
+    assert json.dumps(spec.params[RESET_ACTIONS_PARAM])
+
+
+def test_both_undo_kinds_can_be_named_at_once() -> None:
+    """They answer different worlds and compose; neither replaces the other."""
+    spec = task_spec(
+        "Order a Pad Thai",
+        url=INBOX_URL,
+        reset_url="https://shop.test/__reset",
+        reset_steps=EMPTY_CART,
+    )
+    assert spec.params[RESET_URL_PARAM] == "https://shop.test/__reset"
+    assert len(spec.params[RESET_ACTIONS_PARAM]) == 2
+
+
+def test_a_malformed_step_list_is_refused_before_anything_is_opened(world: World) -> None:
+    """A typo in an argument must not cost a browser launch and a paid exploration.
+
+    The gate is where a bad undo would otherwise surface - after the model has been
+    paid for the whole cold run - which is the most expensive possible place to learn
+    that a JSON array was mistyped.
+    """
+    result = world.invoke("learn", TASK, "--domain", DOMAIN, "--reset-steps", "[{'kind': 'fly'}]")
+    assert result.exit_code == CANNOT
+    assert "--reset-steps" in result.output
+
+
+def test_a_step_list_may_be_kept_in_a_file_beside_the_task(tmp_path: Path) -> None:
+    """Long enough to be interesting is long enough to be unpleasant to quote."""
+    written = tmp_path / "empty-cart.json"
+    written.write_text(EMPTY_CART, encoding="utf-8")
+    assert _reset_steps(str(written)) == EMPTY_CART
+    assert _reset_steps(EMPTY_CART) == EMPTY_CART
+    assert _reset_steps(None) is None
+
+
+def test_the_hint_about_an_unproved_skill_names_both_undo_kinds() -> None:
+    """The run that just paid for a cold exploration is the moment to say so."""
+    help_text = runner.invoke(app, ["learn", "--help"]).output
+    assert "--reset-steps" in help_text and "--reset-url" in help_text
 
 
 # --------------------------------------------------------------------------------------

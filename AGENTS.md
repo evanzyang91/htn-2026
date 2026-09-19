@@ -25,9 +25,28 @@ ten minutes, which a large `max_tokens` alone is enough to trigger. Both are wri
 where they bite, at `_MAX_REPLY_TOKENS` in `src/skillweaver/skills/synthesize.py`.
 
 Anything the agent learns must be RE-RUN before it is stored, so a task that changes
-state cannot be learned unless something can change it back: pass `--reset-url`
-(`learn --help`), and see `WorldReset` in `src/skillweaver/orchestrator.py`. The sandbox
-site's `GET /__reset` is one instance of it.
+state cannot be learned unless something can change it back. `WorldReset` in
+`src/skillweaver/orchestrator.py` is that undo and takes two written forms:
+`--reset-url`, one GET that restores the application, which the sandbox site's
+`GET /__reset` is the instance of; and `--reset-steps`, an undo PERFORMED on the
+screen, which is the only kind a real site offers - nothing on DoorDash empties a
+cart but emptying it. `src/skillweaver/reset_actions.py` holds that second form and
+the three properties it has to keep, all bought in failed runs: the gate resets
+BETWEEN its three re-runs, so an undo that works four times in five does not make a
+flaky demo, it makes the gate REJECT the skill. Read its docstring before adding a
+knob to it - in particular, a negative exit condition passes on every screen that
+lacks the marker INCLUDING the wrong one, and `ElementIndex.best` is a ranking with a
+winner even when nothing fits, which is the same distinction `MIN_ACCOUNTED_FOR` draws
+for the planner.
+
+A reset may read the DOM (`via="dom"`), and that is not the agent breaking the
+pixels-only premise: a real site names its controls where no camera can read them -
+DoorDash's quick-add and header cart are icon-only buttons whose only name is an
+`aria-label`, and a search of that page's visible text finds nothing - so the
+scaffolding that puts the world back is handed `BrowserGroundTruth` explicitly, at the
+one call site in `_dom_of`. Nothing else may. That site is also Cloudflare-gated
+against automated browsers and this project does not evade it; `apps/sandbox-site/README.md`
+explains why the local Pantry Lane cart is the world to build an ordering task against.
 
 "Where the last run of this task ended" is NOT where this run should end: a task that
 takes an argument ends somewhere the argument decides, so a recalled end screen can
