@@ -28,8 +28,9 @@ Configuration comes from :mod:`skillweaver.config` - the environment and ``.env`
 and flags override it per invocation. There is no second configuration mechanism and
 no flag silently resets a configured limit to a default.
 
-``--data-dir``, ``--log-level`` and ``--headless`` are properties of the WHOLE
-invocation rather than of one subcommand - which memories, how loud, which browser -
+``--data-dir``, ``--log-level``, ``--headless`` and ``--chrome-profile`` are properties
+of the WHOLE invocation rather than of one subcommand - which memories, how loud, which
+browser and whose profile -
 so they are written before the subcommand, and one of them therefore covers ``learn``,
 ``run`` and ``eval run`` alike::
 
@@ -38,7 +39,8 @@ so they are written before the subcommand, and one of them therefore covers ``le
 Headed is the default, and ``--headless`` is measurement's flag; see
 :data:`skillweaver.config.DEFAULT_HEADLESS` for why that way round and
 :mod:`skillweaver.render_mode` for what happens to a skill learned in one mode and
-replayed in the other.
+replayed in the other. ``--chrome-profile`` is what a site that refuses an automated
+browser needs; see ``REAL_CHROME_CHANNEL`` in :mod:`skillweaver.controllers.browser`.
 """
 
 from __future__ import annotations
@@ -140,6 +142,22 @@ def root(
             show_default=False,
         ),
     ] = None,
+    chrome_profile: Annotated[
+        Path | None,
+        typer.Option(
+            "--chrome-profile",
+            help="Drive the REAL Google Chrome on this machine out of this persistent "
+            "profile directory, instead of the bundled Chromium with a throwaway "
+            "profile. Applies to learn, run and eval run. Two ordinary browser "
+            "settings, and what a site that refuses an automated browser needs; the "
+            "directory persists, so a verification page cleared by hand once is not "
+            "cleared again next run. Nothing here defeats such a page - one that "
+            "appears fails the run. GIVE EACH RUN ITS OWN DIRECTORY: a profile is "
+            "exclusive, and concurrent runs sharing one fight over the lock. Overrides "
+            "SKILLWEAVER_CHROME_PROFILE.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Open the memories every subcommand reads from.
 
@@ -149,13 +167,16 @@ def root(
     if ctx.obj is not None:  # a caller (a test, an embedder) supplied its own
         return
     try:
-        ctx.obj = build_workbench(_settings(data_dir, log_level, headless))
+        ctx.obj = build_workbench(_settings(data_dir, log_level, headless, chrome_profile))
     except ConfigError as exc:
         _die(f"configuration is invalid: {exc}")
 
 
 def _settings(
-    data_dir: Path | None, log_level: str | None, headless: bool | None = None
+    data_dir: Path | None,
+    log_level: str | None,
+    headless: bool | None = None,
+    chrome_profile: Path | None = None,
 ) -> Settings:
     """Configuration, with the global flags applied on top.
 
@@ -179,6 +200,8 @@ def _settings(
         changes["log_level"] = level
     if headless is not None:
         changes["headless"] = bool(headless)
+    if chrome_profile is not None:
+        changes["chrome_profile"] = Path(chrome_profile).expanduser()
     return dataclasses.replace(resolved, **changes) if changes else resolved
 
 

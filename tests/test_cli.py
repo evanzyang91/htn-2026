@@ -1654,3 +1654,99 @@ def test_eval_run_bounds_a_suite_to_the_tasks_it_was_asked_for(
 
     assert seen[0]["only"] == ["search_ada", "back_to_main"]
     assert seen[1]["only"] is None
+
+
+# --------------------------------------------------------------------------------------
+# --chrome-profile: which browser a run is served by
+# --------------------------------------------------------------------------------------
+
+
+class _SettingsSpy:
+    """Captures what the root callback resolved, instead of opening a world."""
+
+    def __init__(self) -> None:
+        self.config: Settings | None = None
+
+    def __call__(self, config: Settings | None = None) -> Any:
+        self.config = config
+        raise SystemExit(0)  # nothing after this call is under test
+
+
+def _resolved_settings(monkeypatch: pytest.MonkeyPatch, *args: str) -> Settings:
+    spy = _SettingsSpy()
+    monkeypatch.setattr(cli, "build_workbench", spy)
+    monkeypatch.delenv("SKILLWEAVER_CHROME_PROFILE", raising=False)
+    CliRunner().invoke(app, [*args, "skills", "ls"])
+    assert spy.config is not None, "the root callback did not resolve any settings"
+    return spy.config
+
+
+def test_no_chrome_profile_is_configured_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt-in: a plain run opens the bundled Chromium exactly as it always has."""
+    assert _resolved_settings(monkeypatch).chrome_profile is None
+    assert load_settings(env={}, env_file=None).chrome_profile is None
+
+
+def test_the_flag_names_the_profile_and_expands_a_home_relative_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = _resolved_settings(monkeypatch, "--chrome-profile", "~/htn-demo-chrome")
+    assert resolved.chrome_profile == Path.home() / "htn-demo-chrome"
+
+
+def test_the_flag_overrides_the_environment_for_one_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SKILLWEAVER_CHROME_PROFILE", "/configured/profile")
+    assert load_settings(env=None, env_file=None).chrome_profile == Path("/configured/profile")
+
+    spy = _SettingsSpy()
+    monkeypatch.setattr(cli, "build_workbench", spy)
+    CliRunner().invoke(app, ["--chrome-profile", "/flagged/profile", "skills", "ls"])
+    assert spy.config is not None
+    assert spy.config.chrome_profile == Path("/flagged/profile")
+
+
+def test_a_flag_that_was_not_written_leaves_a_configured_profile_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The contract at the top of ``cli``: no flag silently resets a configured value."""
+    monkeypatch.setenv("SKILLWEAVER_CHROME_PROFILE", "/configured/profile")
+    spy = _SettingsSpy()
+    monkeypatch.setattr(cli, "build_workbench", spy)
+    CliRunner().invoke(app, ["skills", "ls"])
+    assert spy.config is not None
+    assert spy.config.chrome_profile == Path("/configured/profile")
+
+
+def test_the_flag_is_written_before_the_subcommand_and_so_covers_all_three() -> None:
+    """``learn``, ``run`` and ``eval run`` open their world through one call, so one
+    root flag reaches all of them - and the top-level help says where to write it."""
+    top = CliRunner().invoke(app, ["--help"])
+    assert "--chrome-profile" in top.output
+    for command in (["learn", "--help"], ["run", "--help"], ["eval", "run", "--help"]):
+        assert CliRunner().invoke(app, command).exit_code == 0
+
+
+def test_the_profile_reaches_the_browser_the_world_opens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_open_world`` is the one place every shipped command gets its browser, so the
+    setting has to arrive THERE rather than merely be resolved."""
+    import skillweaver.controllers.browser as browser_module
+    from skillweaver import orchestrator as orchestrator_module
+
+    seen: dict[str, Any] = {}
+
+    class _Recorder:
+        def __init__(self, **kwargs: Any) -> None:
+            seen.update(kwargs)
+
+    monkeypatch.setattr(browser_module, "BrowserController", _Recorder)
+    monkeypatch.setattr(orchestrator_module, "ComposedPerceiver", lambda *a, **k: None)
+    monkeypatch.setattr("skillweaver.perception.detect_yolo.YoloDetector", lambda *a, **k: None)
+    config_with_profile = load_settings(
+        env={"SKILLWEAVER_CHROME_PROFILE": "/demo/profile"}, env_file=None
+    )
+    task = TaskSpec(text="anything", domain="doordash.com")
+    orchestrator_module._open_world(config_with_profile, task)
+
+    assert seen["user_data_dir"] == Path("/demo/profile")

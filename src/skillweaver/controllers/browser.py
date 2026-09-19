@@ -21,6 +21,10 @@ Typical use::
         ctl.perform(Navigate("https://example.com"))
         shot = ctl.capture()
         ctl.perform(Click(Point(640, 400)))
+
+A site that refuses an automated browser needs the REAL Chrome and a profile that
+outlives the run - ``BrowserController(user_data_dir=...)``, and
+:data:`REAL_CHROME_CHANNEL` for what that is and what it is measured to fix.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import re
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from types import TracebackType
 from typing import Literal
 
@@ -105,6 +110,45 @@ that is deliberately measuring the overlay itself, or patterns of your own - a r
 or a `Playwright URL glob <https://playwright.dev/python/docs/network>`_ where the
 thing to block really is a path - for another site's version of the same problem.
 """
+
+REAL_CHROME_CHANNEL = "chrome"
+"""Playwright's name for the Google Chrome INSTALLED ON THIS MACHINE, as opposed to the
+Chromium build Playwright ships with. Half of what it takes to be served by a real site.
+
+A REAL SITE CAN REFUSE AN AUTOMATED BROWSER OUTRIGHT, and doordash.com does: a plain
+``chromium.launch()``, whose profile Playwright throws away after the run, gets
+Cloudflare's "Verify you are human" on every URL, while an ordinary Chrome window on the
+same machine loads the site. TWO ordinary browser settings are what close that gap:
+
+1. this channel - the real Google Chrome build, not bundled Chromium;
+2. ``launch_persistent_context(<dir>)`` - a profile directory that SURVIVES the run, so
+   whatever a site stored on one run is still there on the next.
+
+Measured on 2026-09-19 against live doordash.com, signed out, no address entered: the
+front page came back titled ``DoorDash: Food, Grocery and Retail - Fast Same Day
+Delivery``, a city listing page carried 32k characters of real stores and a store page a
+real priced menu - no interstitial on any of them.
+
+**That access is not a guarantee, and this mode does not make it one.** Later the same
+day the same profile got the interstitial on every load, and a bare hand-probe with no
+controller in it got the same - so what changed was the site's opinion of us, not the
+launch. Two causes we could see, both our own doing: MANY loads from one address in a
+few minutes, and SHARING one profile directory between concurrent runs, which fight over
+the lock and leave the stored clearance unreliable. Give each run its own directory, and
+do not hammer a site to find out whether it is still letting you in.
+
+**Nothing here masks automation and nothing here may.** No
+``--disable-blink-features=AutomationControlled``, no spoofed fingerprint, no
+user-agent edit, no proxy, no retry-until-it-passes loop: re-measured WITHOUT any such
+argument, the two settings above carried the whole result on their own, and
+``navigator.webdriver`` stays true. If a human-verification page appears, the run fails
+and says so, and a person clears it by hand, once, in the profile - which is exactly what
+a profile that outlives the run is for.
+
+What this mode is, then, is a browser LAUNCH configuration, and it is correct or not on
+its own terms: it opens the real Chrome, on a profile that persists, with the viewport,
+scale, blocking and start URL every other run gets. Whether a particular site then serves
+that browser is the site's business."""
 
 _SUPPORTED_ACTIONS: frozenset[str] = frozenset(
     {"click", "move", "drag", "type_text", "press_key", "scroll", "wait", "navigate"}
@@ -206,7 +250,13 @@ class BrowserController:
         viewport: ``(width, height)`` of the page in LOGICAL pixels.
         device_scale_factor: Physical pixels per logical pixel. ``2.0`` makes
             captures Retina-sharp at the same logical size; ``Screenshot.scale``
-            will report it back.
+            will report it back. It survives ``user_data_dir`` and is not dropped
+            there, but it becomes a LAUNCH option rather than a per-context one: a
+            persistent profile IS the browser, so one process can hold exactly one
+            scale and there is no second context to give another. Measured on real
+            Chrome, headed and headless alike, a 640x400 viewport at ``2.0`` captures
+            1280x800 with ``devicePixelRatio`` 2, on the page the browser opened
+            itself - which is the page this controller adopts.
         browser: Which Playwright engine to launch.
         settle_ms: How long to wait after each action for the page to react.
             Set to ``0`` for the fastest possible replay of a known-good script.
@@ -218,6 +268,15 @@ class BrowserController:
         settle_timeout_ms: Ceiling on waiting for the page to finish reacting to
             an action, including a navigation the action set off. Settling is
             best-effort, so reaching this is not an error.
+        user_data_dir: A PERSISTENT Chrome profile directory. Given, the controller
+            drives the REAL Google Chrome installed on this machine out of that
+            directory instead of a bundled Chromium with a throwaway profile, which
+            is what it takes to be served by a site that refuses an automated browser
+            - see :data:`REAL_CHROME_CHANNEL`. The directory is created if it is
+            missing, is NOT deleted on teardown - persisting cookies between runs is
+            the whole point - and is exclusive: Chrome locks a profile, so a window
+            already open on it makes the launch fail rather than share it. ``None``
+            leaves today's launch path exactly as it was.
         start_url: Loaded once at construction, if given.
         block: URL patterns whose requests are aborted, on the context, so they
             are blocked for every page and every navigation. A regex matches
@@ -226,7 +285,9 @@ class BrowserController:
             changing it; ``()`` blocks nothing.
 
     Raises:
-        ControllerError: if the browser cannot be launched.
+        ControllerError: if the browser cannot be launched. A ``user_data_dir`` whose
+            real Chrome is missing fails HERE, by name; it never quietly falls back to
+            the bundled Chromium, which is the build the bot wall blocks.
     """
 
     def __init__(
@@ -243,6 +304,7 @@ class BrowserController:
         settle_timeout_ms: float = 3_000.0,
         start_url: str | None = None,
         block: Sequence[str | re.Pattern[str]] | None = None,
+        user_data_dir: str | Path | None = None,
     ) -> None:
         width, height = viewport
         if width <= 0 or height <= 0:
@@ -261,6 +323,12 @@ class BrowserController:
         self._blocked: tuple[str | re.Pattern[str], ...] = (
             SOMETIMES_ONLY_OVERLAYS if block is None else tuple(block)
         )
+        self._profile_dir = Path(user_data_dir).expanduser() if user_data_dir is not None else None
+        if self._profile_dir is not None and browser != "chromium":
+            raise ValueError(
+                f"user_data_dir drives real Google Chrome, which is a chromium channel, "
+                f"not {browser!r}"
+            )
         self._closed = False
 
         self._page: Page | None = None
@@ -275,23 +343,41 @@ class BrowserController:
             # _await_scroll_quiet below covers pages that animate scrolling
             # themselves, and engines where this flag does not exist.
             args = ["--disable-smooth-scrolling"] if browser == "chromium" else []
-            self._browser = engine.launch(headless=headless, args=args)
-            self._context = self._browser.new_context(
-                viewport={"width": int(width), "height": int(height)},
-                device_scale_factor=device_scale_factor,
-            )
+            view = {"width": int(width), "height": int(height)}
+            if self._profile_dir is not None:
+                # The persistent context IS the launch: there is no Browser to make a
+                # second context on, and ``self._browser`` stays None. Closing the
+                # context is what shuts the process down.
+                self._context = engine.launch_persistent_context(
+                    str(self._profile_dir),
+                    channel=REAL_CHROME_CHANNEL,
+                    headless=headless,
+                    viewport=view,
+                    device_scale_factor=device_scale_factor,
+                    args=args,
+                )
+            else:
+                self._browser = engine.launch(headless=headless, args=args)
+                self._context = self._browser.new_context(
+                    viewport=view,
+                    device_scale_factor=device_scale_factor,
+                )
             # On the CONTEXT, not the page: the route then survives every
             # navigation and covers a popup the page opens, which is where an
             # appeal reappears if the block is installed one page at a time.
             for pattern in self._blocked:
                 self._context.route(pattern, _abort)
-            self._page = self._context.new_page()
+            # Real Chrome opens a window of its own, so a persistent context already
+            # has a page. ADOPT it rather than opening a second one: the one nobody
+            # drives would stay on screen for the whole demo.
+            existing = self._context.pages if self._profile_dir is not None else []
+            self._page = existing[0] if existing else self._context.new_page()
             if start_url is not None:
                 self._page.goto(start_url, timeout=self._navigation_timeout_ms)
         except Exception as exc:
             # A half-built controller still owns an OS process; do not leak it.
             self.close()
-            raise ControllerError(f"could not launch {browser}: {_brief(exc)}") from exc
+            raise ControllerError(self._launch_failed(exc)) from exc
 
     # -- context manager ---------------------------------------------------------------
 
@@ -307,6 +393,14 @@ class BrowserController:
         sentence written for a human.
         """
         return self._headless
+
+    @property
+    def profile_dir(self) -> Path | None:
+        """The persistent Chrome profile this controller drives, or ``None`` for the
+        ordinary bundled-Chromium launch. Readable for the same reason as
+        :attr:`headless`: it changes which browser rendered a screen, and a person
+        asking why a site served them has to be able to see which one they got."""
+        return self._profile_dir
 
     def __enter__(self) -> BrowserController:
         return self
@@ -389,16 +483,25 @@ class BrowserController:
         return self._blocked
 
     def describe(self) -> str:
-        """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``."""
+        """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``.
+
+        A persistent profile says ``chrome`` rather than ``chromium``, because that is
+        the build a page was actually served to.
+        """
         view = self._viewport if self._closed else self.viewport()
         mode = "" if self._headless else " headed"
-        return (
-            f"playwright {self._browser_name} {view.w}x{view.h} @{self._requested_scale:g}x{mode}"
-        )
+        engine = REAL_CHROME_CHANNEL if self._profile_dir is not None else self._browser_name
+        return f"playwright {engine} {view.w}x{view.h} @{self._requested_scale:g}x{mode}"
 
     def close(self) -> None:
         """Shut the page, context, browser and Playwright driver down. Idempotent
-        and never raises: closing a half-dead browser must not mask the real error."""
+        and never raises: closing a half-dead browser must not mask the real error.
+
+        A persistent profile directory is LEFT ON DISK. There is no browser handle to
+        close in that mode - the context is the process - and the cookies in that
+        directory are what the next run needs; deleting it would put the agent back
+        behind the bot wall one run later.
+        """
         self._closed = True
         for name in ("_page", "_context", "_browser"):
             handle = getattr(self, name, None)
@@ -413,6 +516,22 @@ class BrowserController:
             _release_driver()
 
     # -- internals ---------------------------------------------------------------------
+
+    def _launch_failed(self, exc: BaseException) -> str:
+        """Why the browser did not open, named precisely enough to act on.
+
+        A missing real Chrome is its own sentence: the alternative would be to retry
+        on bundled Chromium, and that is the build a site's bot wall turns away, so a
+        silent fallback would trade a loud failure for a run that is quietly blocked.
+        """
+        if self._profile_dir is None:
+            return f"could not launch {self._browser_name}: {_brief(exc)}"
+        return (
+            f"could not launch real Google Chrome (channel {REAL_CHROME_CHANNEL!r}) on "
+            f"profile {self._profile_dir}: {_brief(exc)}. Install Chrome, or close a "
+            f"window already holding that profile; there is no fallback to bundled "
+            f"Chromium, which is the build a bot wall refuses."
+        )
 
     def _live_page(self) -> Page:
         if self._closed or self._page is None:

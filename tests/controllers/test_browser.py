@@ -12,6 +12,7 @@ because that is the only thing the agent will ever have.
 
 from __future__ import annotations
 
+import time
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -77,6 +78,22 @@ def controller():
     """One headless browser for the whole module; each test navigates it afresh."""
     with BrowserController(viewport=VIEWPORT) as ctl:
         yield ctl
+
+
+@pytest.fixture(scope="module")
+def chrome_profile(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A throwaway persistent profile, shared by the real-Chrome tests.
+
+    Skips the lot where Google Chrome is not installed: this mode drives the browser
+    on the machine rather than the one Playwright ships, so there is nothing to stand
+    in for it and nothing honest to assert without it.
+    """
+    profile = tmp_path_factory.mktemp("chrome-profile")
+    try:
+        BrowserController(viewport=(320, 240), user_data_dir=profile).close()
+    except ControllerError as exc:  # no real Chrome here
+        pytest.skip(str(exc))
+    return profile
 
 
 @pytest.fixture
@@ -517,6 +534,148 @@ class TestBlockedRequests:
             assert ctl.blocked == ()
 
 
+class TestRealChromeProfile:
+    """The real Google Chrome on this machine, driven out of a profile that survives.
+
+    Two ordinary browser settings, no evasion - see ``REAL_CHROME_CHANNEL`` in
+    :mod:`skillweaver.controllers.browser` for what they are measured to fix on a site
+    that refuses an automated browser. Every test here launches the real thing, so the
+    module skips itself where Chrome is not installed rather than reporting a pass it
+    did not earn.
+    """
+
+    def test_the_default_path_opens_bundled_chromium_with_no_profile(self) -> None:
+        """The new mode is opt-in: saying nothing must change nothing."""
+        with BrowserController(viewport=(320, 240)) as ctl:
+            assert ctl.profile_dir is None
+            assert ctl.describe() == "playwright chromium 320x240 @1x"
+
+    def test_a_profile_directory_opens_real_chrome_instead(self, chrome_profile: Path) -> None:
+        with BrowserController(viewport=(320, 240), user_data_dir=chrome_profile) as ctl:
+            assert ctl.profile_dir == chrome_profile
+            assert ctl.describe() == "playwright chrome 320x240 @1x"
+            assert ctl.capture().width == 320
+
+    def test_it_drives_the_window_chrome_opened_rather_than_a_second_one(
+        self, chrome_profile: Path
+    ) -> None:
+        """Real Chrome comes up with a window already open. Adopting it is not tidiness:
+        a second page nobody drives is a blank window sitting on screen for the demo."""
+        with BrowserController(viewport=VIEWPORT, user_data_dir=chrome_profile) as ctl:
+            assert ctl.perform(Navigate(page_url("clicks.html"))).ok
+            assert len(ctl._context.pages) == 1
+            assert readout(BrowserGroundTruth(ctl), "last:") == "last: none"
+
+    def test_the_viewport_and_the_scale_still_hold(self, chrome_profile: Path) -> None:
+        """``device_scale_factor`` becomes a launch option here rather than a per-context
+        one, so this pins that it is still applied - and applied to the adopted page."""
+        with BrowserController(
+            viewport=(320, 240), device_scale_factor=2.0, user_data_dir=chrome_profile
+        ) as ctl:
+            shot = ctl.capture()
+            assert (shot.width, shot.height) == (320, 240)
+            assert shot.scale == pytest.approx(2.0)
+            assert _coords.png_size(shot.png) == (640, 480)
+
+    def test_blocking_still_happens_on_the_context(self, chrome_profile: Path) -> None:
+        with BrowserController(
+            viewport=VIEWPORT, user_data_dir=chrome_profile, block=("**/overlay-banner.js",)
+        ) as ctl:
+            assert ctl.perform(Navigate(page_url("overlay.html"))).ok
+            assert readout(BrowserGroundTruth(ctl), "overlay:") == "overlay: absent"
+
+    def test_start_url_is_loaded_at_construction(self, chrome_profile: Path) -> None:
+        with BrowserController(
+            viewport=(320, 240), user_data_dir=chrome_profile, start_url=page_url("scroll.html")
+        ) as ctl:
+            assert ctl.url() == page_url("scroll.html")
+
+    def test_nothing_hides_that_this_is_automation(self, chrome_profile: Path) -> None:
+        """``navigator.webdriver`` stays TRUE, and that is the point.
+
+        The two settings this mode uses are browser configuration; masking the flag a
+        page reads to know it is being driven would be evasion, and this project does
+        not do it. Re-measured without any such argument, real Chrome plus a persistent
+        profile carries the whole result on its own.
+        """
+        with BrowserController(viewport=(320, 240), user_data_dir=chrome_profile) as ctl:
+            assert ctl._live_page().evaluate("navigator.webdriver") is True
+
+    def test_teardown_closes_the_browser_but_leaves_the_profile(self, chrome_profile: Path) -> None:
+        """Deleting the directory would put the next run back behind the wall the mode
+        exists to get past: the clearance a person granted by hand lives in there."""
+        ctl = BrowserController(viewport=(320, 240), user_data_dir=chrome_profile)
+        ctl.close()
+        ctl.close()  # idempotent, exactly as the default path is
+        with pytest.raises(ControllerError):
+            ctl.capture()
+        assert (chrome_profile / "Default").is_dir(), "Chrome's own profile state is gone"
+
+    def test_a_cookie_set_on_one_run_is_still_there_on_the_next(
+        self, tmp_path: Path, chrome_profile: Path
+    ) -> None:
+        """The property the whole mode exists for, stated as a cookie.
+
+        A human-verification page is cleared by hand ONCE and the clearance is a
+        cookie; it is worth nothing unless the next run still holds it. Contrasted
+        against the default path in the same test, which cannot hold one - that is the
+        configuration the bot wall turns away.
+        """
+        kept = {
+            "name": "sw_profile_probe",
+            "value": "kept",
+            "domain": "example.test",
+            "path": "/",
+            "expires": time.time() + 3600,
+        }
+        profile = tmp_path / "carries-a-cookie"
+        with BrowserController(viewport=(320, 240), user_data_dir=profile) as ctl:
+            ctl._context.add_cookies([kept])  # type: ignore[list-item]
+        with BrowserController(viewport=(320, 240), user_data_dir=profile) as ctl:
+            carried = ctl._context.cookies("https://example.test/")
+        assert [(c["name"], c["value"]) for c in carried] == [("sw_profile_probe", "kept")]
+
+        with BrowserController(viewport=(320, 240)) as ctl:
+            ctl._context.add_cookies([kept])  # type: ignore[list-item]
+        with BrowserController(viewport=(320, 240)) as ctl:
+            assert ctl._context.cookies("https://example.test/") == []
+
+    def test_a_profile_already_in_use_is_refused_by_name_rather_than_shared(
+        self, tmp_path: Path, chrome_profile: Path
+    ) -> None:
+        """One directory, one run. Chrome takes a lock on a profile, and two runs that
+        quietly contend over one leave the stored state - the point of the mode -
+        unreliable. So the second one must fail, fast, saying WHICH directory."""
+        contended = tmp_path / "one-at-a-time"
+        with BrowserController(viewport=(320, 240), user_data_dir=contended):
+            started = time.perf_counter()
+            with pytest.raises(ControllerError) as caught:
+                BrowserController(viewport=(320, 240), user_data_dir=contended)
+            waited = time.perf_counter() - started
+        said = str(caught.value)
+        assert str(contended) in said, "the message has to name the directory to act on"
+        assert "already in use" in said
+        assert "close a window already holding that profile" in said
+        assert waited < 30, f"refusing took {waited:.1f}s; it must fail rather than hang"
+
+    def test_a_profile_given_to_a_non_chromium_engine_is_refused_before_launching(self) -> None:
+        with pytest.raises(ValueError):
+            BrowserController(browser="firefox", user_data_dir="/tmp/whatever")
+
+    def test_a_launch_that_fails_says_real_chrome_and_offers_no_fallback(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing Chrome must be loud. Quietly retrying on bundled Chromium would
+        hand back a working controller that the bot wall turns away."""
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("this is a file, so no profile can live under it")
+        with pytest.raises(ControllerError) as caught:
+            BrowserController(viewport=(320, 240), user_data_dir=blocker / "profile")
+        said = str(caught.value)
+        assert "real Google Chrome" in said
+        assert "no fallback" in said
+
+
 class TestGroundTruth:
     def test_it_finds_every_planted_element_with_the_right_kind_and_box(
         self, elements_page: BrowserController, truth: BrowserGroundTruth
@@ -605,11 +764,11 @@ class TestGroundTruth:
         """It is an offline teacher. If a controller could produce one, an agent
         on the action path could reach it by accident.
 
-        ``headless`` is on the list and is not a way out: it reports which renderer
-        this browser is, which is a fact about the WINDOW and says nothing about the
-        page inside it. It is public because a screen recorded here outlives the
-        browser and the two modes are not comparable - see
-        ``skillweaver.render_mode``.
+        ``headless`` and ``profile_dir`` are on the list and are not a way out: they
+        report which renderer this browser is and which build and profile it was
+        launched from, all facts about the WINDOW that say nothing about the page
+        inside it. They are public because a screen recorded here outlives the browser
+        and two browsers are not interchangeable - see ``skillweaver.render_mode``.
         """
         surface = {name for name in dir(BrowserController) if not name.startswith("_")}
         assert surface == {
@@ -619,6 +778,7 @@ class TestGroundTruth:
             "describe",
             "headless",
             "perform",
+            "profile_dir",  # which browser served the page, not what the page says
             "supports",
             "url",
             "viewport",

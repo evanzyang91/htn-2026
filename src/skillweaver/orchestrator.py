@@ -2129,7 +2129,9 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
         from skillweaver.controllers.browser import BrowserController
 
         controller = BrowserController(
-            headless=config.headless, start_url=task.params.get("start_url")
+            headless=config.headless,
+            start_url=task.params.get("start_url"),
+            user_data_dir=config.chrome_profile,
         )
     # Not ``default_weights_path()``: that reads the process-wide settings, which a
     # --data-dir on this invocation has already overridden.

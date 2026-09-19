@@ -9,6 +9,7 @@ Recognized variables::
     SKILLWEAVER_DATA_DIR        data directory                  (default: data)
     SKILLWEAVER_TARGET          "browser" or "desktop"          (default: browser)
     SKILLWEAVER_HEADLESS        run the browser without a window (default: false)
+    SKILLWEAVER_CHROME_PROFILE  persistent real-Chrome profile dir (default: unset)
     SKILLWEAVER_LOG_LEVEL       DEBUG/INFO/WARNING/ERROR        (default: INFO)
     SKILLWEAVER_CLAUDE_MODEL    Claude model id                 (default: claude-opus-5)
     SKILLWEAVER_GEMINI_MODEL    Gemini computer-use model id
@@ -67,6 +68,20 @@ so a skill learned in one mode can never match a screen rendered in the other. S
 :mod:`skillweaver.render_mode`, which names that mismatch instead of letting it show up
 as a mysteriously low similarity."""
 
+DEFAULT_CHROME_PROFILE: Path | None = None
+"""The persistent Chrome profile a browser run drives, or ``None`` for none.
+
+``None`` by default, so a plain run opens the bundled Chromium with a throwaway profile
+exactly as it always has. Set it - ``SKILLWEAVER_CHROME_PROFILE``, or ``--chrome-profile``
+on one invocation - to drive the real Google Chrome on this machine out of a directory
+that survives the run, which is what a site refusing an automated browser requires. See
+``REAL_CHROME_CHANNEL`` in :mod:`skillweaver.controllers.browser` for what that is
+measured to fix and what it deliberately does not do.
+
+One directory per run. A profile is EXCLUSIVE - a Chrome window already open on it makes
+the launch fail rather than share it - and two runs pointed at one directory fight over
+the lock and spoil the state that made the setting worth having."""
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _TARGETS = ("browser", "desktop")
 _TRUE = ("1", "true", "yes", "on")
@@ -82,6 +97,7 @@ class Settings:
     default_target: Literal["browser", "desktop"] = "browser"
     log_level: str = "INFO"
     headless: bool = DEFAULT_HEADLESS
+    chrome_profile: Path | None = DEFAULT_CHROME_PROFILE
     claude_model: str = DEFAULT_CLAUDE_MODEL
     gemini_model: str = DEFAULT_GEMINI_MODEL
     skill_max_seconds: float = DEFAULT_SKILL_MAX_SECONDS
@@ -168,6 +184,16 @@ def _flag(env: Mapping[str, str], key: str, default: bool) -> bool:
     raise ConfigError(f"{key}={raw!r} is not a boolean: use one of {_TRUE} or one of {_FALSE}")
 
 
+def _path(env: Mapping[str, str], key: str, default: Path | None) -> Path | None:
+    """An optional filesystem path. Blank and unset both mean the default, so
+    ``SKILLWEAVER_CHROME_PROFILE=`` turns a configured profile off rather than
+    resolving to the current directory."""
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    return Path(raw.strip()).expanduser()
+
+
 def load_settings(
     env: Mapping[str, str] | None = None, env_file: Path | str | None = Path(".env")
 ) -> Settings:
@@ -205,6 +231,7 @@ def load_settings(
         default_target=target,  # type: ignore[arg-type]
         log_level=log_level,
         headless=_flag(merged, "SKILLWEAVER_HEADLESS", DEFAULT_HEADLESS),
+        chrome_profile=_path(merged, "SKILLWEAVER_CHROME_PROFILE", DEFAULT_CHROME_PROFILE),
         claude_model=merged.get("SKILLWEAVER_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
         gemini_model=merged.get("SKILLWEAVER_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
         skill_max_seconds=_number(

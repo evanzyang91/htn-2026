@@ -114,6 +114,20 @@ by default because the demo is watched; every shipped command gets it through th
 `BrowserController` in `orchestrator._open_world`. What else a live-site run needs is in
 `eval/wikipedia.yaml`.
 
+A real site can refuse an automated browser outright, and the shipped answer is a
+LAUNCH mode, not a trick: `--chrome-profile <dir>` (`SKILLWEAVER_CHROME_PROFILE`) runs
+the real Google Chrome on this machine out of a profile directory that survives the
+run. `REAL_CHROME_CHANNEL` in `controllers/browser.py` carries what those two settings
+are measured to fix and what they deliberately do not do. Two rules go with it, both
+already paid for: give every run its OWN directory, because a profile is exclusive and
+concurrent runs sharing one spoil the state that made it worth having; and nothing in
+this project defeats a human-verification page - no masking argument, no spoofed
+fingerprint, no retry-until-it-passes - so a challenge FAILS the run and a person clears
+it by hand, once, in that profile. Access is also not a property you can retest your way
+into: hammering a site to find out whether it is still letting you in is what stops it.
+Prove this mode against something that does not gate you - `apps/sandbox-site`, or
+`example.com`.
+
 Perception is dominated by OCR - 84-97% of every observation's time on real pages -
 so the shipped fix is to not read the same pixels twice, and counts, not seconds, are how
 that is judged (seconds move with machine load; this project has been burned by that
