@@ -3,29 +3,72 @@
     {
       "image": "mail_inbox.png",
       "labels": "mail_inbox.txt",
-      "recipe": "mail_inbox",
+      "group": "sandbox",
+      "source": "mail_inbox",
       "width": 1200,
       "height": 780,
       "scale": 1.0,
-      "elements": 55
+      "elements": 57
     },
     {
       "image": "rec_selected.png",
       "labels": "rec_selected.txt",
-      "recipe": "rec_selected",
+      "group": "sandbox",
+      "source": "rec_selected",
       "width": 1200,
       "height": 780,
       "scale": 1.0,
-      "elements": 183
+      "elements": 185
     },
     {
       "image": "set_dialog.png",
       "labels": "set_dialog.txt",
-      "recipe": "set_dialog",
+      "group": "sandbox",
+      "source": "set_dialog",
       "width": 1200,
       "height": 780,
       "scale": 2.0,
-      "elements": 46
+      "elements": 48
+    },
+    {
+      "image": "wiki_article.png",
+      "labels": "wiki_article.txt",
+      "group": "web",
+      "source": "https://en.wikipedia.org/wiki/Great_Barrier_Reef",
+      "width": 1200,
+      "height": 780,
+      "scale": 1.0,
+      "elements": 102
+    },
+    {
+      "image": "wiki_results.png",
+      "labels": "wiki_results.txt",
+      "group": "web",
+      "source": "https://en.wikipedia.org/w/index.php?search=hack+the+north&title=Special%3ASearch&fulltext=1&ns0=1",
+      "width": 1200,
+      "height": 780,
+      "scale": 1.0,
+      "elements": 71
+    },
+    {
+      "image": "sqlite_home.png",
+      "labels": "sqlite_home.txt",
+      "group": "web",
+      "source": "https://sqlite.org/index.html",
+      "width": 1200,
+      "height": 780,
+      "scale": 1.0,
+      "elements": 61
+    },
+    {
+      "image": "python_org.png",
+      "labels": "python_org.txt",
+      "group": "web",
+      "source": "https://www.python.org/",
+      "width": 1200,
+      "height": 780,
+      "scale": 1.0,
+      "elements": 63
     }
   ]
 }

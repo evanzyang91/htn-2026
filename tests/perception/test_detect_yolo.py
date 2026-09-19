@@ -14,6 +14,14 @@ run; they skip loudly, with the two commands that rebuild them, when
 ``SKILLWEAVER_DATA_DIR`` points at a tree without them. What can be tested with no
 model at all - lazy loading, the missing-weights error, the physical-to-logical
 conversion against a stub - is tested unconditionally either way.
+
+It scores the committed fixtures in two groups and never averages them together.
+``sandbox`` frames come from the synthetic app; ``web`` frames are photographs of
+live pages, including one site that is in no part of the training set. A detector
+trained only on a synthetic app scores beautifully on the first group and near zero
+on the second, which is precisely the failure the second group exists to catch - so
+a single blended average would have hidden it. ``fixtures/README.md`` has the
+measured numbers for both, before and after the real pages went into training.
 """
 
 from __future__ import annotations
@@ -53,26 +61,46 @@ from skillweaver.perception.labeling import (
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
-MEAN_RECALL_FLOOR = 0.85
-"""Mean fraction of ground-truth elements the shipped detector must find across the
-committed fixture frames, at IoU 0.5 and the same element kind.
+MEAN_RECALL_FLOOR = {"sandbox": 0.85, "web": 0.35}
+"""Mean fraction of ground-truth elements the shipped detector must find, per group
+of fixture frames, at IoU 0.5 and the same element kind. Measured: 0.930 and 0.452.
 
-Pinned from what the shipped weights actually measure - 0.908 - not from what would
-be nice. A floor nobody can hit is a test that gets deleted; a floor far below the
-truth never catches a regression. ``fixtures/README.md`` records the run. Raise it
-when a better model lands.
+Two floors, not one, because the two groups are genuinely different problems and an
+average over both would hide whichever is worse. ``sandbox`` is the synthetic app
+the detector has always been good at. ``web`` is four photographs of live pages -
+two Wikipedia layouts whose URLs are not in the training set, and two sites that
+are not in it at all - and 0.452 is an average with a very wide spread under it,
+which ``fixtures/README.md`` sets out frame by frame.
+
+Pinned from what the shipped weights actually measure, with room for the wobble of
+a short fine-tune - never from what would be nice. A floor nobody can hit is a test
+that gets deleted; a floor far below the truth never catches a regression.
+``fixtures/README.md`` records the run, including what the previous sandbox-only
+weights scored on the same frames: 0.911 and 0.046. Raise them when a better model
+lands.
 """
 
-FRAME_RECALL_FLOOR = 0.70
+FRAME_RECALL_FLOOR = {"sandbox": 0.70, "web": 0.05}
 """No single frame may fall below this, so a good average cannot hide one blind
-screen. The weakest fixture is the settings dialog at 0.78: its modal scrim dims
-the page behind it and the detector loses a third of the greyed-out body text."""
+screen. The weakest sandbox fixture is the settings dialog at 0.833: its modal scrim
+dims the page behind it and the detector loses some of the greyed-out body text.
 
-CONTROL_RECALL_FLOOR = 0.90
+The web floor is 0.05 and that is not a typo. The weakest web fixture is
+``python_org`` at 0.095 - a light-on-dark page, a look the training set contains
+almost none of - and pretending otherwise by pinning a number it cannot reach would
+only get this test deleted. What 0.05 still catches is the thing worth catching:
+the sandbox-only weights scored 0.032 there, and a regression back to "sees
+essentially nothing on a dark page" would fail here rather than in a demo."""
+
+CONTROL_RECALL_FLOOR = {"sandbox": 0.90, "web": 0.45}
 """Pooled recall over the INTERACTIVE kinds only - buttons, fields, checkboxes,
-menus, rows - which is what the agent actually clicks. It is higher than the
-all-kinds floor on purpose: missing a paragraph of text costs nothing, because OCR
-reads text anyway, and missing the Send button ends the run. Measured: 0.957.
+links, menus, rows - which is what the agent actually clicks. Measured: 0.948 and
+0.583.
+
+Higher than the all-kinds floor in both groups, and for the same reason: missing a
+paragraph of text costs nothing, because OCR reads text anyway, and missing the
+Send button ends the run. On the web the margin is wider still, because a
+documentation page is mostly links and its links ARE its controls.
 """
 
 CONTROL_KINDS = frozenset(
@@ -87,6 +115,9 @@ CONTROL_KINDS = frozenset(
         ElementKind.row,
     }
 )
+
+GROUPS = ("sandbox", "web")
+"""The two kinds of fixture frame, scored separately everywhere below."""
 
 
 # --------------------------------------------------------------------------------------
@@ -552,19 +583,23 @@ class Frame:
     """One committed screenshot and the ground truth that was captured with it."""
 
     name: str
+    group: str
     screenshot: Screenshot
     expected: list[Element]
 
 
-def load_fixture_frames() -> list[Frame]:
+def load_fixture_frames(group: str | None = None) -> list[Frame]:
     """Read ``fixtures/frames.json`` and the PNG and label file each entry names.
 
-    The expectations are stored as ordinary YOLO label files, so this also puts the
-    label reader through a few thousand real boxes on the way past.
+    ``group`` narrows the result to ``"sandbox"`` or ``"web"``; ``None`` is all of
+    them. The expectations are stored as ordinary YOLO label files, so this also
+    puts the label reader through a few thousand real boxes on the way past.
     """
     manifest = json.loads((FIXTURES / "frames.json").read_text(encoding="utf-8"))
     frames: list[Frame] = []
     for entry in manifest["frames"]:
+        if group is not None and entry["group"] != group:
+            continue
         png = (FIXTURES / entry["image"]).read_bytes()
         screenshot = Screenshot(
             png=png,
@@ -578,7 +613,7 @@ def load_fixture_frames() -> list[Frame]:
             entry["width"],
             entry["height"],
         )
-        frames.append(Frame(entry["image"], screenshot, expected))
+        frames.append(Frame(entry["image"], entry["group"], screenshot, expected))
     return frames
 
 
@@ -596,52 +631,80 @@ requires_weights = pytest.mark.skipif(
 
 def test_the_fixture_frames_are_the_ones_the_floor_was_measured_on() -> None:
     frames = load_fixture_frames()
-    assert [frame.name for frame in frames] == [
-        "mail_inbox.png",
-        "rec_selected.png",
-        "set_dialog.png",
+    assert [(frame.group, frame.name) for frame in frames] == [
+        ("sandbox", "mail_inbox.png"),
+        ("sandbox", "rec_selected.png"),
+        ("sandbox", "set_dialog.png"),
+        ("web", "wiki_article.png"),
+        ("web", "wiki_results.png"),
+        ("web", "sqlite_home.png"),
+        ("web", "python_org.png"),
     ]
     assert all(frame.expected for frame in frames)
 
 
-@requires_weights
-def test_detection_meets_the_pinned_recall_floor() -> None:
-    """The real gate: on frames at a viewport and device scale the model never
-    trained on, it has to find most of what is actually there, at the same kind and
-    within IoU 0.5.
+def test_real_sites_the_detector_never_trained_on_are_among_the_fixtures() -> None:
+    """``sqlite.org`` and ``python.org`` are in no recipe and no ``WEB_PAGES`` entry,
+    so the numbers they produce are the one honest answer to "does this generalize
+    past the sites it was trained on".
 
-    Both floors are what the shipped weights measure with headroom, not numbers
-    chosen to make this pass.
+    Asserted here rather than left to a comment because the whole claim collapses
+    the day somebody adds one of those sites to the training set and nothing
+    complains. Two of them, not one, because they fail differently: the light page
+    scores 0.377 and the dark one 0.095, and a single unseen site would have made
+    whichever was picked look like the general case.
+    """
+    manifest = json.loads((FIXTURES / "frames.json").read_text(encoding="utf-8"))
+    sources = [entry["source"] for entry in manifest["frames"] if entry["group"] == "web"]
+    assert any("sqlite.org" in source for source in sources), sources
+    assert any("python.org" in source for source in sources), sources
+    assert any("wikipedia.org" in source for source in sources), sources
+
+
+@requires_weights
+@pytest.mark.parametrize("group", GROUPS)
+def test_detection_meets_the_pinned_recall_floor(group: str) -> None:
+    """The real gate: on frames at a viewport and device scale the model never
+    trained on - and, for the web group, on pages and one whole site it never
+    trained on either - it has to find most of what is actually there, at the same
+    kind and within IoU 0.5.
+
+    Every floor is what the shipped weights measure with headroom, not a number
+    chosen to make this pass. The groups are scored apart so the easy one cannot
+    carry the hard one.
     """
     detector = YoloDetector()
     scores: dict[str, float] = {}
-    for frame in load_fixture_frames():
+    for frame in load_fixture_frames(group):
         detected = detector.detect(frame.screenshot)
         assert detected, f"{frame.name}: detected nothing at all"
         scores[frame.name] = recall_at_iou(frame.expected, detected, iou=0.5)
 
     mean = sum(scores.values()) / len(scores)
-    assert mean >= MEAN_RECALL_FLOOR, f"mean recall {mean:.3f} below {MEAN_RECALL_FLOOR}: {scores}"
+    floor = MEAN_RECALL_FLOOR[group]
+    assert mean >= floor, f"{group} mean recall {mean:.3f} below {floor}: {scores}"
     for name, score in scores.items():
-        assert score >= FRAME_RECALL_FLOOR, f"{name} recall {score:.3f} is a blind screen"
+        assert score >= FRAME_RECALL_FLOOR[group], f"{name} recall {score:.3f} is a blind screen"
 
 
 @requires_weights
-def test_the_controls_the_agent_clicks_are_found_more_reliably_than_prose() -> None:
-    """Pooled over every fixture, because a frame with two menus and a frame with
-    fifty rows should not weigh the same when the question is "can it see a
-    control"."""
+@pytest.mark.parametrize("group", GROUPS)
+def test_the_controls_the_agent_clicks_are_found_more_reliably_than_prose(group: str) -> None:
+    """Pooled over every fixture in the group, because a frame with two menus and a
+    frame with fifty rows should not weigh the same when the question is "can it see
+    a control"."""
     detector = YoloDetector()
     wanted = 0
     found = 0.0
-    for frame in load_fixture_frames():
+    for frame in load_fixture_frames(group):
         controls = [element for element in frame.expected if element.kind in CONTROL_KINDS]
         recall = recall_at_iou(controls, detector.detect(frame.screenshot), iou=0.5)
         wanted += len(controls)
         found += recall * len(controls)
 
     pooled = found / wanted
-    assert pooled >= CONTROL_RECALL_FLOOR, f"control recall {pooled:.3f} below the floor"
+    floor = CONTROL_RECALL_FLOOR[group]
+    assert pooled >= floor, f"{group} control recall {pooled:.3f} below {floor}"
 
 
 @requires_weights

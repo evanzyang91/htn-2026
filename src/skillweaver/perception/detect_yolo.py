@@ -12,6 +12,14 @@ which fine-tunes a small YOLO model on a dataset labelled by ``BrowserGroundTrut
 (see :mod:`scripts.build_ui_dataset`); that dataset stays ignored because it is
 large and regenerable.
 
+**What the shipped weights have actually seen.** The sandbox app and live Wikipedia,
+in several layouts each. The first version of these weights was trained on the
+sandbox alone and was very good at it and close to useless anywhere else; what that
+cost, and what the real pages bought back, is measured on held-out frames in
+``tests/perception/fixtures/README.md``. Wikipedia is the only real site in the
+training set, so a page from somewhere else is still the weakest case - the same
+file says by how much. ``build_ui_dataset.py --bench`` re-measures all of it.
+
 A detector still has to cope with them being gone, because ``SKILLWEAVER_DATA_DIR``
 can point anywhere and a demo laptop is not a clean clone.
 
@@ -56,7 +64,15 @@ value would merge two adjacent buttons into one box."""
 
 DEFAULT_MAX_DETECTIONS = 300
 """Ceiling on boxes per frame. A dense table screen genuinely has a couple of
-hundred elements; far more than that is a model melting down, not a screen."""
+hundred elements; far more than that is a model melting down, not a screen.
+
+A known, measured limit rather than a safe margin: a Hacker News front page has
+323 visible elements and a frame in the training set has 306, so a page CAN carry
+more than this. Detections come back sorted by confidence, so what a cap drops is
+the least confident tail - but on a page like that the count is a truncation, not
+a measurement. Raising it costs NMS time on every frame, which is exactly what the
+skill-timeout work is trying to buy back, so it stays where it is and stays
+written down."""
 
 _BUILD_HINT = (
     "build it with:\n"

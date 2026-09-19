@@ -81,6 +81,14 @@ holds the measured reason the text is NOT read lazily. Read both before trying e
 - Importing it patches `PIL.Image.open`; `skillweaver.perception.detect_yolo._import_yolo`
   explains why that has to be undone and does it.
 
+What the element detector knows is a measured claim, not an assumption. Its training
+set is the sandbox app AND live public pages, so a full `scripts/build_ui_dataset.py`
+run needs the network (`--no-web` opts out) and takes minutes, not seconds. That same
+script's `--bench` scores any set of weights on pages held out of training entirely,
+and `tests/perception/fixtures/README.md` is where the detector's numbers and its
+remaining blind spots are written down. Quote that file rather than guessing, and
+remeasure with `--bench` rather than assuming a retrain helped.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
