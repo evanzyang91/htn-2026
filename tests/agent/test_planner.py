@@ -13,6 +13,7 @@ scripts it, so an unexpected model call is not a subtle accounting error: it rai
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -48,6 +49,8 @@ from tests.fakes import (
     Scenario,
     make_scenario,
 )
+from tests.fakes.controller import FakeController
+from tests.fakes.perception import FakePerceiver
 from tests.fakes.scenario import CONFIRM_BUTTON, DOMAIN, ROW_ACME
 
 PROVENANCE = Provenance("run-1", "pay an invoice", "fake-llm", datetime(2026, 9, 19, tzinfo=UTC))
@@ -490,6 +493,48 @@ def test_a_plan_is_not_executed_at_all_when_no_route_to_the_precondition_exists(
     assert failure is not None and failure.stage == "no_route"
     assert failure.performed_nothing
     assert "no known route" in failure.reason
+
+
+def test_the_start_screen_is_reached_by_its_url_when_the_graph_knows_no_way(
+    scenario: Scenario, store: InMemorySkillStore, fake_llm: FakeLLM
+) -> None:
+    """A URL is an edge from anywhere, and the graph is sparse on a real site.
+
+    The graph only holds edges somebody walked, so it is routinely silent about the
+    commonest move there is - going back to the front page. That silence broke CHAINS
+    rather than single skills: on a live shop the composer read "add these two things
+    and show me the cart", planned add -> add -> open_cart correctly in ONE model call,
+    and then the second skill could not start because nothing had recorded a way back
+    from a product page to the shop's home screen. The whole chain fell through to
+    exploration and spent 26 calls redoing what the library already knew.
+    """
+    source = scenario.controller
+    controller = FakeController(
+        source.states, source.transitions, start=source.state, viewport=source.viewport()
+    )
+    can_navigate = dataclasses.replace(
+        scenario, controller=controller, perceiver=FakePerceiver.for_controller(controller)
+    )
+    store.put(CONFIRM_PAYMENT)
+    # The precondition screen is KNOWN, with an address - but no edge leads to it.
+    graph = InMemorySiteGraph()
+    start = look(can_navigate)
+    graph.upsert_state(
+        UIState(
+            fingerprint=CONFIRM_PAYMENT.precondition,
+            domain=DOMAIN,
+            url_pattern="https://fake.test/invoices/1042",
+        )
+    )
+    assert start.fingerprint != CONFIRM_PAYMENT.precondition
+    planner = build(can_navigate, store, graph, fake_llm, compose=False)
+
+    plan = planner.plan(TaskSpec(text="Confirm the payment on this invoice.", domain=DOMAIN), start)
+
+    assert plan is not None, "a URL is a route when nothing has been walked"
+    navigations = [s for s in plan.steps if getattr(s, "kind", None) == "navigate"]
+    assert navigations, f"expected a navigate step, got {plan.steps}"
+    assert fake_llm.calls == 0, "routing by URL must not cost a model call"
 
 
 def test_an_unreliable_edge_is_refused_rather_than_replayed(

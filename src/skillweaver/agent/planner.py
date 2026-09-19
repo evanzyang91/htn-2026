@@ -73,6 +73,7 @@ from skillweaver.contracts import (
     Critic,
     Fingerprint,
     GraphView,
+    Navigate,
     Observation,
     Perceiver,
     Plan,
@@ -116,6 +117,12 @@ FailureStage = Literal[
     "rejected",
 ]
 """Where the fast path gave up. The first four happen before anything is performed."""
+
+_NAVIGATE_COST_MS = 1_500.0
+"""What a URL jump is assumed to cost when routing weighs it against a walked path.
+
+A guess, and deliberately a pessimistic one: a known route through screens the graph
+has actually seen is preferred, and this is only reached when there is none."""
 
 _PERFORMED_NOTHING = frozenset({"no_candidates", "unbindable_args", "no_route", "no_decomposition"})
 """Stages that are reached while planning, so the screen is untouched."""
@@ -354,7 +361,7 @@ class Planner:
                     # only thing it lacks is its arguments.
                     outranked = True
                 continue
-            route = self._route_to(observation.fingerprint, skill.precondition)
+            route = self._route_to(observation.fingerprint, skill.precondition, skill.domain)
             if route is None:
                 stage = "no_route"
                 reasons.append(
@@ -432,7 +439,7 @@ class Planner:
                 skill=result.steps[0].name,
             )
             return None, result.usage
-        route = self._route_to(observation.fingerprint, first.precondition)
+        route = self._route_to(observation.fingerprint, first.precondition, first.domain)
         if route is None:
             self._last_failure = PlanFailure(
                 stage="no_route",
@@ -502,7 +509,7 @@ class Planner:
                 except (ControllerError, PerceptionError) as exc:
                     return used, PlanFailure("route_failed", f"could not read the screen: {exc}")
 
-            route = self._route_to(current.fingerprint, skill.precondition)
+            route = self._route_to(current.fingerprint, skill.precondition, skill.domain)
             if route is None:
                 return used, PlanFailure(
                     stage="no_route",
@@ -660,7 +667,9 @@ class Planner:
 
     # -- small helpers -------------------------------------------------------------------
 
-    def _route_to(self, src: Fingerprint, precondition: Fingerprint | None) -> Route | None:
+    def _route_to(
+        self, src: Fingerprint, precondition: Fingerprint | None, domain: str
+    ) -> Route | None:
         """The route to a skill's start screen, or ``None`` when none is known.
 
         A skill with no precondition can start anywhere, so it gets the empty route
@@ -668,7 +677,38 @@ class Planner:
         """
         if precondition is None:
             return Route((), 0.0, ())
-        return find_route(src, precondition, self._outgoing, self._policy)
+        found = find_route(src, precondition, self._outgoing, self._policy)
+        return found if found is not None else self._route_by_url(precondition, domain)
+
+    def _route_by_url(self, precondition: Fingerprint, domain: str) -> Route | None:
+        """Go straight to the start screen's address, when the graph knows of none.
+
+        The graph only holds edges somebody walked, so it is sparse on a real site and
+        silent about the commonest move there is: going back to the front page. That
+        silence stopped CHAINS rather than single skills - the composer reads "add
+        these two things and show me the cart", plans
+        ``add_to_cart -> add_to_cart -> open_cart`` correctly in one model call, and
+        then the second skill cannot start because nothing had ever recorded a way back
+        from a product page to the shop's home screen. The whole chain fell through to
+        exploration and cost 26 calls to redo what the library already knew.
+
+        A URL is an edge from ANYWHERE, which is what makes it worth trying when the
+        walked ones run out. It is a fallback and not a preference: a known route is
+        returned first, because it goes through screens the graph has actually seen.
+        """
+        if not self._controller.supports("navigate"):
+            return None
+        url = next(
+            (
+                state.url_pattern
+                for state in self._graph.states(domain)
+                if state.fingerprint == precondition and state.url_pattern
+            ),
+            None,
+        )
+        if url is None or any(ch in url for ch in "*?"):
+            return None
+        return Route((Navigate(url),), _NAVIGATE_COST_MS, ())
 
     def _outgoing(self, value: str) -> Iterable[Transition]:
         return self._graph.neighbors(Fingerprint(value))
