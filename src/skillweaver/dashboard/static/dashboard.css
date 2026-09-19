@@ -301,6 +301,130 @@ svg.routed .gnode.on .box { stroke: var(--route); stroke-width: 2; }
 .frame .sub { margin-top: 8px; font-size: 11.5px; color: var(--ink-4); word-break: break-word; }
 .frame .err { margin-top: 8px; font-size: 12px; color: var(--bad); }
 
+/* ----------------------------------------- panel: what each skill actually does */
+
+/* One procedure per card. Every track that holds a step is a grid with a
+   minmax(0, 1fr) text column and min-width: 0 on the child, because a step's detail
+   is an anchor string read out of stored code and can be arbitrarily long: without
+   both, one over-long anchor widens the grid and the whole page scrolls sideways. */
+
+.routine { margin-top: 16px; padding: 16px; background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm); }
+.routine.retired { opacity: 0.7; }
+.routine-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.routine-head .sk { font-family: var(--mono); font-size: 14.5px; font-weight: 600; color: var(--ink); min-width: 0; word-break: break-word; }
+.routine .sum { color: var(--ink-2); font-size: 13.5px; }
+.routine-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0 14px; font-size: 12px; color: var(--ink-4); }
+.routine-facts span { min-width: 0; word-break: break-word; }
+.routine .foot { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line-soft); font-size: 11.5px; color: var(--ink-4); }
+.routine .foot span { min-width: 0; word-break: break-word; }
+.routine .foot .warn { color: var(--gold); }
+
+ol.steps { list-style: none; margin: 0; padding: 0; }
+.step {
+  display: grid; align-items: start; gap: 10px;
+  grid-template-columns: 26px minmax(0, 1fr);
+  padding: 7px 0 7px calc(var(--d, 0) * 18px);
+  border-top: 1px solid var(--line-soft);
+}
+.step:first-child { border-top: 0; }
+/* The thumbnail column is reserved for the whole list when ANY step of the skill was
+   matched to a screen, so the text of every step starts at the same x whether or not
+   that step has a picture. Its absence is an empty cell, not a different layout. */
+.steps.with-shots .step { grid-template-columns: 26px 118px minmax(0, 1fr); }
+.steps.with-shots .step .txt { grid-column: 3; }
+.step .no {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-4);
+  text-align: right; padding-top: 3px; font-variant-numeric: tabular-nums;
+}
+.step .tshot {
+  display: block; width: 118px; height: 74px; object-fit: cover; object-position: top center;
+  background: #070a11; border: 1px solid var(--line); border-radius: 6px;
+}
+.step .txt { min-width: 0; }
+.step .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; min-width: 0; }
+.step .head .v {
+  font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--warm);
+  white-space: nowrap;
+}
+.step .head .dt { font-size: 13.5px; color: var(--ink); min-width: 0; word-break: break-word; }
+.step .sub { margin-top: 3px; font-size: 12px; color: var(--ink-4); min-width: 0; overflow-wrap: anywhere; }
+.step .sub b { color: var(--ink-2); font-weight: 600; }
+
+/* The kinds, coloured so the shape of a procedure reads before the words do:
+   green does something, blue looks, amber refuses, violet composes. */
+.step.k-look .head .v { color: var(--route); }
+.step.k-check .head .v { color: var(--gold); }
+.step.k-call .head .v { color: #c084fc; }
+.step.k-flow .head .v { color: var(--ink-3); }
+.step.k-note .head .v { color: var(--ink-4); }
+.step.k-result .head .v { color: var(--ink-2); }
+
+.verifier { margin-top: 14px; padding: 12px 14px; background: rgba(96, 165, 250, 0.06); border: 1px solid var(--route-dim); border-radius: var(--radius-sm); }
+.verifier .cap { font-size: 11.5px; font-family: var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-4); margin-bottom: 6px; }
+
+/* ---------------------------------------------- panel: tokens and dollars saved */
+
+.saved-head {
+  display: grid; gap: 16px 24px; margin-bottom: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+  align-items: stretch;
+}
+.saved-head .big {
+  min-width: 0; padding: 18px 20px;
+  display: flex; flex-direction: column; justify-content: center;
+  background: linear-gradient(180deg, rgba(52, 211, 153, 0.12), var(--surface-2));
+  border: 1px solid var(--warm-dim); border-radius: var(--radius);
+}
+.saved-head .big .v {
+  font-size: clamp(34px, 6.2vw, 52px); font-weight: 680; line-height: 1;
+  letter-spacing: -0.04em; color: var(--warm); font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.saved-head .big .l { margin-top: 10px; font-size: 14px; font-weight: 580; color: var(--ink); }
+.saved-head .big .d { margin-top: 4px; font-size: 12px; color: var(--ink-4); }
+
+.ledger { list-style: none; margin: 0; padding: 0; min-width: 0; }
+.ledger li {
+  display: grid; gap: 2px 12px; align-items: baseline; padding: 9px 0;
+  grid-template-columns: 92px minmax(0, 1fr);
+  border-top: 1px solid var(--line-soft);
+}
+.ledger li:first-child { border-top: 0; padding-top: 0; }
+.ledger .k { font-size: 11.5px; font-family: var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-4); }
+.ledger .n { font-size: 17px; font-weight: 640; color: var(--ink); font-variant-numeric: tabular-nums; min-width: 0; overflow-wrap: anywhere; }
+.ledger .d { grid-column: 2; font-size: 12px; color: var(--ink-4); min-width: 0; }
+
+.saved-rows { margin-top: 4px; }
+.srow { padding: 14px 0; border-top: 1px solid var(--line-soft); }
+.srow:first-child { border-top: 0; }
+.srow-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.srow-head .name { font-size: 15px; font-weight: 600; min-width: 0; }
+.srow-head .meta { color: var(--ink-4); font-size: 12px; }
+
+.sbar .track { height: 16px; border-radius: 5px; background: var(--surface-3); overflow: hidden; }
+.sbar .fill { height: 100%; min-width: 3px; border-radius: 5px; background: linear-gradient(90deg, #059669, var(--warm)); }
+.sbar .fill.over { background: linear-gradient(90deg, #b91c1c, var(--bad)); }
+.sbar .none { padding: 0 8px; font-size: 11px; line-height: 16px; color: var(--ink-4); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.sfigs { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 9px; font-size: 12.5px; color: var(--ink-2); }
+.sfigs span { min-width: 0; font-variant-numeric: tabular-nums; }
+.sfigs em { font-style: normal; color: var(--ink-4); font-size: 11.5px; }
+.sfigs i { font-style: normal; font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-4); margin-right: 6px; }
+
+.growth .cline { fill: none; stroke: var(--warm); stroke-width: 2; stroke-linejoin: round; }
+.growth .cpt { fill: var(--warm); stroke: var(--surface-2); stroke-width: 2; }
+
+/* Not a panel's empty state: one skill inside the procedures panel whose stored code
+   could not be read. It costs that card its steps and nothing else, so it is a notice
+   inside the card rather than the dashed box a whole panel falls back to. */
+.unreadable {
+  margin: 4px 0 2px; padding: 12px 14px;
+  border: 1px solid var(--line); border-left: 3px solid var(--gold);
+  border-radius: var(--radius-sm); background: var(--surface-3); color: var(--ink-2);
+  font-size: 13px;
+}
+.unreadable .t { font-weight: 600; color: var(--ink); margin-bottom: 4px; }
+
 footer { margin-top: 40px; color: var(--ink-4); font-size: 12px; }
 footer .mono { word-break: break-all; }
 
@@ -309,6 +433,14 @@ footer .mono { word-break: break-all; }
   .masthead { padding-top: 34px; }
   .panel { padding: 18px 16px; }
   .frame { flex-basis: 250px; max-width: 250px; }
+  /* At phone width a step's thumbnail and its text cannot share a row without one of
+     them overflowing, so the picture goes above the words and the indent shrinks. */
+  .step, .steps.with-shots .step { grid-template-columns: 22px minmax(0, 1fr); padding-left: calc(var(--d, 0) * 10px); }
+  .step .tshot { grid-column: 2; grid-row: 1; width: 100%; max-width: 240px; height: auto; aspect-ratio: 16 / 10; }
+  .steps.with-shots .step .txt { grid-column: 2; }
+  .routine { padding: 14px 12px; }
+  .ledger li { grid-template-columns: minmax(0, 1fr); }
+  .ledger .d { grid-column: 1; }
 }
 
 @media print {

@@ -316,7 +316,7 @@ def test_the_page_is_one_file_with_balanced_markup(full_page: str) -> None:
 
 def test_a_missing_data_directory_still_produces_a_page(empty_page: str) -> None:
     assert empty_page.lstrip().startswith("<!doctype html>")
-    assert empty_page.count('class="empty"') == 4  # one per panel
+    assert empty_page.count('class="empty"') == 6  # one per panel
 
 
 def test_every_panel_explains_what_is_missing(empty_page: str) -> None:
@@ -328,6 +328,10 @@ def test_every_panel_explains_what_is_missing(empty_page: str) -> None:
     assert "No site graph yet" in empty_page
     assert "No run to show" in empty_page
     assert "No runs recorded yet" in empty_page
+    assert "No procedures to read yet" in empty_page
+    assert "Nothing to lay out yet" in empty_page
+    assert "Nothing to price yet" in empty_page
+    assert "there is nothing to price" in empty_page
 
 
 def test_the_empty_page_documents_the_metrics_shape_it_wants(empty_page: str) -> None:
@@ -388,7 +392,7 @@ def test_a_data_directory_of_empty_subdirectories_is_not_a_crash(tmp_path: Path)
     for name in ("skills", "graphs", "trajectories", "eval"):
         (tmp_path / name).mkdir()
     page = build_dashboard(tmp_path, tmp_path / "out.html").read_text(encoding="utf-8")
-    assert page.count('class="empty"') == 4
+    assert page.count('class="empty"') == 6
 
 
 # --------------------------------------------------------------------------------------

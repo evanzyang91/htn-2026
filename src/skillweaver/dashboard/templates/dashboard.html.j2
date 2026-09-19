@@ -42,6 +42,8 @@
     <a href="#speedup">Cold vs warm</a>
     <a href="#skills">Skill library</a>
     <a href="#graph">Site graph</a>
+    <a href="#trajectories">Skill steps</a>
+    <a href="#saved">Tokens saved</a>
     <a href="#run">Run filmstrip</a>
   </nav>
 </header>
@@ -316,6 +318,241 @@
     {% if not p.routes %}<span>No proven route out of the entry state yet - every edge still needs a success before it can be routed through.</span>{% endif %}
   </div>
   {% endfor %}
+  {% endif %}
+</section>
+
+{#- ------------------------------------------------------- skill trajectories -#}
+<section class="panel" id="trajectories">
+  <header>
+    <div class="kicker">Memory, read back</div>
+    <h2>What each stored skill actually does</h2>
+    <p class="why">
+      The library above says a skill <i>exists</i>. This says what calling it will <b>do</b>.
+      Every procedure below is read out of the stored code itself: the action at each step, the
+      text or element it <b>anchors on</b> rather than a coordinate, and the point at which it
+      refuses to continue. Where the recorded run a skill was written from is still on disk, the
+      real screen is shown beside the step it was matched to, in order.
+    </p>
+  </header>
+
+  {% if d.trajectories.empty_reason %}
+  <div class="empty">
+    <div class="t">No procedures to read yet</div>
+    <p>{{ d.trajectories.empty_reason }}</p>
+    {% if d.trajectories.note %}<p class="notes">{{ d.trajectories.note }}</p>{% endif %}
+  </div>
+  {% else %}
+  <p class="hint">
+    {{ d.trajectories.routines|length }} stored skill(s), {{ d.trajectories.total_steps }} step(s)
+    in total; {{ d.trajectories.with_checks }} skill(s) carry a verifier of their own and
+    {{ d.trajectories.with_screens }} still have the run they were learned from on disk.
+    {% if d.trajectories.note %}{{ d.trajectories.note }}{% endif %}
+  </p>
+
+  {% for r in d.trajectories.routines %}
+  <article class="routine{% if r.demoted_reason %} retired{% endif %}">
+    <div class="routine-head">
+      <span class="sk">{{ r.name }}</span>
+      {% if r.domain %}<span class="tag">{{ r.domain }}</span>{% endif %}
+      <span class="tag">v{{ r.version }}</span>
+      <span class="tag">{{ r.steps|length }} step{{ '' if r.steps|length == 1 else 's' }}</span>
+      {% if r.checks %}<span class="tag route">{{ r.checks|length }} self-check(s)</span>{% endif %}
+      {% if r.matched %}<span class="tag good">{{ r.matched }} screen(s) matched</span>{% endif %}
+      {% if r.demoted_reason %}<span class="tag bad">retired</span>{% endif %}
+    </div>
+    {% if r.summary %}<p class="sum">{{ r.summary }}</p>{% endif %}
+    <div class="routine-facts">
+      {% if r.params %}<span>takes {{ r.params|join(', ') }}</span>{% else %}<span>takes no parameters</span>{% endif %}
+      {% if r.requires %}<span>calls {{ r.requires|join(', ') }}</span>{% endif %}
+      {% if r.precondition %}<span>starts from screen {{ r.precondition }}</span>{% endif %}
+      {% if r.run_task %}<span>learned on &ldquo;{{ r.run_task }}&rdquo;, {{ r.run_when }}, {{ r.run_steps }} recorded step(s)</span>{% endif %}
+    </div>
+
+    {% if r.steps_problem %}
+    <div class="unreadable"><div class="t">Its steps cannot be read</div><p>{{ r.steps_problem }}</p></div>
+    {% else %}
+    <ol class="steps{% if r.matched %} with-shots{% endif %}">
+      {% for s in r.steps %}
+      <li class="step k-{{ s.kind }}" style="--d:{{ s.depth }}">
+        <span class="no">{{ s.order }}</span>
+        {% if s.shot %}
+        <img class="tshot" src="{{ s.shot }}" alt="The recorded screen after step {{ s.order }}: {{ s.verb }} {{ s.detail }}" loading="lazy">
+        {% endif %}
+        <div class="txt">
+          <div class="head"><span class="v">{{ s.verb }}</span>{% if s.detail %}<span class="dt">{{ s.detail }}</span>{% endif %}</div>
+          {% if s.anchor %}
+          <div class="sub">anchored on <b>{{ s.anchor }}</b>{% if s.brittle %} <span class="tag bad">fixed pixel, not perception</span>{% endif %}</div>
+          {% endif %}
+          {% if s.why %}<div class="sub">stops with: {{ s.why }}</div>{% endif %}
+          {% if s.shot_caption %}<div class="sub mono">{{ s.shot_caption }}</div>{% endif %}
+        </div>
+      </li>
+      {% endfor %}
+    </ol>
+    {% if r.truncated %}<p class="hint">Only the first {{ r.steps|length }} steps are listed.</p>{% endif %}
+    {% endif %}
+
+    {% if r.checks %}
+    <div class="verifier">
+      <div class="cap">How it checks its own work, after the steps above have run</div>
+      <ol class="steps">
+        {% for s in r.checks %}
+        <li class="step k-{{ s.kind }}" style="--d:{{ s.depth }}">
+          <span class="no">{{ s.order }}</span>
+          <div class="txt">
+            <div class="head"><span class="v">{{ s.verb }}</span>{% if s.detail %}<span class="dt">{{ s.detail }}</span>{% endif %}</div>
+            {% if s.anchor %}<div class="sub">anchored on <b>{{ s.anchor }}</b></div>{% endif %}
+            {% if s.why %}<div class="sub">stops with: {{ s.why }}</div>{% endif %}
+          </div>
+        </li>
+        {% endfor %}
+      </ol>
+    </div>
+    {% elif r.checks_problem %}
+    <p class="hint">No verifier to show: {{ r.checks_problem }}</p>
+    {% endif %}
+
+    <div class="foot">
+      {% if r.demoted_reason %}<span class="warn">retired: {{ r.demoted_reason }}</span>{% endif %}
+      {% if r.run_note %}<span>{{ r.run_note }}</span>{% elif r.run_id %}<span class="mono">from run {{ r.run_id }}{{ ', which succeeded' if r.run_ok else '' }}</span>{% endif %}
+    </div>
+  </article>
+  {% endfor %}
+  {% endif %}
+</section>
+
+{#- ------------------------------------------------------ tokens and cost saved -#}
+<section class="panel" id="saved">
+  <header>
+    <div class="kicker">The bill</div>
+    <h2>What the library has saved, in tokens and in dollars</h2>
+    <p class="why">
+      One arithmetic, stated so it can be checked. For each task, the <b>first attempt</b> - the
+      one that had no library and had to explore - is the baseline for what doing that task costs.
+      Every <b>later attempt at the same task</b> is then charged at what it actually cost, and the
+      difference is the saving. A later attempt that <b>failed</b> is charged its own cost and
+      credited nothing, because the work still had to be done afterwards. A task nobody ever
+      solved cold has no baseline and is excluded rather than assumed - every exclusion is named
+      below.
+    </p>
+  </header>
+
+  {% if d.savings.empty_reason %}
+  <div class="empty">
+    <div class="t">Nothing to price yet</div>
+    <p>{{ d.savings.empty_reason }}</p>
+    {% if d.savings.excluded %}
+    <ul class="notes">
+      {% for e in d.savings.excluded %}<li><span class="mono">{{ e.task_id }}</span> - {{ e.reason }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if d.savings.notes %}
+    <ul class="notes">{% for n in d.savings.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
+  {% else %}
+
+  <div class="saved-head">
+    <div class="big">
+      <div class="v">{{ d.savings.headline }}</div>
+      <div class="l">{{ d.savings.headline_unit }}</div>
+      <div class="d">
+        across {{ d.savings.repeats }} repeat run(s) of {{ d.savings.rows|length }} task(s){% if d.savings.suites %} in the {{ d.savings.suites|join(', ') }} suite{% endif %}{% if d.savings.excluded %}, with {{ d.savings.excluded|length }} task(s) excluded{% endif %}.
+      </div>
+    </div>
+    <ul class="ledger">
+      <li>
+        <span class="k">Tokens</span>
+        <span class="n">{{ d.savings.saved_tokens|count }}</span>
+        <span class="d">
+          {% if d.savings.token_runs %}
+          saved over {{ d.savings.repeats }} repeat run(s), against the {{ d.savings.baseline_tokens|count }} the first attempts spent between them - so the total can exceed the baseline once a task is repeated. Measured on {{ d.savings.token_runs }} of {{ d.savings.repeats }} repeat run(s).
+          {% else %}
+          no usage meter was attached to these runs, so no token saving is claimed here. The dollar and model-call savings below stand on their own.
+          {% endif %}
+        </span>
+      </li>
+      <li>
+        <span class="k">Dollars</span>
+        <span class="n">{{ d.savings.saved_usd|usd }}</span>
+        <span class="d">
+          {% if d.savings.usd_runs %}
+          saved over {{ d.savings.repeats }} repeat run(s), against the {{ d.savings.baseline_usd|usd }} the first attempts spent between them. Measured on {{ d.savings.usd_runs }} of {{ d.savings.repeats }} repeat run(s).
+          {% else %}
+          none of these runs recorded a price, so no dollar saving is claimed.
+          {% endif %}
+        </span>
+      </li>
+      <li>
+        <span class="k">Model calls</span>
+        <span class="n">{{ d.savings.saved_calls|count }}</span>
+        <span class="d">saved over all {{ d.savings.repeats }} repeat run(s), against the {{ d.savings.baseline_calls|count }} the first attempts made between them.</span>
+      </li>
+    </ul>
+  </div>
+
+  {% if d.savings.chart_points %}
+  <div class="growth">
+    <div class="cap">
+      <span>Cumulative {{ d.savings.chart_metric }} saved as the library grew, task by task</span>
+      <span class="mono">{{ d.savings.rows|length }} tasks, in the order the suite ran them</span>
+    </div>
+    <svg viewBox="0 0 {{ '%.0f'|format(d.savings.chart_width) }} {{ '%.0f'|format(d.savings.chart_height) }}" role="img" aria-label="Cumulative saving over the tasks of the suite" preserveAspectRatio="none" height="{{ '%.0f'|format(d.savings.chart_height) }}">
+      <path class="area" d="{{ d.savings.chart_area }}"></path>
+      <path class="cline" d="{{ d.savings.chart_line }}"></path>
+      {% for p in d.savings.chart_points %}
+      <circle class="cpt" cx="{{ '%.1f'|format(p.x) }}" cy="{{ '%.1f'|format(p.y) }}" r="3.4"><title>after {{ p.label }}: {{ ('%.4f'|format(p.value)) if d.savings.chart_metric == 'dollars' else ('%.0f'|format(p.value)) }} {{ d.savings.chart_metric }} saved</title></circle>
+      {% endfor %}
+    </svg>
+  </div>
+  {% endif %}
+
+  <div class="saved-rows">
+    {% for r in d.savings.rows %}
+    <div class="srow">
+      <div class="srow-head">
+        <span class="name">{{ r.task_text }}</span>
+        {% if r.domain %}<span class="tag">{{ r.domain }}</span>{% endif %}
+        {% if r.skills %}<span class="tag good">{{ r.skills }}</span>{% endif %}
+        <span class="meta">{{ r.repeats }} repeat(s), {{ r.repeats_ok }} ok</span>
+      </div>
+      <div class="sbar">
+        {% if r.measured %}
+        <div class="track">
+          <div class="fill{{ ' over' if r.spent_width else '' }}" style="width:{{ '%.1f'|format(r.saved_width if r.saved_width else r.spent_width) }}%"></div>
+        </div>
+        {% else %}
+        <div class="track"><div class="none">{{ d.savings.chart_metric }} not measured for this task</div></div>
+        {% endif %}
+      </div>
+      <div class="sfigs">
+        <span><i>tokens saved</i> {{ r.saved_tokens|count }}{% if r.token_runs %} <em>vs {{ r.baseline_tokens|count }} per first attempt</em>{% endif %}</span>
+        <span><i>dollars saved</i> {{ r.saved_usd|usd }}{% if r.usd_runs %} <em>vs {{ r.baseline_usd|usd }} per first attempt</em>{% endif %}</span>
+        <span><i>calls saved</i> {{ r.saved_calls|count }} <em>vs {{ r.baseline_calls|count }} per first attempt</em></span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="pending">
+    <p><b>What this compares:</b> the repeat runs of {{ d.savings.rows|length }} task(s) against the first attempt at the same task{% if d.savings.suites %}, in the {{ d.savings.suites|join(', ') }} suite{% endif %}{% if d.savings.generated_at %}, measured {{ d.savings.generated_at|date }}{% endif %}. It is what those runs cost, not a rate that carries over to other work or other sites.</p>
+    {% if d.savings.token_gap %}
+    <p>Tokens were not measured for {{ d.savings.token_gap }} of {{ d.savings.repeats }} repeat run(s): the harness writes no token count when no usage meter was attached, and a missing measurement is left missing rather than counted as a saving of zero.</p>
+    {% endif %}
+    {% if d.savings.usd_gap %}
+    <p>Prices were not recorded for {{ d.savings.usd_gap }} of {{ d.savings.repeats }} repeat run(s), which are left out of the dollar figure for the same reason.</p>
+    {% endif %}
+    {% if d.savings.excluded %}
+    <p>Excluded from the arithmetic entirely - {{ d.savings.excluded|length }} task(s):</p>
+    <ul>
+      {% for e in d.savings.excluded %}<li><span class="mono">{{ e.task_id }}</span> - {{ e.reason }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if d.savings.notes %}
+    <p>Files this panel could not read:</p>
+    <ul>{% for n in d.savings.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
   {% endif %}
 </section>
 
