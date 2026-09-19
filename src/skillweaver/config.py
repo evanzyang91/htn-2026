@@ -108,6 +108,19 @@ One directory per run. A profile is EXCLUSIVE - a Chrome window already open on 
 the launch fail rather than share it - and two runs pointed at one directory fight over
 the lock and spoil the state that made the setting worth having."""
 
+DEFAULT_CHROME_ATTACH = False
+"""Whether a browser run starts that real Chrome ITSELF and attaches to it, rather than
+letting Playwright launch it. ``False`` by default, so nothing changes for a run that
+says nothing.
+
+Set it - ``SKILLWEAVER_CHROME_ATTACH``, or ``--chrome-attach`` on one invocation, both
+of which need ``chrome_profile`` as well - for a site that refuses even the real Chrome
+when the automation framework is what started it. That is measured, three configurations
+against live doordash.com, at ``PLAINLY_LAUNCHED`` in
+:mod:`skillweaver.controllers.chrome_launch`, which also carries what this mode must
+never be extended into: it does not defeat, mask or retry past a human-verification page,
+and a challenge fails the run for a person to clear by hand."""
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _TARGETS = ("browser", "desktop")
 _TRUE = ("1", "true", "yes", "on")
@@ -124,6 +137,7 @@ class Settings:
     log_level: str = "INFO"
     headless: bool = DEFAULT_HEADLESS
     chrome_profile: Path | None = DEFAULT_CHROME_PROFILE
+    chrome_attach: bool = DEFAULT_CHROME_ATTACH
     claude_model: str = DEFAULT_CLAUDE_MODEL
     gemini_model: str = DEFAULT_GEMINI_MODEL
     skill_max_seconds: float = DEFAULT_SKILL_MAX_SECONDS
@@ -265,12 +279,13 @@ def load_settings(
         max_usd=_number(merged, "SKILLWEAVER_MAX_USD", defaults.max_usd, float),
         max_llm_calls=_number(merged, "SKILLWEAVER_MAX_LLM_CALLS", defaults.max_llm_calls, int),
     )
-    return Settings(
+    settings = Settings(
         data_dir=Path(merged.get("SKILLWEAVER_DATA_DIR") or "data"),
         default_target=target,  # type: ignore[arg-type]
         log_level=log_level,
         headless=_flag(merged, "SKILLWEAVER_HEADLESS", DEFAULT_HEADLESS),
         chrome_profile=_path(merged, "SKILLWEAVER_CHROME_PROFILE", DEFAULT_CHROME_PROFILE),
+        chrome_attach=_flag(merged, "SKILLWEAVER_CHROME_ATTACH", DEFAULT_CHROME_ATTACH),
         claude_model=merged.get("SKILLWEAVER_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
         gemini_model=merged.get("SKILLWEAVER_GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
         skill_max_seconds=_number(
@@ -286,6 +301,28 @@ def load_settings(
         gemini_api_key=merged.get("GEMINI_API_KEY") or merged.get("GOOGLE_API_KEY") or None,
         default_budget=budget,
     )
+    return check_settings(settings)
+
+
+def check_settings(settings: Settings) -> Settings:
+    """The settings back, or a refusal naming what does not go together.
+
+    Applied to the environment AND to the flags laid over it, because the two halves of
+    a combination can arrive from different places: ``SKILLWEAVER_CHROME_ATTACH=1`` in a
+    shell profile and the directory it needs on the command line, or the other way
+    about. The alternative is discovering it when the browser fails to open, several
+    seconds and one confusing message later.
+
+    Raises:
+        ConfigError: if two settings contradict each other.
+    """
+    if settings.chrome_attach and settings.chrome_profile is None:
+        raise ConfigError(
+            "chrome_attach starts a real Chrome of its own and needs a profile "
+            "directory to start it on: set SKILLWEAVER_CHROME_PROFILE or pass "
+            "--chrome-profile, and give every run its own directory"
+        )
+    return settings
 
 
 @lru_cache(maxsize=1)

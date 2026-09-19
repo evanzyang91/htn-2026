@@ -123,19 +123,38 @@ it was wrong, which is the thing worth knowing, because `no_route` against a rea
 reads like a routing bug and is usually the page having moved. Budget a learn run before
 measuring anything that needs a warm hit.
 
-A real site can refuse an automated browser outright, and the shipped answer is a
-LAUNCH mode, not a trick: `--chrome-profile <dir>` (`SKILLWEAVER_CHROME_PROFILE`) runs
-the real Google Chrome on this machine out of a profile directory that survives the
-run. `REAL_CHROME_CHANNEL` in `controllers/browser.py` carries what those two settings
-are measured to fix and what they deliberately do not do. Two rules go with it, both
-already paid for: give every run its OWN directory, because a profile is exclusive and
-concurrent runs sharing one spoil the state that made it worth having; and nothing in
-this project defeats a human-verification page - no masking argument, no spoofed
-fingerprint, no retry-until-it-passes - so a challenge FAILS the run and a person clears
-it by hand, once, in that profile. Access is also not a property you can retest your way
-into: hammering a site to find out whether it is still letting you in is what stops it.
-Prove this mode against something that does not gate you - `apps/sandbox-site`, or
-`example.com`.
+A real site can refuse an automated browser outright, and what it is reading is WHO
+STARTED THE BROWSER - not the binary, the profile, the IP or the debugging channel, all
+of which the three shipped launch modes can share. Measured against live doordash.com on
+2026-09-19, same machine and minutes apart: framework-launched Chromium refused;
+framework-launched real Chrome (`--chrome-profile <dir>`, `SKILLWEAVER_CHROME_PROFILE`)
+refused, 0 of 6 loads and 0 of 5 on a new profile; a PLAINLY-launched real Chrome
+attached over its debugging port loaded 6 of 6. So `--chrome-attach` (with
+`--chrome-profile`, `SKILLWEAVER_CHROME_ATTACH`) starts Chrome as an ordinary process and
+attaches, and `PLAINLY_LAUNCHED` in `controllers/chrome_launch.py` carries that table and
+the mechanism: `navigator.webdriver` is true in both framework-launched modes and false
+here because `--enable-automation`, which the framework adds and this mode does not, is
+never passed. Nothing rewrites that flag, and the line is exact - not passing a flag of
+our own is allowed, contradicting the browser with a spoofed fingerprint or user agent
+never is. `REAL_CHROME_CHANNEL` in `controllers/browser.py` still carries what the
+profile alone is measured to fix.
+
+Three rules go with all of it, every one already paid for: give every run its OWN
+directory, because a profile is exclusive and concurrent runs sharing one spoil the state
+that made it worth having; nothing in this project defeats a human-verification page - no
+masking argument, no spoofed fingerprint, no retry-until-it-passes - so a challenge FAILS
+the run and a person clears it by hand, once, in that profile; and access is not a
+property you can retest your way into, because hammering a site to find out whether it is
+still letting you in is what stops it. Say what this mode is, too: it makes us stop
+announcing ourselves, which is smaller than making a site accept us. Prove it against
+something that does not gate you - `apps/sandbox-site`, or `example.com`.
+
+Chrome 153 does NOT write `DevToolsActivePort`, in either render mode, so a launcher that
+waits for that file waits out its whole timeout beside a perfectly healthy browser. The
+address comes from Chrome's own `DevTools listening on ws://...` line on the stderr of
+the process we started, and that line is an IDENTITY as well as an address: its per-browser
+UUID is checked against `/json/version` before anything attaches, because attaching to a
+Chrome this run did not start would mean driving somebody's real session.
 
 Perception is dominated by OCR - 84-97% of every observation's time on real pages -
 so the shipped fix is to not read the same pixels twice, and counts, not seconds, are how

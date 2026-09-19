@@ -24,7 +24,11 @@ Typical use::
 
 A site that refuses an automated browser needs the REAL Chrome and a profile that
 outlives the run - ``BrowserController(user_data_dir=...)``, and
-:data:`REAL_CHROME_CHANNEL` for what that is and what it is measured to fix.
+:data:`REAL_CHROME_CHANNEL` for what that is and what it is measured to fix. A site that
+refuses even THAT needs a Chrome the framework did not start:
+``BrowserController(user_data_dir=..., attach=True)``, and
+:data:`~skillweaver.controllers.chrome_launch.PLAINLY_LAUNCHED` for the three-way
+measurement that says why.
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ from skillweaver.contracts import (
     utcnow,
 )
 from skillweaver.controllers import _coords
+from skillweaver.controllers.chrome_launch import PLAINLY_LAUNCHED, ChromeProcess
 from skillweaver.errors import ControllerError
 
 BrowserName = Literal["chromium", "firefox", "webkit"]
@@ -277,6 +282,20 @@ class BrowserController:
             the whole point - and is exclusive: Chrome locks a profile, so a window
             already open on it makes the launch fail rather than share it. ``None``
             leaves today's launch path exactly as it was.
+        attach: Start that real Chrome as an ORDINARY PROCESS and attach to it over
+            Chrome's own debugging interface, rather than letting Playwright launch it.
+            Requires ``user_data_dir``. This is the only one of the three launch
+            configurations a live DoorDash serves, and what it changes is the flags
+            Playwright adds when IT starts the browser - see
+            :data:`~skillweaver.controllers.chrome_launch.PLAINLY_LAUNCHED` for the
+            measurement, and for the boundary this mode must never be extended past.
+            ``headless``, ``block``, ``start_url`` and ``device_scale_factor`` all behave
+            as they do in the other modes; the ONE difference is that ``viewport`` is
+            applied to the adopted page rather than given to a context that does not
+            exist here, so a headed window is sized to match but the page is what is
+            authoritative.
+        chrome_binary: Where Google Chrome is, for ``attach``, or ``None`` to look in
+            this platform's usual places.
         start_url: Loaded once at construction, if given.
         block: URL patterns whose requests are aborted, on the context, so they
             are blocked for every page and every navigation. A regex matches
@@ -305,6 +324,8 @@ class BrowserController:
         start_url: str | None = None,
         block: Sequence[str | re.Pattern[str]] | None = None,
         user_data_dir: str | Path | None = None,
+        attach: bool = False,
+        chrome_binary: str | Path | None = None,
     ) -> None:
         width, height = viewport
         if width <= 0 or height <= 0:
@@ -329,9 +350,16 @@ class BrowserController:
                 f"user_data_dir drives real Google Chrome, which is a chromium channel, "
                 f"not {browser!r}"
             )
+        self._attach = bool(attach)
+        if self._attach and self._profile_dir is None:
+            raise ValueError(
+                "attach=True starts a real Chrome of its own and needs a user_data_dir "
+                "to start it on; give this run its own directory"
+            )
         self._closed = False
 
         self._page: Page | None = None
+        self._chrome: ChromeProcess | None = None
         self._holds_driver = False
         try:
             playwright = _acquire_driver()
@@ -344,7 +372,26 @@ class BrowserController:
             # themselves, and engines where this flag does not exist.
             args = ["--disable-smooth-scrolling"] if browser == "chromium" else []
             view = {"width": int(width), "height": int(height)}
-            if self._profile_dir is not None:
+            if self._attach:
+                # Playwright does not start this browser: an ordinary Chrome process
+                # does, and Playwright is handed the address it published. ``args``
+                # above belongs to a launch that is not happening here, so the same
+                # scroll setting is passed to the process instead - see
+                # :meth:`ChromeProcess._spawn`.
+                assert self._profile_dir is not None  # checked above
+                self._chrome = ChromeProcess(
+                    user_data_dir=self._profile_dir,
+                    headless=headless,
+                    binary=chrome_binary,
+                    device_scale_factor=device_scale_factor,
+                    window=(int(width), int(height)),
+                )
+                self._browser = engine.connect_over_cdp(self._chrome.endpoint)
+                # Take the context and page the browser already has. Making more is how
+                # a run ends up driving a blank tab while the demo watches another.
+                contexts = self._browser.contexts
+                self._context = contexts[0] if contexts else self._browser.new_context()
+            elif self._profile_dir is not None:
                 # The persistent context IS the launch: there is no Browser to make a
                 # second context on, and ``self._browser`` stays None. Closing the
                 # context is what shuts the process down.
@@ -372,6 +419,12 @@ class BrowserController:
             # drives would stay on screen for the whole demo.
             existing = self._context.pages if self._profile_dir is not None else []
             self._page = existing[0] if existing else self._context.new_page()
+            if self._attach:
+                # The viewport is a property of the LAUNCH in the other two modes. Here
+                # the launch was an ordinary one, so the size is set on the page that
+                # came back - which is what every capture and every coordinate is
+                # measured against anyway.
+                self._page.set_viewport_size(view)
             if start_url is not None:
                 self._page.goto(start_url, timeout=self._navigation_timeout_ms)
         except Exception as exc:
@@ -401,6 +454,27 @@ class BrowserController:
         :attr:`headless`: it changes which browser rendered a screen, and a person
         asking why a site served them has to be able to see which one they got."""
         return self._profile_dir
+
+    @property
+    def attached(self) -> bool:
+        """Whether this browser was started as an ordinary process and attached to,
+        rather than launched by Playwright. Readable for the same reason as
+        :attr:`headless` and :attr:`profile_dir`: it is the difference between a screen a
+        live site served and an interstitial it served instead."""
+        return self._attach
+
+    @property
+    def cdp_endpoint(self) -> str | None:
+        """``http://127.0.0.1:<port>`` for the attached browser, or ``None`` in the
+        other modes.
+
+        Readable so this controller is not the only thing that can use the browser it
+        opened: anything else that speaks Chrome's debugging protocol - a policy that
+        reads the DOM rather than the pixels, a person with DevTools - attaches to the
+        same process at this address. The process stays owned here and dies with this
+        controller, so a second user of it is a guest for the run, not an owner.
+        """
+        return None if self._chrome is None else self._chrome.endpoint
 
     def __enter__(self) -> BrowserController:
         return self
@@ -486,11 +560,17 @@ class BrowserController:
         """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``.
 
         A persistent profile says ``chrome`` rather than ``chromium``, because that is
-        the build a page was actually served to.
+        the build a page was actually served to, and an attached one says ``chrome+cdp``,
+        because being started plainly is what a live site is reading.
         """
         view = self._viewport if self._closed else self.viewport()
         mode = "" if self._headless else " headed"
-        engine = REAL_CHROME_CHANNEL if self._profile_dir is not None else self._browser_name
+        if self._attach:
+            engine = f"{REAL_CHROME_CHANNEL}+cdp"
+        elif self._profile_dir is not None:
+            engine = REAL_CHROME_CHANNEL
+        else:
+            engine = self._browser_name
         return f"playwright {engine} {view.w}x{view.h} @{self._requested_scale:g}x{mode}"
 
     def close(self) -> None:
@@ -501,16 +581,27 @@ class BrowserController:
         close in that mode - the context is the process - and the cookies in that
         directory are what the next run needs; deleting it would put the agent back
         behind the bot wall one run later.
+
+        An ATTACHED browser is torn down the other way round. Closing its page or its
+        context would be asking a browser this controller does not own to dismantle
+        itself, so those handles are only dropped; what actually ends the browser is
+        killing the process this run started, which happens last and happens even when
+        the page is already wedged. A Chrome this run did not start is never touched.
         """
         self._closed = True
+        handles = ("_browser",) if self._attach else ("_page", "_context", "_browser")
         for name in ("_page", "_context", "_browser"):
             handle = getattr(self, name, None)
             if handle is not None:
-                try:
-                    handle.close()
-                except Exception:  # noqa: BLE001 - teardown must never raise
-                    pass
+                if name in handles:
+                    try:
+                        handle.close()
+                    except Exception:  # noqa: BLE001 - teardown must never raise
+                        pass
                 setattr(self, name, None)
+        if self._chrome is not None:
+            chrome, self._chrome = self._chrome, None
+            chrome.close()
         if self._holds_driver:
             self._holds_driver = False
             _release_driver()
@@ -524,6 +615,13 @@ class BrowserController:
         on bundled Chromium, and that is the build a site's bot wall turns away, so a
         silent fallback would trade a loud failure for a run that is quietly blocked.
         """
+        if self._attach:
+            return (
+                f"could not start and attach to a plainly-launched Google Chrome on "
+                f"profile {self._profile_dir}: {_brief(exc)}. This mode is "
+                f"{PLAINLY_LAUNCHED}; there is no fallback to a framework-launched "
+                f"browser, which is the configuration a bot wall refuses."
+            )
         if self._profile_dir is None:
             return f"could not launch {self._browser_name}: {_brief(exc)}"
         return (

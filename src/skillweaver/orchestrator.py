@@ -2160,6 +2160,7 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
             headless=config.headless,
             start_url=task.params.get("start_url"),
             user_data_dir=config.chrome_profile,
+            attach=config.chrome_attach,
         )
     # Not ``default_weights_path()``: that reads the process-wide settings, which a
     # --data-dir on this invocation has already overridden.

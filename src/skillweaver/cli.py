@@ -54,7 +54,7 @@ from typing import Annotated, Any
 
 import typer
 
-from skillweaver.config import Settings, load_settings, settings
+from skillweaver.config import Settings, check_settings, load_settings, settings
 from skillweaver.contracts import Skill, Transition, UIState, action_to_dict
 from skillweaver.errors import ConfigError, SkillNotFound, SkillWeaverError
 from skillweaver.orchestrator import (
@@ -158,6 +158,23 @@ def root(
             show_default=False,
         ),
     ] = None,
+    chrome_attach: Annotated[
+        bool | None,
+        typer.Option(
+            "--chrome-attach/--no-chrome-attach",
+            help="Start that real Chrome as an ORDINARY PROCESS and attach to it over "
+            "Chrome's own debugging interface, instead of letting the automation "
+            "framework launch it. Needs --chrome-profile, and applies to learn, run and "
+            "eval run. This is the configuration a live DoorDash serves, and the "
+            "difference is the flags the framework adds when IT starts the browser - "
+            "started plainly, Chrome carries none of them. It makes us stop announcing "
+            "ourselves; it does NOT make a site accept us, and nothing here defeats, "
+            "masks or retries past a human-verification page - one that appears fails "
+            "the run for a person to clear by hand. Overrides "
+            "SKILLWEAVER_CHROME_ATTACH.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Open the memories every subcommand reads from.
 
@@ -167,7 +184,9 @@ def root(
     if ctx.obj is not None:  # a caller (a test, an embedder) supplied its own
         return
     try:
-        ctx.obj = build_workbench(_settings(data_dir, log_level, headless, chrome_profile))
+        ctx.obj = build_workbench(
+            _settings(data_dir, log_level, headless, chrome_profile, chrome_attach)
+        )
     except ConfigError as exc:
         _die(f"configuration is invalid: {exc}")
 
@@ -177,6 +196,7 @@ def _settings(
     log_level: str | None,
     headless: bool | None = None,
     chrome_profile: Path | None = None,
+    chrome_attach: bool | None = None,
 ) -> Settings:
     """Configuration, with the global flags applied on top.
 
@@ -202,7 +222,13 @@ def _settings(
         changes["headless"] = bool(headless)
     if chrome_profile is not None:
         changes["chrome_profile"] = Path(chrome_profile).expanduser()
-    return dataclasses.replace(resolved, **changes) if changes else resolved
+    if chrome_attach is not None:
+        changes["chrome_attach"] = bool(chrome_attach)
+    if not changes:
+        return resolved
+    # Checked again after the flags land: --chrome-attach and the directory it needs can
+    # arrive from opposite sides, one in the environment and one on the command line.
+    return check_settings(dataclasses.replace(resolved, **changes))
 
 
 # --------------------------------------------------------------------------------------
