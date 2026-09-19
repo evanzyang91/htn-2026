@@ -517,7 +517,7 @@ class ElementIndex:
                 continue
             score = _text_score(q, text, fuzzy=fuzzy)
             if score > 0:
-                scored.append((score, element))
+                scored.append((score, narrow_to(element, q, text)))
         return self._ranked(scored, tightest_first=True)
 
     def nearest(self, point: Point, kind: ElementKind | None = None) -> list[Element]:
@@ -662,6 +662,34 @@ about - and short enough that a screen of sixteen such rows does not fill a prom
 with body copy. Reading order puts the identifying lines first, so what a truncation
 drops is the tail of the longest line.
 """
+
+
+def narrow_to(element: Element, query: str, text: str) -> Element:
+    """The part of a line of text that answers the query, rather than the whole line.
+
+    OCR reads a row of adjacent things as ONE line. A navigation bar becomes a single
+    element saying "Donate Create account Log in", and the middle of that - which is
+    where a click on it lands - is somewhere in "Create account". So asking for
+    "Donate" returned an element that pointed at the wrong link, and on a page that is
+    mostly rows of links, most links could not be pressed at all.
+
+    Where the words are inside the line is estimated from where they are inside the
+    string, which is as good as it sounds for a single run of text at one size and far
+    better than the alternative of aiming at the middle of everything.
+
+    Only for TEXT, and only for a line wider than it is tall. A button whose label
+    contains the query is a button: pressing its middle is right, and carving a
+    fraction out of it would be a way to miss it.
+    """
+    if element.kind is not ElementKind.text or not query or query == text:
+        return element
+    start = text.find(query)
+    if start < 0 or not text or element.box.h >= element.box.w:
+        return element
+    width = element.box.w
+    left = element.box.x + int(width * start / len(text))
+    span = max(1, int(width * len(query) / len(text)))
+    return dataclasses.replace(element, box=Box(left, element.box.y, span, element.box.h))
 
 
 def overlap_ratio(a: Box, b: Box) -> float:

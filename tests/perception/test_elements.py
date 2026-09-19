@@ -538,6 +538,35 @@ def test_a_very_wordy_control_is_cut_after_the_identifying_lines() -> None:
     assert text.endswith("…")
 
 
+def test_a_query_that_names_part_of_a_line_points_at_that_part() -> None:
+    """OCR reads a row of adjacent things as ONE line, which is how a navigation bar
+    becomes a single element saying "Donate Create account Log in".
+
+    The middle of that line - where a click on it lands - is somewhere inside "Create
+    account", so asking for "Donate" used to return something that pointed at the
+    wrong link. On Wikipedia and Hacker News, which are mostly rows of links, that made
+    most links unpressable.
+    """
+    bar = _element(Box(1000, 20, 300, 16), ElementKind.text, "Donate Create account Log in", 0.9)
+    index = ElementIndex([bar])
+
+    donate = index.find_text("Donate")[0]
+    log_in = index.find_text("Log in")[0]
+
+    assert donate.box.x < log_in.box.x, "they point at different places along the line"
+    assert bar.box.x <= donate.box.x and donate.box.x + donate.box.w <= bar.box.x + bar.box.w
+    assert donate.box.center.x < bar.box.center.x, "Donate is left of the middle"
+    assert log_in.box.center.x > bar.box.center.x, "Log in is right of it"
+    assert donate.box.y == bar.box.y and donate.box.h == bar.box.h
+
+
+def test_a_button_is_not_carved_up_by_a_query_naming_part_of_its_label() -> None:
+    """A button whose label contains the query is a button: pressing its middle is
+    right, and aiming at a fraction of it would be a way to miss it."""
+    button = _element(Box(40, 40, 200, 40), ElementKind.button, "Save and close", 0.9)
+    assert ElementIndex([button]).find_text("close")[0].box == button.box
+
+
 def test_a_paragraph_does_not_fuzzily_answer_a_two_word_query() -> None:
     """A sentence containing one of the words is not the control you asked for.
 
