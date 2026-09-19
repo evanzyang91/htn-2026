@@ -24,13 +24,19 @@ ctx.ctl.type_text("text")  # types into whatever has focus
 ctx.ctl.press("Enter")  # a chord: press("Meta", "a")
 ctx.ctl.scroll(target, dx=0, dy=0)  # positive dy scrolls DOWN
 ctx.ctl.wait(250)  # milliseconds
+ctx.ctl.navigate("https://shop.test/collections/all")  # straight to a URL
 ctx.ctl.supports("scroll")  # -> bool; ASKS a question, it does not add a method
 ```
 
-Those five are the whole of `ctx.ctl`. Anything else is an `AttributeError` at the
-first call, including `ctx.ctl.navigate` - there is no way to type a URL, and you do
-not need one: you are handed the screen the recording started on, and every other
-screen is reached by pressing something on it, the way a person reaches it.
+Those six are the whole of `ctx.ctl`. Anything else is an `AttributeError` at the
+first call.
+
+Use `navigate` when the RECORDING navigated, and when a section of the site has a
+stable address. A URL outlasts a menu: `/collections/all` will still be there when
+the navigation bar has been re-worded. Do not use it to skip the work - navigating
+straight to a "success" page reaches the right screen without doing the task, and
+the critic is comparing screens, so it will not catch you and the skill will be
+useless the first time it is trusted.
 
 A failed action raises; you never have to check a result. `click` takes an element
 you just found - NOT coordinates (see "Never write coordinates" below).

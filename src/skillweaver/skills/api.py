@@ -368,6 +368,28 @@ class ActionView:
         """Pause for ``ms`` milliseconds. Costs a step, like any other action."""
         return self.perform(Wait(ms))
 
+    def navigate(self, url: str) -> ActionResult:
+        """Go straight to a URL. Costs a step, like any other action.
+
+        This exists because the EXPLORER has it. A run that reached the product
+        listing by going to ``/collections/all`` recorded one ``navigate`` step, and
+        a skill with no way to navigate cannot reproduce that recording at all: the
+        gate spends every repair watching the model imitate a URL jump with menu
+        clicks, and rejects all three. An agent that can solve a task in a way it
+        cannot remember has a hole in it, and this is the hole.
+
+        A URL is also the most durable handle a site offers. Menus move and re-word
+        themselves between visits; ``/collections/all`` does not. What a skill must
+        not do is write a URL that encoded THIS run's data - a basket id, a session
+        token - and :mod:`skillweaver.skills.refactor` lifts those into parameters
+        for the same reason it lifts a typed name.
+
+        Raises:
+            ControllerError: if the controller cannot navigate, as a desktop one
+                cannot, or the page did not load.
+        """
+        return self.perform(Navigate(url))
+
 
 # --------------------------------------------------------------------------------------
 # The graph, read-only

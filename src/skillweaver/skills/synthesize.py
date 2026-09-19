@@ -87,6 +87,7 @@ from skillweaver.contracts import (
 )
 from skillweaver.errors import SandboxViolation
 from skillweaver.logging_ import get_logger
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 from skillweaver.skills.api import SkillLimits, describe_action
 from skillweaver.skills.model import SkillInvalid, make_skill
 from skillweaver.skills.refactor import Hardening, harden
@@ -624,7 +625,16 @@ class Synthesizer:
         min_steps: Runs shorter than this are not worth a skill; ``synthesize``
             returns ``None`` for them.
         min_similarity: How like the recorded starting screen the environment must
-            be before a candidate is run in it (``1.0`` is the same screen).
+            be before a candidate is run in it (``1.0`` is a byte-identical screen).
+            Defaults to
+            :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`, which
+            is this project's measured answer to "are these the same UI state".
+            It used to demand ``1.0``, and that quietly made every DYNAMIC site
+            unlearnable: a real shop redraws a rotating banner and a cart count on
+            every load, so its front page is never identical to itself. The gate
+            refused a candidate at 0.96 similarity - plainly the same screen - and
+            no amount of rewriting the skill could have helped. A genuinely wrong
+            screen scores far below this: the run that found it measured 0.24.
         max_tokens, temperature: Passed to ``llm.complete``.
 
     Not thread-safe, and one instance may be reused across trajectories.
@@ -654,7 +664,7 @@ class Synthesizer:
         max_format_retries: int = 2,
         limits: SkillLimits | None = None,
         min_steps: int = 1,
-        min_similarity: float = 1.0,
+        min_similarity: float = SAME_STATE_THRESHOLD,
         max_tokens: int = 8000,
         temperature: float | None = None,
         prompt: str | None = None,

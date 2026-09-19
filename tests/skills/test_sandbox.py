@@ -48,6 +48,7 @@ from tests.fakes import (
     InMemorySkillStore,
     Scenario,
 )
+from tests.fakes.controller import navigates
 
 DOMAIN = "fake.test"
 PROVENANCE = Provenance("run-0", "confirm a payment", "fake-llm", datetime(2026, 9, 19, tzinfo=UTC))
@@ -472,12 +473,50 @@ def test_the_context_and_its_action_view_satisfy_the_contracts(ctx: Any) -> None
     assert isinstance(ctx.ctl, ActionSurface)
 
 
+def test_a_skill_can_navigate_because_the_explorer_can(
+    runner: SkillRunner, ctx: Any, scenario: Scenario
+) -> None:
+    """A recording that navigated has to be reproducible by the skill written from it.
+
+    The explorer may go straight to a URL, and it does: reaching a product listing at
+    ``/collections/all`` is one ``navigate`` step. Without this the resulting
+    trajectory was unlearnable - the gate spent every repair watching the model
+    imitate a URL jump with menu clicks, then rejected all three. An agent that can
+    solve a task in a way it cannot remember has a hole in it.
+    """
+    # The shared Scenario denies `navigate` on purpose, so this brings its own
+    # controller rather than weakening a fake every other test depends on.
+    source = scenario.controller
+    controller = FakeController(
+        source.states, source.transitions, start=source.state, viewport=source.viewport()
+    )
+    context = runner.context(controller, scenario.perceiver, domain=DOMAIN)
+    url = "https://shop.test/collections/all"
+    code = f"def run(ctx):\n    ctx.ctl.navigate({url!r})\n    return 'gone'\n"
+
+    result = runner.run(make("go", code), {}, context)
+
+    assert result.ok, result.error
+    assert [a.kind for a in controller.actions] == ["navigate"]
+    assert navigates(url)(controller.actions[0])
+    assert result.steps == 1, "navigating costs a step like every other action"
+
+
 def test_ctl_cannot_reach_the_raw_controller_or_ground_truth(
     runner: SkillRunner, ctx: Any, scenario: Scenario
 ) -> None:
     public = {name: getattr(ctx.ctl, name) for name in dir(ctx.ctl) if not name.startswith("_")}
 
-    assert set(public) == {"click", "perform", "press", "scroll", "supports", "type_text", "wait"}
+    assert set(public) == {
+        "click",
+        "navigate",
+        "perform",
+        "press",
+        "scroll",
+        "supports",
+        "type_text",
+        "wait",
+    }
     assert not any(isinstance(value, FakeController | FakeGroundTruth) for value in public.values())
     assert not hasattr(ctx.ctl, "capture"), "a skill looks with ctx.see, never at raw pixels"
     assert not hasattr(ctx.ctl, "close")
