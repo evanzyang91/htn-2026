@@ -98,12 +98,16 @@ def main() -> int:
     parser.add_argument("--sites", nargs="*", default=list(SITES))
     parser.add_argument("--shots", type=Path, default=None, help="save each screenshot here")
     parser.add_argument("--json", type=Path, default=None)
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        default=REPO / "data" / "models" / "ui_detector.pt",
+        help="which detector to measure, so two of them can be compared on one page set",
+    )
     args = parser.parse_args()
 
     controller = BrowserController(headless=True)
-    perceiver = ComposedPerceiver(
-        YoloDetector(REPO / "data" / "models" / "ui_detector.pt"), RapidOcrReader()
-    )
+    perceiver = ComposedPerceiver(YoloDetector(args.weights), RapidOcrReader())
     truth_source = BrowserGroundTruth(controller)
 
     rows = []
@@ -157,10 +161,9 @@ def main() -> int:
         )
     usable = [r for r in rows if r["reachable"] is not None]
     if usable:
-        print(
-            f"\nmean control recall {statistics.fmean(r['control_recall'] for r in rows) * 100:.0f}%"
-            f"   mean reachable {statistics.fmean(r['reachable'] for r in usable) * 100:.0f}%"
-        )
+        recall = statistics.fmean(r["control_recall"] for r in rows) * 100
+        reach = statistics.fmean(r["reachable"] for r in usable) * 100
+        print(f"\nmean control recall {recall:.0f}%   mean reachable {reach:.0f}%")
     for row in rows:
         if row["unreachable"]:
             print(f"\n  could not reach on {row['url'][:40]}: {', '.join(row['unreachable'])}")
