@@ -140,11 +140,15 @@ class AnthropicClient:
 
     Args:
         model: The model id. Defaults to ``settings().claude_model``.
-        api_key: An explicit key. ``None`` lets the SDK resolve its own
-            credentials (``ANTHROPIC_API_KEY``, an auth token, or a stored profile).
+        api_key: An explicit key. ``None`` falls back to ``settings().anthropic_api_key``
+            (which reads both the environment and ``.env``) and then to the SDK's own
+            resolution (auth token, stored profile).
         client: A ready-made SDK client, or any object exposing
             ``messages.create(**kwargs)``. Tests pass a stub here; when given,
-            ``api_key`` and ``timeout`` are ignored.
+            ``api_key``, ``workspace_id`` and ``timeout`` are ignored.
+        workspace_id: Sent as the ``anthropic-workspace-id`` header. Required when
+            the key is scoped to an organization rather than a workspace - such a
+            key gets a 400 on EVERY endpoint without it, ``models.list`` included.
         computer_use: Append :data:`COMPUTER_USE_TOOL` to every request's tools.
         effort: ``"low"``..``"max"``, sent as ``output_config.effort``. ``None``
             leaves the model default (``"high"``).
@@ -160,6 +164,7 @@ class AnthropicClient:
         model: str | None = None,
         api_key: str | None = None,
         client: Any | None = None,
+        workspace_id: str | None = None,
         computer_use: bool = False,
         effort: str | None = None,
         max_attempts: int = 4,
@@ -171,7 +176,8 @@ class AnthropicClient:
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
-        self._model = model or settings().claude_model
+        resolved = settings()
+        self._model = model or resolved.claude_model
         self._computer_use = computer_use
         self._effort = effort
         self._max_attempts = max_attempts
@@ -184,8 +190,17 @@ class AnthropicClient:
             self._client = client
         else:
             kwargs: dict[str, Any] = {"max_retries": 0}
-            if api_key is not None:
-                kwargs["api_key"] = api_key
+            # settings() resolves ANTHROPIC_API_KEY from the process environment
+            # AND from .env; the SDK only looks at the environment, so a key that
+            # lives only in .env never reaches it unless it is passed explicitly.
+            # Leaving this to the SDK cost a failed live run. Falling through with
+            # no key is still correct: the SDK then tries its own auth token and
+            # stored profile.
+            resolved_key = api_key or resolved.anthropic_api_key
+            if resolved_key is not None:
+                kwargs["api_key"] = resolved_key
+            if workspace_id:
+                kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
             if timeout is not None:
                 kwargs["timeout"] = timeout
             self._client = anthropic.Anthropic(**kwargs)

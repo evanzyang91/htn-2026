@@ -337,6 +337,88 @@ class TestRetry:
         assert not is_retryable(ValueError("nope"))
 
 
+class TestCredentialResolution:
+    """What the first live run got wrong.
+
+    The SDK reads only the process environment, so a key that lives in ``.env``
+    reaches it only if the adapter passes it explicitly. ``settings()`` is the one
+    place that merges the two.
+    """
+
+    def test_a_dot_env_key_is_passed_to_the_sdk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skillweaver.llm.anthropic_ as module
+        from skillweaver.config import Settings
+
+        captured: dict[str, object] = {}
+
+        class FakeSDK:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr(module.anthropic, "Anthropic", FakeSDK)
+        monkeypatch.setattr(
+            module, "settings", lambda: Settings(anthropic_api_key="key-from-dot-env")
+        )
+        AnthropicClient()
+        assert captured["api_key"] == "key-from-dot-env"
+        assert captured["max_retries"] == 0, "our backoff must be the only one"
+
+    def test_an_explicit_key_wins_over_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skillweaver.llm.anthropic_ as module
+        from skillweaver.config import Settings
+
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            module.anthropic, "Anthropic", lambda **kw: captured.update(kw) or object()
+        )
+        monkeypatch.setattr(
+            module, "settings", lambda: Settings(anthropic_api_key="key-from-dot-env")
+        )
+        AnthropicClient(api_key="explicit")
+        assert captured["api_key"] == "explicit"
+
+    def test_no_key_anywhere_leaves_sdk_resolution_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An auth token or a stored profile is still a valid credential, so the
+        adapter must not force api_key=None and break them."""
+        import skillweaver.llm.anthropic_ as module
+        from skillweaver.config import Settings
+
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            module.anthropic, "Anthropic", lambda **kw: captured.update(kw) or object()
+        )
+        monkeypatch.setattr(module, "settings", lambda: Settings(anthropic_api_key=None))
+        AnthropicClient()
+        assert "api_key" not in captured
+
+    def test_workspace_id_becomes_a_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An org-scoped key 400s on every endpoint without this header."""
+        import skillweaver.llm.anthropic_ as module
+        from skillweaver.config import Settings
+
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            module.anthropic, "Anthropic", lambda **kw: captured.update(kw) or object()
+        )
+        monkeypatch.setattr(module, "settings", lambda: Settings(anthropic_api_key="k"))
+        AnthropicClient(workspace_id="wrkspc_abc")
+        assert captured["default_headers"] == {"anthropic-workspace-id": "wrkspc_abc"}
+
+    def test_no_workspace_header_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import skillweaver.llm.anthropic_ as module
+        from skillweaver.config import Settings
+
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            module.anthropic, "Anthropic", lambda **kw: captured.update(kw) or object()
+        )
+        monkeypatch.setattr(module, "settings", lambda: Settings(anthropic_api_key="k"))
+        AnthropicClient()
+        assert "default_headers" not in captured
+
+
 class TestErrorMapping:
     def test_a_non_retryable_error_raises_provider_error_with_the_cause(self) -> None:
         original = anthropic_error(400, "messages.0: invalid role")

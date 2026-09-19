@@ -119,12 +119,26 @@ OFFLINE_REPLIES: dict[str, dict[str, Any]] = {
 
 
 def record(client: Any, path: Path, scenarios: Sequence[Scenario] = SCENARIOS) -> None:
-    """Run every scenario through ``client`` wrapped in a recording cassette at ``path``."""
-    path.unlink(missing_ok=True)
-    recorder = CassetteClient(path, mode="record", inner=client)
-    for scenario in scenarios:
-        response = scenario.run(recorder)
-        print(f"  {scenario.key:<10} -> {response.stop_reason:<9} {response.text[:48]!r}")
+    """Run every scenario through ``client`` and write the cassette at ``path``.
+
+    Recording goes to a sibling temporary file and is moved into place only after
+    EVERY scenario has succeeded. A live run that dies on the first call - an
+    unscoped key, a rate limit, a network drop - then leaves the committed
+    cassette untouched instead of deleting it. Recording in place cost exactly
+    that once, and a half-written fixture is worse than a stale one because the
+    suite fails somewhere unrelated to the real problem.
+    """
+    staging = path.with_name(path.name + ".recording")
+    staging.unlink(missing_ok=True)
+    recorder = CassetteClient(staging, mode="record", inner=client)
+    try:
+        for scenario in scenarios:
+            response = scenario.run(recorder)
+            print(f"  {scenario.key:<10} -> {response.stop_reason:<9} {response.text[:48]!r}")
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+    staging.replace(path)
 
 
 def _offline_anthropic() -> Any:
@@ -180,6 +194,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=("anthropic", "gemini"),
         help="record just one backend",
     )
+    parser.add_argument(
+        "--workspace-id",
+        help="anthropic-workspace-id header, for a key scoped to an org not a workspace",
+    )
     args = parser.parse_args(argv)
 
     backends = []
@@ -187,7 +205,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.live:
             from skillweaver.llm.anthropic_ import AnthropicClient
 
-            backends.append(("anthropic", AnthropicClient(), ANTHROPIC_CASSETTE))
+            backends.append(
+                (
+                    "anthropic",
+                    AnthropicClient(workspace_id=args.workspace_id),
+                    ANTHROPIC_CASSETTE,
+                ),
+            )
         else:
             backends.append(("anthropic", _offline_anthropic(), ANTHROPIC_CASSETTE))
     if args.only in (None, "gemini"):

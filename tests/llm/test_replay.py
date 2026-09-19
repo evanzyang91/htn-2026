@@ -128,3 +128,24 @@ class TestRerecording:
         assert [i.response for i in actual.interactions] == [
             i.response for i in expected.interactions
         ]
+
+    def test_a_failed_recording_leaves_the_existing_cassette_intact(self, tmp_path: Path) -> None:
+        """A live run that dies partway must not destroy the committed fixture.
+
+        Recording in place did exactly that the first time a real key was tried:
+        the call failed on scenario one and the cassette was already gone.
+        """
+        from tests.llm.record_fixtures import _offline_anthropic
+
+        target = tmp_path / "existing.json"
+        record(_offline_anthropic(), target)
+        before = target.read_bytes()
+
+        dying = _offline_anthropic()
+        dying._client.messages.script.clear()  # the stub runs out on the first call
+
+        with pytest.raises(ProviderError):
+            record(dying, target)
+
+        assert target.read_bytes() == before, "the previous cassette must survive"
+        assert not list(tmp_path.glob("*.recording")), "no staging file left behind"
