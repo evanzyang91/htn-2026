@@ -41,6 +41,7 @@ import numpy as np
 from skillweaver.config import settings
 from skillweaver.contracts import Box, Element, ElementSource, Screenshot
 from skillweaver.errors import PerceptionError
+from skillweaver.perception.arrays import array_of
 from skillweaver.perception.labeling import CLASS_NAMES, kind_of
 
 DEFAULT_WEIGHTS_NAME = "ui_detector.pt"
@@ -123,7 +124,7 @@ class YoloDetector:
         model = self._load()
         # ultralytics reads a numpy array as BGR, and torch refuses the negative
         # stride a bare ``[..., ::-1]`` view would hand it.
-        image = np.ascontiguousarray(screenshot.to_array(logical=False)[:, :, ::-1])
+        image = np.ascontiguousarray(array_of(screenshot, logical=False)[:, :, ::-1])
         try:
             results = model.predict(
                 source=image,

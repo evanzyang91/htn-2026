@@ -72,6 +72,7 @@ import numpy as np
 
 from skillweaver.contracts import Element, Fingerprint, Screenshot
 from skillweaver.errors import PerceptionError
+from skillweaver.perception.arrays import array_of
 
 SAME_STATE_THRESHOLD = 0.62
 """Recommended cut for "these two frames are the same UI state".
@@ -242,7 +243,7 @@ def _phash_rows(screenshot: Screenshot) -> list[str]:
         PerceptionError: if the screenshot cannot be decoded or hashed.
     """
     try:
-        image = screenshot.to_array()
+        image = array_of(screenshot)
         if image.size == 0:
             return ["0" * ((_PHASH_BITS + 3) // 4)] * _PHASH_ROWS
         gray = image.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)

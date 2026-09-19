@@ -20,6 +20,7 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from skillweaver import contracts
@@ -341,3 +342,122 @@ def test_the_engine_is_built_once_and_only_when_needed() -> None:
     reader.read(_load("login@1x"))
     reader.read(_load("login@1x"))
     assert len(calls) == 2
+
+
+# --------------------------------------------------------------------------------------
+# The line cache: the same pixels are never recognized twice
+# --------------------------------------------------------------------------------------
+
+
+class _StagedEngine:
+    """A RapidOCR-shaped double exposing the three stages the fast path uses.
+
+    Each "line" is a distinct little array, so the reader's content digest separates
+    them the way it separates real crops. ``recognized`` counts the crops that reached
+    the recognizer, which is the quantity the cache exists to reduce.
+    """
+
+    use_cls = True
+
+    def __init__(self, lines: dict[tuple[int, int], str]) -> None:
+        self._lines = lines
+        self.recognized: list[int] = []
+        self.detections = 0
+
+    def text_det(self, image: object) -> tuple[list[object], float]:
+        self.detections += 1
+        boxes = [
+            np.array([[x, y], [x + 40, y], [x + 40, y + 10], [x, y + 10]], dtype=np.float32)
+            for (x, y) in self._lines
+        ]
+        return boxes, 0.0
+
+    def get_crop_img_list(self, image: object, boxes: list[object]) -> list[object]:
+        # One crop per line, its pixels derived from the text so that the same text at
+        # the same place is byte-identical between reads and different text is not.
+        return [
+            np.full((10, 40, 3), abs(hash(text)) % 251, dtype=np.uint8)
+            for text in self._lines.values()
+        ]
+
+    def text_rec(self, crops: list[object], *args: object) -> tuple[list[object], float]:
+        self.recognized.append(len(crops))
+        wanted = list(self._lines.values())
+        answers = []
+        for crop in crops:
+            shade = int(crop[0, 0, 0])
+            answers.append(
+                next((t for t in wanted if abs(hash(t)) % 251 == shade), ("", 0.0)) or ""
+            )
+        return [[text, 0.9] for text in answers], 0.0
+
+
+def test_the_same_screen_read_twice_recognizes_nothing_the_second_time() -> None:
+    """The cache's whole purpose, asserted at the recognizer rather than on a clock.
+
+    Detection still runs on every read - the lines could have moved - but no crop whose
+    pixels have already been read is sent to the recognizer again.
+    """
+    engine = _StagedEngine({(10, 10): "Inbox", (10, 30): "Archived", (10, 50): "Sent"})
+    reader = RapidOcrReader(engine=engine)
+    shot = _load("login@1x")
+
+    first = reader.read(shot)
+    second = reader.read(shot)
+
+    assert [e.text for e in first] == [e.text for e in second], "the same screen reads the same"
+    assert engine.detections == 2, "detection is not cached: the lines may have moved"
+    assert engine.recognized == [3], "three crops recognized once, and never again"
+    assert reader.cache_info()["hits"] == 3
+
+
+def test_only_the_lines_that_changed_are_recognized_again() -> None:
+    """The case a real run is always in: one action changes part of one screen."""
+    lines = {(10, 10): "Inbox", (10, 30): "Archived", (10, 50): "Sent"}
+    engine = _StagedEngine(lines)
+    reader = RapidOcrReader(engine=engine)
+    shot = _load("login@1x")
+    reader.read(shot)
+
+    lines[(10, 50)] = "Drafts"  # one line of three now says something else
+    reader.read(shot)
+
+    assert engine.recognized == [3, 1], "only the changed line went back to the recognizer"
+
+
+def test_a_reader_built_without_a_cache_recognizes_every_line_every_time() -> None:
+    """``cache=False`` is what a benchmark measuring a cold read needs."""
+    engine = _StagedEngine({(10, 10): "Inbox", (10, 30): "Archived"})
+    reader = RapidOcrReader(engine=engine, cache=False)
+    shot = _load("login@1x")
+    reader.read(shot)
+    reader.read(shot)
+    assert engine.recognized == [2, 2]
+
+
+def test_the_staged_path_and_the_plain_path_agree_on_the_real_engine(
+    reader: RapidOcrReader,
+) -> None:
+    """The fast path must not change WHAT is read, only what it costs.
+
+    The shipped reader uses detection plus a cached recognition; a reader handed the
+    same engine wrapped so that the stages are hidden falls back to calling it whole.
+    Both are run over a real screenshot and must agree on every line and every box.
+    """
+
+    class _Opaque:
+        """The same engine with its stages hidden, so only ``__call__`` is reachable."""
+
+        use_cls = True
+
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __call__(self, image: object, **kwargs: object) -> object:
+            return self._inner(image, **kwargs)
+
+    shot = _load("invoices@1x")
+    staged = reader.read(shot)
+    plain = RapidOcrReader(engine=_Opaque(reader._ensure_engine())).read(shot)  # noqa: SLF001
+
+    assert [(e.text, e.box) for e in staged] == [(e.text, e.box) for e in plain]
