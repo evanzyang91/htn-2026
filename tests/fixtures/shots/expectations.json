@@ -1,0 +1,710 @@
+{
+  "generated_by": "tests/fixtures/shots/generate.py",
+  "note": "Boxes and sizes are LOGICAL pixels. Load a shot with perception.screenshot.load_screenshot(path, scale=shot['scale']).",
+  "shots": [
+    {
+      "name": "invoices@1x",
+      "png": "invoices@1x.png",
+      "page": "pages/invoices.html",
+      "width": 800,
+      "height": 600,
+      "scale": 1.0,
+      "expect_text": [
+        {
+          "text": "Open Invoices",
+          "near": [
+            40,
+            32,
+            300,
+            40
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Acme Corporation billing",
+          "near": [
+            40,
+            84,
+            320,
+            24
+          ],
+          "verbatim": false
+        },
+        {
+          "text": "Search invoices",
+          "near": [
+            40,
+            132,
+            300,
+            44
+          ],
+          "verbatim": false
+        },
+        {
+          "text": "New Invoice",
+          "near": [
+            500,
+            132,
+            150,
+            44
+          ],
+          "verbatim": false
+        },
+        {
+          "text": "INV-1042",
+          "near": [
+            40,
+            220,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Globex",
+          "near": [
+            40,
+            220,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Initech",
+          "near": [
+            40,
+            284,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Umbrella",
+          "near": [
+            40,
+            348,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Download report",
+          "near": [
+            40,
+            432,
+            190,
+            28
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Billing settings",
+          "near": [
+            264,
+            432,
+            160,
+            28
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Send Reminders",
+          "near": [
+            40,
+            496,
+            190,
+            48
+          ],
+          "verbatim": false
+        },
+        {
+          "text": "invoices overdue",
+          "near": [
+            264,
+            508,
+            300,
+            24
+          ],
+          "verbatim": false
+        }
+      ],
+      "elements": [
+        {
+          "kind": "text",
+          "text": "Open Invoices",
+          "box": [
+            40,
+            32,
+            300,
+            40
+          ]
+        },
+        {
+          "kind": "text",
+          "text": "Acme Corporation billing",
+          "box": [
+            40,
+            84,
+            320,
+            24
+          ]
+        },
+        {
+          "kind": "text_field",
+          "text": "Search invoices",
+          "box": [
+            40,
+            132,
+            300,
+            44
+          ]
+        },
+        {
+          "kind": "button",
+          "text": "Search",
+          "box": [
+            360,
+            132,
+            120,
+            44
+          ]
+        },
+        {
+          "kind": "button",
+          "text": "New Invoice",
+          "box": [
+            500,
+            132,
+            150,
+            44
+          ]
+        },
+        {
+          "kind": "row",
+          "text": "INV-1042 Globex $1,280.00",
+          "box": [
+            40,
+            220,
+            610,
+            48
+          ]
+        },
+        {
+          "kind": "row",
+          "text": "INV-1043 Initech $940.50",
+          "box": [
+            40,
+            284,
+            610,
+            48
+          ]
+        },
+        {
+          "kind": "row",
+          "text": "INV-1044 Umbrella $3,115.75",
+          "box": [
+            40,
+            348,
+            610,
+            48
+          ]
+        },
+        {
+          "kind": "link",
+          "text": "Download report",
+          "box": [
+            40,
+            432,
+            190,
+            28
+          ]
+        },
+        {
+          "kind": "link",
+          "text": "Billing settings",
+          "box": [
+            264,
+            432,
+            160,
+            28
+          ]
+        },
+        {
+          "kind": "button",
+          "text": "Send Reminders",
+          "box": [
+            40,
+            496,
+            190,
+            48
+          ]
+        },
+        {
+          "kind": "text",
+          "text": "3 invoices overdue",
+          "box": [
+            264,
+            508,
+            300,
+            24
+          ]
+        }
+      ],
+      "ocr_text": [
+        "Open Invoices",
+        "Acme Corporationbilling",
+        "Searchinvoices",
+        "Search",
+        "NewInvoice",
+        "INV-1042Globex$1,280.00",
+        "INV-1043Initech$940.50",
+        "INV-1044 Umbrella$3,115.75",
+        "Download report",
+        "Billing settings",
+        "SendReminders",
+        "3invoicesoverdue"
+      ]
+    },
+    {
+      "name": "invoices@2x",
+      "png": "invoices@2x.png",
+      "page": "pages/invoices.html",
+      "width": 800,
+      "height": 600,
+      "scale": 2.0,
+      "expect_text": [
+        {
+          "text": "Open Invoices",
+          "near": [
+            40,
+            32,
+            300,
+            40
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Acme Corporation billing",
+          "near": [
+            40,
+            84,
+            320,
+            24
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Search invoices",
+          "near": [
+            40,
+            132,
+            300,
+            44
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "New Invoice",
+          "near": [
+            500,
+            132,
+            150,
+            44
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "INV-1042",
+          "near": [
+            40,
+            220,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Globex",
+          "near": [
+            40,
+            220,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Initech",
+          "near": [
+            40,
+            284,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Umbrella",
+          "near": [
+            40,
+            348,
+            610,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Download report",
+          "near": [
+            40,
+            432,
+            190,
+            28
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Billing settings",
+          "near": [
+            264,
+            432,
+            160,
+            28
+          ],
+          "verbatim": false
+        },
+        {
+          "text": "Send Reminders",
+          "near": [
+            40,
+            496,
+            190,
+            48
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "invoices overdue",
+          "near": [
+            264,
+            508,
+            300,
+            24
+          ],
+          "verbatim": true
+        }
+      ],
+      "elements": [
+        {
+          "kind": "text",
+          "text": "Open Invoices",
+          "box": [
+            40,
+            32,
+            300,
+            40
+          ]
+        },
+        {
+          "kind": "text",
+          "text": "Acme Corporation billing",
+          "box": [
+            40,
+            84,
+            320,
+            24
+          ]
+        },
+        {
+          "kind": "text_field",
+          "text": "Search invoices",
+          "box": [
+            40,
+            132,
+            300,
+            44
+          ]
+        },
+        {
+          "kind": "button",
+          "text": "Search",
+          "box": [
+            360,
+            132,
+            120,
+            44
+          ]
+        },
+        {
+          "kind": "button",
+          "text": "New Invoice",
+          "box": [
+            500,
+            132,
+            150,
+            44
+          ]
+        },
+        {
+          "kind": "row",
+          "text": "INV-1042 Globex $1,280.00",
+          "box": [
+            40,
+            220,
+            610,
+            48
+          ]
+        },
+        {
+          "kind": "row",
+          "text": "INV-1043 Initech $940.50",
+          "box": [
+            40,
+            284,
+            610,
+            48
+          ]
+        },
+        {
+          "kind": "row",
+          "text": "INV-1044 Umbrella $3,115.75",
+          "box": [
+            40,
+            348,
+            610,
+            48
+          ]
+        },
+        {
+          "kind": "link",
+          "text": "Download report",
+          "box": [
+            40,
+            432,
+            190,
+            28
+          ]
+        },
+        {
+          "kind": "link",
+          "text": "Billing settings",
+          "box": [
+            264,
+            432,
+            160,
+            28
+          ]
+        },
+        {
+          "kind": "button",
+          "text": "Send Reminders",
+          "box": [
+            40,
+            496,
+            190,
+            48
+          ]
+        },
+        {
+          "kind": "text",
+          "text": "3 invoices overdue",
+          "box": [
+            264,
+            508,
+            300,
+            24
+          ]
+        }
+      ],
+      "ocr_text": [
+        "Open Invoices",
+        "Acme Corporation billing",
+        "Search invoices",
+        "Search",
+        "New Invoice",
+        "INV-1042 Globex $1,280.00",
+        "INV-1043 Initech$940.50",
+        "INV-1044 Umbrella $3,115.75",
+        "Download report",
+        "Billing_settings",
+        "Send Reminders",
+        "3 invoices overdue"
+      ]
+    },
+    {
+      "name": "login@1x",
+      "png": "login@1x.png",
+      "page": "pages/login.html",
+      "width": 640,
+      "height": 480,
+      "scale": 1.0,
+      "expect_text": [
+        {
+          "text": "Sign in to Ledger",
+          "near": [
+            56,
+            48,
+            300,
+            36
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Email address",
+          "near": [
+            56,
+            120,
+            160,
+            22
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Password",
+          "near": [
+            56,
+            214,
+            160,
+            22
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Enter password",
+          "near": [
+            56,
+            244,
+            320,
+            44
+          ],
+          "verbatim": false
+        },
+        {
+          "text": "Keep me signed in",
+          "near": [
+            88,
+            312,
+            180,
+            22
+          ],
+          "verbatim": true
+        },
+        {
+          "text": "Forgot password",
+          "near": [
+            248,
+            380,
+            180,
+            24
+          ],
+          "verbatim": true
+        }
+      ],
+      "elements": [
+        {
+          "kind": "text",
+          "text": "Sign in to Ledger",
+          "box": [
+            56,
+            48,
+            300,
+            36
+          ]
+        },
+        {
+          "kind": "text",
+          "text": "Email address",
+          "box": [
+            56,
+            120,
+            160,
+            22
+          ]
+        },
+        {
+          "kind": "text_field",
+          "text": "you@example.com",
+          "box": [
+            56,
+            150,
+            320,
+            44
+          ]
+        },
+        {
+          "kind": "text",
+          "text": "Password",
+          "box": [
+            56,
+            214,
+            160,
+            22
+          ]
+        },
+        {
+          "kind": "text_field",
+          "text": "Enter password",
+          "box": [
+            56,
+            244,
+            320,
+            44
+          ]
+        },
+        {
+          "kind": "checkbox",
+          "text": "",
+          "box": [
+            56,
+            312,
+            22,
+            22
+          ]
+        },
+        {
+          "kind": "text",
+          "text": "Keep me signed in",
+          "box": [
+            88,
+            312,
+            180,
+            22
+          ]
+        },
+        {
+          "kind": "button",
+          "text": "Sign In",
+          "box": [
+            56,
+            368,
+            160,
+            48
+          ]
+        },
+        {
+          "kind": "link",
+          "text": "Forgot password?",
+          "box": [
+            248,
+            380,
+            180,
+            24
+          ]
+        }
+      ],
+      "ocr_text": [
+        "Sign in to Ledger",
+        "Email address",
+        "you@example.com",
+        "Password",
+        "Enterpassword",
+        "Keep me signed in",
+        "Sign In",
+        "Forgot password?"
+      ]
+    }
+  ]
+}
