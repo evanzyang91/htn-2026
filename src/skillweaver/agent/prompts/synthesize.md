@@ -32,6 +32,12 @@ then waits for the page to finish loading, up to three seconds. A click that sta
 navigation has already arrived by the time `click` returns. You never have to wait for
 that yourself, and rule 10 is what follows from it.
 
+What that settle does NOT cover is a control the page answers WITHOUT navigating - an
+"Add to cart" that fires a background request, a filter that swaps a list in place,
+anything that redirects a moment later. The load event those are settled against fired
+long before they were clicked. `ctx.wait_for_text` below is for exactly that, and rule
+11 is when to reach for it.
+
 A failed action raises; you never have to check a result. `click` takes an element
 you just found - NOT coordinates (see "Never write coordinates" below).
 
@@ -65,10 +71,17 @@ and `.confidence`.
 
 ```python
 ctx.expect(condition, "why this matters")  # false -> the skill fails cleanly here
+ctx.wait_for_text("Subtotal")  # find_text, allowed to look again while the page answers
+ctx.wait_for_text("Subtotal", "button")  # a kind filter, exactly like find_text
 ctx.log("what just happened")  # one line into the run trace
 ctx.call("other_skill", arg=1)  # run another skill of the same domain
 ctx.graph.neighbors(fingerprint)  # read-only site graph; rarely needed
 ```
+
+`ctx.wait_for_text` returns a LIST, best first, and an EMPTY list when the text never
+appeared - so you check it exactly like a `find_text`, and `ctx.expect` is what turns
+"it never arrived" into an honest failure. It matches on containment only, never
+fuzzily, because a near match answers on the screen you were waiting to leave.
 
 `ctx.expect` is how a skill fails HONESTLY. Check before you act: an empty lookup
 followed by `[0]` is an `IndexError` and tells whoever reads the trace nothing.
@@ -179,6 +192,34 @@ followed by `[0]` is an `IndexError` and tells whoever reads the trace nothing.
 
     Announced like that, the wait stays exactly as you wrote it. Do not announce a
     wait for the page to load: that is the reflex, and it is removed either way.
+11. **Wait for a THING, not for a TIME.** Rule 10 is not "never wait"; it is "never
+    wait a duration". When you click something the page answers WITHOUT navigating -
+    "Add to cart", "Apply filter", a control that redirects a moment later - the
+    settle does not cover it, and the very next `ctx.see` reads the page you are still
+    standing on. Measured on a live shop: the click returned in 130ms with the old
+    page complete, and the page it leads to did not commit until 1170ms.
+
+    ```python
+    # NO - reads the page the click has not finished answering yet
+    ctx.ctl.click(add_to_cart[0])
+    cart = ctx.see.find_text("Subtotal")
+    ctx.expect(bool(cart), "the cart never appeared")
+
+    # YES - looks again until it is there, and returns the instant it is
+    ctx.ctl.click(add_to_cart[0])
+    cart = ctx.wait_for_text("Subtotal")
+    ctx.expect(bool(cart), "the cart never appeared")
+    ```
+
+    This is not the sleep rule 10 removes and it is not charged like one: on a page
+    that has already answered, the first look IS the observation you were about to
+    make, so it costs nothing. Name text that **only the answered screen says**. "Add
+    to cart" is on the page you are leaving, so waiting for it returns at once and
+    proves nothing; "Subtotal", "Your cart", the confirmation heading, are the cart's
+    own words. The hardening pass writes this rewrite in for you where your code makes
+    a read and then `ctx.expect`s it, so write it yourself and it stays as you wrote
+    it - and a read you only branch on is left alone, which is right, because you are
+    asking what is on screen rather than waiting for something to arrive.
 
 ## What you must return
 

@@ -9,6 +9,7 @@ exist as far as skill code is concerned::
         rows = ctx.see.find_text(company, ElementKind.row)  # eyes, re-observed
         ctx.expect(bool(rows), f"no row for {company}")  # a clean failure
         ctx.ctl.click(rows[0])
+        ctx.expect(bool(ctx.wait_for_text("Invoice")), "the invoice never opened")
         ctx.log(f"opened {company}")
         return ctx.call("confirm_payment")               # composition
 
@@ -27,6 +28,10 @@ actually work from pixels.
 
 *Graph writing.* ``ctx.graph`` is wrapped in a :class:`ReadOnlyGraph`, so a skill can
 route but cannot teach the graph things it has not verified.
+
+``ctx.wait_for_text`` is ``ctx.see.find_text`` allowed to look again while the page
+answers - the one wait this surface offers, and it waits for a THING rather than for a
+TIME. See :data:`AWAIT_BUDGET_MS` for the control that makes it necessary.
 
 *Unbounded work.* Every action goes through the :class:`RunLedger`, which charges a
 step and checks the clock, so a skill cannot outrun its budget between two
@@ -66,6 +71,7 @@ from skillweaver.contracts import (
     Drag,
     Element,
     ElementIndex,
+    ElementKind,
     Fingerprint,
     GraphView,
     MouseButton,
@@ -93,6 +99,8 @@ from skillweaver.errors import (
 from skillweaver.logging_ import get_logger
 
 __all__ = [
+    "AWAIT_BUDGET_MS",
+    "AWAIT_POLL_MS",
     "ActionView",
     "DepthLimitExceeded",
     "LimitExceeded",
@@ -111,6 +119,40 @@ log = get_logger(__name__)
 
 TRUNCATED = "... trace truncated"
 """The single line appended once a run's trace reaches ``SkillLimits.max_trace_lines``."""
+
+AWAIT_BUDGET_MS = 4000.0
+"""How long :meth:`SkillAPI.wait_for_text` will keep looking, by default.
+
+**Not a sleep, and not the reflex wait that was removed from skills.** The difference
+fits in one sentence: ``ctx.ctl.wait(ms)`` spends a fixed duration whatever the page
+does, while this returns the instant the text is on screen and therefore costs NOTHING
+on a page that already answered - its first look is the very observation the skill was
+about to make anyway. That is why one is stripped by
+:func:`~skillweaver.skills.refactor.strip_reflex_waits` and this one is written in by
+:meth:`~skillweaver.skills.refactor._Hardener.await_expected_reads`.
+
+It exists because a control the page answers WITHOUT navigating is invisible to
+``BrowserController._settle``, which waits for the load event. Measured on live
+splitkb.com on 2026-09-19: the click on "Add to cart" returned in 130ms with the
+document complete and the OLD url still showing, and the cart it redirects to did not
+commit until 1170ms. A skill recorded at model speed never sees that gap - a model was
+being asked what to do next between every pair of actions - and the same skill replayed
+at code speed reads the page it is still standing on and concludes, correctly for the
+screen in front of it, that the cart is empty.
+
+Four seconds is the same number :data:`~skillweaver.reset_actions.SETTLE_BUDGET_MS`
+carries and for the same reason: it only has to outlast one slow request, and a wait
+that will never be answered still says so within one budget rather than hanging.
+"""
+
+AWAIT_POLL_MS = 120.0
+"""How long :meth:`SkillAPI.wait_for_text` pauses between looks.
+
+Each look is a real observation - detection and OCR - so this is not the thing that
+paces the loop; it is there so a perceiver that answers instantly is not spun flat out.
+An unchanged page is cheap to re-read by design: ``CachingTextReader`` is keyed on the
+exact pixels, so the second look at a page that has not moved pays no OCR at all.
+"""
 
 
 # --------------------------------------------------------------------------------------
@@ -678,6 +720,73 @@ class SkillAPI:
             self.ledger.note(f"log: {msg}")
         except Exception:  # pragma: no cover - note() is already total
             pass
+
+    def wait_for_text(
+        self,
+        text: str,
+        kind: ElementKind | None = None,
+        *,
+        budget_ms: float | None = None,
+    ) -> list[Element]:
+        """``ctx.see.find_text`` that is allowed to look again while the page answers.
+
+        Returns the matching elements, best first, exactly as ``find_text`` does - and
+        an empty list when the budget ran out without them ever appearing, so a caller
+        checks the result rather than catching something. Pair it with ``ctx.expect``,
+        which is what turns "it never arrived" into an honest failure::
+
+            ctx.ctl.click(add_to_cart[0])
+            cart = ctx.wait_for_text("Subtotal")
+            ctx.expect(bool(cart), "the cart never appeared after Add to cart")
+
+        **Wait for a THING, not for a TIME.** That one line is the whole difference
+        between this and ``ctx.ctl.wait(ms)``, which
+        :func:`~skillweaver.skills.refactor.strip_reflex_waits` removes on sight: a
+        duration is spent whether or not it was needed, and this returns the moment the
+        text is there. On a page that has already answered the first look IS the
+        observation the skill was about to make, so the fast path pays nothing - which
+        is the property that let this ship beside a measured 2x speedup rather than
+        against it. See :data:`AWAIT_BUDGET_MS` for the measurement that makes it
+        necessary at all.
+
+        Matching is ``fuzzy=False`` - equality or containment, case-insensitive - and
+        that is not a detail. A wait decides which SCREEN the rest of the skill acts
+        on, and a near match answers on the screen it was supposed to wait out: asked
+        fuzzily for "Your cart" while still standing on the product page, the "Add to
+        cart" button answers. This is the same choice, for the same reason, that
+        ``_says`` makes in :mod:`skillweaver.reset_actions`. Name text that only the
+        ANSWERED screen says.
+
+        The time spent looking is banked as blocked, not charged: a page taking a
+        second to commit is a slow world, not a runaway skill, and charging it would
+        make the skill that waits correctly look more expensive than the one that reads
+        too early and fails. The budget is what bounds it.
+
+        Args:
+            text: What the answered screen says. Not what the current one says.
+            kind: Restrict to one element kind, as ``find_text`` does.
+            budget_ms: How long to keep looking. Default :data:`AWAIT_BUDGET_MS`.
+
+        Raises:
+            PerceptionError: if observing fails, as ``ctx.see`` does.
+            TimeLimitExceeded: if the skill's limit is already spent.
+        """
+        budget = AWAIT_BUDGET_MS if budget_ms is None else max(float(budget_ms), 0.0)
+        deadline = time.monotonic() + budget / 1000.0
+        looks = 0
+        while True:
+            looks += 1
+            found = self.see.find_text(text, kind, fuzzy=False)
+            if found:
+                if looks > 1:
+                    self.ledger.note(f"waited for {text!r}: on screen after {looks} looks")
+                return found
+            if time.monotonic() >= deadline:
+                self.ledger.note(f"waited for {text!r}: still not on screen after {budget:.0f}ms")
+                return []
+            with self.ledger.blocked():
+                time.sleep(AWAIT_POLL_MS / 1000.0)
+            self._forget_observation()
 
     # -- for the runner, not for skill code ------------------------------------------------
 

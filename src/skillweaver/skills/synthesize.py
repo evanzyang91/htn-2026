@@ -397,11 +397,14 @@ def _repair_brief(attempt: Attempt) -> str:
     """What the model is shown after a rejection: the stage, the error, the trace.
 
     Rewrites the hardening pass made are normally left unsaid - the model is being
-    asked about the defect, not about the polish. Removed sleeps are the exception,
-    and deliberately so: the model cannot see the code that was actually run, so a
-    wait it genuinely needed and is never told was deleted is a repair loop with no
-    exit. It would write the same wait again, the pass would remove it again, and the
-    gate would reject it again until the attempts ran out.
+    asked about the defect, not about the polish. The two that change how the skill
+    WAITS are the exception, and deliberately so: the model cannot see the code that
+    was actually run. A sleep it genuinely needed and is never told was deleted is a
+    repair loop with no exit - it would write the same wait again, the pass would
+    remove it again, and the gate would reject it again until the attempts ran out.
+    A read the pass made wait is the same debt the other way round: told nothing, the
+    model reads a failure that is no longer about timing and "fixes" the wait it
+    already has.
     """
     lines = [
         "Your skill was REJECTED and has not been stored.",
@@ -429,7 +432,21 @@ def _repair_brief(attempt: Attempt) -> str:
             "spinner - write the wait again with a ctx.log on the line before it "
             "naming that thing, and it will be kept exactly as you wrote it."
         )
-    if attempt.stage == "execution" and not removed:
+    awaited = attempt.hardening.awaits_added if attempt.hardening is not None else ()
+    if awaited:
+        lines.append("")
+        lines.append(
+            "Before this run, "
+            + ", ".join(str(read) for read in awaited)
+            + (" was" if len(awaited) == 1 else " were")
+            + " rewritten to ctx.wait_for_text(...), which looks again for up to four "
+            "seconds while the page answers and returns the instant the text is there. "
+            "So that read did NOT fail because it was too early. If it still found "
+            "nothing, either the click did not do what it was supposed to or the text "
+            "you named is not what the answered screen says - and text that is on the "
+            "screen you were LEAVING satisfies the wait at once and proves nothing."
+        )
+    if attempt.stage == "execution" and not removed and not awaited:
         lines.append("")
         lines.append(_SLOWER_THAN_THE_RECORDING)
     if attempt.stage == "discrimination":
@@ -455,11 +472,13 @@ _SLOWER_THAN_THE_RECORDING = (
     "still standing on and correctly concluded the cart was empty. The recording never "
     "hit this because a model was being asked what to do next between every pair of "
     "actions. If that is what happened here, do NOT add a retry around the whole "
-    "sequence - it fails the same way, only twice. Either wait for the page to agree "
-    "(re-read ctx.see in a short bounded loop until what you expect is on it), or put "
-    "one ctx.ctl.wait(...) immediately after the offending action with a ctx.log on "
-    "the line before it naming what is being waited for - a background cart update, a "
-    "redirect the load event does not cover - and that wait will be kept."
+    "sequence - it fails the same way, only twice, and do not add ctx.ctl.wait(...), "
+    "which spends a fixed duration whether or not it was needed and is removed before "
+    "your skill is run. Use ctx.wait_for_text(<what the ANSWERED screen says>) in place "
+    "of the ctx.see.find_text that read too early: it looks again while the page "
+    "answers, returns the instant the text is there, and costs nothing when the page "
+    "had already answered. Name text only the answered screen carries - 'Add to cart' "
+    "is on the page you are leaving and would satisfy the wait immediately."
 )
 """What a skill rejected at EXECUTION is told, on top of its error.
 
@@ -474,9 +493,11 @@ execution on all three attempts, and the model's repair each time was to wrap th
 whole sequence in a retry - which fails identically, only twice, because the second
 pass is just as fast as the first.
 
-It is NOT offered when the hardening pass removed a wait: that case has its own and
-more specific message directly above, and two paragraphs about waiting would make the
-more precise one easier to miss.
+It is NOT offered when the hardening pass removed a wait, nor when it already made a
+read wait: both cases have their own and more specific message directly above, and two
+paragraphs about waiting would make the more precise one easier to miss. The second
+exclusion matters most - telling a model to add a wait to code the pass has ALREADY
+made wait is how a repair loop spends three attempts on a race that is no longer there.
 """
 
 

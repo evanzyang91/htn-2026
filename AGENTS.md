@@ -330,16 +330,28 @@ defect above, because it is what a demo and a measurement both quote.
 A skill is recorded at MODEL speed and replayed at CODE speed, one to two orders of
 magnitude faster, so a control the page answers WITHOUT navigating is a race the recording
 never sees. `_settle` in `controllers/browser.py` waits for the load event, which such a
-control fired long ago: measured on live splitkb.com, the click on "Add to cart" returned in
-130ms with the document complete and the old URL showing, and the cart it redirects to did
-not commit until 1170ms. Every symptom reads as a logic bug - "the cart is still empty" is
-what an empty cart and a cart read too early both say - so `_SLOWER_THAN_THE_RECORDING` in
-`skills/synthesize.py` tells a skill rejected at execution to rule this out first, and
-`SETTLE_BUDGET_MS` in `reset_actions.py` is the same lesson for a converging undo, which
-must wait for the screen to change AND go quiet because such a page answers in two frames.
-Do NOT fix this by widening `_settle`: a quiet WINDOW is the only signal that works, a
-zero-window check reads quiet before the request has even started (measured: 25-45ms on both
-Wikipedia and splitkb), and a window taxes every action on every site.
+control fired long ago: measured on live splitkb.com, the click on "Add to cart" returns in
+~130ms with the document complete and the old URL showing, while the cart commits at ~900ms
+and the redirect lands at ~1050ms. `ComposedPerceiver.observe` CAPTURES FIRST and reads
+after, so the frame a post-click `ctx.see` judges is the one taken while the click was still
+being answered - waiting longer for the index cannot help, only re-capturing can. The wait
+is therefore per-control and conditional: `ctx.wait_for_text` (`AWAIT_BUDGET_MS` in
+`skills/api.py`) is `find_text` allowed to look again, it returns the instant the text is
+there, and on a page that already answered its first look IS the observation the skill was
+about to make - so it costs the fast path nothing. Wait for a THING, not for a TIME; that is
+the whole difference from the `ctx.ctl.wait(ms)` reflex that `strip_reflex_waits` removes,
+and the two passes sit next to each other in `skills/refactor.py` on purpose. It matches
+strictly, never fuzzily, because a fuzzy `find_text("Your cart")` on splitkb's PRODUCT page
+answers with "Add tocart" - a wait satisfied by the screen it was meant to outlast. The
+hardening pass writes the rewrite in wherever a read is followed by a `ctx.expect` on it
+(`awaited_reads`), which is the only shape that proves the text is REQUIRED rather than
+merely asked about; a read that is only branched on is left alone, or every run pays the
+budget for something it hoped was absent. `SETTLE_BUDGET_MS` in `reset_actions.py` is the
+same lesson for a converging undo, which must wait for the screen to change AND go quiet
+because such a page answers in two frames. Do NOT fix any of this by widening `_settle`: a
+quiet WINDOW is the only signal that works, a zero-window check reads quiet before the
+request has even started (measured: 25-45ms on both Wikipedia and splitkb), and a window
+taxes every action on every site.
 
 And a verifier that passes on the wrong screen is worse than none, because it is what turns
 a skill that did nothing into a stored one, and then into a STATISTIC. A synthesized

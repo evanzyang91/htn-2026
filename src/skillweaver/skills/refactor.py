@@ -12,7 +12,7 @@ trajectory it was written from, BEFORE the admission gate in
     hardened.changes          # one readable line per rewrite, for the run log
     hardened.added_params     # params to merge into the skill's schema
 
-Six rewrites, applied in this order:
+Seven rewrites, applied in this order:
 
 *Fixed sleeps are removed.* ``ctx.ctl.press("Enter")`` followed by
 ``ctx.ctl.wait(2000)`` does not wait for the page: every action is SETTLED by the
@@ -24,6 +24,26 @@ measurement is in ``AGENTS.md``). The capability is not removed, only the reflex
 wait for something no load event covers - an animation, a debounce, a spinner - is KEPT
 when an adjacent ``ctx.log`` NAMES that thing, which is the same bargain a positional
 lookup gets below. See :func:`reflex_waits`, which is the detector on its own.
+
+*A read the skill INSISTS on is allowed to look twice.* The pass above removes a sleep
+because the controller already settled the action; this one adds the wait that settle
+cannot give. ``BrowserController._settle`` waits for the page's LOAD EVENT, and a
+control the page answers without navigating fired that long ago - measured on live
+splitkb.com, the click on "Add to cart" returned in 130ms with the document complete
+and the old url still showing, while the cart it redirects to did not commit until
+1170ms. A recording made at model speed never meets that gap; the skill replayed at code
+speed walks straight into it and reads the page it is still standing on.
+
+    So ``NAME = ctx.see.find_text(...)`` immediately followed by a ``ctx.expect`` on
+    ``NAME`` - and only that shape, only after an action, and only once per action -
+    becomes ``ctx.wait_for_text(...)``. The ``expect`` is the whole warrant: it is the
+    skill declaring that the text MUST be there, which is exactly when looking again is
+    right and never when the skill is merely asking what is on screen. A read that
+    branches (``if ctx.see.find_text("Error"): ...``) expects nothing and is left alone,
+    because waiting four seconds for something you hope is absent is a tax on every run.
+    On the happy path the rewrite costs NOTHING: the first look is the observation the
+    skill was about to make. See :func:`awaited_reads`, which is the detector on its own,
+    and :data:`~skillweaver.skills.api.AWAIT_BUDGET_MS` for the measurement.
 
 *Hardcoded navigation is lifted out.* A ``run`` that begins by typing a URL, or by
 performing a ``Navigate``, is a skill that insists on arriving its own way. The
@@ -95,9 +115,11 @@ from skillweaver.logging_ import get_logger
 
 __all__ = [
     "COORDINATE_METHODS",
+    "AwaitedRead",
     "Hardening",
     "PositionalLookup",
     "ReflexWait",
+    "awaited_reads",
     "element_at",
     "harden",
     "positional_lookups",
@@ -213,6 +235,9 @@ class Hardening:
             already been settled. A caller that reports a rejection to the model must
             report these too: the model cannot see the code that was run, and a wait
             it needs and never learns was deleted is a repair loop with no exit.
+        awaits_added: Reads that were allowed to look again while the page answers.
+            The counterpart of :attr:`waits_removed`, and the opposite trade: a
+            duration was taken away, a condition was put in.
     """
 
     code: str
@@ -225,6 +250,7 @@ class Hardening:
     positions_anchored: int = 0
     positions_announced: tuple[str, ...] = ()
     waits_removed: tuple[ReflexWait, ...] = ()
+    awaits_added: tuple[AwaitedRead, ...] = ()
 
     @property
     def positions_unanchored(self) -> int:
@@ -301,6 +327,27 @@ class ReflexWait:
 
     def __str__(self) -> str:
         return f"ctx.ctl.wait({self.ms}) after {self.after}()"
+
+
+@dataclass(frozen=True, slots=True)
+class AwaitedRead:
+    """One read a skill required, which was allowed to look again while the page answers.
+
+    Attributes:
+        query: The text the read is looking for, when it was a literal; ``None`` when
+            it was computed - a parameter, or a string the skill built.
+        after: The ``ctx.ctl`` action the read follows. This is the control whose
+            answer is being waited for, and the reason the read races at all.
+        line: Line number in the source it was found at, 1-based.
+    """
+
+    query: str | None
+    after: str
+    line: int = 0
+
+    def __str__(self) -> str:
+        what = repr(self.query) if self.query is not None else "a computed string"
+        return f"the read for {what} after {self.after}()"
 
 
 # --------------------------------------------------------------------------------------
@@ -823,6 +870,129 @@ def _reflex_waits_in(body: Sequence[ast.stmt]) -> dict[int, ReflexWait]:
     return found
 
 
+def _is_expect(call: ast.Call) -> bool:
+    """Whether ``call`` is ``ctx.expect(...)``."""
+    match call.func:
+        case ast.Attribute(value=ast.Name(id="ctx"), attr="expect"):
+            return True
+    return False
+
+
+def _required_read(statement: ast.stmt, following: ast.stmt | None) -> ast.Call | None:
+    """The ``ctx.see.find_text`` call ``statement`` makes and then INSISTS on, or ``None``.
+
+    Two shapes count, and nothing else::
+
+        found = ctx.see.find_text("Subtotal")        # bound, then
+        ctx.expect(bool(found), "no cart")           # required by the very next line
+
+        ctx.expect(bool(ctx.see.find_text("Subtotal")), "no cart")   # required inline
+
+    The ``ctx.expect`` is what makes the read a requirement rather than a question,
+    and a requirement is the only read worth looking twice for. A read whose result is
+    branched on, logged, counted or returned is asking what is on screen right now, and
+    the honest answer to that is what is on screen right now.
+
+    A call that passes ``fuzzy`` is declined: ``ctx.wait_for_text`` does not take it,
+    on purpose - a near match answers on the screen the wait was supposed to outlast.
+    """
+
+    def usable(call: ast.Call) -> ast.Call | None:
+        if _ctx_method(call.func, "see") != "find_text":
+            return None
+        if any(keyword.arg == "fuzzy" for keyword in call.keywords):
+            return None
+        return call
+
+    match statement:
+        case ast.Expr(value=ast.Call() as call) if _is_expect(call):
+            if not call.args:
+                return None
+            for node in ast.walk(call.args[0]):
+                if isinstance(node, ast.Call) and (found := usable(node)) is not None:
+                    return found
+            return None
+        case ast.Assign(targets=[ast.Name(id=name)], value=ast.Call() as call):
+            if usable(call) is None or following is None:
+                return None
+            if not isinstance(following, ast.Expr) or not isinstance(following.value, ast.Call):
+                return None
+            expectation = following.value
+            if not _is_expect(expectation) or not expectation.args:
+                return None
+            for node in ast.walk(expectation.args[0]):
+                if isinstance(node, ast.Name) and node.id == name:
+                    return call
+            return None
+        case _:
+            return None
+
+
+def _awaited_reads_in(body: Sequence[ast.stmt]) -> dict[int, tuple[AwaitedRead, ast.Call]]:
+    """Which reads of ONE block race the control before them, keyed by index.
+
+    The block is walked in order carrying the last action the controller settled,
+    exactly as :func:`_reflex_waits_in` does, and for the same reason: a read is only
+    racing if something just acted. Crossing a :func:`_page_neutral` statement keeps
+    that action; anything else clears it, and so does converting a read - one action
+    is answered once, and every later read on that screen is a read of a screen that
+    has already arrived.
+    """
+    found: dict[int, tuple[AwaitedRead, ast.Call]] = {}
+    settled: str | None = None
+    for position, statement in enumerate(body):
+        following = body[position + 1] if position + 1 < len(body) else None
+        read = _required_read(statement, following) if settled is not None else None
+        if read is not None:
+            query = _string(read.args[0]) if read.args else None
+            found[position] = (
+                AwaitedRead(query, settled, getattr(statement, "lineno", 0)),
+                read,
+            )
+            settled = None
+            continue
+        action = _settling_action(statement)
+        if action is not None:
+            settled = action
+        elif not _page_neutral(statement):
+            settled = None
+    return found
+
+
+def _string(node: ast.expr) -> str | None:
+    """``node`` as a string literal, or ``None`` when it is anything else."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def awaited_reads(code: str) -> tuple[AwaitedRead, ...]:
+    """Every read in ``code``'s ``run`` that would race the control before it.
+
+    The detector on its own, with no trajectory and no rewriting, so one question can
+    be asked of a skill: does it read the screen straight after acting on a control
+    whose answer has not arrived? Source that does not parse, or that defines no
+    ``run``, has no reads to report rather than being an error.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ()
+    fn = _run_function(tree)
+    if fn is None:
+        return ()
+    found: list[AwaitedRead] = []
+
+    def descend(body: Sequence[ast.stmt]) -> None:
+        found.extend(read for read, _ in _awaited_reads_in(body).values())
+        for statement in body:
+            for _, _, block in _blocks(statement):
+                descend(block)
+
+    descend(fn.body)
+    return tuple(sorted(found, key=lambda read: read.line))
+
+
 def reflex_waits(code: str) -> tuple[ReflexWait, ...]:
     """Every fixed sleep in ``code``'s ``run`` that an action's settle already covers.
 
@@ -1013,6 +1183,7 @@ class _Hardener:
         self.announced: list[str] = []
         self.owned_up = False
         self.waits: list[ReflexWait] = []
+        self.awaits: list[AwaitedRead] = []
 
     # -- sleeps -------------------------------------------------------------------------
 
@@ -1038,6 +1209,35 @@ class _Hardener:
                 "were spent on top of a wait that had already happened"
             )
         return [statement for position, statement in enumerate(body) if position not in reflexes]
+
+    # -- the wait that settling cannot give ----------------------------------------------
+
+    def await_expected_reads(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        """Let a read the skill REQUIRES look again while the control answers.
+
+        Runs straight after the sleeps are stripped, and the pairing is the point: the
+        sleep went because the controller had already waited for the page's load event,
+        and this goes in because that event is exactly what a control answering in the
+        background does not fire. A duration out, a condition in.
+
+        Only the shapes :func:`_required_read` accepts, only after an action, and only
+        once per action - see :func:`_awaited_reads_in`. Statements are rewritten in
+        place: nothing is added, nothing is removed, and the read's arguments are
+        carried across untouched, so a parameterized query stays parameterized.
+        """
+        for statement in body:
+            for owner, name, block in _blocks(statement):
+                setattr(owner, name, self.await_expected_reads(block))
+        for read, call in _awaited_reads_in(body).values():
+            call.func = _attr("ctx", "wait_for_text")
+            self.awaits.append(read)
+            self.changes.append(
+                f"let {read} wait for the page to answer (ctx.wait_for_text): the "
+                f"controller settles {read.after}() by waiting for the load event, which "
+                "a control that answers in the background never fires - and a skill runs "
+                "far faster than the recording it was written from"
+            )
+        return body
 
     # -- navigation ---------------------------------------------------------------------
 
@@ -1338,6 +1538,7 @@ def harden(
     pass_ = _Hardener(trajectory, params or {})
     pass_.taken |= _bound_names(fn)
     body = pass_.strip_reflex_waits(fn.body)
+    body = pass_.await_expected_reads(body)
     body = pass_.strip_navigation(body)
     rewritten: list[ast.stmt] = []
     for statement in body:
@@ -1359,6 +1560,7 @@ def harden(
         positions_anchored=pass_.anchored,
         positions_announced=tuple(pass_.announced),
         waits_removed=tuple(pass_.waits),
+        awaits_added=tuple(pass_.awaits),
     )
     log.info(
         "skill.harden",
@@ -1370,5 +1572,6 @@ def harden(
         positional=hardened.positions_unanchored,
         waits=len(hardened.waits_removed),
         slept_ms=sum(wait.ms for wait in hardened.waits_removed),
+        awaits=len(hardened.awaits_added),
     )
     return hardened
