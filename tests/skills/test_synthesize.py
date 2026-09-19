@@ -16,6 +16,7 @@ same gate by hand (it admits this skill programmatically, with no model call).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections.abc import Callable
 from typing import Any
@@ -25,8 +26,10 @@ import pytest
 from skillweaver.contracts import Fingerprint, LLMResponse, Trajectory, Verdict
 from skillweaver.errors import SkillNotFound
 from skillweaver.llm.cassette import CassetteClient
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 from skillweaver.skills.refactor import harden, positional_lookups
 from skillweaver.skills.synthesize import (
+    MIN_PRECONDITION_SIMILARITY,
     ReplayEnvironment,
     Synthesizer,
     describe_trajectory,
@@ -837,13 +840,234 @@ def test_the_prompt_is_what_the_model_is_given(trajectory, critic, skill_store):
 
 def test_a_fingerprint_mismatch_is_reported_not_raised(trajectory, critic, skill_store, scenario):
     """A precondition that matches nothing on screen fails the attempt cleanly."""
-
-    def elsewhere() -> ReplayEnvironment:
-        return ReplayEnvironment(scenario.controller, scenario.perceiver, restored=True)
-
+    recorded, seen = _live_pair(agreeing=0)
     llm = FakeLLM([reply()])
-    synth = synthesizer(llm, skill_store, critic, max_repairs=0, min_similarity=2.0)
-    admission = synth.admit(trajectory, elsewhere)
+    synth = synthesizer(llm, skill_store, critic, max_repairs=0)
+    admission = synth.admit(*_gate(trajectory, scenario, recorded, seen))
     assert not admission.ok
     assert admission.attempts[-1].stage == "precondition"
     assert isinstance(trajectory.steps[0].before.fingerprint, Fingerprint)
+
+
+# --------------------------------------------------------------------------------------
+# The precondition threshold
+# --------------------------------------------------------------------------------------
+#
+# The gate used to demand the EXACT recorded screen, which the sandbox always gives and
+# no website ever does, so a skill learned on a real page was written correctly and then
+# destroyed every time. The measurements behind the replacement are tabulated at
+# `MIN_PRECONDITION_SIMILARITY` in skills/synthesize.py; what is checked here is that
+# the shipped default still puts each of them on the side it was measured to be on, and
+# that the gate admits and rejects accordingly.
+#
+# Nothing here needs a browser. A live fingerprint carries about 25 parts and
+# `Fingerprint.similarity` is the fraction of part names that agree, so a pair built to
+# agree on `n` of 25 scores exactly `n / 25` - which is why every score in the table
+# below is a whole twenty-fifth.
+
+LIVE_PARTS = 25
+"""Parts the shipped fingerprinter emits for a 1280x800 live page. Measured, not
+assumed: `StateFingerprinter` gave 25 for every en.wikipedia.org capture taken while
+calibrating the threshold (a URL, up to 4 layout quadrants, up to 20 hash rows)."""
+
+# score -> what scored it, live unless noted. See MIN_PRECONDITION_SIMILARITY.
+MEASURED = [
+    (25, "same", "docs.python.org and the sandbox, every trial: nothing moved"),
+    (23, "same", "an article whose text reflowed between the record and the re-run"),
+    (22, "same", "the Main Page's right rail hydrating after load"),
+    (21, "same", "six of nine re-navigations of a real recording; the floor"),
+    (12, "different", "the corpus's contrived worst case: one list, two accounts"),
+    (7, "different", "two Wikipedia revision-history pages: one template, other rows"),
+    (3, "different", "two Wikipedia category listings"),
+    (2, "different", "two Wikipedia search-result pages"),
+    (1, "different", "a fundraising banner arriving and pushing the page down"),
+    (0, "different", "two stdlib pages, and two stub articles"),
+]
+
+
+def _live_pair(*, agreeing: int, total: int = LIVE_PARTS) -> tuple[Fingerprint, Fingerprint]:
+    """A recorded screen and a second look at it agreeing on ``agreeing`` of ``total``
+    parts - so their similarity is exactly ``agreeing / total``.
+
+    The values differ, so this is never the trivial ``value ==`` shortcut: the gate is
+    made to do the part-by-part comparison a live page forces on it.
+    """
+    return (
+        Fingerprint("recorded", {f"p{i}": "a" for i in range(total)}),
+        Fingerprint("seen-again", {f"p{i}": ("a" if i < agreeing else "b") for i in range(total)}),
+    )
+
+
+class _ReRendered:
+    """A perceiver whose FIRST look carries ``fingerprint``, and whose later ones do not.
+
+    The gate observes twice: once to check the precondition, once to hand the critic the
+    screen the skill reached. Only the first is what the threshold judges, so only the
+    first is replaced - the critic still judges the real run.
+    """
+
+    def __init__(self, inner, fingerprint: Fingerprint) -> None:
+        self._inner = inner
+        self._fingerprint = fingerprint
+        self.calls = 0
+
+    def observe(self, controller):
+        observation = self._inner.observe(controller)
+        self.calls += 1
+        if self.calls > 1:
+            return observation
+        return dataclasses.replace(observation, fingerprint=self._fingerprint)
+
+
+def _gate(trajectory: Trajectory, scenario: Scenario, recorded: Fingerprint, seen: Fingerprint):
+    """``(trajectory, environment)`` for a run recorded on ``recorded`` and re-run on a
+    screen fingerprinting as ``seen``.
+
+    The recording's first screen is rewritten because that is where ``_build`` takes the
+    precondition from; everything else about the run, and the skill it produces, is
+    untouched.
+    """
+    first = trajectory.steps[0]
+    start = dataclasses.replace(
+        trajectory,
+        steps=(
+            dataclasses.replace(
+                first, before=dataclasses.replace(first.before, fingerprint=recorded)
+            ),
+            *trajectory.steps[1:],
+        ),
+    )
+
+    def environment() -> ReplayEnvironment:
+        scenario.controller.reset()
+        return ReplayEnvironment(
+            scenario.controller, _ReRendered(scenario.perceiver, seen), restored=True
+        )
+
+    return start, environment
+
+
+def test_the_default_threshold_is_the_projects_one_measured_same_state_cut():
+    """Two constants for "is this the same screen?" would be two things to calibrate and
+    one of them silently wrong. There is one, and this is the gate using it."""
+    assert MIN_PRECONDITION_SIMILARITY == SAME_STATE_THRESHOLD
+    assert Synthesizer(FakeLLM([]), InMemorySkillStore(), FakeCritic())._min_similarity == (
+        MIN_PRECONDITION_SIMILARITY
+    )
+
+
+@pytest.mark.parametrize("agreeing,label,why", MEASURED, ids=[str(m[0]) for m in MEASURED])
+def test_every_measured_pair_falls_on_the_side_it_was_measured_on(agreeing, label, why):
+    recorded, seen = _live_pair(agreeing=agreeing)
+    score = recorded.similarity(seen)
+    if label == "same":
+        assert score >= MIN_PRECONDITION_SIMILARITY, f"{why} (scored {score:.3f})"
+    else:
+        assert score < MIN_PRECONDITION_SIMILARITY, f"{why} (scored {score:.3f})"
+
+
+def test_the_threshold_sits_in_a_gap_and_not_on_an_edge():
+    """The point of a measured constant: daylight either side, so a page that renders a
+    little differently tomorrow does not land on the wrong side of it."""
+    scores: dict[str, list[float]] = {"same": [], "different": []}
+    for agreeing, label, _ in MEASURED:
+        recorded, seen = _live_pair(agreeing=agreeing)
+        scores[label].append(recorded.similarity(seen))
+    assert min(scores["same"]) - max(scores["different"]) >= 0.3
+    assert min(scores["same"]) - MIN_PRECONDITION_SIMILARITY > 0.1
+    assert MIN_PRECONDITION_SIMILARITY - max(scores["different"]) > 0.1
+
+
+def test_a_page_that_re_renders_the_way_a_live_page_does_is_admitted(
+    trajectory, critic, skill_store, scenario
+):
+    """The defect, as a test. 21 of 25 parts is what six of nine re-navigations of a
+    real live-Wikipedia recording scored, and every one of them was a correct skill the
+    old ``1.0`` threshold destroyed."""
+    recorded, seen = _live_pair(agreeing=21)
+    assert recorded.similarity(seen) == pytest.approx(0.84)
+
+    llm = FakeLLM([reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
+        *_gate(trajectory, scenario, recorded, seen)
+    )
+
+    assert admission.ok, admission.reason
+    assert admission.skill is not None
+    assert [s.name for s in skill_store.list()] == ["confirm_invoice_payment"]
+
+
+def test_a_genuinely_different_screen_is_still_refused(trajectory, critic, skill_store, scenario):
+    """The other direction, and the reason the threshold is not simply removed. 7 of 25
+    is two revision-history pages: the same template, somebody else's rows."""
+    recorded, seen = _live_pair(agreeing=7)
+    assert recorded.similarity(seen) == pytest.approx(0.28)
+
+    llm = FakeLLM([reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
+        *_gate(trajectory, scenario, recorded, seen)
+    )
+
+    assert not admission.ok
+    assert admission.attempts[-1].stage == "precondition"
+    assert skill_store.list() == []
+
+
+def test_the_corpus_worst_case_of_one_list_for_two_accounts_is_still_refused(
+    trajectory, critic, skill_store, scenario
+):
+    """The row that sets the floor. `same_layout_different_content` in
+    tests/fixtures/shots/pairs scores 0.500 - identical URL, chrome and layout, every
+    row a different account - and admitting it would let the gate prove a skill against
+    the wrong world's data. Nothing measured live came near it."""
+    recorded, seen = _live_pair(agreeing=12)
+    assert recorded.similarity(seen) < 0.5
+
+    llm = FakeLLM([reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
+        *_gate(trajectory, scenario, recorded, seen)
+    )
+
+    assert not admission.ok
+    assert admission.attempts[-1].stage == "precondition"
+    assert skill_store.list() == []
+
+
+def test_a_rejection_names_the_threshold_it_was_measured_against(
+    trajectory, critic, skill_store, scenario
+):
+    """A bare "similarity 0.96" is what this defect looked like for a year. The number
+    it fell short of belongs beside it."""
+    llm = FakeLLM([reply()])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
+        *_gate(trajectory, scenario, *_live_pair(agreeing=7))
+    )
+    error = admission.attempts[-1].error or ""
+    assert "similarity 0.28" in error
+    assert f"below the {MIN_PRECONDITION_SIMILARITY:.2f} required" in error
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.5, 2.0])
+def test_a_min_similarity_outside_zero_to_one_is_refused(fake_llm, skill_store, fake_critic, value):
+    """`similarity` is capped at 1.0, so anything above it rejects every candidate while
+    looking like a stricter gate. One live run was lost to a rig that passed 2.0."""
+    with pytest.raises(ValueError, match="min_similarity"):
+        Synthesizer(fake_llm, skill_store, fake_critic, min_similarity=value)
+
+
+def test_the_precondition_logs_its_score_whether_it_passes_or_fails(
+    trajectory, critic, skill_store, scenario, caplog
+):
+    """The measurement that was missing. A gate that speaks only when it refuses cannot
+    be calibrated - the passing scores are what say how much room is left."""
+    for agreeing, expected in ((22, True), (7, False)):
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            synthesizer(FakeLLM([reply()]), InMemorySkillStore(), critic, max_repairs=0).admit(
+                *_gate(trajectory, scenario, *_live_pair(agreeing=agreeing))
+            )
+        logged = [r for r in caplog.records if "skill.admit.precondition" in r.getMessage()]
+        assert len(logged) == 1
+        message = logged[0].getMessage()
+        assert f"similarity={agreeing / LIVE_PARTS:g}" in message
+        assert f"ok={expected}" in message

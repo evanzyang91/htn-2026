@@ -27,6 +27,9 @@ The gate, in order, for every attempt:
    before anything executes, and never admitted.
 3. **The precondition.** The environment is put back to the recorded starting screen
    and must actually be there; a skill proved against the wrong screen proves nothing.
+   "There" is :data:`MIN_PRECONDITION_SIMILARITY` alike, not identical - a live page
+   never reproduces itself exactly, and demanding that it does is how a correct skill
+   gets written and thrown away on every website that is not the demo.
    When the world could not be put back at all - the run archived a message, and
    re-opening the page does not un-archive it - the attempt stops at ``"reset"``
    rather than ``"precondition"``. That distinction is the whole point: a skill that
@@ -94,12 +97,14 @@ from skillweaver.contracts import (
 )
 from skillweaver.errors import SandboxViolation
 from skillweaver.logging_ import get_logger
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 from skillweaver.skills.api import SkillLimits, describe_action
 from skillweaver.skills.model import SkillInvalid, make_skill
 from skillweaver.skills.refactor import Hardening, harden
 from skillweaver.skills.sandbox import SkillRunner, scan_code
 
 __all__ = [
+    "MIN_PRECONDITION_SIMILARITY",
     "PROMPT",
     "Admission",
     "Attempt",
@@ -143,6 +148,126 @@ whose implied duration passes ten minutes - a real run died at ``max_tokens=3200
 with "Streaming is required for operations that may take longer than 10 minutes"
 before this ceiling was lowered. 16000 is the contract's own default for
 ``LLMClient.complete`` and has been exercised live against ``claude-opus-5``."""
+
+
+MIN_PRECONDITION_SIMILARITY = SAME_STATE_THRESHOLD
+"""How like the recorded starting screen the environment must be before a candidate
+is re-run in it.
+
+This used to be ``1.0`` - the EXACT same screen - and that is why nothing was ever
+learned on a real website. A live page does not reproduce exactly. The demo site
+does, at 1.000 after ``/__reset``, so every sandbox run looked green while every
+live run wrote a correct skill and threw it away.
+
+What was measured, and where
+----------------------------
+
+All of it on 2026-09-19, Chromium at 1280x800 - headless except where a paragraph
+says otherwise - through the SHIPPED pipeline (``YoloDetector`` + ``RapidOcrReader``
++ ``StateFingerprinter``), which emits about 25 parts for a live page, so every score
+below is an exact ``n/25``.
+
+The numbers are taken on **the path the gate actually walks**: a COLD first
+observation, which is what the recording captures, against a WARM re-navigation in
+the SAME browser, which is what ``navigating_environment`` hands the gate. Three
+trials a page, same rendering mode on both sides:
+
+===================================  ==========================  ======================
+page                                 cold record -> warm re-run  what moved
+===================================  ==========================  ======================
+en.wikipedia.org/wiki/Main_Page      0.880, 1.000, 1.000         the right rail hydrating
+en.wikipedia.org/wiki/Ada_Lovelace   1.000, 0.920, 0.040         a reflow; then a banner
+docs.python.org/3/library/json.html  1.000, 1.000, 1.000         nothing
+the sandbox site at ``/``            1.000, 1.000, 1.000         nothing
+===================================  ==========================  ======================
+
+The 0.040 is not noise and not a near miss: a Wikimedia fundraising notice arrived
+between the two captures and pushed the whole article down the viewport. That is a
+genuinely different screen and rejecting it is the right answer, which is the point
+of keeping a threshold at all.
+
+Then the same question asked of three trajectories this gate had actually recorded on
+live Wikipedia, re-navigated three times each - nine re-runs, no model calls. Six
+scored **0.840**, every one of which the old ``1.0`` threw away and every one of which
+now runs. The other three were the fundraising banner again (0.040, 0.040, 0.200) and
+are still refused. Those recordings were made through the CLI, which opens a visible
+window, and the re-runs were headless, so 0.840 is a cross-mode score as well; it is
+the lowest same-page number anywhere in this calibration and it sets the floor.
+
+And the rejections that have to keep working - different screens built from the same
+template, which is the only kind worth testing:
+
+==========================================  =====
+pair                                        score
+==========================================  =====
+two Wikipedia revision-history pages        0.280
+two Wikipedia category listings             0.120
+two Wikipedia search-result pages           0.080
+two Wikipedia stub articles                 0.000
+two docs.python.org stdlib pages            0.000
+the Main Page against an article            0.040
+------------------------------------------  -----
+``same_layout_different_content``           0.500
+==========================================  =====
+
+The last row is the contrived worst case committed under
+``tests/fixtures/shots/pairs``: one invoice list for two different accounts,
+identical URL, identical chrome, identical layout, every row different. Nothing
+live came near it, and it is the row that sets the floor - admitting it would let
+the gate prove a skill against the wrong account's data and store the result.
+
+Why 0.62
+--------
+
+Same-page bottoms out at **0.840** and different-screen tops out at **0.280** live
+and **0.500** contrived, so the cut belongs in ``(0.500, 0.840)``. 0.62 sits there
+with 0.12 of margin below and 0.22 above.
+
+It is deliberately nearer the bottom of that window, because the two mistakes do not
+cost the same. A false REJECT is total: the skill was written correctly and is
+destroyed, which is the defect this constant exists to fix. A false ACCEPT costs one
+sandbox execution and nothing else - the precondition is the third of five gates, and
+a candidate run against the wrong screen still has to execute, satisfy its own
+verifier and satisfy the critic before anything is stored.
+
+That it lands on :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` is
+worth saying out loud rather than leaving as a coincidence. That constant was
+calibrated independently, on a different corpus, for the graph's question; this is
+the same question - "am I looking at the screen I recorded?" - so the project holds
+ONE number for it, and the measurements above are this gate's own evidence for it
+rather than a borrowing.
+
+Headed and headless are NOT made comparable
+-------------------------------------------
+
+Two FRESH browsers on one page, one visible and one headless, score 0.440 (Main Page)
+and 0.680 (``json.html``). The recorded precondition still does not record which mode
+produced it, for three reasons.
+
+The gate never compares across modes. ``orchestrator._open_world`` builds ONE
+controller and ``navigating_environment`` re-navigates in THAT controller, so the
+recording and the re-run are always the same window, and all three live ``learn``
+runs behind this constant scored their precondition at 1.000 in-process. The gap is
+real and is simply not on this path.
+
+Nor does it need a field to survive being off that path. Re-navigating those same
+recordings from the other mode scored 0.840 - inside the window, six times out of
+six - because a re-navigation is not a cold first paint. The 0.440 is two races
+compounding, a different renderer AND a rail that had not hydrated; separate them and
+the mode alone does not move a page out of the window.
+
+Where it IS real - a stored skill replayed later by another process in another mode -
+the precondition is the wrong place to carry the answer. ``Controller.describe()``
+already reports ``headed``, so a caller that wants to refuse a cross-mode replay can
+compare two strings without every stored skill in the library growing a field, and
+``Fingerprint`` is shared surface besides.
+
+And it would make the identity worse. A screen is the same screen whoever rendered
+it; 0.440 is the fingerprinter correctly reporting that these two renderers produce
+measurably different pixels. The answer is to run one renderer - ``eval/wikipedia.yaml``
+already says headless, for exactly this reason - not to teach the identity to ignore
+a difference it was right to notice.
+"""
 
 
 @lru_cache(maxsize=4)
@@ -566,7 +691,9 @@ def _echo(reply: str) -> tuple[LLMMessage, ...]:
     return (LLMMessage(role="assistant", text=reply),) if reply.strip() else ()
 
 
-def _not_at_the_start(candidate: Skill, similarity: float, *, restored: bool) -> str:
+def _not_at_the_start(
+    candidate: Skill, similarity: float, threshold: float, *, restored: bool
+) -> str:
     """Why the candidate was not run, in the words the difference deserves.
 
     The same fingerprint mismatch means two opposite things. With the world genuinely
@@ -574,8 +701,15 @@ def _not_at_the_start(candidate: Skill, similarity: float, *, restored: bool) ->
     is the difference between "your model wrote bad code" and "this task changes
     something and nothing here can change it back", which is the reason a mutating
     task could never be learned at all.
+
+    The threshold is quoted next to the score either way. A bare "similarity 0.96" is
+    what this gate reported for a year while a ``1.0`` default rejected every live
+    page, and reading it needs the number it was measured against.
     """
-    where = f"(similarity {similarity:.2f} to {candidate.precondition.value})"  # type: ignore[union-attr]
+    where = (
+        f"(similarity {similarity:.2f}, below the {threshold:.2f} required, "
+        f"to {candidate.precondition.value})"  # type: ignore[union-attr]
+    )
     if restored:
         return (
             f"the environment is not on the recorded starting screen {where}; "
@@ -631,7 +765,9 @@ class Synthesizer:
         min_steps: Runs shorter than this are not worth a skill; ``synthesize``
             returns ``None`` for them.
         min_similarity: How like the recorded starting screen the environment must
-            be before a candidate is run in it (``1.0`` is the same screen).
+            be before a candidate is run in it, in ``0.0..1.0``. Defaults to
+            :data:`MIN_PRECONDITION_SIMILARITY`, which is measured; ``1.0`` demands
+            the byte-identical screen and no live page ever gives one.
         max_tokens, temperature: Passed to ``llm.complete``.
 
     Not thread-safe, and one instance may be reused across trajectories.
@@ -661,7 +797,7 @@ class Synthesizer:
         max_format_retries: int = 2,
         limits: SkillLimits | None = None,
         min_steps: int = 1,
-        min_similarity: float = 1.0,
+        min_similarity: float = MIN_PRECONDITION_SIMILARITY,
         max_tokens: int = 8000,
         temperature: float | None = None,
         prompt: str | None = None,
@@ -670,6 +806,12 @@ class Synthesizer:
             raise ValueError(f"max_repairs must not be negative, got {max_repairs}")
         if max_format_retries < 0:
             raise ValueError(f"max_format_retries must not be negative, got {max_format_retries}")
+        if not 0.0 <= min_similarity <= 1.0:
+            # A value above 1.0 is unreachable - `Fingerprint.similarity` is capped
+            # there - so it silently rejects EVERY candidate. That is how a test rig
+            # can look like it is exercising the gate while proving nothing, and it
+            # is worth a loud failure rather than an afternoon.
+            raise ValueError(f"min_similarity must be within 0.0..1.0, got {min_similarity}")
         self._llm = llm
         self._store = store
         self._critic = critic
@@ -888,13 +1030,26 @@ class Synthesizer:
         before = env.perceiver.observe(env.controller)
         if candidate.precondition is not None:
             similarity = before.fingerprint.similarity(candidate.precondition)
+            # Logged whether it passes or fails. A gate that only speaks when it
+            # refuses cannot be calibrated: the number that mattered here was the one
+            # from the runs that were REJECTED at 0.96, and nobody could see the ones
+            # that passed to know how much room was left.
+            log.info(
+                "skill.admit.precondition",
+                name=candidate.name,
+                similarity=round(similarity, 3),
+                required=self._min_similarity,
+                ok=similarity >= self._min_similarity,
+            )
             if similarity < self._min_similarity:
                 return Attempt(
                     index,
                     "precondition" if env.restored else "reset",
                     False,
                     skill=candidate,
-                    error=_not_at_the_start(candidate, similarity, restored=env.restored),
+                    error=_not_at_the_start(
+                        candidate, similarity, self._min_similarity, restored=env.restored
+                    ),
                     hardening=hardening,
                 )
 
