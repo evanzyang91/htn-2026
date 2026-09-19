@@ -24,9 +24,9 @@
         "tool_calls": [],
         "usage": {
           "calls": 1,
-          "cost_usd": 0.00021,
-          "input_tokens": 27,
-          "output_tokens": 3
+          "cost_usd": 0.000675,
+          "input_tokens": 40,
+          "output_tokens": 19
         }
       }
     },
@@ -59,9 +59,9 @@
         "tool_calls": [],
         "usage": {
           "calls": 1,
-          "cost_usd": 0.00166,
-          "input_tokens": 312,
-          "output_tokens": 4
+          "cost_usd": 0.00075,
+          "input_tokens": 125,
+          "output_tokens": 5
         }
       }
     },
@@ -115,15 +115,15 @@
               "x": 120,
               "y": 240
             },
-            "id": "call_fixture_1",
+            "id": "toolu_01JDZkibSUJssN1UuiZVbi5a",
             "name": "click"
           }
         ],
         "usage": {
           "calls": 1,
-          "cost_usd": 0.003025,
-          "input_tokens": 415,
-          "output_tokens": 38
+          "cost_usd": 0.00414,
+          "input_tokens": 498,
+          "output_tokens": 66
         }
       }
     }

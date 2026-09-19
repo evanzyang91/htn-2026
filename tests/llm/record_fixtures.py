@@ -14,10 +14,13 @@ One definition, used three ways:
 Keeping the scenarios here rather than in the test is what makes the recording and
 the replay provably the same request: the digest is computed from these values.
 
-The committed cassettes were recorded OFFLINE, from the stub SDKs: no provider key
-was available when they were written, so they hold stubbed replies rather than real
-ones. Re-record them with ``--live`` as soon as a key exists - that is the step that
-turns "cassette-verified" into "proven against the live API".
+Provenance of the committed cassettes, which differs by backend and matters:
+
+* ``anthropic_basics.json`` was recorded LIVE from ``claude-opus-5`` on
+  2026-09-19. Every reply in it is a real API response.
+* ``gemini_basics.json`` is still stub-recorded. No ``GEMINI_API_KEY`` has been
+  supplied, so that adapter has never made a real call. Re-record it with
+  ``--live --only gemini`` when a key exists.
 """
 
 from __future__ import annotations
@@ -104,16 +107,37 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
 )
 
-#: A canned reply per scenario, for offline re-recording. Token counts are real
-#: enough to make the recorded cost non-zero and therefore assertable.
-OFFLINE_REPLIES: dict[str, dict[str, Any]] = {
-    "plain": {"text": "ready", "input_tokens": 27, "output_tokens": 3},
-    "image": {"text": "Submit", "input_tokens": 312, "output_tokens": 4},
-    "tool_call": {
-        "text": "",
-        "tool_calls": [("call_fixture_1", "click", {"x": 120, "y": 240})],
-        "input_tokens": 415,
-        "output_tokens": 38,
+#: A canned reply per scenario per backend, used to re-record a cassette offline.
+#:
+#: The ``anthropic`` entries are TRANSCRIBED FROM THE LIVE RECORDING - the text,
+#: the tool-call id and the token counts are what claude-opus-5 actually returned
+#: on 2026-09-19. They are not invented, and they are what makes the committed
+#: live cassette reproducible without a key. If a later live re-record changes
+#: them, ``test_offline_rerecord_matches_the_committed_file`` fails and the new
+#: values belong here.
+#:
+#: The ``gemini`` entries are still INVENTED stubs: no GEMINI_API_KEY has ever
+#: been supplied, so that cassette has never seen a real response.
+OFFLINE_REPLIES: dict[str, dict[str, dict[str, Any]]] = {
+    "anthropic": {
+        "plain": {"text": "ready", "input_tokens": 40, "output_tokens": 19},
+        "image": {"text": "Submit", "input_tokens": 125, "output_tokens": 5},
+        "tool_call": {
+            "text": "",
+            "tool_calls": [("toolu_01JDZkibSUJssN1UuiZVbi5a", "click", {"x": 120, "y": 240})],
+            "input_tokens": 498,
+            "output_tokens": 66,
+        },
+    },
+    "gemini": {
+        "plain": {"text": "ready", "input_tokens": 27, "output_tokens": 3},
+        "image": {"text": "Submit", "input_tokens": 312, "output_tokens": 4},
+        "tool_call": {
+            "text": "",
+            "tool_calls": [("call_fixture_1", "click", {"x": 120, "y": 240})],
+            "input_tokens": 415,
+            "output_tokens": 38,
+        },
     },
 }
 
@@ -146,7 +170,7 @@ def _offline_anthropic() -> Any:
 
     script = []
     for scenario in SCENARIOS:
-        reply = OFFLINE_REPLIES[scenario.key]
+        reply = OFFLINE_REPLIES["anthropic"][scenario.key]
         script.append(
             anthropic_message(
                 text=reply["text"],
@@ -169,7 +193,7 @@ def _offline_gemini() -> Any:
 
     script = []
     for scenario in SCENARIOS:
-        reply = OFFLINE_REPLIES[scenario.key]
+        reply = OFFLINE_REPLIES["gemini"][scenario.key]
         script.append(
             gemini_response(
                 text=reply["text"],

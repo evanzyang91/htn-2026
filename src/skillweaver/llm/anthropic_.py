@@ -22,18 +22,19 @@ nothing else has to survive the round trip.
 and testable. Anything not on the retryable list is re-raised as
 :class:`~skillweaver.errors.ProviderError` with the real cause attached.
 
-.. warning::
-   **Verification status: cassette-verified, NOT yet proven against the live API.**
-   Every path here is exercised against the real ``anthropic`` SDK types and
-   replayed from the cassettes in ``tests/fixtures/cassettes/``, but no request
-   has ever reached ``api.anthropic.com``: no ``ANTHROPIC_API_KEY`` was available
-   when this was written, so the committed cassettes hold stubbed replies rather
-   than real ones. The request shapes below - in particular the computer-use
-   toolset entry and the decision to omit ``thinking`` - follow the current docs
-   but are unconfirmed by a live call. Run
-   ``python tests/llm/record_fixtures.py --live`` once a key exists; it re-records
-   the same three scenarios from the real API, and the offline re-record test
-   will then show exactly what changed.
+.. note::
+   **Verification status: proven against the live API.** On 2026-09-19 this
+   adapter made real ``claude-opus-5`` calls for all three cassette scenarios -
+   a plain completion, a completion with an attached screenshot, and a
+   completion returning a tool call - and the replies in
+   ``tests/fixtures/cassettes/anthropic_basics.json`` are those real responses.
+   The offline suite replays them, so the request shapes below are confirmed by
+   a live round trip, not only by the docs. Re-record with
+   ``python tests/llm/record_fixtures.py --live``.
+
+   Not yet exercised live: the computer-use toolset entry
+   (:data:`COMPUTER_USE_TOOL`), ``effort``, and the ``workspace_id`` header.
+   Those follow the current docs but no live call has used them.
 """
 
 from __future__ import annotations

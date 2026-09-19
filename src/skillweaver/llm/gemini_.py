@@ -20,16 +20,17 @@ walked in order.
 non-``None`` value is forwarded rather than dropped.
 
 .. warning::
-   **Verification status: cassette-verified, NOT yet proven against the live API.**
-   Every path here is exercised against the real ``google-genai`` types and
-   replayed from the cassettes in ``tests/fixtures/cassettes/``, but no request
-   has ever reached Google: no ``GEMINI_API_KEY`` was available when this was
-   written, so the committed cassettes hold stubbed replies rather than real
-   ones. The request shapes below - in particular the computer-use tool and the
-   screenshot-carrying function response - follow the current docs but are
-   unconfirmed by a live call. Run ``python tests/llm/record_fixtures.py --live``
-   once a key exists; it re-records the same three scenarios from the real API,
-   and the offline re-record test will then show exactly what changed.
+   **Verification status: cassette-only. This adapter has NEVER made a real
+   call.** No ``GEMINI_API_KEY`` has been supplied, so every path here is
+   exercised against the real ``google-genai`` types and replayed from
+   ``tests/fixtures/cassettes/gemini_basics.json``, but that cassette holds
+   INVENTED replies, not recorded ones. The request shapes below - the
+   computer-use tool, the screenshot-carrying function response, the
+   finish-reason mapping - follow the current docs and are unconfirmed by any
+   live round trip. The sibling Claude adapter IS live-proven; do not read its
+   status as covering this one. Run
+   ``python tests/llm/record_fixtures.py --live --only gemini`` once a key
+   exists.
 """
 
 from __future__ import annotations
