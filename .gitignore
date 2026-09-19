@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local settings - never commit
+.env
+.env.*
+
+# Runtime data (skills, graphs, trajectories, models, eval). Force-add seed files.
+data/
+runs/
+*.pt
+*.onnx
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
