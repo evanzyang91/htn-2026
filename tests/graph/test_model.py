@@ -15,7 +15,8 @@ from skillweaver.graph.model import (
     merge_transitions,
 )
 from skillweaver.graph.route import EXPLORATORY
-from tests.graph.builders import DOMAIN, click, edge, fp, screen, state
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
+from tests.graph.builders import DOMAIN, click, edge, fp, live_pair, screen, state
 
 LIST, DETAIL, EDIT = screen("list"), screen("detail"), screen("edit")
 
@@ -142,31 +143,38 @@ def test_a_nonsensical_threshold_is_rejected(bad):
         InMemorySiteGraph(match_threshold=bad)
 
 
-def test_the_default_threshold_suits_a_three_part_fingerprint():
-    """The fingerprinters in this project emit ``url``, ``layout`` and ``text``, so
-    the default has to sit between one part drifting and two. A default above
-    0.667 rejects every drift a three-part fingerprint can express."""
-    assert 1 / 3 < DEFAULT_MATCH_THRESHOLD <= 2 / 3
+def test_the_default_threshold_is_the_projects_one_measured_same_state_cut():
+    """Two constants for "is this the same screen?" would be two things to calibrate and
+    one of them silently wrong. The fingerprinter measures it; the graph keys on it."""
+    assert DEFAULT_MATCH_THRESHOLD == SAME_STATE_THRESHOLD
 
 
-def test_a_real_three_part_fingerprint_resolves_when_one_part_drifts(graph):
-    settled = fp(value="v1", url="u", layout="l", text="t1")
+def test_a_page_pushed_down_by_a_notice_resolves_to_the_node_it_already_had(graph):
+    """THE defect this threshold exists to stop. A notice arriving at the top leaves
+    about 120 of 175 band parts standing - 0.52 - and that screen is one the graph
+    already knows. Rejecting it is how the graph filled up with singletons."""
+    settled, moved = live_pair(agreeing=120)
+    graph.upsert_state(state(settled, label="the article"))
+    assert moved.similarity(settled) == pytest.approx(0.522, abs=0.005)
+
+    resolved = graph.resolve(moved)
+    assert resolved is not None
+    assert resolved.fingerprint == settled
+    assert resolved.label == "the article"
+    assert len(graph.states(DOMAIN)) == 1, "one screen, one node"
+
+
+def test_two_pages_built_from_one_template_still_fork(graph):
+    """The other direction, and the reason the threshold is not simply removed: two
+    different pages of one site share their chrome and nothing else that matters.
+    Collapsing them would give the router edges that lead somewhere unpredictable."""
+    settled, elsewhere = live_pair(agreeing=60)
     graph.upsert_state(state(settled))
-
-    ticked = fp(value="v2", url="u", layout="l", text="t2")
-    assert ticked.similarity(settled) == pytest.approx(1 / 3 * 2)
-
-    assert graph.canonical(ticked) == settled
-
-
-def test_a_real_three_part_fingerprint_forks_when_two_parts_drift(graph):
-    settled = fp(value="v1", url="u", layout="l", text="t1")
-    graph.upsert_state(state(settled))
-
-    elsewhere = fp(value="v2", url="u", layout="l2", text="t2")
-    assert elsewhere.similarity(settled) == pytest.approx(1 / 3)
+    assert elsewhere.similarity(settled) == pytest.approx(0.207, abs=0.005)
 
     assert graph.resolve(elsewhere) is None
+    graph.upsert_state(state(elsewhere))
+    assert len(graph.states(DOMAIN)) == 2, "two screens, two nodes"
 
 
 # -- observe_transition --------------------------------------------------------------

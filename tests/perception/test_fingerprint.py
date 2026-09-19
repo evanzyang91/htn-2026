@@ -24,6 +24,7 @@ from skillweaver.errors import PerceptionError
 from skillweaver.perception.fingerprint import (
     SAME_STATE_THRESHOLD,
     StateFingerprinter,
+    band_parts,
     normalize_url,
     perceptual_hash,
     structural_hash,
@@ -103,6 +104,28 @@ def _gradient(width: int = 800, height: int = 600, *, seed: int = 0) -> np.ndarr
     return np.repeat(np.repeat(coarse, height // 12, axis=0), width // 16, axis=1)
 
 
+def _column_page(height: int = 800, width: int = 1280) -> np.ndarray:
+    """A deterministic stand-in for a page: header, left rail, a column of body lines.
+
+    Used ONLY to compare a frame with ITSELF under some transformation - a taller
+    viewport, a shift. It is deliberately not used to argue that two DIFFERENT pages stay
+    apart: a hand-drawn frame shares far more with another hand-drawn frame than two real
+    pages share, and measuring against one would flatter the fingerprint. Two of these
+    "articles" score 0.325 to 0.496 against each other where two real Wikipedia articles
+    score 0.034, so the different-page claims are made against real captures instead.
+    """
+    frame = np.full((height, width, 3), 250, dtype=np.uint8)
+    frame[:52] = 240  # header bar
+    frame[20:36, 24:180] = 60  # wordmark
+    frame[20:36, 400:900] = 210  # search box
+    frame[64:, :210] = 246  # left rail
+    for y in range(80, height - 20, 34):  # rail links
+        frame[y : y + 12, 24:170] = 90
+    for y in range(80, height - 20, 26):  # body lines
+        frame[y : y + 13, 260 : 1040 - (y * 37 % 260)] = 40
+    return frame
+
+
 # --------------------------------------------------------------------------------------
 # The threshold, over the labelled pairs
 # --------------------------------------------------------------------------------------
@@ -117,13 +140,20 @@ def test_labelled_pair_falls_on_the_right_side_of_the_threshold(meta: dict) -> N
         assert score < SAME_STATE_THRESHOLD, f"{meta['name']}: {meta['why']} (scored {score:.3f})"
 
 
-def test_the_threshold_sits_in_a_wide_gap() -> None:
-    """The point of the constant: there is real daylight either side of it, not a hair."""
+def test_the_threshold_sits_in_a_gap_on_this_corpus() -> None:
+    """The point of the constant: there is daylight either side of it, not a hair.
+
+    These are the CONTRIVED pairs, which separate widely - they were built to. The live
+    captures behind ``SAME_STATE_THRESHOLD`` are what makes the gap narrow, and the
+    binding pair is cross-corpus: a live page whose advertisement rotated (0.305)
+    against ``same_layout_different_content`` here (0.213). Both halves are asserted,
+    here and in :func:`test_a_page_pushed_down_by_a_notice_is_still_the_same_screen`.
+    """
     same = [_score(m) for m in PAIRS if m["label"] == "same"]
     different = [_score(m) for m in PAIRS if m["label"] == "different"]
-    assert min(same) - max(different) >= 0.2, f"same={sorted(same)} different={sorted(different)}"
-    assert min(same) - SAME_STATE_THRESHOLD > 0.1
-    assert SAME_STATE_THRESHOLD - max(different) > 0.1
+    assert min(same) - max(different) >= 0.4, f"same={sorted(same)} different={sorted(different)}"
+    assert min(same) - SAME_STATE_THRESHOLD > 0.3
+    assert SAME_STATE_THRESHOLD - max(different) > 0.04
 
 
 def test_same_screen_twice_is_exactly_one() -> None:
@@ -137,8 +167,14 @@ def test_same_screen_twice_is_exactly_one() -> None:
     assert len({a, b}) == 1
 
 
-def test_shared_layout_does_not_carry_a_pair_over_the_threshold() -> None:
-    """The trap: same URL, same structure, different content. Layout must not outvote pixels."""
+def test_shared_layout_and_url_do_not_carry_a_pair_over_the_threshold() -> None:
+    """The trap this cut exists for: same URL, same chrome, same element layout, every
+    row's text different - one list for two different accounts.
+
+    It is the hardest DIFFERENT pair anywhere in the calibration, and it is what stops
+    the threshold being lowered further. Admitting it would let a skill run against the
+    wrong account's data.
+    """
     meta = next(m for m in PAIRS if m["name"] == "same_layout_different_content")
     fingerprinter = StateFingerprinter()
     a_shot, a_elements, a_url = _load_side(meta["dir"], meta["a"])
@@ -146,21 +182,33 @@ def test_shared_layout_does_not_carry_a_pair_over_the_threshold() -> None:
     a = fingerprinter.fingerprint(a_shot, a_elements, a_url)
     b = fingerprinter.fingerprint(b_shot, b_elements, b_url)
 
-    layout_parts = [name for name in a.parts if name.startswith("layout.")]
-    assert layout_parts, "the pair should have a structural signal at all"
-    assert all(a.parts[name] == b.parts[name] for name in layout_parts)
+    assert structural_hash(a_elements, a_shot.width, a_shot.height) == structural_hash(
+        b_elements, b_shot.width, b_shot.height
+    ), "the pair is only interesting while its layouts really are identical"
     assert a.parts["url"] == b.parts["url"]
     assert a.similarity(b) < SAME_STATE_THRESHOLD
 
 
-def test_parts_name_all_three_signals() -> None:
+def test_the_element_index_contributes_no_part() -> None:
+    """Measured, not assumed: quadrant parts cost at BOTH ends on the live corpus, and a
+    detector that reads 47 elements on one capture and 31 on the next reports that as
+    disagreement. The elements still reach ``value`` - see the next test."""
+    meta = next(m for m in PAIRS if m["name"] == "same_screen_twice")
+    shot, elements, url = _load_side(meta["dir"], meta["a"])
+    with_elements = StateFingerprinter().fingerprint(shot, elements, url)
+    without = StateFingerprinter().fingerprint(shot, [], url)
+    assert with_elements.parts == without.parts
+    assert with_elements != without, "but they must still be different FRAMES"
+
+
+def test_parts_name_both_signals() -> None:
     """``parts`` is the explanation of a match, so every signal has to be visible in it."""
     meta = next(m for m in PAIRS if m["name"] == "same_screen_twice")
     fingerprint = StateFingerprinter().fingerprint(*_load_side(meta["dir"], meta["a"]))
     names = set(fingerprint.parts)
     assert "url" in names
-    assert any(name.startswith("layout.") for name in names)
-    assert any(name.startswith("phash.") for name in names)
+    assert any(name.startswith("band.") for name in names)
+    assert not any(name.startswith(("layout.", "phash.")) for name in names)
 
 
 # --------------------------------------------------------------------------------------
@@ -176,21 +224,12 @@ def _sparse(*bands: tuple[int, int, int, int]) -> np.ndarray:
     return frame
 
 
-def test_an_empty_quadrant_emits_no_layout_part() -> None:
-    """A quadrant with nothing in it is the absence of evidence, not a piece of it."""
-    top_left_only = [_element(20, 40), _element(120, 90)]
-    parts = StateFingerprinter().fingerprint(_shot(_gradient()), top_left_only, None).parts
-    assert "layout.q0" in parts
-    assert not {"layout.q1", "layout.q2", "layout.q3"} & set(parts)
-
-
-def test_a_featureless_hash_row_emits_no_phash_part() -> None:
+def test_a_featureless_band_emits_no_part() -> None:
     """A band of flat background has no horizontal structure to report."""
-    parts = StateFingerprinter().fingerprint(_shot(_sparse()), [], None).parts
-    phash_parts = [name for name in parts if name.startswith("phash.")]
-    bands = len(perceptual_hash(_shot(_sparse())).split("-"))
-    assert phash_parts, "the one strip of content must still be reported"
-    assert len(phash_parts) < bands, "the blank bands must not all report in"
+    shot = _shot(_sparse())
+    parts = band_parts(shot)
+    assert parts, "the one strip of content must still be reported"
+    assert len(parts) < len(perceptual_hash(shot).split("-")), "blank bands must not report in"
 
 
 def test_two_sparse_screens_get_no_credit_for_being_blank_in_the_same_places() -> None:
@@ -218,7 +257,142 @@ def test_suppressed_chunks_still_count_towards_identity() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Signal 1: the perceptual hash, alone
+# The defect: a page that moved is still the page
+# --------------------------------------------------------------------------------------
+
+
+def _page_shifted_down(shot: Screenshot, pixels: int, fill: int = 235) -> Screenshot:
+    """``shot`` with a notice ``pixels`` tall pushed onto the top, exactly as a
+    fundraising appeal, a cookie bar or a logged-out prompt does it."""
+    frame = np.asarray(Image.open(io.BytesIO(shot.png)).convert("RGB"))
+    moved = np.empty_like(frame)
+    moved[:pixels] = fill
+    moved[pixels:] = frame[: frame.shape[0] - pixels]
+    return _shot(moved, scale=shot.scale)
+
+
+@pytest.mark.parametrize(("pixels", "floor"), [(20, 0.95), (60, 0.85), (120, 0.70), (200, 0.55)])
+def test_a_page_pushed_down_by_a_notice_is_still_the_same_screen(pixels: int, floor: float) -> None:
+    """THE regression. A notice arriving at the top displaces everything below it, and
+    under a fingerprint whose parts were named by grid ROW that scored a live page
+    against itself at 0.040 - the same as two unrelated websites - so the graph grew a
+    fresh node for a screen it already knew, every single visit.
+
+    The floors fall with the size of the notice, because a notice really does hide that
+    much of the screen; what matters is that they stay far above the cut.
+    """
+    meta = next(m for m in PAIRS if m["name"] == "same_screen_twice")
+    shot, _, url = _load_side(meta["dir"], meta["a"])
+    fingerprinter = StateFingerprinter()
+    before = fingerprinter.fingerprint(shot, [], url)
+    after = fingerprinter.fingerprint(_page_shifted_down(shot, pixels), [], url)
+
+    score = before.similarity(after)
+    assert score >= floor, f"a {pixels}px notice scored the page against itself at {score:.3f}"
+    assert score > SAME_STATE_THRESHOLD
+    assert before != after, "it is still a different FRAME, and value must say so"
+
+
+def test_the_same_screen_that_moved_keeps_its_parts_but_not_its_value() -> None:
+    """The two jobs of a fingerprint, pulled apart: ``value`` is a node id and must
+    change when anything does, ``parts`` is the recognition and must not."""
+    meta = next(m for m in PAIRS if m["name"] == "same_screen_twice")
+    shot, _, url = _load_side(meta["dir"], meta["a"])
+    moved = _page_shifted_down(shot, 60)
+    assert perceptual_hash(shot) != perceptual_hash(moved), "the POSITIONAL hash does move"
+    kept = set(band_parts(shot)) & set(band_parts(moved))
+    assert len(kept) > 0.7 * len(band_parts(shot))
+
+
+def test_a_band_part_is_named_by_its_content_and_never_by_its_position() -> None:
+    """The mechanism, stated directly: the name of a part carries no ``y``."""
+    shot = _shot(_sparse((100, 140, 100, 300)))
+    moved = _shot(_sparse((300, 340, 100, 300)))
+    assert set(band_parts(shot)) == set(band_parts(moved))
+    for name, value in band_parts(shot).items():
+        assert name == f"band.{value}#{name.rsplit('#', 1)[1]}"
+
+
+def test_occupancy_still_counts_but_only_in_powers_of_two() -> None:
+    """Position is thrown away; how MUCH of the screen a pattern covers is not. Without
+    it, two lists that share a layout and differ only in how far each block runs would
+    collapse into one screen."""
+    short = band_parts(_shot(_sparse((100, 140, 100, 300))))
+    tall = band_parts(_shot(_sparse((100, 400, 100, 300))))
+    assert set(short) < set(tall), "a taller run of one pattern must add parts, not replace them"
+    nudged = band_parts(_shot(_sparse((100, 152, 100, 300))))
+    assert set(short) == set(nudged), "but 12px more of it must cost nothing"
+
+
+@pytest.mark.parametrize(
+    ("pair", "what"),
+    [
+        ("different_screens", "an index page against a settings page: nothing in common"),
+        ("article_vs_search_results", "an article against the results page for a search"),
+        ("dense_text_different_article", "one template, entirely different prose"),
+        ("modal_open_vs_closed", "a dialog and its scrim over the page beneath"),
+        ("same_layout_different_content", "one list for two accounts: same URL, chrome, layout"),
+    ],
+)
+def test_differently_laid_out_pages_stay_different_screens(pair: str, what: str) -> None:
+    """Tolerance must not become "everything is one node".
+
+    These are REAL browser captures, which is the point - the claim is about pages, and
+    a hand-drawn stand-in is not a page. Live captures agree: an article against a page
+    of search results scores 0.036, two different Wikipedia articles 0.034, and two
+    search-result pages for different queries 0.189 - that last being the highest any
+    genuinely different pair reached anywhere in the calibration.
+    """
+    meta = next(m for m in PAIRS if m["name"] == pair)
+    assert meta["label"] == "different", f"{pair} is not a different-state pair"
+    assert _score(meta) < SAME_STATE_THRESHOLD, what
+
+
+def test_an_article_and_a_page_of_search_results_stay_different_screens() -> None:
+    """Named on its own because it is the pair a tolerant identity is likeliest to
+    collapse, and the one the graph would be worst served by collapsing.
+
+    The two pages share a site, a header, a toolbar and a stylesheet; only the body
+    differs - prose against a column of hits. They score 0.054 here and 0.036 on live
+    Wikipedia. Merging them would give the router an edge out of "the article" that
+    actually leaves from the results page, and a skill written for one would run on the
+    other.
+    """
+    meta = next(m for m in PAIRS if m["name"] == "article_vs_search_results")
+    article = StateFingerprinter().fingerprint(*_load_side(meta["dir"], meta["a"]))
+    results = StateFingerprinter().fingerprint(*_load_side(meta["dir"], meta["b"]))
+    assert article.similarity(results) < SAME_STATE_THRESHOLD
+
+
+def test_the_results_page_pushed_down_is_still_the_results_page() -> None:
+    """And the counterweight, on the very same page: a notice at the top moves every hit
+    down 120px and it is still the screen a skill was written for.
+
+    Together these two are the whole claim of this module. One real page moved scores
+    0.659; two real pages that merely share a template score 0.054. A cut between them
+    exists - which, before parts were named by content, it did not.
+    """
+    moved = next(m for m in PAIRS if m["name"] == "search_results_pushed_down")
+    apart = next(m for m in PAIRS if m["name"] == "article_vs_search_results")
+    assert _score(moved) > SAME_STATE_THRESHOLD
+    assert _score(moved) > _score(apart) + 0.4
+
+
+def test_a_notice_does_not_turn_a_page_into_a_different_page() -> None:
+    """The two properties together, which is the whole claim: the SAME page that moved
+    stays closer to itself than two DIFFERENT pages ever get to each other."""
+    fingerprinter = StateFingerprinter()
+    meta = next(m for m in PAIRS if m["name"] == "dense_text_different_article")
+    here, _, url = _load_side(meta["dir"], meta["a"])
+    other, _, other_url = _load_side(meta["dir"], meta["b"])
+    a = fingerprinter.fingerprint(here, [], url)
+    moved = fingerprinter.fingerprint(_page_shifted_down(here, 120), [], url)
+    elsewhere = fingerprinter.fingerprint(other, [], other_url)
+    assert a.similarity(moved) > a.similarity(elsewhere) + 0.4
+
+
+# --------------------------------------------------------------------------------------
+# Signal 1: the band hash, alone
 # --------------------------------------------------------------------------------------
 
 
@@ -227,42 +401,39 @@ def test_perceptual_hash_is_deterministic() -> None:
     assert perceptual_hash(shot) == perceptual_hash(shot)
 
 
-def test_perceptual_hash_ignores_the_device_scale_factor() -> None:
-    """A 2x Retina capture of one screen must hash like the 1x capture: only antialiasing."""
+def test_a_retina_capture_is_the_same_screen_as_the_one_x_capture() -> None:
+    """A 2x capture of one screen differs from the 1x capture only by resampling, so it
+    must resolve to the same node. It is no longer bit-identical - 32 columns across the
+    viewport is fine enough to see the resampling - so this is a similarity claim."""
     meta = next(m for m in PAIRS if m["name"] == "same_screen_retina")
-    one_x, _, _ = _load_side(meta["dir"], meta["a"])
+    one_x, _, url = _load_side(meta["dir"], meta["a"])
     two_x, _, _ = _load_side(meta["dir"], meta["b"])
     assert two_x.scale == 2.0 and one_x.scale == 1.0
-    assert perceptual_hash(one_x) == perceptual_hash(two_x)
-
-
-def test_perceptual_hash_survives_pixel_noise() -> None:
-    """Capture noise moves every pixel a little; the hash averages it away."""
-    base = _gradient()
-    rng = np.random.default_rng(11)
-    noisy = np.clip(base.astype(np.int16) + rng.normal(0, 6, base.shape), 0, 255).astype(np.uint8)
-    assert perceptual_hash(_shot(base)) == perceptual_hash(_shot(noisy))
-
-
-@pytest.mark.parametrize(
-    ("pair", "allowed_losses"),
-    [("same_screen_scrolled", 2), ("dense_text_scrolled_slightly", 6)],
-)
-def test_perceptual_hash_survives_a_few_pixels_of_scroll(pair: str, allowed_losses: int) -> None:
-    """A real scroll of a real page must leave most row chunks intact.
-
-    ``dense_text_scrolled_slightly`` is the hard one and gets a looser budget: a page of
-    solid body text moves every line of type when it scrolls, so some bands do change.
-    """
-    meta = next(m for m in PAIRS if m["name"] == pair)
-    still, _, _ = _load_side(meta["dir"], meta["a"])
-    scrolled, _, _ = _load_side(meta["dir"], meta["b"])
-    rows_still = perceptual_hash(still).split("-")
-    rows_scrolled = perceptual_hash(scrolled).split("-")
-    agreeing = sum(x == y for x, y in zip(rows_still, rows_scrolled, strict=True))
-    assert agreeing >= len(rows_still) - allowed_losses, (
-        f"{agreeing}/{len(rows_still)} row chunks survived"
+    fingerprinter = StateFingerprinter()
+    score = fingerprinter.fingerprint(one_x, [], url).similarity(
+        fingerprinter.fingerprint(two_x, [], url)
     )
+    assert score > SAME_STATE_THRESHOLD + 0.3, f"scored {score:.3f}"
+
+
+@pytest.mark.parametrize(("sigma", "floor"), [(1.5, 0.90), (6, 0.55), (24, 0.40)])
+def test_pixel_noise_does_not_lose_the_screen(sigma: float, floor: float) -> None:
+    """A lossy or noisy capture path moves every pixel a little. The deadzone and the
+    band averaging absorb it; at 32 columns they no longer absorb it EXACTLY, so what is
+    asserted is that the screen is still recognisable, not that the hash is unchanged."""
+    meta = next(m for m in PAIRS if m["name"] == "same_screen_twice")
+    shot, _, url = _load_side(meta["dir"], meta["a"])
+    frame = np.asarray(Image.open(io.BytesIO(shot.png)).convert("RGB"))
+    rng = np.random.default_rng(11)
+    noisy = np.clip(frame.astype(np.int16) + rng.normal(0, sigma, frame.shape), 0, 255).astype(
+        np.uint8
+    )
+    fingerprinter = StateFingerprinter()
+    score = fingerprinter.fingerprint(shot, [], url).similarity(
+        fingerprinter.fingerprint(_shot(noisy), [], url)
+    )
+    assert score >= floor, f"sigma {sigma} scored {score:.3f}"
+    assert score > SAME_STATE_THRESHOLD
 
 
 def test_perceptual_hash_separates_two_pages_of_different_prose() -> None:
@@ -295,12 +466,32 @@ def test_perceptual_hash_is_stable_on_a_flat_field() -> None:
     assert perceptual_hash(_shot(flat)) == perceptual_hash(_shot(jittered))
 
 
-def test_perceptual_hash_handles_a_frame_smaller_than_its_grid() -> None:
-    """A 4x4 icon has fewer rows than the hash has bands: degrade, do not raise."""
+def test_perceptual_hash_handles_a_frame_shorter_than_one_band() -> None:
+    """A 4x4 icon is shorter than a single band is tall: degrade, do not raise.
+
+    Bands are a fixed number of LOGICAL pixels apart rather than a fixed count, which is
+    what lets a 900px viewport line up with an 800px one; the price is that a frame can
+    be too short to fill even one, and numpy's ``same`` convolution silently returns the
+    wrong length there.
+    """
     rng = np.random.default_rng(5)
     tiny = rng.integers(0, 255, size=(4, 4, 3), dtype=np.uint8)
-    expected_bands = len(perceptual_hash(_shot(_gradient())).split("-"))
-    assert len(perceptual_hash(_shot(tiny)).split("-")) == expected_bands
+    assert len(perceptual_hash(_shot(tiny)).split("-")) == 1
+    assert len(perceptual_hash(_shot(_gradient())).split("-")) > 1
+
+
+def test_a_taller_viewport_lines_up_with_a_shorter_one() -> None:
+    """Bands are pitched in logical pixels, not cut into a fixed number per frame, so a
+    window resized taller shows the same screen with more of it rather than a rescaled
+    and unrecognisable one."""
+    short = _column_page(height=800)
+    tall = np.full((900, 1280, 3), 250, dtype=np.uint8)
+    tall[:800] = short
+    fingerprinter = StateFingerprinter()
+    score = fingerprinter.fingerprint(_shot(short), [], None).similarity(
+        fingerprinter.fingerprint(_shot(tall), [], None)
+    )
+    assert score > SAME_STATE_THRESHOLD + 0.3, f"scored {score:.3f}"
 
 
 def test_perceptual_hash_raises_perception_error_on_undecodable_png() -> None:
@@ -452,7 +643,7 @@ def test_fingerprint_with_an_empty_element_list_degrades_rather_than_raising() -
     b = fingerprinter.fingerprint(_shot(_gradient(seed=2)), [], url)
     assert not any(name.startswith("layout.") for name in a.parts)
     assert a != b
-    assert a.similarity(b) < SAME_STATE_THRESHOLD
+    assert a.similarity(b) < SAME_STATE_THRESHOLD, "two different screens, no borrowed match"
 
 
 def test_fingerprint_with_neither_url_nor_elements_still_identifies_the_pixels() -> None:

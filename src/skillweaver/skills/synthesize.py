@@ -159,102 +159,47 @@ learned on a real website. A live page does not reproduce exactly. The demo site
 does, at 1.000 after ``/__reset``, so every sandbox run looked green while every
 live run wrote a correct skill and threw it away.
 
-What was measured, and where
-----------------------------
+It is deliberately not a number of its own. "Am I looking at the screen I recorded?"
+is one question, and the project answers it in one place:
+:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`, which carries the two
+corpora it was calibrated on and what it refuses. Do not copy those measurements here.
+An earlier version of this docstring did, as a table of whole twenty-fifths, and when
+the fingerprinter was rebuilt the table became a record of a signal that no longer
+existed - still stating that a page pushed down by a notice was a DIFFERENT screen,
+which by then was the defect rather than the behaviour. A threshold is only meaningful
+against the shape of the signal it judges, and a second copy of it drifts silently.
 
-All of it on 2026-09-19, Chromium at 1280x800 - headless except where a paragraph
-says otherwise - through the SHIPPED pipeline (``YoloDetector`` + ``RapidOcrReader``
-+ ``StateFingerprinter``), which emits about 25 parts for a live page, so every score
-below is an exact ``n/25``.
+What this gate sees, specifically
+---------------------------------
 
-The numbers are taken on **the path the gate actually walks**: a COLD first
-observation, which is what the recording captures, against a WARM re-navigation in
-the SAME browser, which is what ``navigating_environment`` hands the gate. Three
-trials a page, same rendering mode on both sides:
+The gate walks a COLD first observation - what the recording captured - against a WARM
+re-navigation in the SAME browser, which is what ``navigating_environment`` hands it.
+That path is kinder than the general case: across the live ``learn`` runs on
+en.wikipedia.org behind this constant the precondition scored **1.000 every time**, and
+the sandbox scores 1.000 after a reset. The margin the calibration leaves is spent on
+the live page that has moved between the two captures, not on this path's own noise.
 
-===================================  ==========================  ======================
-page                                 cold record -> warm re-run  what moved
-===================================  ==========================  ======================
-en.wikipedia.org/wiki/Main_Page      0.880, 1.000, 1.000         the right rail hydrating
-en.wikipedia.org/wiki/Ada_Lovelace   1.000, 0.920, 0.040         a reflow; then a banner
-docs.python.org/3/library/json.html  1.000, 1.000, 1.000         nothing
-the sandbox site at ``/``            1.000, 1.000, 1.000         nothing
-===================================  ==========================  ======================
+Which way to be wrong
+---------------------
 
-The 0.040 is not noise and not a near miss: a Wikimedia fundraising notice arrived
-between the two captures and pushed the whole article down the viewport. That is a
-genuinely different screen and rejecting it is the right answer, which is the point
-of keeping a threshold at all.
-
-Then the same question asked of three trajectories this gate had actually recorded on
-live Wikipedia, re-navigated three times each - nine re-runs, no model calls. Six
-scored **0.840**, every one of which the old ``1.0`` threw away and every one of which
-now runs. The other three were the fundraising banner again (0.040, 0.040, 0.200) and
-are still refused. Those recordings were made through the CLI, which opens a visible
-window, and the re-runs were headless, so 0.840 is a cross-mode score as well; it is
-the lowest same-page number anywhere in this calibration and it sets the floor.
-
-And the rejections that have to keep working - different screens built from the same
-template, which is the only kind worth testing:
-
-==========================================  =====
-pair                                        score
-==========================================  =====
-two Wikipedia revision-history pages        0.280
-two Wikipedia category listings             0.120
-two Wikipedia search-result pages           0.080
-two Wikipedia stub articles                 0.000
-two docs.python.org stdlib pages            0.000
-the Main Page against an article            0.040
-------------------------------------------  -----
-``same_layout_different_content``           0.500
-==========================================  =====
-
-The last row is the contrived worst case committed under
-``tests/fixtures/shots/pairs``: one invoice list for two different accounts,
-identical URL, identical chrome, identical layout, every row different. Nothing
-live came near it, and it is the row that sets the floor - admitting it would let
-the gate prove a skill against the wrong account's data and store the result.
-
-Why 0.62
---------
-
-Same-page bottoms out at **0.840** and different-screen tops out at **0.280** live
-and **0.500** contrived, so the cut belongs in ``(0.500, 0.840)``. 0.62 sits there
-with 0.12 of margin below and 0.22 above.
-
-It is deliberately nearer the bottom of that window, because the two mistakes do not
-cost the same. A false REJECT is total: the skill was written correctly and is
-destroyed, which is the defect this constant exists to fix. A false ACCEPT costs one
-sandbox execution and nothing else - the precondition is the third of five gates, and
-a candidate run against the wrong screen still has to execute, satisfy its own
-verifier and satisfy the critic before anything is stored.
-
-That it lands on :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` is
-worth saying out loud rather than leaving as a coincidence. That constant was
-calibrated independently, on a different corpus, for the graph's question; this is
-the same question - "am I looking at the screen I recorded?" - so the project holds
-ONE number for it, and the measurements above are this gate's own evidence for it
-rather than a borrowing.
+A false REJECT is total: the skill was written correctly and is destroyed, which is the
+defect this constant exists to fix. A false ACCEPT costs one sandbox execution and
+nothing else - the precondition is the third of five gates, and a candidate run against
+the wrong screen still has to execute, satisfy its own verifier and satisfy the critic
+before anything is stored. So where the two are close, prefer admitting.
 
 Headed and headless are NOT made comparable
 -------------------------------------------
 
-Two FRESH browsers on one page, one visible and one headless, score 0.440 (Main Page)
-and 0.680 (``json.html``). The recorded precondition still does not record which mode
-produced it, for three reasons.
+Two FRESH browsers on one page, one visible and one headless, score 0.126 (Wikipedia
+Main Page) and 0.421 (``docs.python.org/3/library/json.html``) - straddling the cut, and
+the Main Page decisively below it. Two headless browsers on the same page score 1.000.
+The recorded precondition still does not record which mode produced it, for three
+reasons.
 
-The gate never compares across modes. ``orchestrator._open_world`` builds ONE
-controller and ``navigating_environment`` re-navigates in THAT controller, so the
-recording and the re-run are always the same window, and all three live ``learn``
-runs behind this constant scored their precondition at 1.000 in-process. The gap is
-real and is simply not on this path.
-
-Nor does it need a field to survive being off that path. Re-navigating those same
-recordings from the other mode scored 0.840 - inside the window, six times out of
-six - because a re-navigation is not a cold first paint. The 0.440 is two races
-compounding, a different renderer AND a rail that had not hydrated; separate them and
-the mode alone does not move a page out of the window.
+The gate never compares across modes. ``orchestrator._open_world`` builds ONE controller
+and ``navigating_environment`` re-navigates in THAT controller, so the recording and the
+re-run are always the same window. The gap is real and is simply not on this path.
 
 Where it IS real - a stored skill replayed later by another process in another mode -
 the precondition is the wrong place to carry the answer. ``Controller.describe()``
@@ -262,11 +207,11 @@ already reports ``headed``, so a caller that wants to refuse a cross-mode replay
 compare two strings without every stored skill in the library growing a field, and
 ``Fingerprint`` is shared surface besides.
 
-And it would make the identity worse. A screen is the same screen whoever rendered
-it; 0.440 is the fingerprinter correctly reporting that these two renderers produce
+And it would make the identity worse. A screen is the same screen whoever rendered it;
+these scores are the fingerprinter correctly reporting that two renderers produce
 measurably different pixels. The answer is to run one renderer - ``eval/wikipedia.yaml``
-already says headless, for exactly this reason - not to teach the identity to ignore
-a difference it was right to notice.
+already says headless, for exactly this reason - not to teach the identity to ignore a
+difference it was right to notice.
 """
 
 

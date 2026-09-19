@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from skillweaver.contracts import Route
+from skillweaver.contracts import Fingerprint, Route
 from skillweaver.errors import RouteNotFound
 from skillweaver.graph.route import (
     EXPLORATORY,
@@ -18,9 +18,11 @@ from skillweaver.graph.route import (
     find_route,
     is_verified,
     require_route,
+    same_state,
     success_rate,
 )
-from tests.graph.builders import click, edge, screen
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
+from tests.graph.builders import click, edge, live_pair, screen
 
 A, B, C, D = screen("a"), screen("b"), screen("c"), screen("d")
 
@@ -205,6 +207,62 @@ def test_a_route_from_a_state_to_itself_is_empty_and_free():
 
 def test_a_route_to_itself_is_free_even_for_an_unknown_state():
     assert find_route(screen("unseen"), screen("unseen"), outgoing_from()) == Route((), 0.0, ())
+
+
+# -- already there -------------------------------------------------------------------
+
+
+def test_the_screen_the_agent_is_standing_on_needs_no_route():
+    """THE defect. A skill records the screen it starts from; on the next run the agent
+    is looking at that screen and fingerprints it afresh, so the two ids differ. Asked
+    for a route between them, exact matching answers ``None`` - and the planner reports
+    ``no_route`` for a journey of nought steps, which is how the first skill ever learned
+    on live Wikipedia became unusable the moment it was stored."""
+    recorded, seen_again = live_pair(agreeing=120)
+    assert recorded.value != seen_again.value
+    assert seen_again.similarity(recorded) > SAME_STATE_THRESHOLD
+
+    assert find_route(seen_again, recorded, outgoing_from()) == Route((), 0.0, ())
+
+
+def test_two_screens_that_merely_resemble_each_other_are_not_one_screen():
+    """The tempting wrong fix, refused: loosen this and a skill runs on a screen it was
+    never written for, which on a real site means clicking real things."""
+    recorded, elsewhere = live_pair(agreeing=60)
+    assert elsewhere.similarity(recorded) < SAME_STATE_THRESHOLD
+
+    assert find_route(elsewhere, recorded, outgoing_from()) is None
+
+
+def test_exactness_can_still_be_demanded():
+    """``InMemorySiteGraph.route`` needs it: ``contracts.GraphView.route`` specifies
+    matching on ``Fingerprint.value``, and that promise is kept."""
+    recorded, seen_again = live_pair(agreeing=120)
+
+    assert find_route(seen_again, recorded, outgoing_from(), same_state_threshold=1.0) is None
+    assert find_route(recorded, recorded, outgoing_from(), same_state_threshold=1.0) == Route(
+        (), 0.0, ()
+    )
+
+
+def test_a_fingerprint_without_parts_never_matches_by_similarity():
+    """Half this project reconstructs ``Fingerprint(value)`` to use as a node key. Such a
+    fingerprint carries no evidence at all, and no evidence must never read as agreement."""
+    bare_a, bare_b = Fingerprint("a"), Fingerprint("b")
+    assert same_state(bare_a, bare_b) is False
+    assert find_route(bare_a, bare_b, outgoing_from()) is None
+
+
+def test_endpoints_can_be_resolved_onto_the_nodes_they_belong_to():
+    """Only the ENDPOINTS are fuzzy; the hops between them are node ids and are matched
+    exactly. A caller holding live fingerprints hands over the mapping."""
+    drifted, _ = live_pair(agreeing=120)
+    edges = outgoing_from(edge(A, B))
+
+    assert find_route(drifted, B, edges) is None
+    route = find_route(drifted, B, edges, resolve=lambda f: A if f is drifted else f)
+    assert route is not None
+    assert route.edges == (edge(A, B),)
 
 
 def test_a_cycle_does_not_hang_the_search():

@@ -3,62 +3,79 @@
 :class:`StateFingerprinter` turns a frame into a :class:`~skillweaver.contracts.Fingerprint`
 whose ``value`` is a graph node id and whose ``parts`` explain *why* two screens matched.
 
-Three independent signals
--------------------------
+The problem this shape solves
+-----------------------------
 
-**Perceptual hash** (``phash.r0``..``phash.r19``) - a difference hash computed directly on
-numpy: luma, area-averaged down to a 20x17 grid, then each cell compared with its
-right-hand neighbour through a deadzone. Two things make it survive a recapture of the
-same screen. Averaging each cell over thousands of pixels, with a vertical window several
-band-heights wide so band edges do not snap, absorbs antialiasing and a few pixels of
-scroll; the deadzone stops a flat region - where the true difference between neighbours
-is zero - from deciding its bit on rounding noise. One part per grid ROW, so a change
-confined to part of the screen only spoils the rows it touches.
+A real page moves. A fundraising notice, a cookie bar, a logged-out prompt or an A/B
+strip arrives at the top and pushes everything below it DOWN, and a screen the agent
+knows perfectly well stops being recognisable. Measured live on 2026-09-19 with the
+previous design - a difference hash on a grid pegged to the viewport, one part per grid
+ROW - a 200px notice scored a page against itself at **0.040**, the same score as two
+unrelated websites. Since every graph node is keyed on a fingerprint, that does not
+merely fail one run: the per-site graph grows a fresh node on every visit and never
+accumulates.
 
-**Structural hash** (``layout.q0``..``layout.q3``) - over the element index: each element
-becomes a ``kind@cell+size`` token with its centre quantized to a coarse 4x4 grid and its
-size bucketed to 16 logical pixels. Text is deliberately ignored, because text is the
-volatile part. Tokens are sorted per screen quadrant and one part is emitted per quadrant,
-so a dialog appearing in the middle does not erase the evidence from the corners.
+Anchoring a part to a fixed grid row is what caused it. Shift the page by 200px and
+every row's content moves to a different row, so every part name still exists and every
+one of them disagrees. The fix is to stop naming a part by WHERE it is.
+
+Two signals
+-----------
+
+**Content-addressed pixel bands** (``band.<pattern>#<k>``) - the frame is reduced to
+horizontal bands and each band becomes a short bit pattern; the part is then named by
+that PATTERN, never by its position. Two screens therefore agree on a band the moment
+they both contain it, wherever it sits, which is exactly the invariance a page that
+scrolled or was pushed down needs. ``#<k>`` carries how much of the screen the pattern
+covers, in powers of two (see :data:`_BAND_PITCH`), so occupancy still counts without a
+few pixels of it mattering.
 
 **Normalized URL** (``url``) - scheme and host lowercased, default port and query and
 fragment dropped, volatile path segments (digits, hex ids, UUIDs) replaced by ``{id}``.
 Omitted entirely when there is no URL, rather than contributing a fake match.
 
-Why parts are chunked
----------------------
+What is NOT in ``parts``, and why
+---------------------------------
 
-:meth:`Fingerprint.similarity` is fixed by ``contracts``: it is the fraction of part NAMES
-whose sub-hashes agree. Three whole-signal parts would therefore only ever score 0, 1/3,
-2/3 or 1 - too coarse to separate "scrolled a little" from "same layout, other content".
-Splitting each signal into locality-preserving chunks turns that fraction into a real
-gradient, and the chunk counts (up to 20 visual, 4 structural, 1 URL) are the weighting:
-pixels outvote layout, because two screens sharing a layout with different content are two
-different states.
+The element index is hashed into ``value`` (see :func:`structural_hash`) but deliberately
+contributes NO part. It was measured, not assumed: over the 88 live captures behind
+:data:`SAME_STATE_THRESHOLD`, adding the four quadrant parts of the previous design moved
+the same-state floor from 0.305 to 0.301 and the different-state ceiling from 0.213 to
+0.225 - it costs at both ends. Detection and OCR do not reproduce across loads (47
+elements on one capture of a page, 31 on the next when a notice pushed content off the
+bottom), so an element signal reports that noise as disagreement. A sketch of the
+on-screen TEXT was measured too and is worse still: it drops the same-state floor to
+0.151 while leaving the different-state ceiling where it was.
 
-Note what this costs. Chunk agreement is exact, never graded, so a perturbation that
-nudges every chunk a little scores no better than one that rewrites the screen. That is
-why the pixel signal is smoothed as hard as it is: it has to put a perturbed chunk back on
-exactly the value it had, not merely close to it.
+Bands are full width on purpose
+-------------------------------
+
+A band spans the whole viewport, so a narrow thing changing - a rotating advertisement in
+a right-hand rail - spoils every band it touches. Tiling the frame into columns fixes
+that and was measured: it lifts a page with a rotating ad from 0.335 to 0.692. It also
+lifts two DIFFERENT Wikipedia articles from 0.034 to **0.505**, because half-width bands
+carry too few bits to tell one body of text from another. That is the trade refused here:
+the conjunction of all :data:`_BAND_BITS` bits across the full width is both what makes a
+band fragile and what makes two different screens score near zero, and the second is
+worth more than the first.
 
 Silence is not agreement
 ------------------------
 
-A part is only emitted for a chunk that carries evidence: a screen quadrant with no
-elements in it, and a hash row with no horizontal structure in it, emit nothing. Because
+A band with no horizontal structure in it - flat background - emits nothing. Because
 ``similarity`` divides by the UNION of both fingerprints' part names, two sparse screens
-that are blank in the same places no longer collect credit for it - measured on the fake
-invoicing app in ``tests/fakes/scenario.py``, whose states are mostly empty, this is the
-difference between scoring two different states 0.714 and scoring them 0.143.
+that are blank in the same places collect no credit for it.
 
-``value``, unlike ``parts``, always hashes the whole signal including the silent chunks,
-so two frames are equal only when everything about them matches.
+``value``, unlike ``parts``, hashes the WHOLE signal - the URL, the element layout and
+every band including the silent ones - so two frames are equal only when everything about
+them matches.
 
 Threshold
 ---------
 
-:data:`SAME_STATE_THRESHOLD` is the recommended "same state" cut. See
-``tests/perception/test_fingerprint.py`` for the measured separation it is based on.
+:data:`SAME_STATE_THRESHOLD` is the recommended "same state" cut, and
+:mod:`skillweaver.graph.route` applies it to routing. See that constant for the two
+corpora it was calibrated on.
 """
 
 from __future__ import annotations
@@ -73,91 +90,146 @@ import numpy as np
 from skillweaver.contracts import Element, Fingerprint, Screenshot
 from skillweaver.errors import PerceptionError
 
-SAME_STATE_THRESHOLD = 0.62
+SAME_STATE_THRESHOLD = 0.26
 """Recommended cut for "these two frames are the same UI state".
 
-Measured over the labelled pairs in ``tests/fixtures/shots/pairs`` (800x600 browser
-captures, around 24 parts each):
+Calibrated on 2026-09-19 against TWO corpora at once, because either one alone is
+misleading: the committed pairs are contrived and reproduce exactly, and live pages
+never reproduce at all.
+
+**Live pages** - 88 captures through the shipped pipeline (``YoloDetector`` +
+``RapidOcrReader`` + this fingerprinter), Chromium headless at 1280x800, across eight
+pages of four sites (Wikipedia Main Page, two articles, two search-result pages, two
+docs.python.org pages, one MDN page). Each page was captured in two fresh browsers, in
+one browser twice, with a notice of 60, 120 and 200px injected at the top, at a 900px
+viewport, and scrolled 8 and 40px:
+
+=========================================  ===  =====  ======  =====
+class                                        n    min  median    max
+=========================================  ===  =====  ======  =====
+SAME page, reload or fresh browser          76  0.335   1.000  1.000
+SAME page, notice pushed it down 60-200px  117  0.342   0.780  0.871
+SAME page, viewport 800 vs 900 high         34  0.305   0.870  0.894
+SAME page, scrolled 8 or 40px               32  0.834   0.903  0.961
+-----------------------------------------  ---  -----  ------  -----
+DIFFERENT page, same site and template      42  0.019   0.042  0.189
+DIFFERENT page, unrelated site              38  0.000   0.000  0.042
+=========================================  ===  =====  ======  =====
+
+Every page but one reloads at exactly 1.000. The 0.335 floor is MDN, whose right-hand
+advertisement and top promotion strip are re-rolled on every load - the "an ad rotates"
+case, and the hardest thing on this list that is still the same screen.
+
+**The committed pairs** in ``tests/fixtures/shots/pairs``, which carry the contrived
+worst cases a live corpus will not produce:
 
 ===============================  =====  =========================================
 pair                             score  what differs
 ===============================  =====  =========================================
 same_screen_twice                1.000  nothing
-same_screen_caret_blink          1.000  the text caret's blink phase
 same_screen_clock_tick           1.000  a clock digit, and a ``?t=`` query
-same_screen_retina               1.000  captured at 2x instead of 1x
-same_screen_no_url               1.000  no URL at all, plus a caret blink
-same_screen_scrolled             0.917  scrolled 6px, pulling a new row into view
-dense_text_scrolled_slightly     0.750  solid body text scrolled 8px
+dense_text_scrolled_slightly     0.966  solid body text scrolled 8px
+same_screen_caret_blink          0.965  the text caret's blink phase
+same_screen_no_url               0.964  no URL at all, plus a caret blink
+same_screen_retina               0.770  captured at 2x instead of 1x
+same_screen_scrolled             0.674  scrolled 6px, pulling a new row into view
+search_results_pushed_down       0.659  a 120px notice moved every hit down
 -------------------------------  -----  -----------------------------------------
-same_layout_different_content    0.500  every row's text; layout and URL identical
-modal_open_vs_closed             0.240  a dialog and its scrim
-dense_text_different_article     0.167  one template, entirely different prose
-different_screens                0.000  another page entirely
+same_layout_different_content    0.213  every row's text; layout and URL identical
+modal_open_vs_closed             0.198  a dialog and its scrim
+dense_text_different_article     0.101  one template, entirely different prose
+article_vs_search_results        0.054  one site, prose against a column of hits
+different_screens                0.011  another page entirely
 ===============================  =====  =========================================
 
-Same-state bottoms out at 0.750 and different-state tops out at 0.500, so 0.62 sits in the
-middle of a 0.25-wide gap with about 0.13 of margin either side. Both ends are the hard
-cases on purpose: the same-state floor is a page of solid text, the worst thing you can
-scroll past a pixel hash, and the different-state ceiling is two screens contrived to
-share their URL, their chrome and their element layout exactly.
+Taking the two together, same-state bottoms out at **0.305** and different-state tops out
+at **0.213**, so 0.26 sits in the middle of that 0.09-wide gap. The last two rows above
+are the same claim on one pair of pages: the results page moved scores 0.659, and the
+article against that same results page scores 0.054. The binding pair is
+cross-corpus - a live page whose advertisement rotated, against two contrived invoice
+lists that share a URL, a chrome and a layout - which is the conservative way to combine
+them.
 
-It holds outside that corpus too. On live third-party pages the fingerprinter was never
-tuned against - English Wikipedia and the Python documentation - a recapture scores 1.000,
-a 2x Retina capture 0.960 and a 3-8px scroll 0.760 to 0.800, while two sister articles
-with the same skin score 0.000 and unrelated pages 0.000 to 0.040. Additive pixel noise on
-those pages, standing in for a lossy or noisy capture path, still scores 0.760 at sigma
-40. Driving the sparse fake invoicing app of ``tests/fakes/scenario.py``, whose line-art
-frames are mostly blank, separates its four reachable states at 0.333 or below while every
-revisit of a state recovers its node exactly.
+The gap is narrow, and it is worth saying what it replaces: under the previous design the
+same two corpora gave a same-state floor of **0.040** and a different-state ceiling of
+**0.500**. The classes OVERLAPPED, so no threshold existed at all, and a live page pushed
+down by a notice was indistinguishable from an unrelated website. A 0.09-wide gap is a
+poor thing to have to defend; a negative one cannot be defended at all.
 
-The known limit is scrolling, and it is worth stating precisely. On a dense page of body
-text the pixel signal holds to about 8 logical pixels (0.800) and then falls off a cliff:
-16px already scores 0.440 and 40px scores 0.160, both read as a different state. Ordinary
-application UI, which has far more whitespace, holds further. This is a deliberate trade -
-a hash blurry enough to shrug off a 40px scroll is also too blurry to notice a dialog
-opening - but a caller that scrolls ON PURPOSE should track the state it scrolled from
-rather than expect this threshold to tie the two captures together.
+What is still NOT the same state
+--------------------------------
+
+**A notice that takes over the screen.** The live corpus caught a real Wikimedia
+fundraising appeal arriving mid-session. It is not a strip: it displaces the article by
+**555 of 800 pixels**, leaving 31% of the recorded screen visible. It scores 0.124, below
+this cut, and refusing it is correct - 69% of what the skill was written against is gone.
+The information-theoretic ceiling for that pair is about 0.18, so no fingerprint recovers
+it; the answer is to DISMISS the banner and look again, not to loosen identity.
+
+**Scrolling on purpose.** A caller that scrolls should track the state it scrolled from
+rather than expect this cut to tie the two captures together. It holds much further than
+it used to - 40px of dense body text now scores 0.834 where it used to score 0.160 - but
+it is not a promise.
+
+Re-check this value if :class:`StateFingerprinter` changes what it puts in ``parts``. A
+threshold has to be read against the shape of the signal, never in the abstract.
 """
 
-# --- perceptual hash ------------------------------------------------------------------
+# --- pixel bands ----------------------------------------------------------------------
 
-_PHASH_ROWS = 20
-"""Grid rows, and therefore the number of ``phash.rN`` parts."""
+_BAND_PITCH = 4.0
+"""Logical pixels between the centres of consecutive bands.
 
-_PHASH_BITS = 16
-"""Bits per row; the grid is ``_PHASH_ROWS`` x ``_PHASH_BITS + 1`` cells."""
+Bands overlap heavily - each is :data:`_BAND_HEIGHT` tall and they start every 4px - and
+that redundancy is the point. A part is named by its band's PATTERN, so a page shifted
+down by N pixels re-emits the same patterns as long as some band lands where the old one
+did; the pitch is how finely that can be met. Measured on the live corpus, a pitch of 8px
+drops the notice class from 0.780 to 0.168 because a 200px shift no longer lands on a
+band, while 2px buys nothing the 4px pitch does not already have and doubles the part
+count.
 
-_PHASH_OVERSAMPLE = 4
-"""Fine rows computed per output row, setting the resolution of the smoothing window.
-
-Straight area averaging would cut the frame into hard horizontal bands, and scrolling a
-few pixels swaps that fraction of a band's content across a boundary - enough to flip
-bits. Computing this many times more rows than are needed lets the window in
-:func:`_band_weights` taper smoothly instead of snapping; :data:`_PHASH_SMOOTH` sets how
-wide it tapers.
+The redundancy also means one pattern usually repeats over a run of bands, which is what
+``#<k>`` counts: a pattern seen ``c`` times emits parts ``#0`` up to ``#floor(log2(c))``.
+Powers of two rather than a plain count, so a region growing from 120px to 145px costs at
+most one part instead of six. Dropping occupancy altogether was measured and is wrong: it
+lifts two contrived invoice lists that share a layout from 0.213 to 0.714, because their
+band patterns are the same and only the amount of screen each covers differs.
 """
 
-_PHASH_SMOOTH = 3.0
-"""Width of the vertical smoothing window, in band heights.
+_BAND_HEIGHT = 24.0
+"""Half-width, in logical pixels, of the triangular window averaged into one band.
 
-This is the knob that makes the hash survive scrolling a page of solid text. The window
-has to be several times taller than a line of body text, so that a band's value is an
-average over many lines and shifting the text by a few pixels barely moves it. At 1.0 -
-smoothing just wide enough to soften the band edges - an 8px scroll of a dense
-documentation page scored 0.381; at 3.0 the same pair scores 0.760, while two genuinely
-different screens are unaffected because they differ at every scale.
+Sets how much of the page a single band reports on, and therefore how far a local change
+spreads: a notice arriving contaminates the bands within this distance of it, and
+everything further away still matches. The previous design needed a window of 120px to
+survive scrolling, because its bands were pegged to a grid and had to reproduce a
+perturbed value EXACTLY; content addressing removes that need, and shrinking the window to
+24px is most of why a notice now scores 0.780 instead of 0.040.
+
+Averaging over a window rather than sampling is still what absorbs antialiasing and
+sub-pixel rendering differences, which is why it is not smaller.
 """
 
-_PHASH_TOLERANCE = 2.0
+_BAND_BITS = 32
+"""Bits per band: the frame is reduced to ``_BAND_BITS + 1`` columns and neighbours
+compared.
+
+This is the discrimination knob, and it is set by the hardest DIFFERENT pair rather than
+by any same pair. At 16 bits - 80 logical pixels per column - two contrived invoice lists
+that share a layout score 0.615, because 80px of body text averages to the same value
+whatever it says. At 32 bits each column is 40px, about three characters, and the same
+pair scores 0.213. Past that it starts costing same-state pairs for nothing: at 48 bits a
+2x Retina capture of one unchanged screen falls from 0.770 to 0.520 while the invoice
+pair barely moves.
+"""
+
+_BAND_TOLERANCE = 2.0
 """Deadzone, in luma units (0..255), for the neighbour comparison.
 
-A cell is only called brighter than its neighbour when it beats it by this much, so the
-huge flat regions of a UI - page background, a card's fill - resolve to a stable ``0``
-instead of a coin flip on rounding noise. Quantizing the cell values instead would only
-move the coin flip to the quantization boundaries: measured on the fixture pages, a
-step-4 quantizer was already losing a third of its rows to additive noise at sigma 1,
-where this deadzone still matches exactly and holds past sigma 24.
+A column is only called brighter than its neighbour when it beats it by this much, so the
+flat regions of a UI - page background, a card's fill - resolve to a stable ``0`` instead
+of a coin flip on rounding noise. Quantizing the column values instead would only move the
+coin flip to the quantization boundaries.
 """
 
 # --- structural hash ------------------------------------------------------------------
@@ -222,21 +294,35 @@ def _area_downsample(gray: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     return cells
 
 
-def _band_weights(rows: int, oversample: int, smooth: float = 1.0) -> np.ndarray:
-    """A ``rows x (rows * oversample)`` triangular smoothing matrix, each row summing to 1.
+def _smooth_rows(fine: np.ndarray, half: float) -> np.ndarray:
+    """``fine`` smoothed down its first axis by a triangular window of half-width ``half``.
 
-    Output band ``r`` is centred on the fine rows it would have owned outright, and its
-    weight decays linearly to zero ``smooth`` band-heights either side.
+    Each output row is the weighted mean of the fine rows within ``half`` of it, the
+    weight falling linearly to zero. Dividing by the same convolution of ones renormalizes
+    the ends, so the top and bottom bands average over what is actually there rather than
+    over an implied field of black.
     """
-    fine = rows * oversample
-    centres = np.arange(rows) * oversample + (oversample - 1) / 2.0
-    distance = np.abs(np.arange(fine)[None, :] - centres[:, None])
-    weights = np.clip(1.0 - distance / (oversample * smooth), 0.0, None)
-    return weights / weights.sum(axis=1, keepdims=True)
+    reach = max(int(np.ceil(half)), 1)
+    kernel = np.clip(1.0 - np.abs(np.arange(-reach, reach + 1)) / half, 0.0, None)
+    # Zero-padded ``valid`` rather than ``same``: numpy returns max(len) for ``same``,
+    # which is the wrong length whenever the frame is shorter than the window.
+    pad = np.zeros((reach, fine.shape[1]), dtype=fine.dtype)
+    padded = np.vstack((pad, fine, pad))
+    mask = np.concatenate((np.zeros(reach), np.ones(fine.shape[0]), np.zeros(reach)))
+    norm = np.convolve(mask, kernel, mode="valid")
+    out = np.empty_like(fine)
+    for column in range(fine.shape[1]):
+        out[:, column] = np.convolve(padded[:, column], kernel, mode="valid") / norm
+    return out
 
 
-def _phash_rows(screenshot: Screenshot) -> list[str]:
-    """One hex string per grid row of the difference hash, top row first.
+def _bands(screenshot: Screenshot) -> list[str]:
+    """One hex bit pattern per band of ``screenshot``, top band first.
+
+    Bands are :data:`_BAND_HEIGHT` tall and start every :data:`_BAND_PITCH` logical
+    pixels, so consecutive entries overlap and a run of equal entries means a region of
+    the page looks the same all the way down. The list is POSITIONAL; it is
+    :meth:`StateFingerprinter.fingerprint` that throws the positions away.
 
     Raises:
         PerceptionError: if the screenshot cannot be decoded or hashed.
@@ -244,23 +330,28 @@ def _phash_rows(screenshot: Screenshot) -> list[str]:
     try:
         image = screenshot.to_array()
         if image.size == 0:
-            return ["0" * ((_PHASH_BITS + 3) // 4)] * _PHASH_ROWS
+            return []
         gray = image.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-        fine = _area_downsample(gray, _PHASH_ROWS * _PHASH_OVERSAMPLE, _PHASH_BITS + 1)
-        cells = _band_weights(_PHASH_ROWS, _PHASH_OVERSAMPLE, _PHASH_SMOOTH) @ fine
-        bits = (cells[:, 1:] - cells[:, :-1]) > _PHASH_TOLERANCE
+        rows = max(int(round(screenshot.height / _BAND_PITCH)), 1)
+        fine = _area_downsample(gray, rows, _BAND_BITS + 1)
+        cells = _smooth_rows(fine, max(_BAND_HEIGHT / _BAND_PITCH, 1.0))
+        bits = (cells[:, 1:] - cells[:, :-1]) > _BAND_TOLERANCE
     except PerceptionError:
         raise
     except Exception as exc:  # numpy/Pillow surprises stay inside the perception boundary
-        raise PerceptionError(f"perceptual hash failed: {exc}") from exc
-    width = (_PHASH_BITS + 3) // 4
+        raise PerceptionError(f"band hash failed: {exc}") from exc
+    width = (_BAND_BITS + 3) // 4
     return [format(int("".join("1" if b else "0" for b in row), 2), f"0{width}x") for row in bits]
 
 
 def perceptual_hash(screenshot: Screenshot) -> str:
-    """The whole difference hash of ``screenshot`` as one hex string, rows joined by ``-``.
+    """The whole band hash of ``screenshot`` as one hex string, bands joined by ``-``.
 
-    Deterministic, and tolerant of antialiasing and of a few pixels of scroll.
+    Deterministic, and tolerant of antialiasing and of sub-pixel rendering differences.
+    This is the POSITIONAL form, and so it is NOT what makes a fingerprint survive a page
+    being pushed down - it changes completely when the page shifts. It is the whole-signal
+    identity that goes into ``Fingerprint.value``, and it is useful for asking whether two
+    frames are pixel-identical.
 
     It encodes STRUCTURE, not brightness or colour: two frames whose edges fall in the
     same places hash alike even when their palettes differ, so a recoloured banner reads
@@ -270,7 +361,37 @@ def perceptual_hash(screenshot: Screenshot) -> str:
     Raises:
         PerceptionError: if the screenshot cannot be decoded.
     """
-    return "-".join(_phash_rows(screenshot))
+    return "-".join(_bands(screenshot))
+
+
+def band_parts(screenshot: Screenshot) -> dict[str, str]:
+    """The content-addressed band parts of ``screenshot``: ``{"band.<pattern>#<k>": pattern}``.
+
+    A band with no horizontal structure - flat background - contributes nothing, because
+    two screens that are blank in the same places have agreed about nothing. A pattern
+    covering ``c`` bands emits ``#0`` up to ``#floor(log2(c))``, so how much of the screen
+    it covers still counts while a few pixels of it do not; see :data:`_BAND_PITCH`.
+
+    The part's VALUE is the pattern itself rather than a hash of it, so two parts that
+    agree by name are checked to agree in substance as well.
+
+    Raises:
+        PerceptionError: if the screenshot cannot be decoded or hashed.
+    """
+    return _parts_from_bands(_bands(screenshot))
+
+
+def _parts_from_bands(bands: Sequence[str]) -> dict[str, str]:
+    """:func:`band_parts`, over bands already computed. Never raises."""
+    counts: dict[str, int] = {}
+    for pattern in bands:
+        if pattern.strip("0"):
+            counts[pattern] = counts.get(pattern, 0) + 1
+    return {
+        f"band.{pattern}#{k}": pattern
+        for pattern, count in counts.items()
+        for k in range(count.bit_length())
+    }
 
 
 def _layout_buckets(elements: Sequence[Element], width: int, height: int) -> list[list[str]]:
@@ -338,7 +459,8 @@ def normalize_url(url: str | None) -> str | None:
 
 
 class StateFingerprinter:
-    """A :class:`~skillweaver.contracts.Fingerprinter` combining pixels, layout and URL.
+    """A :class:`~skillweaver.contracts.Fingerprinter` over content-addressed pixel bands
+    and the normalized URL.
 
     Stateless and deterministic: the same screenshot, elements and URL always produce an
     equal fingerprint, and nothing is cached between calls.
@@ -347,27 +469,25 @@ class StateFingerprinter:
     def fingerprint(
         self, screenshot: Screenshot, elements: Sequence[Element], url: str | None = None
     ) -> Fingerprint:
-        """Identify the screen. See the module docstring for the three signals.
+        """Identify the screen. See the module docstring for what goes into each field.
+
+        ``elements`` is hashed into ``value`` but contributes no part, so a screen whose
+        detector or OCR read it differently is still the same screen by ``similarity``
+        while remaining a different frame by ``==``.
 
         Raises:
             PerceptionError: if the screenshot cannot be decoded or hashed.
         """
         pattern = normalize_url(url)
-        buckets = _layout_buckets(elements, screenshot.width, screenshot.height)
-        quadrants = [_digest(*sorted(bucket)) for bucket in buckets]
-        rows = _phash_rows(screenshot)
+        bands = _bands(screenshot)
 
-        parts: dict[str, str] = {}
+        parts: dict[str, str] = _parts_from_bands(bands)
         if pattern is not None:
             parts["url"] = pattern
-        for i, bucket in enumerate(buckets):
-            if bucket:
-                parts[f"layout.q{i}"] = quadrants[i]
-        for i, row in enumerate(rows):
-            if row.strip("0"):
-                parts[f"phash.r{i}"] = row
 
-        # ``value`` hashes the WHOLE signal, including the chunks left out of ``parts``,
-        # so two frames are equal only when everything about them matches.
-        value = _digest(pattern or "", *quadrants, *rows)
+        # ``value`` hashes the WHOLE signal - the layout and the silent bands included,
+        # and the bands in their original ORDER - so two frames are equal only when
+        # everything about them matches.
+        layout = structural_hash(elements, screenshot.width, screenshot.height)
+        value = _digest(pattern or "", layout, *bands)
         return Fingerprint(value, parts)

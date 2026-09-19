@@ -25,6 +25,31 @@ def screen(name: str, **parts: str) -> Fingerprint:
     return fp(name, url=f"u:{name}", layout=f"l:{name}", text=f"t:{name}", chrome="c")
 
 
+REAL_PARTS = 175
+"""How many parts the SHIPPED fingerprinter emits for a live page, near enough.
+
+A threshold is only meaningful against the shape of the signal it judges, so the tests
+that exercise :data:`~skillweaver.graph.model.DEFAULT_MATCH_THRESHOLD` have to use a
+fingerprint of roughly the real shape. A four-part ``screen`` can only express 0.0,
+0.25, 0.5, 0.75 and 1.0, which says nothing about a cut of 0.26.
+"""
+
+
+def live_pair(agreeing: int, total: int = REAL_PARTS) -> tuple[Fingerprint, Fingerprint]:
+    """Two fingerprints of realistic SHAPE that share ``agreeing`` of ``total`` parts.
+
+    The shipped fingerprinter names each part by its CONTENT, so two screens share the
+    parts they have in common and each keeps the rest; the similarity is therefore
+    ``agreeing / (2 * total - agreeing)``, a Jaccard, not ``agreeing / total``. At
+    ``total=175`` that puts 120 agreeing parts at 0.52 - a page pushed down by a notice -
+    and 60 at 0.21 - two different pages built from one template.
+    """
+    shared = {f"band.shared.{i}": "1" for i in range(agreeing)}
+    left = shared | {f"band.left.{i}": "1" for i in range(total - agreeing)}
+    right = shared | {f"band.right.{i}": "1" for i in range(total - agreeing)}
+    return fp(f"left:{agreeing}", **left), fp(f"right:{agreeing}", **right)
+
+
 def state(
     fingerprint: Fingerprint, *, domain: str = DOMAIN, label: str = "", day: int = 1
 ) -> UIState:

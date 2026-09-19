@@ -45,6 +45,7 @@ from skillweaver.contracts import (
 )
 from skillweaver.errors import ProviderError
 from skillweaver.llm.cassette import CassetteClient
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 from tests.fakes import FakeLLM, Scenario
 from tests.fakes.controller import render_png
 from tests.fakes.perception import SimpleElementIndex
@@ -84,21 +85,42 @@ def make_obs(
     )
 
 
-def fingerprints(matching: int, total: int = 10) -> tuple[Fingerprint, Fingerprint]:
+def fingerprints(matching: int, total: int = 100) -> tuple[Fingerprint, Fingerprint]:
     """Two distinct fingerprints whose ``similarity`` is exactly ``matching / total``.
 
     Lets a test land a score precisely inside or outside the ambiguity band around
     ``SAME_STATE_THRESHOLD`` without depending on what any real screen happens to hash to.
+
+    ``total`` is 100 so the score can be placed to a hundredth. It used to be 10, which
+    could only express tenths - enough while the cut was 0.62 and the band 0.56 to 0.68,
+    and not enough afterwards. A test that wants "inside the band" should ask for it by
+    name with :func:`band_score` rather than by writing a number down.
     """
     left = {f"p{i}": "same" for i in range(total)}
     right = {f"p{i}": ("same" if i < matching else "other") for i in range(total)}
     return Fingerprint("left", left), Fingerprint("right", right)
 
 
+def band_score(total: int = 100) -> int:
+    """A ``matching`` count landing on the CENTRE of the ambiguity band.
+
+    Derived from the constants rather than written down, so re-deriving the threshold
+    moves these tests with it instead of breaking them. The centre is the threshold
+    itself: :data:`~skillweaver.agent.checks.AMBIGUITY_MARGIN` is the half-width around
+    it, so a score there is the most undecidable one there is.
+    """
+    matching = round(SAME_STATE_THRESHOLD * total)
+    edge = C.AMBIGUITY_MARGIN
+    assert abs(matching / total - SAME_STATE_THRESHOLD) <= edge, (
+        f"{matching}/{total} is not inside the +/-{edge} band around {SAME_STATE_THRESHOLD}"
+    )
+    return matching
+
+
 def band_pair() -> tuple[Observation, Observation]:
-    """Two observations whose similarity (``0.6``) sits inside the ambiguity band."""
-    left, right = fingerprints(6)
-    assert left.similarity(right) == pytest.approx(0.6)
+    """Two observations whose similarity sits inside the ambiguity band."""
+    left, right = fingerprints(band_score())
+    assert left.similarity(right) == pytest.approx(SAME_STATE_THRESHOLD, abs=0.01)
     return make_obs((element("a"),), fingerprint=left), make_obs((element("b"),), fingerprint=right)
 
 
@@ -133,6 +155,70 @@ class TestCheckVerdict:
 # --------------------------------------------------------------------------------------
 # Fingerprint checks
 # --------------------------------------------------------------------------------------
+
+
+def _live_like(score: float, total: int = 175) -> tuple[Fingerprint, Fingerprint]:
+    """Two fingerprints of the SHAPE a real page produces, scoring ``score``.
+
+    Content-addressed parts mean the sides share what they agree on and each keeps the
+    rest, so similarity is ``shared / (2 * total - shared)``; this inverts that.
+    """
+    shared = round(2 * total * score / (1 + score))
+    rest = total - shared
+    common = {f"band.shared{i}": "1" for i in range(shared)}
+    return (
+        Fingerprint("recorded", common | {f"band.rec{i}": "1" for i in range(rest)}),
+        Fingerprint("seen", common | {f"band.seen{i}": "1" for i in range(rest)}),
+    )
+
+
+# score -> what scored it, from the calibration behind SAME_STATE_THRESHOLD.
+DECISIVE = [
+    (1.000, C.Outcome.passed, "an identical reload"),
+    (0.780, C.Outcome.passed, "a notice of 60-200px pushed the page down"),
+    (0.335, C.Outcome.passed, "a page whose right-rail advertisement is re-rolled"),
+    (0.305, C.Outcome.passed, "the same-state FLOOR: that ad and a taller viewport"),
+    (0.213, C.Outcome.failed, "the different-state CEILING: one list, two accounts"),
+    (0.189, C.Outcome.failed, "two search-result pages for different queries"),
+    (0.132, C.Outcome.failed, "a fundraising appeal taking over the screen"),
+    (0.034, C.Outcome.failed, "two different articles"),
+]
+
+
+@pytest.mark.parametrize(
+    ("score", "expected", "why"), DECISIVE, ids=[f"{d[0]:.3f}" for d in DECISIVE]
+)
+def test_every_measured_pair_is_decided_and_not_abstained_on(score, expected, why) -> None:
+    """The ambiguity band must sit INSIDE the measured separation, never across it.
+
+    A band wider than the gap makes the check abstain at both ends; each abstention
+    escalates to the vision model and each escalation is a model call, so an over-wide
+    band raises the cost of every run while reading as caution. This is the test that
+    says so - it fails the moment the margin swallows either end of the calibration.
+    """
+    left, right = _live_like(score)
+    verdict = C.matches_state(left)(make_obs(fingerprint=left), make_obs(fingerprint=right))
+    assert verdict.outcome is expected, f"{why} (scored {left.similarity(right):.3f})"
+    assert verdict.decisive
+    assert verdict.confidence >= 0.8
+
+
+def test_the_band_abstains_in_the_middle_of_the_gap() -> None:
+    """The other half of the bargain: where the calibration genuinely cannot say,
+    the check still refuses to commit rather than guessing."""
+    left, right = _live_like(round((0.305 + 0.213) / 2, 3))
+    verdict = C.matches_state(left)(make_obs(fingerprint=left), make_obs(fingerprint=right))
+    assert verdict.outcome is C.Outcome.unknown
+
+
+def test_the_ambiguity_band_is_half_the_measured_gap() -> None:
+    """Both numbers come from one calibration and cannot be chosen apart. If
+    SAME_STATE_THRESHOLD is re-derived, this margin is re-derived with it."""
+    floor, ceiling = 0.305, 0.213  # see SAME_STATE_THRESHOLD for where these come from
+    assert ceiling < SAME_STATE_THRESHOLD < floor
+    assert C.AMBIGUITY_MARGIN == pytest.approx((floor - ceiling) / 4, abs=0.001)
+    assert SAME_STATE_THRESHOLD - C.AMBIGUITY_MARGIN > ceiling
+    assert SAME_STATE_THRESHOLD + C.AMBIGUITY_MARGIN < floor
 
 
 class TestStateChanged:
@@ -179,7 +265,7 @@ class TestStateUnchanged:
 
 class TestMatchesState:
     def test_unknown_inside_the_ambiguity_band(self) -> None:
-        left, right = fingerprints(6)
+        left, right = fingerprints(band_score())
         result = C.matches_state(left)(make_obs(), make_obs(fingerprint=right))
         assert result.outcome is C.Outcome.unknown
 

@@ -65,6 +65,13 @@ class Pair:
 
 _HIDE_CARET = "document.getElementById('search').classList.add('blink')"
 _TICK_CLOCK = "document.getElementById('clock').textContent = '09:42'"
+_NOTICE = """
+const n = document.createElement('div');
+n.style.cssText = 'height:120px;background:#fdf2d0;border-bottom:1px solid #c8b880;'
+  + 'padding:14px 20px;font-size:14px;color:#4a4330';
+n.textContent = 'Scheduled maintenance this weekend. Some reports may be unavailable.';
+document.body.insertBefore(n, document.body.firstChild);
+"""
 
 PAIRS: tuple[Pair, ...] = (
     Pair(
@@ -140,6 +147,23 @@ PAIRS: tuple[Pair, ...] = (
         "Two handbook articles: one template, one typography, entirely different prose.",
         Side("article.html", "https://invoices.test/handbook/closing-the-books"),
         Side("article_alt.html", "https://invoices.test/handbook/servicing-the-assembly"),
+    ),
+    Pair(
+        "article_vs_search_results",
+        "different",
+        "A handbook article against the results page for a search: one site, one header, "
+        "one stylesheet, and a body laid out as prose against a body laid out as hits. "
+        "The pair a tolerant identity is most likely to collapse, and must not.",
+        Side("article.html", "https://invoices.test/handbook/closing-the-books"),
+        Side("search_results.html", "https://invoices.test/handbook/search"),
+    ),
+    Pair(
+        "search_results_pushed_down",
+        "same",
+        "The results page with a notice at the top pushing every hit down 120px - the "
+        "commonest thing a live site does between a recording and a re-run.",
+        Side("search_results.html", "https://invoices.test/handbook/search"),
+        Side("search_results.html", "https://invoices.test/handbook/search", script=_NOTICE),
     ),
     Pair(
         "same_screen_no_url",

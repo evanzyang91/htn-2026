@@ -840,7 +840,7 @@ def test_the_prompt_is_what_the_model_is_given(trajectory, critic, skill_store):
 
 def test_a_fingerprint_mismatch_is_reported_not_raised(trajectory, critic, skill_store, scenario):
     """A precondition that matches nothing on screen fails the attempt cleanly."""
-    recorded, seen = _live_pair(agreeing=0)
+    recorded, seen = _live_pair(score=0.0)
     llm = FakeLLM([reply()])
     synth = synthesizer(llm, skill_store, critic, max_repairs=0)
     admission = synth.admit(*_gate(trajectory, scenario, recorded, seen))
@@ -860,41 +860,73 @@ def test_a_fingerprint_mismatch_is_reported_not_raised(trajectory, critic, skill
 # the shipped default still puts each of them on the side it was measured to be on, and
 # that the gate admits and rejects accordingly.
 #
-# Nothing here needs a browser. A live fingerprint carries about 25 parts and
-# `Fingerprint.similarity` is the fraction of part names that agree, so a pair built to
-# agree on `n` of 25 scores exactly `n / 25` - which is why every score in the table
-# below is a whole twenty-fifth.
+# Nothing here needs a browser. `StateFingerprinter` names each part by its CONTENT, so
+# two screens share the parts they have in common and each keeps the rest: similarity is
+# a Jaccard, not a fraction of a fixed set. `_live_pair` builds a pair to a target SCORE
+# rather than to a part count, because the score is what was measured.
 
-LIVE_PARTS = 25
-"""Parts the shipped fingerprinter emits for a 1280x800 live page. Measured, not
-assumed: `StateFingerprinter` gave 25 for every en.wikipedia.org capture taken while
-calibrating the threshold (a URL, up to 4 layout quadrants, up to 20 hash rows)."""
+LIVE_PARTS = 175
+"""Parts the shipped fingerprinter emits for a 1280x800 live page, near enough.
 
-# score -> what scored it, live unless noted. See MIN_PRECONDITION_SIMILARITY.
+Measured over the 88 live captures behind `SAME_STATE_THRESHOLD`: 132 at the tenth
+percentile, 177 median, 204 at the top. It was 25 under the previous design, and the
+table below was expressed in whole twenty-fifths for that reason - a habit worth
+dropping, because it silently pins a calibration to a shape the fingerprinter no longer
+has.
+"""
+
+# score -> what scored it, live unless noted. See MIN_PRECONDITION_SIMILARITY, and
+# SAME_STATE_THRESHOLD in perception/fingerprint.py for the corpora these come from.
 MEASURED = [
-    (25, "same", "docs.python.org and the sandbox, every trial: nothing moved"),
-    (23, "same", "an article whose text reflowed between the record and the re-run"),
-    (22, "same", "the Main Page's right rail hydrating after load"),
-    (21, "same", "six of nine re-navigations of a real recording; the floor"),
-    (12, "different", "the corpus's contrived worst case: one list, two accounts"),
-    (7, "different", "two Wikipedia revision-history pages: one template, other rows"),
-    (3, "different", "two Wikipedia category listings"),
-    (2, "different", "two Wikipedia search-result pages"),
-    (1, "different", "a fundraising banner arriving and pushing the page down"),
-    (0, "different", "two stdlib pages, and two stub articles"),
+    (1.000, "same", "every page but one, reloaded or in a fresh browser: nothing moved"),
+    (0.870, "same", "the same page in an 800 and a 900 pixel high viewport"),
+    (0.834, "same", "a page of dense body text scrolled 40px"),
+    (0.780, "same", "a notice of 60-200px pushed the page down; median of 117 pairs"),
+    (0.342, "same", "the same, worst of those 117"),
+    (0.335, "same", "MDN, whose right-rail advertisement is re-rolled on every load"),
+    (0.305, "same", "that ad AND a taller viewport at once; the floor"),
+    (0.213, "different", "contrived: one list for two accounts, same URL, chrome, layout"),
+    (0.198, "different", "a modal dialog and its scrim"),
+    (0.189, "different", "two Wikipedia search-result pages: one template, other results"),
+    (0.132, "different", "Wikipedia's fundraising appeal TAKING OVER the screen"),
+    (0.101, "different", "one template, entirely different prose"),
+    (0.036, "different", "an article page against a page of search results"),
+    (0.034, "different", "two different Wikipedia articles"),
+    (0.000, "different", "an unrelated site"),
 ]
+"""What the shipped fingerprinter scored, and which side of the cut each belongs on.
+
+Two rows deserve saying out loud, because between them they ARE the defect that moved
+this threshold. A notice pushing the page down used to sit in this table labelled
+`different`, at one part in twenty-five - so a test asserted, as correct behaviour, that
+a page which had merely moved was a screen the agent had never seen. It is the same
+screen and it now scores 0.780.
+
+What is still `different` is the TAKEOVER: Wikipedia's appeal does not push the article
+down, it displaces 555 of 800 pixels and leaves 31% of the recorded screen showing. That
+scores 0.132 and is refused, and refusing it is right - the skill was written against a
+screen that is no longer visible. The answer there is to dismiss the banner, not to
+loosen the cut.
+"""
 
 
-def _live_pair(*, agreeing: int, total: int = LIVE_PARTS) -> tuple[Fingerprint, Fingerprint]:
-    """A recorded screen and a second look at it agreeing on ``agreeing`` of ``total``
-    parts - so their similarity is exactly ``agreeing / total``.
+def _live_pair(*, score: float, total: int = LIVE_PARTS) -> tuple[Fingerprint, Fingerprint]:
+    """A recorded screen and a second look at it, built to score ``score``.
+
+    Content-addressed parts mean the two sides SHARE the parts they agree on and each
+    carries its own for the rest, so the similarity is ``shared / (2 * total - shared)``;
+    this inverts that. The result is within about 0.005 of ``score``, which is finer than
+    anything the table distinguishes.
 
     The values differ, so this is never the trivial ``value ==`` shortcut: the gate is
     made to do the part-by-part comparison a live page forces on it.
     """
+    shared = round(2 * total * score / (1 + score))
+    common = {f"band.shared{i}": "1" for i in range(shared)}
+    rest = total - shared
     return (
-        Fingerprint("recorded", {f"p{i}": "a" for i in range(total)}),
-        Fingerprint("seen-again", {f"p{i}": ("a" if i < agreeing else "b") for i in range(total)}),
+        Fingerprint("recorded", common | {f"band.rec{i}": "1" for i in range(rest)}),
+        Fingerprint("seen-again", common | {f"band.seen{i}": "1" for i in range(rest)}),
     )
 
 
@@ -956,9 +988,9 @@ def test_the_default_threshold_is_the_projects_one_measured_same_state_cut():
     )
 
 
-@pytest.mark.parametrize("agreeing,label,why", MEASURED, ids=[str(m[0]) for m in MEASURED])
-def test_every_measured_pair_falls_on_the_side_it_was_measured_on(agreeing, label, why):
-    recorded, seen = _live_pair(agreeing=agreeing)
+@pytest.mark.parametrize("measured,label,why", MEASURED, ids=[f"{m[0]:.3f}" for m in MEASURED])
+def test_every_measured_pair_falls_on_the_side_it_was_measured_on(measured, label, why):
+    recorded, seen = _live_pair(score=measured)
     score = recorded.similarity(seen)
     if label == "same":
         assert score >= MIN_PRECONDITION_SIMILARITY, f"{why} (scored {score:.3f})"
@@ -970,22 +1002,25 @@ def test_the_threshold_sits_in_a_gap_and_not_on_an_edge():
     """The point of a measured constant: daylight either side, so a page that renders a
     little differently tomorrow does not land on the wrong side of it."""
     scores: dict[str, list[float]] = {"same": [], "different": []}
-    for agreeing, label, _ in MEASURED:
-        recorded, seen = _live_pair(agreeing=agreeing)
+    for measured, label, _ in MEASURED:
+        recorded, seen = _live_pair(score=measured)
         scores[label].append(recorded.similarity(seen))
-    assert min(scores["same"]) - max(scores["different"]) >= 0.3
-    assert min(scores["same"]) - MIN_PRECONDITION_SIMILARITY > 0.1
-    assert MIN_PRECONDITION_SIMILARITY - max(scores["different"]) > 0.1
+    # 0.305 against 0.213: a 0.09-wide gap, and the cut sits near the middle of it. That
+    # is narrow and is not pretended otherwise - see MEASURED. What it replaced was a
+    # same-state floor BELOW the different-state ceiling, where no cut existed at all.
+    assert min(scores["same"]) - max(scores["different"]) >= 0.08
+    assert min(scores["same"]) - MIN_PRECONDITION_SIMILARITY > 0.04
+    assert MIN_PRECONDITION_SIMILARITY - max(scores["different"]) > 0.04
 
 
 def test_a_page_that_re_renders_the_way_a_live_page_does_is_admitted(
     trajectory, critic, skill_store, scenario
 ):
-    """The defect, as a test. 21 of 25 parts is what six of nine re-navigations of a
-    real live-Wikipedia recording scored, and every one of them was a correct skill the
-    old ``1.0`` threshold destroyed."""
-    recorded, seen = _live_pair(agreeing=21)
-    assert recorded.similarity(seen) == pytest.approx(0.84)
+    """The defect, as a test. 0.780 is what a live page scores against itself once a
+    notice has arrived at the top and pushed it down - the commonest thing a real site
+    does between a recording and a re-run, and a correct skill every time."""
+    recorded, seen = _live_pair(score=0.780)
+    assert recorded.similarity(seen) == pytest.approx(0.78, abs=0.01)
 
     llm = FakeLLM([reply()])
     admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
@@ -998,10 +1033,10 @@ def test_a_page_that_re_renders_the_way_a_live_page_does_is_admitted(
 
 
 def test_a_genuinely_different_screen_is_still_refused(trajectory, critic, skill_store, scenario):
-    """The other direction, and the reason the threshold is not simply removed. 7 of 25
-    is two revision-history pages: the same template, somebody else's rows."""
-    recorded, seen = _live_pair(agreeing=7)
-    assert recorded.similarity(seen) == pytest.approx(0.28)
+    """The other direction, and the reason the threshold is not simply removed. 0.189 is
+    two Wikipedia search-result pages: the same template, somebody else's results."""
+    recorded, seen = _live_pair(score=0.189)
+    assert recorded.similarity(seen) == pytest.approx(0.19, abs=0.01)
 
     llm = FakeLLM([reply()])
     admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
@@ -1016,12 +1051,13 @@ def test_a_genuinely_different_screen_is_still_refused(trajectory, critic, skill
 def test_the_corpus_worst_case_of_one_list_for_two_accounts_is_still_refused(
     trajectory, critic, skill_store, scenario
 ):
-    """The row that sets the floor. `same_layout_different_content` in
-    tests/fixtures/shots/pairs scores 0.500 - identical URL, chrome and layout, every
+    """The row that sets the ceiling. `same_layout_different_content` in
+    tests/fixtures/shots/pairs scores 0.213 - identical URL, chrome and layout, every
     row a different account - and admitting it would let the gate prove a skill against
-    the wrong world's data. Nothing measured live came near it."""
-    recorded, seen = _live_pair(agreeing=12)
-    assert recorded.similarity(seen) < 0.5
+    the wrong world's data. It is the highest-scoring DIFFERENT pair anywhere in the
+    calibration, live or contrived, which is what stops the cut going lower."""
+    recorded, seen = _live_pair(score=0.213)
+    assert recorded.similarity(seen) < MIN_PRECONDITION_SIMILARITY
 
     llm = FakeLLM([reply()])
     admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
@@ -1040,10 +1076,10 @@ def test_a_rejection_names_the_threshold_it_was_measured_against(
     it fell short of belongs beside it."""
     llm = FakeLLM([reply()])
     admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(
-        *_gate(trajectory, scenario, *_live_pair(agreeing=7))
+        *_gate(trajectory, scenario, *_live_pair(score=0.189))
     )
     error = admission.attempts[-1].error or ""
-    assert "similarity 0.28" in error
+    assert "similarity 0.19" in error
     assert f"below the {MIN_PRECONDITION_SIMILARITY:.2f} required" in error
 
 
@@ -1060,14 +1096,15 @@ def test_the_precondition_logs_its_score_whether_it_passes_or_fails(
 ):
     """The measurement that was missing. A gate that speaks only when it refuses cannot
     be calibrated - the passing scores are what say how much room is left."""
-    for agreeing, expected in ((22, True), (7, False)):
+    for measured, expected in ((0.870, True), (0.189, False)):
         caplog.clear()
         with caplog.at_level("INFO"):
             synthesizer(FakeLLM([reply()]), InMemorySkillStore(), critic, max_repairs=0).admit(
-                *_gate(trajectory, scenario, *_live_pair(agreeing=agreeing))
+                *_gate(trajectory, scenario, *_live_pair(score=measured))
             )
         logged = [r for r in caplog.records if "skill.admit.precondition" in r.getMessage()]
         assert len(logged) == 1
         message = logged[0].getMessage()
-        assert f"similarity={agreeing / LIVE_PARTS:g}" in message
+        recorded, seen = _live_pair(score=measured)
+        assert f"similarity={round(recorded.similarity(seen), 3):g}" in message
         assert f"ok={expected}" in message

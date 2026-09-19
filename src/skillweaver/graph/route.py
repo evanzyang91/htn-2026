@@ -36,6 +36,29 @@ a 1%-reliable edge is merely expensive, and Dijkstra will still route through it
 when nothing else connects; the agent is better served by "no route" and a fresh
 exploration than by replaying something that reliably does not work.
 
+Being already there is not an exact-match question
+--------------------------------------------------
+
+The endpoints of a route are usually a LIVE screen on one side and a RECORDED one on
+the other - "get me from what I am looking at to the screen this skill starts on" -
+and a live page never fingerprints identically twice. Asking whether those two are
+the same state by comparing ``Fingerprint.value`` therefore answers "no" for a screen
+the agent is already standing on, and the caller is told ``no_route`` for a journey of
+zero steps. That is not a hypothetical: it is how the first skill ever learned on live
+Wikipedia became unusable the moment it was stored.
+
+So :func:`find_route` settles the trivial case with
+:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`, the project's one
+calibrated answer to "am I looking at the screen I recorded", and returns the empty
+route when the two endpoints are the same screen by that measure. Pass ``same_state=1.0``
+to demand exact equality instead; ``InMemorySiteGraph.route`` does exactly that, because
+``contracts.GraphView.route`` specifies exact matching for the graph's own query method.
+
+Tolerance stops there, and deliberately. Only the endpoints are compared this way; the
+hops in between are matched exactly on ``Fingerprint.value``, because those values ARE
+node ids and a node id is never a drifted observation. A caller holding a live
+fingerprint that should be resolved onto a known node passes ``resolve``.
+
 Failure behavior
 ----------------
 
@@ -55,6 +78,7 @@ from dataclasses import dataclass
 
 from skillweaver.contracts import Fingerprint, Route, Transition
 from skillweaver.errors import RouteNotFound
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 
 Outgoing = Callable[[str], Iterable[Transition]]
 """Supplies the outgoing edges of a node, keyed by ``Fingerprint.value``.
@@ -152,24 +176,54 @@ def edge_cost(edge: Transition, policy: RoutingPolicy = VERIFIED_ONLY) -> float 
     return edge.mean_ms / rate
 
 
+def same_state(
+    left: Fingerprint, right: Fingerprint, threshold: float = SAME_STATE_THRESHOLD
+) -> bool:
+    """Whether these two fingerprints name the same screen.
+
+    Equal ``value`` always says yes. Otherwise it is
+    :meth:`~skillweaver.contracts.Fingerprint.similarity` against ``threshold``, which
+    is how a live screen is recognised as one seen before although it never reproduces
+    its id. ``threshold >= 1.0`` demands exact equality. Never raises.
+    """
+    if left.value == right.value:
+        return True
+    return threshold < 1.0 and left.similarity(right) >= threshold
+
+
 def find_route(
     src: Fingerprint,
     dst: Fingerprint,
     outgoing: Outgoing,
     policy: RoutingPolicy = VERIFIED_ONLY,
+    *,
+    same_state_threshold: float = SAME_STATE_THRESHOLD,
+    resolve: Callable[[Fingerprint], Fingerprint] | None = None,
 ) -> Route | None:
     """The lowest-cost known route from ``src`` to ``dst``, or ``None``.
 
     Dijkstra over :func:`edge_cost`, which is non-negative, so the first time a node
-    is settled it is settled with its best cost. Matching is exact on
-    ``Fingerprint.value``; an unknown fingerprint simply has no outgoing edges and
-    yields ``None`` rather than an error. A route from a state to itself is
-    ``Route((), 0.0, ())``.
+    is settled it is settled with its best cost. An unknown fingerprint simply has no
+    outgoing edges and yields ``None`` rather than an error.
+
+    A route from a state to the SAME state is ``Route((), 0.0, ())``, and sameness is
+    :func:`same_state` rather than equality - see "Being already there" in the module
+    docstring for why that is the whole point of this function. Intermediate hops are
+    matched exactly on ``Fingerprint.value``.
 
     Ties are broken by insertion order - the order ``outgoing`` yields edges - so
     the same graph always produces the same route.
+
+    Args:
+        same_state_threshold: How alike the two endpoints must be to count as one
+            screen. ``1.0`` restores exact matching on ``Fingerprint.value``.
+        resolve: Maps each endpoint onto the node it belongs to before the search.
+            For a caller holding fingerprints taken from live observations rather than
+            from the graph; ``InMemorySiteGraph.route(approximate=True)`` passes its own.
     """
-    if src.value == dst.value:
+    if resolve is not None:
+        src, dst = resolve(src), resolve(dst)
+    if same_state(src, dst, same_state_threshold):
         return Route((), 0.0, ())
 
     order = itertools.count()
@@ -205,13 +259,14 @@ def require_route(
     dst: Fingerprint,
     outgoing: Outgoing,
     policy: RoutingPolicy = VERIFIED_ONLY,
+    **kwargs: object,
 ) -> Route:
-    """:func:`find_route`, but insisting on an answer.
+    """:func:`find_route`, but insisting on an answer. Keyword arguments pass through.
 
     Raises:
         RouteNotFound: when :func:`find_route` would return ``None``.
     """
-    route = find_route(src, dst, outgoing, policy)
+    route = find_route(src, dst, outgoing, policy, **kwargs)  # type: ignore[arg-type]
     if route is None:
         raise RouteNotFound(f"no known route from {src.value!r} to {dst.value!r}")
     return route

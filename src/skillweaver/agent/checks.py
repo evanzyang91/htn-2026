@@ -146,15 +146,28 @@ class Check(Protocol):
 # Fingerprint checks
 # --------------------------------------------------------------------------------------
 
-AMBIGUITY_MARGIN = 0.06
+AMBIGUITY_MARGIN = 0.023
 """Half-width of the "I do not know" band around the same-state threshold.
 
-:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` is ``0.62``, measured
-against labelled pairs whose same-state scores bottom out at ``0.750`` and whose
-different-state scores top out at ``0.500``. A margin of ``0.06`` puts the decisive cuts
-at ``0.56`` and ``0.68``, which still calls every measured pair decisively while refusing
-to commit anywhere inside the gap the threshold was fitted to. A similarity landing in
-that band is exactly the case the model exists for.
+Derived from the separation :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`
+was fitted to, and it has to be re-derived whenever that is. Same-state scores bottom out
+at ``0.305`` and different-state scores top out at ``0.213``, so the cut at ``0.26`` has
+``0.047`` of clearance below it and ``0.045`` above. This margin is **half the gap**:
+the band is ``0.237`` to ``0.283``, and every measured pair keeps half its clearance
+rather than being swallowed. Only a score in the middle half of the gap - where the
+calibration genuinely cannot say - refuses to commit, which is the case the model exists
+for.
+
+Getting this wrong is expensive in a way that does not announce itself. A margin WIDER
+than the gap makes every check abstain at both extremes, each abstention escalates to
+the vision model, and each escalation is a model call - so an over-wide band raises the
+cost of every run while looking like caution. It was ``0.06`` against a threshold of
+``0.62``, whose corpus separated ``0.500`` from ``0.750``; carried onto the present cut
+unchanged it would span ``0.20`` to ``0.32`` and swallow the whole measured separation.
+
+Even ``0.04`` is too wide here: it clears the measured extremes by ``0.005`` and
+``0.007``, which is finer than the thing being measured. Half the gap is the widest
+band that leaves both ends decisive by a margin worth having.
 """
 
 

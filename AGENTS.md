@@ -44,21 +44,35 @@ never charged itself for, both vanish otherwise - and a number that flatters us 
 one kind of bug this project cannot ship.
 
 A live page never fingerprints identically twice, so nothing that compares two screens
-may ask it to: same-page-on-a-second-load bottoms out around 0.84 while a genuinely
-different screen tops out around 0.28. Both cuts that judge it - `SAME_STATE_THRESHOLD`
-in `perception/fingerprint.py` and `MIN_PRECONDITION_SIMILARITY` in
-`skills/synthesize.py` - are 0.62, and each carries the measurements it was calibrated
-from. An exact match is a property of the demo site alone, which is why a gate tuned
+may ask it to - including routing, which is why `find_route` settles "am I already
+there?" by similarity and not by id. One number answers that question everywhere:
+`SAME_STATE_THRESHOLD` in `perception/fingerprint.py`, which `MIN_PRECONDITION_SIMILARITY`
+and `DEFAULT_MATCH_THRESHOLD` both defer to, and which carries the two corpora it was
+calibrated on. Re-derive it, do not nudge it, and re-derive it again if the fingerprinter
+changes what it puts in `parts` - a cut is only meaningful against the shape of the signal
+it judges. An exact match is a property of the demo site alone, which is why a gate tuned
 against the sandbox looks green until it meets a website.
 
-Prefer **headless** against a REAL site anyway: two fresh browsers of opposite modes on
-one Wikipedia page score 0.44. Block anything that renders only SOMETIMES, too:
-Wikipedia's fundraising banner appears on some loads, pushes the article down, and a page
-re-opened with one scores **0.04** against the same page recorded without one - one part
-in twenty-five, the URL - so the library never grows and a retrieval measurement has
-nothing to retrieve. Aborting `**/Special:BannerLoader*`, `**/Special:RecordImpression*`
-and `**/geoiplookup*` on the Playwright context makes one URL fingerprint identically
-every time. What else a live-site run needs is in `eval/wikipedia.yaml`.
+What moves a real page is a notice arriving at the top - a fundraising appeal, a cookie
+bar, an A/B strip - which pushes everything below it DOWN. A fingerprint part must
+therefore never be named by WHERE it is; `StateFingerprinter` names each one by its
+content, so the same page pushed down 200px scores 0.78 where a grid-anchored part scored
+it 0.040. A full-screen takeover is a different matter and is refused on purpose:
+Wikipedia's appeal displaces 555 of 800 pixels, and no identity can recover a screen that
+is 69% gone.
+
+So block anything that renders only SOMETIMES rather than relying on the identity to
+absorb it - a measurement wants one page to be one screen. Aborting
+`**/Special:BannerLoader*`, `**/Special:RecordImpression*` and `**/geoiplookup*` on the
+Playwright context makes one Wikipedia URL fingerprint identically every time.
+
+Use **headless** against a REAL site, on both sides of anything that will be compared.
+Headed and headless are different screens and are meant to be: two fresh browsers of
+opposite modes on one page score 0.13 (Wikipedia Main Page) and 0.42 (`json.html`), both
+at or below the same-state cut, while headless against headless scores 1.000. Note that
+`orchestrator._open_world` opens the CLI's browser HEADED, so a skill learned through the
+CLI does not match one replayed headless. What else a live-site run needs is in
+`eval/wikipedia.yaml`.
 
 Perception is dominated by OCR - 84-97% of every observation's time on real pages -
 so the shipped fix is to not read the same pixels twice, and counts, not seconds, are how

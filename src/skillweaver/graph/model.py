@@ -48,22 +48,27 @@ from skillweaver.graph.route import (
     find_route,
     success_rate,
 )
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 
-DEFAULT_MATCH_THRESHOLD = 0.6
+DEFAULT_MATCH_THRESHOLD = SAME_STATE_THRESHOLD
 """Similarity at or above which two fingerprints are taken to be the same screen.
 
-Pitched against the shape a fingerprinter in this project actually produces: three
-parts - ``url``, ``layout`` and ``text``. With three parts the only similarities
-reachable are ``1.0``, ``0.667``, ``0.333`` and ``0.0``, so this default draws the
-line in the one gap that matters. One part drifting (``0.667``) still resolves,
-which is the badge-ticked, clock-advanced, ad-rotated case. Two parts drifting
-(``0.333``) does not, because a screen whose layout AND text both changed is a
-different screen.
+The project holds ONE number for "am I looking at the screen I recorded", and this
+is that question asked of a graph node, so this is that number - see
+:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` for the two corpora
+it is calibrated on and for what it refuses.
 
-A threshold has to be read against the part count, not in the abstract: ``0.75``
-sounds stricter by a hair but silently rejects every single-part drift a
-three-part fingerprint can express, and the graph fragments into singletons.
-Re-check this value if a fingerprinter changes how many parts it emits.
+Deferring to it rather than carrying a separate constant is not tidiness. A
+threshold is only meaningful against the SHAPE of the signal it judges, so a
+fingerprinter and the graph that keys on it cannot pick their cuts independently.
+This value used to be an independent ``0.6``, reasoned about a fingerprint of three
+parts; the shipped fingerprinter emits around 175, whose same-state floor is 0.305,
+and against that a cut of 0.6 rejects every screen that moved and hands the graph
+back the pile of singletons it exists to avoid.
+
+Pass ``match_threshold`` to :class:`InMemorySiteGraph` to override it - ``1.0``
+demands exact equality and disables near matching entirely - and re-derive it if a
+fingerprinter changes what it puts in ``parts``.
 """
 
 _EdgeKey = tuple[str, str, tuple[Action, ...]]
@@ -146,6 +151,8 @@ class InMemorySiteGraph:
             return exact
         if self.match_threshold >= 1.0:
             return None
+        # The same rule as ``route.same_state``, but this loop needs the SCORE to pick
+        # the BEST match among several candidates, not just a yes or no.
         best: UIState | None = None
         best_score = -1.0
         for state in self._states.values():
@@ -249,9 +256,18 @@ class InMemorySiteGraph:
                 it when the fingerprints came from live observations rather than
                 from the graph.
         """
-        if approximate:
-            src_fp, dst_fp = self.canonical(src_fp), self.canonical(dst_fp)
-        return find_route(src_fp, dst_fp, self._outgoing, self.policy)
+        # ``find_route`` treats endpoints within SAME_STATE_THRESHOLD as one screen,
+        # which is right for a live fingerprint and wrong for this method: the contract
+        # says exact. ``approximate=True`` is how a caller asks for the other behavior,
+        # and then :meth:`canonical` has already mapped both onto real node ids.
+        return find_route(
+            src_fp,
+            dst_fp,
+            self._outgoing,
+            self.policy,
+            same_state_threshold=self.match_threshold if approximate else 1.0,
+            resolve=self.canonical if approximate else None,
+        )
 
     def neighbors(self, fp: Fingerprint, *, approximate: bool = False) -> list[Transition]:
         """Outgoing edges of ``fp``, most reliable first, then fastest.

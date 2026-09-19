@@ -651,7 +651,13 @@ def _admit_archive(reset_url: str | None) -> Any:
     }
     llm = FakeLLM([json.dumps(draft)])
     critic = FakeCritic(goal=trajectory.steps[-1].after.fingerprint)
-    admission = Synthesizer(llm, store, critic, max_repairs=2).admit(trajectory, factory)
+    # FakeFingerprinter emits THREE parts, so its only scores are 0, 1/3, 2/3 and 1; the
+    # shipped 0.26 is calibrated against the ~175 a real page gives. Judge the fake by
+    # its own shape, or "the whole message list changed" reads as one part in three.
+    min_similarity = 2 / 3
+    admission = Synthesizer(llm, store, critic, max_repairs=2, min_similarity=min_similarity).admit(
+        trajectory, factory
+    )
     return admission, store
 
 

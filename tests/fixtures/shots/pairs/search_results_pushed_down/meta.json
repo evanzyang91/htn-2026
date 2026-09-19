@@ -1,0 +1,287 @@
+{
+  "name": "search_results_pushed_down",
+  "label": "same",
+  "why": "The results page with a notice at the top pushing every hit down 120px - the commonest thing a live site does between a recording and a re-run.",
+  "a": {
+    "png": "a.png",
+    "url": "https://invoices.test/handbook/search",
+    "width": 800,
+    "height": 600,
+    "scale": 1.0,
+    "elements": [
+      {
+        "x": 20,
+        "y": 12,
+        "w": 96,
+        "h": 28,
+        "kind": "text",
+        "text": "Handbook"
+      },
+      {
+        "x": 745,
+        "y": 16,
+        "w": 35,
+        "h": 20,
+        "kind": "text",
+        "text": "09:41"
+      },
+      {
+        "x": 20,
+        "y": 66,
+        "w": 400,
+        "h": 32,
+        "kind": "text_field",
+        "text": "remittance"
+      },
+      {
+        "x": 430,
+        "y": 66,
+        "w": 66,
+        "h": 32,
+        "kind": "button",
+        "text": "Clear"
+      },
+      {
+        "x": 730,
+        "y": 66,
+        "w": 50,
+        "h": 32,
+        "kind": "link",
+        "text": "Index"
+      },
+      {
+        "x": 110,
+        "y": 130,
+        "w": 580,
+        "h": 20,
+        "kind": "text",
+        "text": "7 results for \u201cremittance\u201d"
+      },
+      {
+        "x": 110,
+        "y": 166,
+        "w": 580,
+        "h": 24,
+        "kind": "link",
+        "text": "Closing the books"
+      },
+      {
+        "x": 110,
+        "y": 189,
+        "w": 580,
+        "h": 17,
+        "kind": "text",
+        "text": "handbook > period close"
+      },
+      {
+        "x": 110,
+        "y": 210,
+        "w": 580,
+        "h": 42,
+        "kind": "text",
+        "text": "Remittance accrual vendor statement vendor payable remittance balance receipt reconcile invoice period. Ledger reconcile invoice accrual posting ledger remittance statement."
+      },
+      {
+        "x": 110,
+        "y": 256,
+        "w": 580,
+        "h": 42,
+        "kind": "text",
+        "text": "Remittance accrual vendor statement vendor payable remittance balance receipt reconcile invoice period. Ledger reconcile invoice accrual posting ledger remittance statement."
+      },
+      {
+        "x": 110,
+        "y": 318,
+        "w": 580,
+        "h": 24,
+        "kind": "link",
+        "text": "Servicing the assembly"
+      },
+      {
+        "x": 110,
+        "y": 342,
+        "w": 580,
+        "h": 17,
+        "kind": "text",
+        "text": "handbook > plant > line 4"
+      },
+      {
+        "x": 110,
+        "y": 363,
+        "w": 580,
+        "h": 42,
+        "kind": "text",
+        "text": "Torque fixture spindle calibration pallet fixture spindle coolant. Conveyor tolerance gauge spindle."
+      },
+      {
+        "x": 110,
+        "y": 425,
+        "w": 580,
+        "h": 24,
+        "kind": "link",
+        "text": "Vendor remittance advice"
+      },
+      {
+        "x": 110,
+        "y": 449,
+        "w": 580,
+        "h": 17,
+        "kind": "text",
+        "text": "handbook > payable"
+      },
+      {
+        "x": 110,
+        "y": 469,
+        "w": 580,
+        "h": 63,
+        "kind": "text",
+        "text": "Payable audit period remittance close entry close. Entry ledger invoice accrual vendor close remittance entry. Accrual vendor payable ledger audit reconcile period accrual audit journal journal payable period."
+      },
+      {
+        "x": 110,
+        "y": 536,
+        "w": 580,
+        "h": 63,
+        "kind": "text",
+        "text": "Payable audit period remittance close entry close. Entry ledger invoice accrual vendor close remittance entry. Accrual vendor payable ledger audit reconcile period accrual audit journal journal payable period."
+      }
+    ]
+  },
+  "b": {
+    "png": "b.png",
+    "url": "https://invoices.test/handbook/search",
+    "width": 800,
+    "height": 600,
+    "scale": 1.0,
+    "elements": [
+      {
+        "x": 20,
+        "y": 132,
+        "w": 96,
+        "h": 28,
+        "kind": "text",
+        "text": "Handbook"
+      },
+      {
+        "x": 745,
+        "y": 136,
+        "w": 35,
+        "h": 20,
+        "kind": "text",
+        "text": "09:41"
+      },
+      {
+        "x": 20,
+        "y": 186,
+        "w": 400,
+        "h": 32,
+        "kind": "text_field",
+        "text": "remittance"
+      },
+      {
+        "x": 430,
+        "y": 186,
+        "w": 66,
+        "h": 32,
+        "kind": "button",
+        "text": "Clear"
+      },
+      {
+        "x": 730,
+        "y": 186,
+        "w": 50,
+        "h": 32,
+        "kind": "link",
+        "text": "Index"
+      },
+      {
+        "x": 110,
+        "y": 250,
+        "w": 580,
+        "h": 20,
+        "kind": "text",
+        "text": "7 results for \u201cremittance\u201d"
+      },
+      {
+        "x": 110,
+        "y": 286,
+        "w": 580,
+        "h": 24,
+        "kind": "link",
+        "text": "Closing the books"
+      },
+      {
+        "x": 110,
+        "y": 309,
+        "w": 580,
+        "h": 17,
+        "kind": "text",
+        "text": "handbook > period close"
+      },
+      {
+        "x": 110,
+        "y": 330,
+        "w": 580,
+        "h": 42,
+        "kind": "text",
+        "text": "Remittance accrual vendor statement vendor payable remittance balance receipt reconcile invoice period. Ledger reconcile invoice accrual posting ledger remittance statement."
+      },
+      {
+        "x": 110,
+        "y": 376,
+        "w": 580,
+        "h": 42,
+        "kind": "text",
+        "text": "Remittance accrual vendor statement vendor payable remittance balance receipt reconcile invoice period. Ledger reconcile invoice accrual posting ledger remittance statement."
+      },
+      {
+        "x": 110,
+        "y": 438,
+        "w": 580,
+        "h": 24,
+        "kind": "link",
+        "text": "Servicing the assembly"
+      },
+      {
+        "x": 110,
+        "y": 462,
+        "w": 580,
+        "h": 17,
+        "kind": "text",
+        "text": "handbook > plant > line 4"
+      },
+      {
+        "x": 110,
+        "y": 483,
+        "w": 580,
+        "h": 42,
+        "kind": "text",
+        "text": "Torque fixture spindle calibration pallet fixture spindle coolant. Conveyor tolerance gauge spindle."
+      },
+      {
+        "x": 110,
+        "y": 545,
+        "w": 580,
+        "h": 24,
+        "kind": "link",
+        "text": "Vendor remittance advice"
+      },
+      {
+        "x": 110,
+        "y": 569,
+        "w": 580,
+        "h": 17,
+        "kind": "text",
+        "text": "handbook > payable"
+      },
+      {
+        "x": 110,
+        "y": 589,
+        "w": 580,
+        "h": 11,
+        "kind": "text",
+        "text": "Payable audit period remittance close entry close. Entry ledger invoice accrual vendor close remittance entry. Accrual vendor payable ledger audit reconcile period accrual audit journal journal payable period."
+      }
+    ]
+  }
+}
