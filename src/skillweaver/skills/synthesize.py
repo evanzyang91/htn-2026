@@ -407,12 +407,52 @@ def _repair_brief(attempt: Attempt) -> str:
             "spinner - write the wait again with a ctx.log on the line before it "
             "naming that thing, and it will be kept exactly as you wrote it."
         )
+    if attempt.stage == "execution" and not removed:
+        lines.append("")
+        lines.append(_SLOWER_THAN_THE_RECORDING)
     lines.append("")
     lines.append(
         "Fix exactly this and return the same JSON object shape again. "
         "Keep what was working; change what the error names."
     )
     return "\n".join(lines)
+
+
+_SLOWER_THAN_THE_RECORDING = (
+    "One thing to rule out before you change the logic, because your skill runs FAR "
+    "faster than the recording it was written from: a control that acts WITHOUT "
+    "navigating is not covered by the settle after each action. That settle waits for "
+    "the page's load event, which a control that fires a background request and then "
+    "redirects has already fired long before. Measured on a live shop on 2026-09-19: "
+    "the click on 'Add to cart' returned in 130ms with the document complete and the "
+    "old URL still showing, and the cart page it leads to did not commit until 1170ms "
+    "- so a skill that read the cart straight after the click read the page it was "
+    "still standing on and correctly concluded the cart was empty. The recording never "
+    "hit this because a model was being asked what to do next between every pair of "
+    "actions. If that is what happened here, do NOT add a retry around the whole "
+    "sequence - it fails the same way, only twice. Either wait for the page to agree "
+    "(re-read ctx.see in a short bounded loop until what you expect is on it), or put "
+    "one ctx.ctl.wait(...) immediately after the offending action with a ctx.log on "
+    "the line before it naming what is being waited for - a background cart update, a "
+    "redirect the load event does not cover - and that wait will be kept."
+)
+"""What a skill rejected at EXECUTION is told, on top of its error.
+
+The synthesizer writes a skill from a recording made at model speed and it is then
+re-run at code speed, which is one to two orders of magnitude faster. Every failure
+mode that is really a race looks, in the error text, exactly like a logic bug: "the
+cart is still empty" is what an empty cart and a cart read too early both say.
+
+Without this the repair loop reliably picks the wrong fix. Measured on live
+splitkb.com on 2026-09-19, a correctly-explored add-to-cart run was rejected at
+execution on all three attempts, and the model's repair each time was to wrap the
+whole sequence in a retry - which fails identically, only twice, because the second
+pass is just as fast as the first.
+
+It is NOT offered when the hardening pass removed a wait: that case has its own and
+more specific message directly above, and two paragraphs about waiting would make the
+more precise one easier to miss.
+"""
 
 
 # --------------------------------------------------------------------------------------

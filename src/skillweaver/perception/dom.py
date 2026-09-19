@@ -65,6 +65,7 @@ why ``SCROLL_UP``/``SCROLL_DOWN`` are in the action space at all.
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -92,6 +93,8 @@ __all__ = [
     "MAX_CONTROLS",
     "MAX_PAGE_TEXT",
     "MAX_TEXT_NODES",
+    "SNAPSHOT_ATTEMPTS",
+    "SNAPSHOT_RETRY_MS",
     "DomControl",
     "DomOption",
     "DomPerceiver",
@@ -116,6 +119,18 @@ article legitimately has hundreds of lines. It is still a cap: the element list 
 :class:`~skillweaver.contracts.ElementIndex`, whose ``best`` and ``find_text`` scan it
 per query.
 """
+
+SNAPSHOT_ATTEMPTS = 4
+"""How many times :meth:`DomPerceiver._read` asks a document that answers ``null``.
+
+See the loop for what that answer means and why the controller's own retry does not
+cover it. Four, with :data:`SNAPSHOT_RETRY_MS` between, because a page that has
+committed a navigation gets a body within a frame or two and one that never does is a
+broken page worth reporting rather than waiting on.
+"""
+
+SNAPSHOT_RETRY_MS = 150.0
+"""How long to wait between those attempts."""
 
 MAX_PAGE_TEXT = 6000
 """Characters of visible page text carried on the snapshot, as in Jev's ``snapshot.js``.
@@ -350,13 +365,24 @@ class DomPerceiver:
                 f"{controller.describe()} cannot. The DOM path is browser-only; use "
                 "--perception pixels for a desktop target."
             )
-        raw = evaluate(_SNAPSHOT_JS)
-        if not isinstance(raw, dict):
-            raise PerceptionError(
-                f"the page snapshot script returned {type(raw).__name__}, not an object; "
-                "the document was probably navigating"
-            )
-        return _snapshot_from(raw, shot)
+        raw = None
+        for attempt in range(SNAPSHOT_ATTEMPTS):
+            raw = evaluate(_SNAPSHOT_JS)
+            if isinstance(raw, dict):
+                return _snapshot_from(raw, shot)
+            # ``null``, not an exception: the script's own first line answers a document
+            # with no ``body`` yet, which is a commit that has landed and not finished.
+            # The controller's retry cannot see this - it catches a DESTROYED execution
+            # context, and this context is alive and nearly empty - so the wait is here.
+            # Measured on live splitkb.com: a click that navigates hit it once in a run
+            # and, before this loop existed, ended the run with a PerceptionError.
+            if attempt + 1 < SNAPSHOT_ATTEMPTS:
+                log.info("dom.snapshot.retry", attempt=attempt + 1, url=controller.url())
+                time.sleep(SNAPSHOT_RETRY_MS / 1000.0)
+        raise PerceptionError(
+            f"the page snapshot script returned {type(raw).__name__}, not an object, "
+            f"{SNAPSHOT_ATTEMPTS} times: the document has a window but still no body"
+        )
 
 
 # --------------------------------------------------------------------------------------

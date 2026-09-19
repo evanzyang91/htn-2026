@@ -9,13 +9,32 @@ Two rules the code cannot tell you, because this repository is built by many wor
   Create and edit only the files your task names.
   If you need a change in a file you do not own, report it instead of editing it.
 
+**Work here is proven by a real end-to-end run, not by tests.** Do not write test files and
+do not run the suite; run the thing you built against the real target and report what it did -
+the task, the steps, the wall time, the outcome. Change a default path that already worked and
+you owe it one real run too. Report failures plainly: "it worked" with no run behind it is
+worse than "I could not get it to run, here is where it stopped". The linter still runs.
+
+**Perception is pixels-only EXCEPT for browser use, on purpose and behind a switch.**
+`--perception dom` (`SKILLWEAVER_PERCEPTION`) reads the page's own controls through
+`perception/dom.py` and runs no detector and no OCR; `--policy jev`
+(`SKILLWEAVER_POLICY`) then lets TypeSafe's Jev choose each move through `llm/jev_.py`.
+Both default OFF and the pixel path is untouched. Actions stay POINT-based through the
+unchanged `BrowserController` - there is no second action plane - and the only thing the
+DOM path adds to that class is a read-only `evaluate`. Computer use is still pixels-only
+and no part of this reaches a desktop target. `BrowserGroundTruth` remains what it was:
+an offline teacher, reachable only from `_dom_of`, and NOT what the DOM perceiver uses.
+The two paths keep SEPARATE skill libraries, namespaced by domain in `perception_mode.py` -
+read that module before assuming a fingerprint would have caught the crossing, because it
+does not: `parts` come from the screenshot and the URL, which both paths share.
+
 The command line is the way to drive all of this: `uv run python -m skillweaver.cli --help`.
 There is no `skillweaver` console script - `pyproject.toml` has no `[project.scripts]`, and
 that file is shared surface. `src/skillweaver/orchestrator.py` holds the cold-versus-warm
 decision and `build_agent`, the one place the real agent is wired; build on that rather than
 assembling a planner and an explorer by hand.
 
-Test without a browser, a model or a network by using the doubles in `tests/fakes/` (fixtures in `tests/conftest.py`; `tests/fakes/scenario.py` is a small fake app to drive).
+To iterate without a browser, a model or a network, drive the doubles in `tests/fakes/` (fixtures in `tests/conftest.py`; `tests/fakes/scenario.py` is a small fake app). They are a development aid - the evidence of done is still a real run.
 
 Two live-API facts that no test can teach you, both already paid for in lost runs.
 `claude-opus-5` **refuses an assistant prefill** - a conversation ending on an assistant
@@ -307,6 +326,27 @@ And a fall-through is not a success. A warm attempt that missed and was rescued 
 exploration reports the miss in its headline (`RunReport.warm_missed` and `rescued`,
 `orchestrator.py`); `SOLVED by the cold path` on its own is the sentence that hid the
 defect above, because it is what a demo and a measurement both quote.
+
+A skill is recorded at MODEL speed and replayed at CODE speed, one to two orders of
+magnitude faster, so a control the page answers WITHOUT navigating is a race the recording
+never sees. `_settle` in `controllers/browser.py` waits for the load event, which such a
+control fired long ago: measured on live splitkb.com, the click on "Add to cart" returned in
+130ms with the document complete and the old URL showing, and the cart it redirects to did
+not commit until 1170ms. Every symptom reads as a logic bug - "the cart is still empty" is
+what an empty cart and a cart read too early both say - so `_SLOWER_THAN_THE_RECORDING` in
+`skills/synthesize.py` tells a skill rejected at execution to rule this out first, and
+`SETTLE_BUDGET_MS` in `reset_actions.py` is the same lesson for a converging undo, which
+must wait for the screen to change AND go quiet because such a page answers in two frames.
+Do NOT fix this by widening `_settle`: a quiet WINDOW is the only signal that works, a
+zero-window check reads quiet before the request has even started (measured: 25-45ms on both
+Wikipedia and splitkb), and a window taxes every action on every site.
+
+And a verifier that passes on the wrong screen is worse than none, because it is what turns
+a skill that did nothing into a stored one. A synthesized verifier matching `"Keycaps"` -
+the word the top nav says on EVERY page of that shop - passed 5 replays in which the cart
+was empty all 5 times; `/cart.js` said `item_count=0`. The warm critic caught it every time
+and the report said `warm miss`, which is the system working. Check a replay against the
+SITE, never against the skill's own say-so.
 
 ## Maintaining this file
 
