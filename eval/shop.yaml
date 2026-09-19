@@ -1,0 +1,145 @@
+# The shop suite: 10 tasks against apps/shop-site (Harbour Supply).
+#
+# A second application, in a deliberately different idiom from the console suite in
+# tasks.yaml: a grid of product cards rather than a table of rows, sidebar filters and
+# a radio group rather than a toolbar, a drawer with quantity steppers rather than a
+# bulk menu, and a three-field checkout behind a confirm dialog. Nothing in the agent
+# knows which of them it is looking at, which is the point of having two.
+#
+# Same rules as tasks.yaml - read its header for how a task is scored, what `params`
+# are for, and what the tags mean. Run it with:
+#
+#     python3 apps/shop-site/serve.py --port 8766 &
+#     uv run python scripts/bench_live.py --suite eval/shop.yaml --repeat 3
+#
+# Counts: 4 single-step, 4 multi-step, 2 composite.
+
+suite: shop-site
+domain: shop.test
+base_url: http://127.0.0.1:8766
+
+warm_runs: 3
+
+tasks:
+  # -- single-step ------------------------------------------------------------------
+
+  - id: filter_to_tools
+    text: Show only the products in the Tools category.
+    tags: [single-step]
+    params: {category: "Tools"}
+    expect:
+      - path: ui.category
+        equals: Tools
+
+  - id: search_for_lantern
+    text: Search the shop for "lantern".
+    tags: [single-step]
+    params: {query: "lantern"}
+    expect:
+      - path: ui.search
+        equals: lantern
+
+  - id: sort_by_price_ascending
+    text: Sort the products by price, cheapest first.
+    tags: [single-step]
+    params: {sort: "Price: low to high"}
+    expect:
+      - path: ui.sort
+        equals: price-asc
+
+  - id: show_cheap_products
+    text: Show only the products under $25.
+    tags: [single-step]
+    params: {band: "Under $25"}
+    expect:
+      - path: ui.priceBand
+        equals: under25
+
+  # -- multi-step -------------------------------------------------------------------
+
+  - id: add_hammer_to_cart
+    text: Add the Anchor Claw Hammer to the cart.
+    tags: [multi-step]
+    params: {product: "Anchor Claw Hammer"}
+    expect:
+      - path: cart.lines[productId=p01].qty
+        equals: 1
+      # Exactly that one: a run that added the whole first row of the grid also puts
+      # a hammer in the cart, and that is not what was asked for.
+      - path: cart.lines
+        count: 1
+
+  - id: add_two_levels
+    text: Put two of the Brass Level 24 in in the cart.
+    tags: [multi-step]
+    params: {product: "Brass Level 24 in", quantity: "2"}
+    expect:
+      - path: cart.lines[productId=p02].qty
+        equals: 2
+      - path: cart.lines
+        count: 1
+
+  - id: open_the_cart
+    text: Open the shopping cart.
+    tags: [multi-step]
+    expect:
+      - path: ui.cartOpen
+        equals: true
+
+  - id: empty_the_cart_again
+    text: Add the Cobalt Drill Bit Set to the cart, then take it back out again.
+    tags: [multi-step]
+    params: {product: "Cobalt Drill Bit Set"}
+    expect:
+      # The cart is empty because the line was removed, not because nothing was ever
+      # added: the drawer is open, which only happens once something has been in it.
+      - path: cart.lines
+        count: 0
+      - path: ui.cartOpen
+        equals: true
+
+  # -- composite --------------------------------------------------------------------
+
+  - id: filter_then_add_cheapest
+    text: >-
+      Show only the Lighting products, sort them by price with the cheapest first, and
+      add the first one to the cart.
+    tags: [composite]
+    params: {category: "Lighting", sort: "Price: low to high"}
+    expect:
+      - path: ui.category
+        equals: Lighting
+      - path: ui.sort
+        equals: price-asc
+      # Zenith Reading Light, p24, is the cheapest thing in Lighting at $12.99.
+      - path: cart.lines[productId=p24].qty
+        equals: 1
+
+  - id: buy_the_drill_bits
+    text: >-
+      Add the Cobalt Drill Bit Set to the cart and place the order for Dana Reed,
+      dana.reed@harbour.example, 14 Harbour Road, with express shipping.
+    tags: [composite]
+    params:
+      product: "Cobalt Drill Bit Set"
+      name: "Dana Reed"
+      email: "dana.reed@harbour.example"
+      address: "14 Harbour Road"
+      shipping: "Express"
+    expect:
+      - path: orders
+        at_least: 1
+      - path: orders[0].name
+        equals: Dana Reed
+      - path: orders[0].email
+        equals: dana.reed@harbour.example
+      - path: orders[0].address
+        equals: 14 Harbour Road
+      - path: orders[0].shipping
+        equals: express
+      - path: orders[0].items[0].productId
+        equals: p03
+      # Placing an order empties the cart, so this separates "ordered" from "filled in
+      # the form and stopped".
+      - path: cart.lines
+        count: 0

@@ -806,17 +806,32 @@ def _pointable(cluster: Sequence[Element], seed: Element) -> list[Element]:
     fused element still carries the word, so a search still finds the container; it
     just no longer has only the container to offer.
 
+    A container with SEVERAL lines is kept apart whatever its size, because several
+    lines is what makes something a container rather than a labelled control, and what
+    is clickable in a container is usually one of its lines rather than the middle of
+    it - a board card's title opens the ticket and the rest of the card does nothing.
+
     Only for lines that came from reading text. A control fused into another control
     is two detections of one thing, and emitting it twice would double-count a real
     click target.
     """
+    lines = [
+        element
+        for element in cluster[1:]
+        if element.source is ElementSource.ocr
+        and element.kind is ElementKind.text
+        and normalize_text(element.text)
+        and element.box.area > 0
+    ]
+    # Several lines means the thing they are inside is a container rather than a
+    # labelled control - a card, a row, a tile - and what is clickable in a container
+    # is usually one of its lines rather than the middle of it. A board card's title
+    # opens the ticket and the rest of the card does nothing, so an agent that could
+    # only click the card's centre could not open it at all.
+    composite = len(lines) >= 2
     kept: list[Element] = []
-    for element in cluster[1:]:
-        if element.source is not ElementSource.ocr or element.kind is not ElementKind.text:
-            continue
-        if not normalize_text(element.text) or element.box.area <= 0:
-            continue
-        if seed.box.area < element.box.area * STANDALONE_RATIO:
+    for element in lines:
+        if not composite and seed.box.area < element.box.area * STANDALONE_RATIO:
             continue
         kept.append(
             element

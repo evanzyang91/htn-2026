@@ -35,6 +35,13 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+from playbooks_common import (  # type: ignore[import-not-found]
+    bind,
+    go,
+    press,
+    sees,
+    skill,
+)
 from scripted_operator import (  # type: ignore[import-not-found]
     Element,
     Playbook,
@@ -58,26 +65,6 @@ COMPOSE = (760, 430, 1280, 800)
 # --------------------------------------------------------------------------------------
 # Step builders
 # --------------------------------------------------------------------------------------
-
-
-def go(label: str, *, done: bool = False):
-    """Click a top-bar navigation button."""
-
-    def step(elements: Sequence[Element], failures: int) -> dict[str, Any] | None:
-        target = find(elements, label, within=TOP_BAR)
-        return None if target is None else click(target, done=done)
-
-    return step
-
-
-def press(label: str, *, kind: str | None = None, within=None, done: bool = False):
-    """Click the first thing whose text contains ``label``, optionally in a region."""
-
-    def step(elements: Sequence[Element], failures: int) -> dict[str, Any] | None:
-        target = find(elements, label, kind=kind, within=within)
-        return None if target is None else click(target, done=done)
-
-    return step
 
 
 def fill(label: str, value: str, *, kind: str = "text_field", done: bool = False):
@@ -275,120 +262,6 @@ def scroll_down(anchor_text: str, dy: int = 400):
 # --------------------------------------------------------------------------------------
 # Skills: what each run teaches
 # --------------------------------------------------------------------------------------
-
-HELPERS = '''
-def only(ctx, hits, what):
-    """The first hit, or a clean failure naming what was wanted."""
-    ctx.expect(bool(hits), "nothing on screen matching " + what)
-    return hits[0]
-
-
-def region(ctx, hits, x0, y0, x1, y1, what):
-    """The first hit whose middle lies in a part of the screen.
-
-    Pages repeat their words: the mail toolbar has an Archive button and the sidebar
-    an Archived folder, and clicking the wrong one quietly does the wrong thing.
-    """
-    for hit in hits:
-        cx = hit.box.x + hit.box.w // 2
-        cy = hit.box.y + hit.box.h // 2
-        if x0 <= cx <= x1 and y0 <= cy <= y1:
-            return hit
-    ctx.expect(False, "nothing matching " + what + " where it was expected")
-
-
-def boxes(ctx):
-    """Every checkbox on screen."""
-    return [e for e in ctx.see.all() if e.kind.value == "checkbox"]
-
-
-def fields(ctx):
-    """Every text box on screen."""
-    return [e for e in ctx.see.all() if e.kind.value == "text_field"]
-
-
-def buttons_saying(ctx, text):
-    """Controls whose label matches, and not the prose that happens to read like it."""
-    return [e for e in ctx.see.find_text(text) if e.kind.value in ("button", "link", "menu")]
-
-
-def broad(ctx):
-    """The biggest thing on screen - where to put the pointer before scrolling.
-
-    A wheel event scrolls whatever is under the cursor, and the first element in
-    reading order is in the application bar, which scrolls nothing at all. The largest
-    element is inside the content, which is the part that moves.
-    """
-    best = None
-    for element in ctx.see.all():
-        if best is None or element.box.area > best.box.area:
-            best = element
-    ctx.expect(best is not None, "the screen appears to be empty")
-    return best
-
-
-def checkbox_for(ctx, row, what):
-    """The checkbox belonging to a list row: leftmost, aligned with it."""
-    middle = row.box.y + row.box.h // 2
-    best = None
-    for element in boxes(ctx):
-        centre = element.box.y + element.box.h // 2
-        if abs(centre - middle) > 30 or element.box.x > row.box.x:
-            continue
-        if best is None or element.box.x < best.box.x:
-            best = element
-    ctx.expect(best is not None, "no checkbox on the row for " + what)
-    return best
-
-
-def fill_in(ctx, field, value):
-    """Replace a field's contents. The caret is invisible, so select all first."""
-    ctx.ctl.click(field)
-    ctx.ctl.press("Control", "a")
-    ctx.ctl.type_text(value)
-
-
-def go_to(ctx, screen):
-    """Click a top-bar navigation button, not the heading of the same name."""
-    ctx.ctl.click(region(ctx, ctx.see.find_text(screen), 0, 0, 2000, 52, screen))
-'''
-
-
-def skill(
-    name: str,
-    summary: str,
-    ends_on: str,
-    params: Sequence[str],
-    example: dict[str, Any],
-    body: str,
-    verifier: str,
-) -> dict[str, Any]:
-    """One skill in the shape the synthesizer is asked to reply with."""
-    return {
-        "name": name,
-        "summary": summary,
-        "docstring": (
-            f"{summary}\n\nAssumes: the Northwind Console is open on its first screen.\n"
-            f"Ends on: {ends_on}"
-        ),
-        "params": {
-            parameter: {"type": "string", "description": f"The {parameter.replace('_', ' ')}."}
-            for parameter in params
-        },
-        "example_args": example,
-        "requires": [],
-        "code": f"{HELPERS}\ndef run({', '.join(['ctx', *params])}):\n{body}\n",
-        "verifier_code": verifier,
-    }
-
-
-def bind(name: str, args: dict[str, Any], why: str) -> dict[str, Any]:
-    """The composer's reply: which stored skill, with what read out of the sentence."""
-    return {"steps": [{"skill": name, "args": args}], "why": why}
-
-
-def sees(text: str) -> str:
-    return f'def verify(ctx, result):\n    return bool(ctx.see.find_text("{text}"))\n'
 
 
 # --------------------------------------------------------------------------------------
@@ -632,11 +505,11 @@ _ALL: tuple[Playbook, ...] = (
             "            box = element\n"
             '    ctx.expect(box is not None, "no text box on the settings screen")\n'
             "    fill_in(ctx, box, display_name)\n"
-            '    hits = buttons_saying(ctx, "Save changes")\n'
+            '    hits = controls(ctx, "Save changes")\n'
             "    if not hits:\n"
             "        # The save bar sits below the fold on a short window.\n"
-            "        ctx.ctl.scroll(broad(ctx), 0, 400)\n"
-            '        hits = buttons_saying(ctx, "Save changes")\n'
+            "        ctx.ctl.scroll(biggest(ctx), 0, 400)\n"
+            '        hits = controls(ctx, "Save changes")\n'
             '    ctx.ctl.click(only(ctx, hits, "the save button"))\n'
             '    ctx.ctl.click(only(ctx, ctx.see.find_text("Confirm and save"), "the confirm"))\n'
             "    return True\n",
@@ -721,7 +594,7 @@ _ALL: tuple[Playbook, ...] = (
         steps=(
             go("Records"),
             fill("Filter records", "ledger"),
-            press("Export", done=True),
+            press("Export", kind="button", done=True),
         ),
         skill=skill(
             "export_filtered_records",
@@ -732,7 +605,9 @@ _ALL: tuple[Playbook, ...] = (
             '    go_to(ctx, "Records")\n'
             '    field = only(ctx, ctx.see.find_text("Filter records"), "the records filter")\n'
             "    fill_in(ctx, field, query)\n"
-            '    ctx.ctl.click(only(ctx, ctx.see.find_text("Export"), "the export button"))\n'
+            "    # The BUTTON: the footer also counts 'Exports this session', and the\n"
+            "    # tightest thing that says the word is that line rather than the control.\n"
+            '    ctx.ctl.click(only(ctx, controls(ctx, "Export"), "the export button"))\n'
             "    return True\n",
             sees("Exported"),
         ),

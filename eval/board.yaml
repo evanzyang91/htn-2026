@@ -1,0 +1,134 @@
+# The board suite: 10 tasks against apps/board-site (Lantern Board).
+#
+# A third application, again in a different idiom: four columns of cards rather than a
+# grid or a table, a per-card menu rather than a toolbar, a detail panel with an
+# editable field and a comment list, a create modal, and a bulk archive behind a
+# confirm dialog. Nothing in the agent is told which application it is looking at.
+#
+# Same rules as tasks.yaml - read its header for how a task is scored, what `params`
+# are for, and what the tags mean. Run it with:
+#
+#     python3 apps/board-site/serve.py --port 8767 &
+#     uv run python scripts/bench_live.py --suite eval/board.yaml --repeat 3
+#
+# Counts: 4 single-step, 4 multi-step, 2 composite.
+
+suite: board-site
+domain: board.test
+base_url: http://127.0.0.1:8767
+
+warm_runs: 3
+
+tasks:
+  # -- single-step ------------------------------------------------------------------
+
+  - id: search_the_board
+    text: Search the board for "webhook".
+    tags: [single-step]
+    params: {query: "webhook"}
+    expect:
+      - path: ui.search
+        equals: webhook
+
+  - id: filter_by_assignee
+    text: Show only the tickets assigned to Ada Lindgren.
+    tags: [single-step]
+    params: {assignee: "Ada Lindgren"}
+    expect:
+      - path: ui.assignee
+        equals: Ada Lindgren
+
+  - id: filter_by_priority
+    text: Show only the High priority tickets.
+    tags: [single-step]
+    params: {priority: "High"}
+    expect:
+      - path: ui.priority
+        equals: High
+
+  - id: open_a_ticket
+    text: Open the ticket about the flicker when the gauge crosses zero.
+    tags: [single-step]
+    params: {title: "Fix flicker when the gauge crosses zero"}
+    expect:
+      - path: ui.openId
+        equals: t02
+
+  # -- multi-step -------------------------------------------------------------------
+
+  - id: move_ticket_to_review
+    text: Move the ticket "Fix flicker when the gauge crosses zero" to the Review column.
+    tags: [multi-step]
+    params: {title: "Fix flicker when the gauge crosses zero", column: "Review"}
+    expect:
+      - path: board.tickets[id=t02].column
+        equals: review
+      # Nothing else moved: a run that dragged the whole column across also satisfies
+      # the check above, and that is not the task.
+      - path: board.tickets[id=t05].column
+        equals: inprogress
+
+  - id: reassign_a_ticket
+    text: Reassign the ticket "Add bulk import for device registries" to June Nakagawa.
+    tags: [multi-step]
+    params: {title: "Add bulk import for device registries", assignee: "June Nakagawa"}
+    expect:
+      - path: board.tickets[id=t04].assignee
+        equals: June Nakagawa
+
+  - id: rename_a_ticket
+    text: >-
+      Rename the ticket "Set up nightly export of usage metrics" to "Nightly usage
+      export".
+    tags: [multi-step]
+    params:
+      title: "Set up nightly export of usage metrics"
+      new_title: "Nightly usage export"
+    expect:
+      - path: board.tickets[id=t01].title
+        equals: Nightly usage export
+
+  - id: comment_on_a_ticket
+    text: >-
+      Add the comment "Checked on staging" to the ticket "Cache the schedule preview
+      per workspace".
+    tags: [multi-step]
+    params:
+      title: "Cache the schedule preview per workspace"
+      comment: "Checked on staging"
+    expect:
+      - path: board.tickets[id=t05].comments
+        at_least: 1
+      - path: board.tickets[id=t05].comments[-1].text
+        equals: Checked on staging
+
+  # -- composite --------------------------------------------------------------------
+
+  - id: create_a_ticket
+    text: >-
+      Create a new ticket titled "Audit the export retry path", assigned to Theo
+      Barros at High priority.
+    tags: [composite]
+    params:
+      title: "Audit the export retry path"
+      assignee: "Theo Barros"
+      priority: "High"
+    expect:
+      - path: board.tickets[id=t15].title
+        equals: Audit the export retry path
+      - path: board.tickets[id=t15].assignee
+        equals: Theo Barros
+      - path: board.tickets[id=t15].priority
+        equals: High
+      - path: board.tickets[id=t15].column
+        equals: backlog
+
+  - id: archive_the_done_column
+    text: Archive everything in the Done column.
+    tags: [composite]
+    expect:
+      - path: archived
+        at_least: 3
+      # The board really lost them, rather than a copy being taken.
+      - path: board.tickets[id=t06]
+        absent: true

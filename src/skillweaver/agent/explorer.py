@@ -122,6 +122,7 @@ from skillweaver.contracts import (
 from skillweaver.contracts import Move as PointerMove
 from skillweaver.errors import BudgetExceeded, ControllerError, SkillWeaverError
 from skillweaver.logging_ import get_logger
+from skillweaver.perception.elements import normalize_text
 from skillweaver.skills.api import SkillLimits, describe_action
 from skillweaver.skills.sandbox import SkillRunner
 
@@ -145,16 +146,38 @@ log = get_logger(__name__)
 PROMPT_PATH = Path(__file__).parent / "prompts" / "explore.md"
 """The acting prompt, used as the system prompt of every model call this loop makes."""
 
-MAX_BLOCK_ACTIONS = 8
+MAX_BLOCK_ACTIONS = 16
 """Controller actions one model-written code block may perform.
 
 A block is a move, not a program: the loop has to see the screen again to stay grounded,
 and a block that acts more than this has stopped being one decision. The sandbox stops it
 at the limit and the actions it already performed are kept and judged.
+
+Sixteen rather than a handful because the commonest intent that is genuinely one
+decision and genuinely many actions is filling in a form - nobody means to type a name
+and then stop - and a three-field checkout costs twelve: a click, a select-all and a
+typing for each field, then the same again for a dropdown. Capping below that forces a
+form to be filled across several moves, and every move is one the agent must still be
+able to see it made later.
+
+The grounding argument survives the larger number, because a block that reaches the
+screen through ``ctx.see`` re-reads it between actions anyway; what the cap really
+bounds is how much an unverified answer can set in motion before anything judges it.
 """
 
-RECENT_MOVES = 8
-"""How many past moves of this run are quoted back to the model."""
+RECENT_MOVES = 20
+"""How many past moves of this run are quoted back to the model.
+
+Long enough to cover a whole run of anything in the shipped suites, which matters
+more than it sounds: the conversation is rebuilt from scratch every move, so a move
+that scrolls out of this window is a move the model can no longer see it made. At
+eight, a nine-step errand - add to the cart, open it, check out, fill three fields,
+choose a shipping speed, place the order, confirm - lost its own beginning and began
+repeating steps it had already done.
+
+Each line is one short sentence, so the cost of the larger window is a few hundred
+tokens on the longest runs and nothing at all on the short ones.
+"""
 
 RE_OBSERVE_AFTER = 3
 """Tries that reach the screen with nothing before it is read again.
@@ -173,12 +196,14 @@ observation on every ordinary mistake.
 NEIGHBOURS = 6
 """How many known outgoing edges of the current state are quoted back to the model."""
 
-CATALOG_LINES = 80
+CATALOG_LINES = 160
 """Elements listed in the prompt. See :meth:`ElementCatalog.render` for what is kept.
 
-A dense screen in the shipped sandbox reports around 85 elements, of which about 30
-are controls, so this fits every control on every screen of it with room to spare -
-and when it does not, controls are what stays.
+Sized to show EVERYTHING on the densest screen in the shipped suites - a board of
+fourteen cards with a detail panel open over it, at about 145 elements - because the
+cost of a line is a few tokens beside a screenshot, and the cost of omitting one is a
+control the agent cannot act on. On a denser page than that the ordering is the
+safety net rather than the size: see :meth:`ElementCatalog.render`.
 """
 
 _CONTROLS: frozenset[Any] = frozenset(
@@ -194,25 +219,77 @@ _CONTROLS: frozenset[Any] = frozenset(
 )
 """Kinds an agent acts on directly. Listed before anything else."""
 
-_SECONDARY: frozenset[Any] = frozenset({ElementKind.row, ElementKind.icon})
-"""Kinds that are often clickable but come in crowds - a row per record, an icon
-inside every button. Listed after the controls and before the prose."""
+_SECONDARY: frozenset[Any] = frozenset({ElementKind.row})
+"""Kinds that are often clickable but come in crowds - a row per record. Listed after
+the controls and before the prose.
+
+Icons are NOT here. A page has one inside almost every button and they come back with
+no text at all, so listing them ahead of the words on the screen fills the catalogue
+with things that say nothing: on a board with a panel open they used the whole of it,
+and the panel's own captions and placeholders never reached the prompt. An icon that
+DID come back with text is text, and is listed as such."""
 
 
 def _choose(items: Sequence[tuple[str, Element]], limit: int) -> set[str]:
-    """The ids to show, controls first, then the clickable crowd, then text."""
+    """The ids to show, controls first, then the clickable crowd, then text.
+
+    Text that is printed INSIDE something already kept goes last of all, because the
+    element holding it already says the same words: a card's three lines are listed
+    again by the card, and spending the remaining room on them is how a screen's real
+    controls - a button at the bottom of a panel, say - get pushed out by a repeat of
+    what is at the top.
+    """
     if len(items) <= limit:
         return {name for name, _ in items}
     keep: set[str] = set()
-    for tier in (_CONTROLS, _SECONDARY, None):
+    for tier in (_CONTROLS, _SECONDARY, _FRESH_TEXT, _ECHOED_TEXT):
         for name, element in items:
             if len(keep) >= limit:
                 return keep
             if name in keep:
                 continue
-            if tier is None or element.kind in tier:
-                keep.add(name)
+            if tier in (_CONTROLS, _SECONDARY):
+                if element.kind not in tier:
+                    continue
+                if element.kind is ElementKind.icon and not normalize_text(element.text):
+                    continue
+            elif (tier is _ECHOED_TEXT) != _inside_any(element, items, keep):
+                continue
+            keep.add(name)
     return keep
+
+
+_FRESH_TEXT = "text that says something no kept element already says"
+_ECHOED_TEXT = "text repeated by something already kept"
+
+
+def _inside_any(element: Element, items: Sequence[tuple[str, Element]], keep: set[str]) -> bool:
+    """Whether something already being shown both contains this and repeats its words.
+
+    Both halves matter. Containment alone is not repetition - a panel contains
+    everything drawn on it without saying any of it, and treating that as a repeat
+    threw away every line of the panel's contents. What is genuinely redundant is a
+    line whose words are already printed in the element that holds it, which is what
+    a card or a row does with each of its own lines.
+    """
+    words = normalize_text(element.text)
+    if not words:
+        return False
+    for name, other in items:
+        if name not in keep or other is element:
+            continue
+        if _covers(other.box, element.box) and words in normalize_text(other.text):
+            return True
+    return False
+
+
+def _covers(outer: Box, inner: Box) -> bool:
+    """Whether ``outer`` contains essentially all of ``inner``."""
+    if inner.area <= 0:
+        return False
+    ix = max(0, min(outer.x + outer.w, inner.x + inner.w) - max(outer.x, inner.x))
+    iy = max(0, min(outer.y + outer.h, inner.y + inner.h) - max(outer.y, inner.y))
+    return (ix * iy) / inner.area >= 0.9
 
 
 DEFAULT_MAX_TOKENS = 1024

@@ -157,14 +157,14 @@ def find(
         elements: What is on screen.
         wanted: Text to look for, compared with spacing and case ignored.
         kind: Restrict to one element kind.
-        nth: Which match to take, in reading order.
+        nth: Which match to take, tightest first.
         within: ``(x0, y0, x1, y1)`` bounding region the element's centre must be in -
             how a step says "the nav bar one, not the heading with the same word".
         exclude: Skip matches whose text also contains this.
     """
     needle = squash(wanted)
     skip = squash(exclude) if exclude else None
-    hits = []
+    hits: list[Element] = []
     for element in elements:
         if kind is not None and element.kind != kind:
             continue
@@ -178,6 +178,12 @@ def find(
             if not (x0 <= element.cx <= x1 and y0 <= element.cy <= y1):
                 continue
         hits.append(element)
+    # Tightest first. A page nests its text - a card's title is inside the card, and a
+    # detector will sometimes draw a band across a whole row of columns that contains
+    # several cards' worth of words - and the smallest thing that says the words is
+    # where they actually are. A point inside it is inside every larger one too, so
+    # choosing it can only ever be more precise.
+    hits.sort(key=lambda e: (e.w * e.h, e.y, e.x))
     return hits[nth] if len(hits) > nth else None
 
 

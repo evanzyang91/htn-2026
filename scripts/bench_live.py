@@ -33,6 +33,7 @@ import json
 import sys
 import time
 import types
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +47,6 @@ _tests = types.ModuleType("tests")
 _tests.__path__ = [str(REPO / "tests")]
 sys.modules["tests"] = _tests
 
-from playbooks_sandbox import PLAYBOOKS  # noqa: E402
 from scripted_operator import ScriptedOperator  # noqa: E402
 
 from skillweaver.contracts import Budget, TaskSpec  # noqa: E402
@@ -181,13 +181,14 @@ def main() -> int:
         print("start it with: python3 apps/sandbox-site/serve.py --port 8765")
         return 2
 
-    covered = {task.id for task in suite.tasks if task.text in PLAYBOOKS}
+    playbooks = _playbooks_for(suite.name)
+    covered = {task.id for task in suite.tasks if task.text in playbooks}
     missing = sorted({task.id for task in suite.tasks} - covered)
     if missing:
         print(f"no playbook for: {', '.join(missing)} - those tasks will fail to explore")
 
     data_dir = args.data_dir or (REPO / "data" / "bench-live")
-    operator = ScriptedOperator(playbooks=dict(PLAYBOOKS), latency_ms=args.model_latency_ms)
+    operator = ScriptedOperator(playbooks=dict(playbooks), latency_ms=args.model_latency_ms)
     operator.debug_to = args.dump_prompt
     bench = LiveWorkbench(data_dir, operator, headless=not args.headed)
 
@@ -230,6 +231,25 @@ def main() -> int:
     if operator.unmatched:
         print(f"  tasks with no playbook {sorted(set(operator.unmatched))}")
     return 0
+
+
+def _playbooks_for(suite: str) -> dict:
+    """The playbooks for one application, imported by the suite's own name.
+
+    Keeping them per application rather than in one pile is the honest arrangement:
+    nothing shared between them may know which site it is looking at, and a module
+    that is never imported cannot accidentally be the reason another site works.
+    """
+    modules = {
+        "sandbox-site": "playbooks_sandbox",
+        "shop-site": "playbooks_shop",
+        "board-site": "playbooks_board",
+    }
+    name = modules.get(suite)
+    if name is None:
+        print(f"no playbooks are written for the {suite!r} suite")
+        return {}
+    return dict(import_module(name).PLAYBOOKS)
 
 
 def _fmt(value: Any) -> str:

@@ -499,9 +499,14 @@ def test_a_fused_row_says_every_line_printed_inside_it() -> None:
     index = ElementIndex(merged)
     assert index.find_text("Billing"), "the sender is findable"
     assert index.find_text("Invoice 4471 is ready"), "the subject is findable"
-    # The short lines are also kept where they are printed, because a row is far
-    # larger than a word on it and something drawn over one is not part of it.
-    assert {e.box for e in merged if e.source is ElementSource.ocr} == {sender.box, subject.box}
+    # Every line is also kept where it is printed. Several lines is what makes this a
+    # container rather than a labelled control, and what is clickable in a container is
+    # usually one of its lines rather than the middle of it.
+    assert {e.box for e in merged if e.source is ElementSource.ocr} == {
+        sender.box,
+        subject.box,
+        preview.box,
+    }
 
 
 def test_a_fused_control_does_not_repeat_a_line_it_reads_twice() -> None:
@@ -601,6 +606,26 @@ def test_a_word_on_a_large_surface_stays_pointable_where_it_is_printed() -> None
     assert any(e.box == row.box and "Paused" in e.text for e in merged), (
         "and the row still says what is printed on it, so a search for the row finds it"
     )
+
+
+def test_a_card_whose_only_clickable_part_is_its_title_can_still_be_opened() -> None:
+    """A board card, which is where this came from.
+
+    Its title opens the ticket and the rest of the card does nothing at all, so an
+    agent that could only click the card's centre could not open one. Several lines is
+    what makes something a container rather than a labelled control, whatever its size
+    relative to any one line.
+    """
+    card = _element(Box(33, 186, 258, 75), ElementKind.button, "", 0.85, ElementSource.yolo)
+    title = _element(
+        Box(41, 192, 200, 20), ElementKind.text, "Set up nightly export", 0.95, ElementSource.ocr
+    )
+    who = _element(Box(41, 222, 90, 18), ElementKind.text, "Mira Solano", 0.95, ElementSource.ocr)
+
+    merged = merge_elements([card], [title, who])
+    hit = ElementIndex(merged).find_text("Set up nightly export")[0]
+
+    assert hit.box == title.box, "the click lands on the title, which is what opens it"
 
 
 def test_a_button_is_not_split_from_its_own_label() -> None:
