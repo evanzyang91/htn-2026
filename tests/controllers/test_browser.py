@@ -12,6 +12,7 @@ because that is the only thing the agent will ever have.
 
 from __future__ import annotations
 
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,11 @@ from skillweaver.contracts import (
     Wait,
 )
 from skillweaver.controllers import _coords
-from skillweaver.controllers.browser import BrowserController, BrowserGroundTruth
+from skillweaver.controllers.browser import (
+    SOMETIMES_ONLY_OVERLAYS,
+    BrowserController,
+    BrowserGroundTruth,
+)
 from skillweaver.errors import ControllerError
 
 PAGES = Path(__file__).resolve().parent.parent / "fixtures" / "pages"
@@ -448,6 +453,70 @@ PLANTED = {
 }
 
 
+class TestBlockedRequests:
+    """A page that renders an overlay only SOMETIMES must not be two screens.
+
+    ``overlay.html`` is that page offline: it is 420px taller when the script it
+    fetches arrives, and its readout line says which of the two it became. Live,
+    the script is Wikipedia's ``Special:BannerLoader`` - see
+    :data:`~skillweaver.controllers.browser.SOMETIMES_ONLY_OVERLAYS` for the
+    measurement that put the default there.
+    """
+
+    def test_the_overlay_renders_when_nothing_is_blocked(self) -> None:
+        with BrowserController(viewport=VIEWPORT, block=()) as ctl:
+            assert ctl.perform(Navigate(page_url("overlay.html"))).ok
+            assert readout(BrowserGroundTruth(ctl), "overlay:") == "overlay: shown"
+
+    def test_a_blocked_request_cannot_render_its_overlay(self) -> None:
+        with BrowserController(viewport=VIEWPORT, block=("**/overlay-banner.js",)) as ctl:
+            assert ctl.perform(Navigate(page_url("overlay.html"))).ok
+            assert readout(BrowserGroundTruth(ctl), "overlay:") == "overlay: absent"
+
+    def test_the_block_survives_navigating_away_and_back(self) -> None:
+        """The route is installed on the context, so one navigation cannot shed it."""
+        with BrowserController(viewport=VIEWPORT, block=("**/overlay-banner.js",)) as ctl:
+            assert ctl.perform(Navigate(page_url("overlay.html"))).ok
+            assert ctl.perform(Navigate(page_url("link.html"))).ok
+            assert ctl.perform(Navigate(page_url("overlay.html"))).ok
+            assert readout(BrowserGroundTruth(ctl), "overlay:") == "overlay: absent"
+
+    def test_blocking_leaves_the_rest_of_the_page_working(self) -> None:
+        """Only the overlay goes. A block that cost the run its page would be worse
+        than the screen it was tidying up."""
+        with BrowserController(viewport=VIEWPORT, block=("**/overlay-banner.js",)) as ctl:
+            assert ctl.perform(Navigate(page_url("overlay.html"))).ok
+            texts = [el.text for el in BrowserGroundTruth(ctl).elements()]
+            assert "overlay: absent" in texts
+
+    def test_the_default_blocks_the_three_measured_wikipedia_endpoints(self) -> None:
+        """The shipped default, pinned. Losing one of these is a demo that fails on
+        stage roughly one load in five, which is how it was found."""
+        with BrowserController(viewport=(320, 240)) as ctl:
+            assert ctl.blocked == SOMETIMES_ONLY_OVERLAYS
+        assert [p.pattern for p in SOMETIMES_ONLY_OVERLAYS] == [
+            "Special:BannerLoader",
+            "Special:RecordImpression",
+            "geoiplookup",
+        ]
+
+    def test_the_default_patterns_match_the_url_wikipedia_actually_serves(self) -> None:
+        """A glob cannot: CentralNotice puts the page name in the QUERY STRING, and a
+        Playwright glob matches path segments. Blocking it with ``**/Special:...*``
+        aborted nothing on a live forced appeal, and the banner rendered at 531px."""
+        served = (
+            "https://meta.wikimedia.org/w/index.php?title=Special:BannerLoader"
+            "&campaign=WMF_FR_FY2627_en6C_dsk_0701&banner=B2627_091718_en6C_dsk_p1_lg"
+            "&uselang=en&debug=false"
+        )
+        assert any(p.search(served) for p in SOMETIMES_ONLY_OVERLAYS)
+        assert not fnmatch(served, "**/Special:BannerLoader*")
+
+    def test_blocking_can_be_turned_off_entirely(self) -> None:
+        with BrowserController(viewport=(320, 240), block=()) as ctl:
+            assert ctl.blocked == ()
+
+
 class TestGroundTruth:
     def test_it_finds_every_planted_element_with_the_right_kind_and_box(
         self, elements_page: BrowserController, truth: BrowserGroundTruth
@@ -537,6 +606,7 @@ class TestGroundTruth:
         on the action path could reach it by accident."""
         surface = {name for name in dir(BrowserController) if not name.startswith("_")}
         assert surface == {
+            "blocked",  # URL patterns it refuses - configuration, not a reading of the page
             "capture",
             "close",
             "describe",

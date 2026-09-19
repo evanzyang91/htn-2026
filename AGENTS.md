@@ -62,9 +62,14 @@ Wikipedia's appeal displaces 555 of 800 pixels, and no identity can recover a sc
 is 69% gone.
 
 So block anything that renders only SOMETIMES rather than relying on the identity to
-absorb it - a measurement wants one page to be one screen. Aborting
-`**/Special:BannerLoader*`, `**/Special:RecordImpression*` and `**/geoiplookup*` on the
-Playwright context makes one Wikipedia URL fingerprint identically every time.
+absorb it - a measurement wants one page to be one screen. `BrowserController` now does
+it for every run, not just for measurement scripts: `SOMETIMES_ONLY_OVERLAYS` in
+`controllers/browser.py` aborts the appeal's own endpoints on the context, and carries
+what it cost to find out that those patterns have to be REGEXES. Wikipedia serves the
+appeal from `index.php?title=Special:BannerLoader&...`, so the name is in the query
+string, and the `**/Special:BannerLoader*` glob this file used to recommend matches
+nothing and aborts nothing. Force the appeal with `?banner=<name>&force=1` to check any
+of this again without waiting for it.
 
 Use **headless** against a REAL site, on both sides of anything that will be compared.
 Headed and headless are different screens and are meant to be: two fresh browsers of

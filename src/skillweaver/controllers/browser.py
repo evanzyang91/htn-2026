@@ -26,13 +26,15 @@ Typical use::
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import time
+from collections.abc import Sequence
 from types import TracebackType
 from typing import Literal
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, Playwright, sync_playwright
+from playwright.sync_api import Page, Playwright, Route, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from skillweaver.contracts import (
@@ -59,6 +61,50 @@ from skillweaver.controllers import _coords
 from skillweaver.errors import ControllerError
 
 BrowserName = Literal["chromium", "firefox", "webkit"]
+
+SOMETIMES_ONLY_OVERLAYS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Special:BannerLoader"),
+    re.compile(r"Special:RecordImpression"),
+    re.compile(r"geoiplookup"),
+)
+"""Requests that serve an overlay a page renders only SOMETIMES, aborted by default.
+
+A measurement wants one page to be one screen. Everything downstream of this
+controller compares two screens of the same URL - the admission gate against the
+screen the recording started on, the critic against the screen before the move,
+``find_route`` against where it thinks it already is - and every one of those
+comparisons is a lie when a page is a full-width appeal on one load and not on the
+next. The identity cannot be taught to forgive this one: see ``SAME_STATE_THRESHOLD``
+in :mod:`skillweaver.perception.fingerprint`, which refuses a full-screen takeover on
+purpose, because a screen that is two thirds gone is not that screen.
+
+Measured on live ``en.wikipedia.org`` on 2026-09-19. Thirty plain loads of
+``/wiki/Main_Page``, each in a fresh context and no blocking: FIVE rendered a
+CentralNotice fundraising appeal 531px tall in an 800px viewport and twenty-five
+rendered nothing, and the two groups fingerprint against each other at 0.132 - far
+below the 0.26 same-state cut. That is the whole defect: of fifteen live learning runs
+of one task, the two that met the appeal both threw away a correct skill, one because
+the recorded starting screen could no longer be stood on (0.09) and one because it
+never was (0.12). Ten loads with these patterns aborted rendered it zero times.
+
+Waiting for a one-in-six event is no way to check this, so force it:
+``?banner=<name>&force=1`` renders the appeal on every load. Ten forced loads with
+nothing blocked were the appeal ten times out of ten and the ordinary screen zero
+times out of ten; ten with the block on were the ordinary screen ten times out of ten.
+
+**Regexes, not the glob patterns this looks like it should use.** CentralNotice serves
+the appeal from ``meta.wikimedia.org/w/index.php?title=Special:BannerLoader&...`` -
+the name is in the QUERY STRING, and a Playwright glob matches path segments, so
+``**/Special:BannerLoader*`` matches nothing on a real Wikipedia load. On one forced
+load the glob aborted 0 requests and the appeal rendered at 531px; the regex aborted 1
+and it did not render at all.
+
+This is not ad-blocking for its own sake and it hides nothing a run needs: the page is
+fully readable and every link on it still works. Pass ``block=()`` to a controller
+that is deliberately measuring the overlay itself, or patterns of your own - a regex,
+or a `Playwright URL glob <https://playwright.dev/python/docs/network>`_ where the
+thing to block really is a path - for another site's version of the same problem.
+"""
 
 _SUPPORTED_ACTIONS: frozenset[str] = frozenset(
     {"click", "move", "drag", "type_text", "press_key", "scroll", "wait", "navigate"}
@@ -106,6 +152,16 @@ def _release_driver() -> None:
             pass
         _THREAD_DRIVER.playwright = None
         _THREAD_DRIVER.users = 0
+
+
+def _abort(route: Route) -> None:
+    """Refuse one request. A route handler that raises kills the page, and a
+    request can be gone - the page navigated away - by the time this runs, so the
+    abort is best-effort and a failure to abort is not an error."""
+    try:
+        route.abort()
+    except Exception:  # noqa: BLE001 - a request that is already gone is blocked enough
+        pass
 
 
 _SCROLL_QUIET_MS = 80
@@ -163,6 +219,11 @@ class BrowserController:
             an action, including a navigation the action set off. Settling is
             best-effort, so reaching this is not an error.
         start_url: Loaded once at construction, if given.
+        block: URL patterns whose requests are aborted, on the context, so they
+            are blocked for every page and every navigation. A regex matches
+            anywhere in the URL; a string is a Playwright path glob. ``None``
+            means :data:`SOMETIMES_ONLY_OVERLAYS` - read that constant before
+            changing it; ``()`` blocks nothing.
 
     Raises:
         ControllerError: if the browser cannot be launched.
@@ -181,6 +242,7 @@ class BrowserController:
         navigation_timeout_ms: float = 15_000.0,
         settle_timeout_ms: float = 3_000.0,
         start_url: str | None = None,
+        block: Sequence[str | re.Pattern[str]] | None = None,
     ) -> None:
         width, height = viewport
         if width <= 0 or height <= 0:
@@ -196,6 +258,9 @@ class BrowserController:
         self._drag_steps = max(int(drag_steps), 1)
         self._navigation_timeout_ms = float(navigation_timeout_ms)
         self._settle_timeout_ms = max(float(settle_timeout_ms), 0.0)
+        self._blocked: tuple[str | re.Pattern[str], ...] = (
+            SOMETIMES_ONLY_OVERLAYS if block is None else tuple(block)
+        )
         self._closed = False
 
         self._page: Page | None = None
@@ -215,6 +280,11 @@ class BrowserController:
                 viewport={"width": int(width), "height": int(height)},
                 device_scale_factor=device_scale_factor,
             )
+            # On the CONTEXT, not the page: the route then survives every
+            # navigation and covers a popup the page opens, which is where an
+            # appeal reappears if the block is installed one page at a time.
+            for pattern in self._blocked:
+                self._context.route(pattern, _abort)
             self._page = self._context.new_page()
             if start_url is not None:
                 self._page.goto(start_url, timeout=self._navigation_timeout_ms)
@@ -299,6 +369,11 @@ class BrowserController:
     def url(self) -> str | None:
         """The address the page is on, or ``None`` if it has none yet."""
         return self._live_page().url or None
+
+    @property
+    def blocked(self) -> tuple[str | re.Pattern[str], ...]:
+        """The URL patterns this controller aborts. See :data:`SOMETIMES_ONLY_OVERLAYS`."""
+        return self._blocked
 
     def describe(self) -> str:
         """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``."""

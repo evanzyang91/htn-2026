@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>skillweaver overlay fixture</title>
+<!--
+  A page that renders a full-width overlay only when a script it fetches arrives -
+  the shape of a fundraising appeal, a cookie bar or an A/B strip, offline. The
+  script is a sibling file, so blocking it is a request-level decision exactly as
+  it is on a real site, and the readout line says which of the two screens this
+  load turned out to be.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; }
+  body { font: 16px/1.4 -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  #overlay { display: none; height: 420px; background: #dbe7c9; }
+  #readout { position: absolute; left: 20px; top: 500px; }
+</style>
+<div id="overlay">We owe you an explanation.</div>
+<p id="readout">overlay: absent</p>
+<script src="overlay-banner.js"></script>
