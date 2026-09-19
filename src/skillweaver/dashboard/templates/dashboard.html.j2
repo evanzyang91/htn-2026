@@ -1,0 +1,400 @@
+{#- The whole dashboard, rendered into ONE self-contained file.
+    Rules this template keeps, because the tests check them and the point depends on them:
+      * no <link>, no <script src>, no external font, no linked image
+      * inline <svg> carries NO xmlns attribute - its value is an http:// URL, and the
+        HTML parser namespaces inline SVG on its own
+      * every image is a data: URI produced by build.data_uri
+    Autoescaping is on; |safe appears only on assets this package owns. -#}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>skillweaver - what the agent has learned</title>
+<style>{{ asset('dashboard.css')|safe }}</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="masthead">
+  <div class="brand"><span class="dot"></span>skillweaver</div>
+  <h1>The agent <span class="hl">got permanently better</span>.</h1>
+  <p class="lede">
+    It solved each task once the slow way - by looking at the screen and trying things -
+    then wrote what worked down as code. Everything below is what it kept: the skills it
+    can now call instead of re-deriving, the map of each site it built while exploring,
+    and what that memory buys on the second encounter.
+  </p>
+  <p class="built">built {{ d.built_at }} from <span class="mono">{{ d.data_dir }}</span></p>
+
+  <div class="stats">
+    {% for s in d.stats %}
+    <div class="stat {{ s.tone }}">
+      <div class="v"><span class="num">{{ s.value }}</span>{% if s.unit %}<span class="u">{{ s.unit }}</span>{% endif %}</div>
+      <div class="l">{{ s.label }}</div>
+      <div class="d">{{ s.detail }}</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <nav class="nav">
+    <a href="#speedup">Cold vs warm</a>
+    <a href="#skills">Skill library</a>
+    <a href="#graph">Site graph</a>
+    <a href="#run">Run filmstrip</a>
+  </nav>
+</header>
+
+<main>
+
+{#- ------------------------------------------------------------ cold vs warm -#}
+<section class="panel" id="speedup">
+  <header>
+    <div class="kicker">The payoff</div>
+    <h2>Cold versus warm, on the same task</h2>
+    <p class="why">
+      <b>Cold</b> is the first time the agent ever met a task: no stored skill, no map, so it
+      explored, asked the model at every step, and eventually got there. <b>Warm</b> is every
+      later encounter, where it retrieved the skill it wrote and ran it. Same task, same
+      success criterion - only the memory changed.
+    </p>
+  </header>
+
+  {% if d.speedup.empty_reason %}
+  <div class="empty">
+    <div class="t">Nothing to compare yet</div>
+    <p>{{ d.speedup.empty_reason }}</p>
+    {% if d.speedup.pending %}
+    <ul class="notes">
+      {% for t in d.speedup.pending %}
+      <li><span class="mono">{{ t.task_id }}</span> - {{ t.runs|length }} run(s) recorded</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% if d.speedup.notes %}
+    <ul class="notes">
+      {% for note in d.speedup.notes %}<li>{{ note }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    <details>
+      <summary>The shape this panel reads from &lt;data&gt;/eval/*.json</summary>
+      <pre class="code">{{ d.eval_format }}</pre>
+    </details>
+  </div>
+  {% else %}
+  <div class="legend">
+    <span><i class="c"></i>cold - first encounter, solved by exploring</span>
+    <span><i class="w"></i>warm - mean of later runs using the stored skill</span>
+  </div>
+
+  {% for r in d.speedup.rows %}
+  <div class="task">
+    <div class="task-head">
+      <span class="name">{{ r.task_text }}</span>
+      {% if r.domain %}<span class="tag">{{ r.domain }}</span>{% endif %}
+      {% if r.skill_used %}<span class="tag good">{{ r.skill_used }}</span>{% endif %}
+      <span class="meta">{{ r.warm_runs }} warm run(s), {{ r.warm_ok }} ok</span>
+    </div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="cap"><span>Wall clock</span>
+          {% if r.time_factor %}<span class="factor">{{ '%.1f'|format(r.time_factor) }}x faster</span>{% endif %}
+        </div>
+        <div class="bar cold">
+          <span class="k">cold</span>
+          <div class="track"><div class="fill" style="width:{{ '%.1f'|format(r.cold_ms_width) }}%"></div></div>
+          <span class="v">{{ r.cold_ms|ms }}</span>
+        </div>
+        <div class="bar warm">
+          <span class="k">warm</span>
+          <div class="track"><div class="fill" style="width:{{ '%.1f'|format(r.warm_ms_width) }}%"></div></div>
+          <span class="v">{{ r.warm_ms|ms }}</span>
+        </div>
+      </div>
+      <div class="metric">
+        <div class="cap"><span>Model calls</span>
+          {% if r.call_factor %}<span class="factor">{{ '%.1f'|format(r.call_factor) }}x fewer</span>{% endif %}
+        </div>
+        <div class="bar cold">
+          <span class="k">cold</span>
+          <div class="track"><div class="fill" style="width:{{ '%.1f'|format(r.cold_calls_width) }}%"></div></div>
+          <span class="v">{{ '%.0f'|format(r.cold_calls) }}</span>
+        </div>
+        <div class="bar warm">
+          <span class="k">warm</span>
+          <div class="track"><div class="fill" style="width:{{ '%.1f'|format(r.warm_calls_width) }}%"></div></div>
+          <span class="v">{{ '%.1f'|format(r.warm_calls) }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+
+  {% if d.speedup.pending or d.speedup.notes or d.speedup.suites %}
+  <div class="pending">
+    {% if d.speedup.suites %}<p>Suite: {{ d.speedup.suites|join(', ') }}{% if d.speedup.generated_at %}, measured {{ d.speedup.generated_at|date }}{% endif %}.</p>{% endif %}
+    {% if d.speedup.pending %}
+    <p>Run once so far, still waiting for a warm encounter:</p>
+    <ul>
+      {% for t in d.speedup.pending %}<li><span class="mono">{{ t.task_id }}</span> - {{ t.task_text }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+    {% if d.speedup.notes %}
+    <p>Files this panel could not read:</p>
+    <ul>{% for note in d.speedup.notes %}<li>{{ note }}</li>{% endfor %}</ul>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% endif %}
+</section>
+
+{#- ----------------------------------------------------------- skill library -#}
+<section class="panel" id="skills">
+  <header>
+    <div class="kicker">Memory, as code</div>
+    <h2>The skill library{% if d.skills.cards %}, newest first{% endif %}</h2>
+    <p class="why">
+      Each card is a Python function the agent wrote for itself after solving a task, stored
+      with the run it was distilled from and the record of how it has performed since. This is
+      the part that makes the improvement permanent: skills outlive the session, get versioned
+      when they are rewritten, and are retired rather than deleted when they stop working.
+    </p>
+  </header>
+
+  {% if d.skills.empty_reason %}
+  <div class="empty">
+    <div class="t">No skills learned yet</div>
+    <p>{{ d.skills.empty_reason }}</p>
+    {% if d.skills.note %}<p class="notes">{{ d.skills.note }}</p>{% endif %}
+  </div>
+  {% else %}
+  {% if d.skills.note %}<p class="hint">{{ d.skills.note }}</p>{% endif %}
+
+  {% if d.skills.timeline %}
+  <div class="growth">
+    <div class="cap">
+      <span>Skills known over time - {{ d.skills.cards|length }} learned</span>
+      <span class="mono">{{ d.skills.timeline_span }}</span>
+    </div>
+    <svg viewBox="0 0 {{ '%.0f'|format(d.skills.timeline_width) }} {{ '%.0f'|format(d.skills.timeline_height) }}" role="img" aria-label="Cumulative count of learned skills over time" preserveAspectRatio="none" height="{{ '%.0f'|format(d.skills.timeline_height) }}">
+      <path class="area" d="{{ d.skills.timeline_area }}"></path>
+      <path class="line" d="{{ d.skills.timeline_line }}"></path>
+      {% for p in d.skills.timeline %}
+      <circle class="pt" cx="{{ '%.1f'|format(p.x) }}" cy="{{ '%.1f'|format(p.y) }}" r="3.4"><title>{{ p.label }}</title></circle>
+      {% endfor %}
+    </svg>
+  </div>
+  {% endif %}
+
+  <div class="skills">
+    {% for c in d.skills.cards %}
+    <article class="skill{% if loop.first %} newest{% endif %}{% if c.demoted_reason %} demoted{% endif %}">
+      <div class="skill-head">
+        <span class="n">{{ c.name }}</span>
+        {% if c.domain %}<span class="tag">{{ c.domain }}</span>{% endif %}
+        <span class="tag">v{{ c.version }}</span>
+        {% if loop.first and not c.demoted_reason %}<span class="tag good">newest</span>{% endif %}
+        {% if c.has_verifier %}<span class="tag route">self-checking</span>{% endif %}
+        {% if c.demoted_reason %}<span class="tag bad">demoted</span>{% endif %}
+      </div>
+      <p class="sum">{{ c.summary }}</p>
+      {% if c.demoted_reason %}<p class="why-demoted">Retired: {{ c.demoted_reason }}</p>{% endif %}
+
+      <div class="meter">
+        {% if c.rate is none %}
+        <span class="lab">not run yet</span>
+        {% else %}
+        <div class="track"><div class="fill{% if c.rate < 0.6 %} low{% endif %}" style="width:{{ '%.1f'|format(c.rate_percent) }}%"></div></div>
+        <span class="lab">{{ '%.0f'|format(c.rate_percent) }}% of {{ c.runs }} run{{ '' if c.runs == 1 else 's' }}{% if c.mean_ms %}, {{ c.mean_ms|ms }} mean{% endif %}</span>
+        {% endif %}
+      </div>
+
+      <div class="params">
+        {% if c.params %}
+        {% for p in c.params %}
+        <div class="row"><span class="pn">{{ p.name }}</span><span class="pt">{{ p.type_ }}</span><span class="pd clip">{{ p.description }}</span></div>
+        {% endfor %}
+        {% else %}
+        <div class="none">takes no parameters</div>
+        {% endif %}
+      </div>
+
+      <details>
+        <summary>What it does, and the code it runs ({{ c.code_lines }} lines)</summary>
+        {% if c.docstring %}<p class="sum" style="margin-top:10px">{{ c.docstring }}</p>{% endif %}
+        {% if c.requires %}<p class="sub mono" style="color:var(--ink-4);font-size:12px">calls: {{ c.requires|join(', ') }}</p>{% endif %}
+        <pre class="code">{{ c.code }}</pre>
+      </details>
+
+      <div class="foot">
+        <span>learned {{ c.learned_ago }}</span>
+        <span>{{ c.learned_at|date }}</span>
+        {% if c.model %}<span>by {{ c.model }}</span>{% endif %}
+        {% if c.trajectory_id %}<span class="mono">from {{ c.trajectory_id }}</span>{% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
+
+{#- -------------------------------------------------------------- site graph -#}
+<section class="panel" id="graph">
+  <header>
+    <div class="kicker">Memory, as a map</div>
+    <h2>What the agent knows about each site</h2>
+    <p class="why">
+      Every box is a screen the agent learned to recognize; every arrow is a sequence of
+      actions it has actually watched move between two screens, labelled with how often that
+      worked. <b>Click any screen</b> to light up the cheapest known way to reach it from the
+      entry state - that is the route the agent takes instead of exploring, and its cost is
+      each edge's mean time divided by its success rate, so a flaky shortcut prices itself out.
+    </p>
+  </header>
+
+  {% if d.graph.empty_reason %}
+  <div class="empty">
+    <div class="t">No map yet</div>
+    <p>{{ d.graph.empty_reason }}</p>
+    {% if d.graph.note %}<p class="notes">{{ d.graph.note }}</p>{% endif %}
+  </div>
+  {% else %}
+  {% if d.graph.note %}<p class="hint">{{ d.graph.note }}</p>{% endif %}
+
+  <svg class="gdefs" aria-hidden="true" width="0" height="0">
+    <defs>
+      <marker id="arrow" viewBox="0 0 10 10" refX="9.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#3a4c68"></path>
+      </marker>
+      <marker id="arrow-on" viewBox="0 0 10 10" refX="9.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#60a5fa"></path>
+      </marker>
+    </defs>
+  </svg>
+
+  {% for p in d.graph.panels %}
+  <div class="domain-head">
+    <span class="dn">{{ p.domain }}</span>
+    <span class="tag">{{ p.nodes|length }} screens</span>
+    <span class="tag">{{ p.edges|length }} actions</span>
+    <span class="tag {{ 'good' if p.verified_edges else 'cold' }}">{{ p.verified_edges }} proven</span>
+    {% if p.entry_label %}<span class="tag route">entry: {{ p.entry_label }}</span>{% endif %}
+  </div>
+
+  <div class="canvas">
+    <svg data-graph="{{ p.prefix }}" width="{{ '%.0f'|format(p.width) }}" height="{{ '%.0f'|format(p.height) }}" viewBox="{{ p.view_box }}" role="img" aria-label="Known screens of {{ p.domain }} and the actions between them">
+      {% for e in p.edges %}
+      <g class="gedge{{ '' if e.verified else ' unverified' }}" data-edge="{{ e.key }}">
+        <title>{{ e.title }}</title>
+        <path class="wire" d="{{ e.path }}" marker-end="url(#arrow)"></path>
+        <path class="hit" d="{{ e.path }}"></path>
+        <rect class="epill" x="{{ '%.1f'|format(e.label_x - e.label_w / 2) }}" y="{{ '%.1f'|format(e.label_y - 9) }}" width="{{ '%.1f'|format(e.label_w) }}" height="18" rx="9"></rect>
+        <text class="elabel" x="{{ '%.1f'|format(e.label_x) }}" y="{{ '%.1f'|format(e.label_y + 4) }}" text-anchor="middle">{{ e.label }}</text>
+      </g>
+      {% endfor %}
+
+      {% for n in p.nodes %}
+      <g class="gnode clickable{{ ' entry' if n.is_entry }}" data-node="{{ n.key }}" data-label="{{ n.label }}">
+        <title>{{ n.label }} - first seen {{ n.first_seen }}, {{ n.in_degree }} in, {{ n.out_degree }} out</title>
+        <rect class="box" x="{{ '%.1f'|format(n.x) }}" y="{{ '%.1f'|format(n.y) }}" width="176" height="58" rx="10"></rect>
+        {% if n.thumbnail %}
+        <clipPath id="{{ p.prefix }}-clip-{{ n.key }}"><rect x="{{ '%.1f'|format(n.x + 9) }}" y="{{ '%.1f'|format(n.y + 11) }}" width="36" height="36" rx="6"></rect></clipPath>
+        <image href="{{ n.thumbnail }}" x="{{ '%.1f'|format(n.x + 9) }}" y="{{ '%.1f'|format(n.y + 11) }}" width="36" height="36" preserveAspectRatio="xMidYMid slice" clip-path="url(#{{ p.prefix }}-clip-{{ n.key }})"></image>
+        {% endif %}
+        <text class="nl" x="{{ '%.1f'|format(n.text_x) }}" y="{{ '%.1f'|format(n.y + 25) }}">{{ n.label_fit }}</text>
+        <text class="ns" x="{{ '%.1f'|format(n.text_x) }}" y="{{ '%.1f'|format(n.y + 42) }}">{{ n.sublabel_fit }}</text>
+      </g>
+      {% endfor %}
+    </svg>
+  </div>
+
+  <div class="routebar" id="{{ p.prefix }}-routebar">
+    <button type="button" hidden>clear route</button>
+    <span class="out"></span>
+    {% if p.routes %}<span class="idle">Click a screen above to trace the cheapest route the agent knows to it.</span>{% endif %}
+    {% if not p.routes %}<span>No proven route out of the entry state yet - every edge still needs a success before it can be routed through.</span>{% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+</section>
+
+{#- --------------------------------------------------------------- filmstrip -#}
+<section class="panel" id="run">
+  <header>
+    <div class="kicker">The evidence</div>
+    <h2>One recorded run, frame by frame</h2>
+    <p class="why">
+      Every run is recorded: the screenshot before and after each action, what the agent did,
+      and whether a critic judged the step to have worked. This is the raw material a skill is
+      compiled from, and the thing you replay when one goes wrong.
+    </p>
+  </header>
+
+  {% if d.film.empty_reason %}
+  <div class="empty">
+    <div class="t">No run to show</div>
+    <p>{{ d.film.empty_reason }}</p>
+    {% if d.film.other_runs %}<p class="notes">{{ d.film.other_runs }} other run(s) are stored.</p>{% endif %}
+  </div>
+  {% else %}
+  <div class="run-head">
+    <span class="task">{{ d.film.task }}</span>
+    {% if d.film.domain %}<span class="tag">{{ d.film.domain }}</span>{% endif %}
+    <span class="tag {{ 'good' if d.film.ok else 'bad' }}">{{ 'succeeded' if d.film.ok else 'did not succeed' }}</span>
+    {% if not d.film.complete %}<span class="tag cold">incomplete</span>{% endif %}
+    <span class="tag">{{ d.film.step_count }} steps</span>
+    <span class="tag">{{ d.film.duration }}</span>
+    <span class="tag mono">{{ d.film.run_id }}</span>
+  </div>
+
+  {% if d.film.frames %}
+  <div class="strip">
+    {% for f in d.film.frames %}
+    <figure class="frame{{ '' if f.ok else ' failed' }}" style="margin:0">
+      {% if f.image %}
+      <img class="shot" src="{{ f.image }}" alt="Screen after step {{ f.index + 1 }}: {{ f.verb }} {{ f.detail }}" loading="lazy">
+      {% else %}
+      <div class="noshot">screenshot not stored</div>
+      {% endif %}
+      <figcaption class="body">
+        <div class="step">
+          <span>step {{ f.index + 1 }}</span>
+          <span class="tag {{ 'good' if f.verdict_ok else ('bad' if f.verdict == 'fail' else '') }}">{{ f.verdict }}</span>
+          <span>{{ f.elapsed }}</span>
+        </div>
+        <div class="act"><span class="verb">{{ f.verb }}</span> <span class="det">{{ f.detail }}</span></div>
+        {% if f.note %}<div class="sub">&ldquo;{{ f.note }}&rdquo;</div>{% endif %}
+        {% if f.verdict_reason %}<div class="sub">{{ f.verdict_reason }}{% if f.verdict_source %} ({{ f.verdict_source }}){% endif %}</div>{% endif %}
+        {% if f.url %}<div class="sub mono">{{ f.url }}</div>{% endif %}
+        {% if f.error %}<div class="err">{{ f.error }}</div>{% endif %}
+      </figcaption>
+    </figure>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty"><div class="t">This run recorded no steps</div><p>It started and finished without performing an action.</p></div>
+  {% endif %}
+
+  <p class="hint">
+    {% if d.film.shown > 3 %}Scroll the strip sideways to follow all {{ d.film.shown }} frames. {% endif %}
+    {% if d.film.truncated %}Showing the first {{ d.film.shown }} of {{ d.film.step_count }} steps. {% endif %}
+    {% if d.film.note %}Closing note: {{ d.film.note }} {% endif %}
+    {% if d.film.other_runs %}{{ d.film.other_runs }} other run(s) are stored alongside this one.{% endif %}
+  </p>
+  {% endif %}
+</section>
+
+</main>
+
+<footer>
+  <p>Generated by <span class="mono">skillweaver.dashboard.build</span> - one file, no server, no network.</p>
+  <p class="mono">source: {{ d.data_dir }} - built {{ d.built_at }}</p>
+</footer>
+
+</div>
+
+<script type="application/json" id="route-data">{{ routes|tojson }}</script>
+<script>{{ asset('dashboard.js')|safe }}</script>
+</body>
+</html>

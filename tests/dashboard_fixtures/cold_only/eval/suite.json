@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "suite": "first-pass",
+  "tasks": [
+    {
+      "task_id": "find_invoice",
+      "task_text": "Find the invoice for Acme Corp and open it",
+      "runs": [
+        {
+          "attempt": 1,
+          "ok": true,
+          "wall_ms": 48120.0,
+          "llm_calls": 23
+        }
+      ]
+    }
+  ]
+}

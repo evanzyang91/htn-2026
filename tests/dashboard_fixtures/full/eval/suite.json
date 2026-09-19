@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "suite": "sandbox-site",
+  "generated_at": "2026-09-19T09:55:00+00:00",
+  "tasks": [
+    {
+      "task_id": "find_invoice",
+      "task_text": "Find the invoice for Acme Corp and open it",
+      "domain": "sandbox.test",
+      "runs": [
+        {
+          "attempt": 1,
+          "ok": true,
+          "wall_ms": 48120.0,
+          "llm_calls": 23,
+          "steps": 14,
+          "skill_used": null,
+          "usd": 0.42,
+          "run_id": "a1b2c3d4e5f6",
+          "started_at": "2026-09-19T09:41:00+00:00"
+        },
+        {
+          "attempt": 2,
+          "ok": true,
+          "wall_ms": 6210.0,
+          "llm_calls": 2,
+          "steps": 4,
+          "skill_used": "search_records",
+          "usd": 0.03
+        },
+        {
+          "attempt": 3,
+          "ok": true,
+          "wall_ms": 5890.0,
+          "llm_calls": 2,
+          "steps": 4,
+          "skill_used": "search_records",
+          "usd": 0.03
+        }
+      ]
+    },
+    {
+      "task_id": "open_record",
+      "task_text": "Open the detail view of invoice INV-101",
+      "domain": "sandbox.test",
+      "runs": [
+        {
+          "attempt": 1,
+          "ok": true,
+          "wall_ms": 19400.0,
+          "llm_calls": 11,
+          "steps": 7
+        },
+        {
+          "attempt": 2,
+          "ok": true,
+          "wall_ms": 4100.0,
+          "llm_calls": 2,
+          "steps": 3,
+          "skill_used": "open_record_detail"
+        }
+      ]
+    },
+    {
+      "task_id": "send_reply",
+      "task_text": "Reply to the newest message in the inbox",
+      "domain": "sandbox.test",
+      "runs": [
+        {
+          "attempt": 1,
+          "ok": true,
+          "wall_ms": 62000.0,
+          "llm_calls": 31,
+          "steps": 19
+        },
+        {
+          "attempt": 2,
+          "ok": true,
+          "wall_ms": 15800.0,
+          "llm_calls": 5,
+          "steps": 6,
+          "skill_used": "send_reply"
+        },
+        {
+          "attempt": 3,
+          "ok": false,
+          "wall_ms": 41000.0,
+          "llm_calls": 18,
+          "steps": 12,
+          "skill_used": "send_reply"
+        }
+      ]
+    },
+    {
+      "task_id": "export_csv",
+      "task_text": "Export the current records view as CSV",
+      "domain": "sandbox.test",
+      "runs": [
+        {
+          "attempt": 1,
+          "ok": true,
+          "wall_ms": 27300.0,
+          "llm_calls": 15,
+          "steps": 9
+        }
+      ]
+    }
+  ]
+}
