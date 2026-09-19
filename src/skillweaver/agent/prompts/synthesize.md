@@ -35,12 +35,16 @@ you just found - NOT coordinates (see "Never write coordinates" below).
 ```python
 ctx.see.find_text("Confirm payment")  # best match first, [] when none
 ctx.see.find_text("Confirm payment", "button")  # restricted to a kind
-ctx.see.by_kind("row")  # every row, in reading order
-ctx.see.best("blue submit button")  # free-form description
-ctx.see.nearest(element.box.center, "button")  # by distance, nearest first
+ctx.see.best("blue submit button")  # free-form description, kind words included
+ctx.see.nearest(element.box.center, "checkbox")  # by distance from a point you found
 ctx.see.containing(element.box.center)  # smallest box first
+ctx.see.by_kind("row")  # every row, in reading order
 ctx.see.all()  # everything, in reading order
 ```
+
+The first four NAME what they are looking for; the last two only count. That
+difference is rule 7, and it is the difference between a skill that keeps working
+and one that does not.
 
 Every one of these returns a LIST, best first, and an EMPTY list when nothing
 matches - never `None`, never an exception. Index it only after you have checked it.
@@ -78,26 +82,64 @@ followed by `[0]` is an `IndexError` and tells whoever reads the trace nothing.
    zip all any isinstance issubclass chr` and ordinary exceptions.
 6. **Never write coordinates.** `ctx.ctl.click(Point(400, 140))` or
    `click((400, 140))` is a screenshot, not a skill: it breaks the first time the
-   page moves. Find the element by its text or kind, check it, then click IT.
-   Each recorded step tells you which element its coordinate landed on. Use THAT
-   element. When it has no readable text - many checkboxes and icons do not, and no
-   amount of wishing makes the text appear - address it by kind and by its place in
-   reading order, which is the handle the recording gives you:
+   page moves. Find the element, check it, then click IT. Each recorded step tells
+   you which element its coordinate landed on. Use THAT element.
+7. **Anchor on meaning, never on position.** This is the rule that decides whether
+   your skill survives its second run. `ctx.see.by_kind("text")[1]` and
+   `ctx.see.all()[4]` say "the second text on screen" and "the fifth thing on
+   screen": an advert, a banner, one extra caption read by OCR, a different window
+   width, and the index points at something else. Name the thing instead.
 
    ```python
-   boxes = ctx.see.by_kind("checkbox")  # reading order, always a list
-   ctx.expect(len(boxes) >= 2, "the inbox rows have no checkboxes")
-   ctx.ctl.click(boxes[1])  # "checkbox number 2 of 9"
+   # NO - counts, and the count changes
+   field = ctx.see.by_kind("text_field")[1]
+
+   # YES - names the thing, and checks it
+   field = ctx.see.find_text("Search Wikipedia", "text_field")
+   ctx.expect(bool(field), "no search field on this page")
+   ctx.ctl.click(field[0])
    ```
+
+   `find_text(...)[0]`, `best(...)[0]`, `nearest(...)[0]` and `containing(...)[0]`
+   are NOT positional: the `[0]` there means "the best match for what I asked for",
+   which is what you want. The recorded elements above are where the names come
+   from - the label on the button, the heading of the column, the text of the row.
+
+   When the element carries no text of its own - many checkboxes and icons do not,
+   and no amount of wishing makes the text appear - anchor on the labelled thing it
+   sits in or beside:
+
+   ```python
+   row = ctx.see.find_text("Acme Corp", "row")
+   ctx.expect(bool(row), "no Acme Corp row on the list")
+   box = ctx.see.nearest(row[0].box.center, "checkbox")
+   ctx.expect(bool(box), "that row has no checkbox")
+   ctx.ctl.click(box[0])
+   ```
+
+   Only when the recording gives you NOTHING to name - no text on the element, none
+   on anything around it - may you fall back to an index, and then you must say so
+   in the trace on the line before you use it:
+
+   ```python
+   ctx.log("no readable text on these rows: taking checkbox number 2 in reading order")
+   boxes = ctx.see.by_kind("checkbox")
+   ctx.expect(len(boxes) >= 2, "the inbox rows have no checkboxes")
+   ctx.ctl.click(boxes[1])
+   ```
+
+   A hardening pass reads your code before it is run: it re-anchors positional picks
+   it can ground in the recording, and writes that `ctx.log` line for the ones it
+   cannot. Write it anchored yourself and it stays exactly as you wrote it.
 
    Do NOT invent a `find_text` for words the recording never shows you. Searching
    for a name that is not in the elements above returns `[]`, and a fallback that
    then clicks "the nearest something" acts on the wrong row - which is how a skill
    passes its own verifier and is thrown out by the critic.
-7. **Parameterize what varied.** The name, the amount, the query this run happened
+8. **Parameterize what varied.** The name, the amount, the query this run happened
    to use belongs in a parameter, not in a literal. What is structural - a button
    label, a column heading - stays a literal.
-8. **Keep it short and straight.** No classes, no decorators, no helper functions
+9. **Keep it short and straight.** No classes, no decorators, no helper functions
    unless the body genuinely repeats. A skill is one short procedure; if it needs
    forty actions it is not a skill yet.
 

@@ -54,8 +54,15 @@ nothing stored. Assistant prefill would be the tidier fix and is not available:
 ``claude-opus-5`` rejects a conversation that ends on an assistant turn outright.
 
 Before any of that the draft goes through :mod:`skillweaver.skills.refactor`, which
-replaces literal coordinates with perception lookups and lifts this run's data into
-parameters. Hardening first, admission second: what is judged is what is stored.
+replaces literal coordinates with perception lookups, lifts this run's data into
+parameters, and re-anchors every element the draft reached for BY POSITION onto
+something nameable. That last one is the difference between a skill that replays on a
+real site and one that does not: a model that has just watched a run writes
+``ctx.see.by_kind("text")[1]`` for the search box, which is true of exactly the page
+it watched. Where the recording names nothing to anchor on the lookup is KEPT and
+made to log that it navigates by position - a brittle skill that says so is worth
+more than no skill. Hardening first, admission second: what is judged is what is
+stored, and the gate's guarantee is untouched by any of it.
 """
 
 from __future__ import annotations
@@ -950,7 +957,21 @@ class Synthesizer:
         hardening = harden(draft.code, trajectory, params=draft.params)
         params = {**dict(draft.params), **dict(hardening.added_params)}
         if hardening.changed:
-            log.debug("skill.harden.applied", name=draft.name, changes=len(hardening.changes))
+            log.debug(
+                "skill.harden.applied",
+                name=draft.name,
+                changes=len(hardening.changes),
+                anchored=hardening.positions_anchored,
+            )
+        if hardening.positions_announced:
+            # Not a rejection: the recording offered nothing to anchor these on, so
+            # the skill keeps them and says so in its own trace. Worth a line in the
+            # run log, because it is the honest measure of how thin a skill is.
+            log.info(
+                "skill.harden.positional",
+                name=draft.name,
+                lookups=hardening.positions_announced,
+            )
         try:
             candidate = make_skill(
                 name=draft.name,

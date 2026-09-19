@@ -25,7 +25,7 @@ import pytest
 from skillweaver.contracts import Fingerprint, LLMResponse, Trajectory, Verdict
 from skillweaver.errors import SkillNotFound
 from skillweaver.llm.cassette import CassetteClient
-from skillweaver.skills.refactor import harden
+from skillweaver.skills.refactor import harden, positional_lookups
 from skillweaver.skills.synthesize import (
     ReplayEnvironment,
     Synthesizer,
@@ -729,6 +729,71 @@ def test_hardening_keeps_an_already_hard_skill_working(trajectory, environment, 
     assert store.get("confirm_invoice_payment", DOMAIN).version == 1
 
 
+def test_a_skill_that_navigates_by_position_is_stored_anchored_on_meaning(
+    trajectory, environment, critic, skill_store
+):
+    """End to end, on the source the STORE holds: the defect the live Wikipedia run
+    shipped - reach the search box by counting - does not survive into the library.
+
+    The model here writes exactly what it wrote on Wikipedia: a bare index into a
+    perception-ordered list. What is stored names both elements instead, and still
+    runs: ``admission.ok`` is the gate agreeing, not this test asserting.
+    """
+    positional = (
+        "def run(ctx, company):\n"
+        "    ctx.ctl.type_text('acme')\n"
+        "    rows = ctx.see.by_kind('row')\n"
+        "    ctx.expect(len(rows) >= 1, 'no rows')\n"
+        "    ctx.ctl.click(rows[0])\n"
+        "    ctx.ctl.click(ctx.see.by_kind('button')[0])\n"
+        "    return True\n"
+    )
+    assert len(positional_lookups(positional)) == 2  # what the model wrote
+
+    llm = FakeLLM([reply(positional)])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(trajectory, environment)
+
+    assert admission.ok, admission.reason
+    stored = skill_store.get("confirm_invoice_payment", DOMAIN)
+    assert positional_lookups(stored.code) == ()  # what the library holds
+    assert "ctx.see.find_text('Acme Corp INV-1042 $1,200.00', 'row')" in stored.code
+    assert "ctx.see.find_text('Confirm payment', 'button')" in stored.code
+    assert admission.attempts[-1].hardening is not None
+    assert admission.attempts[-1].hardening.positions_anchored == 2
+
+
+def test_a_skill_with_no_anchor_to_move_to_is_still_admitted_and_says_so(
+    trajectory, environment, critic, skill_store
+):
+    """The line this pass must not cross. Nothing in this run is a checkbox, so there
+    is no anchor to rewrite onto - and a skill that works positionally and announces
+    it is worth more than no skill. It is stored, carrying its own confession."""
+    stubborn = (
+        "def run(ctx, company):\n"
+        "    ctx.ctl.type_text('acme')\n"
+        "    ctx.ctl.click(ctx.see.find_text('Acme Corp', 'row')[0])\n"
+        "    boxes = ctx.see.by_kind('checkbox')\n"
+        "    if boxes:\n"
+        "        ctx.ctl.click(boxes[0])\n"
+        "    ctx.ctl.click(ctx.see.find_text('Confirm payment', 'button')[0])\n"
+        "    return True\n"
+    )
+    assert len(positional_lookups(stubborn)) == 1
+
+    llm = FakeLLM([reply(stubborn)])
+    admission = synthesizer(llm, skill_store, critic, max_repairs=0).admit(trajectory, environment)
+
+    assert admission.ok, admission.reason
+    stored = skill_store.get("confirm_invoice_payment", DOMAIN)
+    assert stored.version == 1
+    # Kept, not rejected - and now it announces itself, in the branch that uses it.
+    assert len(positional_lookups(stored.code)) == 1
+    assert "checkbox number 1 in reading order" in stored.code
+    hardening = admission.attempts[-1].hardening
+    assert hardening is not None
+    assert hardening.positions_unanchored == 1
+
+
 # --------------------------------------------------------------------------------------
 # The prompt and the brief
 # --------------------------------------------------------------------------------------
@@ -741,6 +806,18 @@ def test_the_prompt_states_the_api_forbids_imports_and_demands_a_verifier():
     assert "No imports" in prompt
     assert "def verify(ctx, result)" in prompt
     assert "Never write coordinates" in prompt
+
+
+def test_the_prompt_teaches_meaning_over_position():
+    """The other half of the rule the hardening pass enforces. A prompt is a request
+    and the pass is the guarantee, but a model that anchors its own code costs no
+    rewrite - and the prompt has to name the finders it can anchor WITH."""
+    prompt = load_prompt()
+    assert "Anchor on meaning, never on position" in prompt
+    for finder in ("ctx.see.find_text", "ctx.see.best", "ctx.see.nearest"):
+        assert finder in prompt
+    assert 'ctx.see.by_kind("text")[1]' in prompt  # named as the thing NOT to write
+    assert "ctx.log(" in prompt  # the confession a positional fallback must carry
 
 
 def test_the_brief_describes_the_run_deterministically(trajectory):

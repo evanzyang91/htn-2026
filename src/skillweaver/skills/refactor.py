@@ -12,7 +12,7 @@ trajectory it was written from, BEFORE the admission gate in
     hardened.changes          # one readable line per rewrite, for the run log
     hardened.added_params     # params to merge into the skill's schema
 
-Four rewrites, applied in this order:
+Five rewrites, applied in this order:
 
 *Hardcoded navigation is lifted out.* A ``run`` that begins by typing a URL, or by
 performing a ``Navigate``, is a skill that insists on arriving its own way. The
@@ -39,6 +39,18 @@ value as its default - so the skill generalizes without breaking its own replay.
 *Names become readable.* A local bound to a perception lookup and called ``e`` or
 ``tmp`` is renamed after what it holds (``confirm_payment_button``).
 
+*Positions become meanings.* ``ctx.see.by_kind("text")[1]`` is a skill that reaches
+its search box by counting, and the count changes the moment an advert loads or OCR
+reads one extra caption - this is the single commonest reason a stored skill fails to
+replay on a real site. Every bare positional subscript into a perception result is
+found (including through an intermediate variable) and re-anchored on something
+nameable: the element's own text where the recording shows some, otherwise the
+nearest labelled thing it sits in or beside. Where the recording genuinely offers no
+anchor - an unlabelled checkbox on a page of unlabelled checkboxes - the lookup is
+KEPT and a ``ctx.log`` line is injected saying so, because a skill that works
+positionally and announces it is worth more than no skill. See
+:func:`positional_lookups`, which is the detector on its own.
+
 Everything here is AST-to-AST and the result is re-emitted with ``ast.unparse``,
 which normalizes formatting and DROPS COMMENTS. That is the deliberate trade: a
 uniform, re-parseable library beats a model's commentary. Nothing here validates or
@@ -51,16 +63,18 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from skillweaver.contracts import (
+    Box,
     Click,
     Drag,
     Element,
     ElementKind,
     Move,
+    Observation,
     Point,
     Scroll,
     Trajectory,
@@ -71,8 +85,10 @@ from skillweaver.logging_ import get_logger
 __all__ = [
     "COORDINATE_METHODS",
     "Hardening",
+    "PositionalLookup",
     "element_at",
     "harden",
+    "positional_lookups",
     "typed_texts",
 ]
 
@@ -114,6 +130,27 @@ _OPAQUE_NAME = re.compile(
 
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 
+_POSITIONAL_QUERIES = frozenset({"by_kind", "all"})
+"""``ctx.see`` queries that name NOTHING about what they return. Subscripting one
+picks an element by where it happens to sit in the perception order, and that order
+moves with the page: one extra advert, one more caption read by OCR, a wider window."""
+
+_NAMED_QUERIES = frozenset({"find_text", "best", "by_id", "nearest", "containing"})
+"""``ctx.see`` queries that already say what they are looking for. ``result[0]`` on
+one of these is "the best match for what I asked", not "the second thing on screen",
+so it is left alone - this is what a re-anchored lookup is rewritten INTO."""
+
+_ANNOUNCES_POSITION = re.compile(
+    r"position|reading order|no readable|not readable|by index|ordinal", re.IGNORECASE
+)
+"""What a ``ctx.log`` line has to mention for a positional lookup to count as already
+announced. The archive skill's own "sender name not readable" line matches, so a model
+that owned up to its fallback is not made to own up twice."""
+
+_ANCHOR_REACH = 240
+"""How far, in LOGICAL pixels, a textless element may sit from the labelled thing used
+to find it. Past that they are not the same row and the anchor would be a guess."""
+
 
 # --------------------------------------------------------------------------------------
 # The report
@@ -135,6 +172,11 @@ class Hardening:
         lookups_added: ``ctx.see`` queries introduced.
         navigation_lifted: The navigation targets removed from the body.
         renamed: Opaque local names mapped to what they became.
+        positions_anchored: Positional subscripts rewritten onto a named element.
+        positions_announced: Positional subscripts the recording gave no anchor for,
+            which were KEPT and made to announce themselves with a ``ctx.log`` line.
+            A non-empty tuple is not a failure; it is the skill saying where it is
+            thin, and :attr:`positions_unanchored` counts it.
     """
 
     code: str
@@ -144,6 +186,13 @@ class Hardening:
     lookups_added: int = 0
     navigation_lifted: tuple[str, ...] = ()
     renamed: Mapping[str, str] = field(default_factory=dict, hash=False)
+    positions_anchored: int = 0
+    positions_announced: tuple[str, ...] = ()
+
+    @property
+    def positions_unanchored(self) -> int:
+        """How many lookups still navigate by position, having said so."""
+        return len(self.positions_announced)
 
     @property
     def changed(self) -> bool:
@@ -155,6 +204,46 @@ class Hardening:
         if not self.changes:
             return "hardening: nothing to change"
         return "hardening: " + "; ".join(self.changes)
+
+
+@dataclass(frozen=True, slots=True)
+class PositionalLookup:
+    """One place a skill reaches for an element by counting instead of by naming.
+
+    Attributes:
+        query: The ``ctx.see`` method that produced the list - ``"by_kind"`` or
+            ``"all"``. Both say nothing about WHICH element is wanted.
+        kind: The kind ``by_kind`` was given, when it was a literal; ``None`` for
+            ``all()`` and for a kind computed at runtime.
+        index: The constant subscript. Negative counts from the end.
+        via: The local the list was held in, when the subscript went through one
+            (``rows = ctx.see.by_kind("row")`` ... ``rows[2]``); ``None`` when the
+            query was subscripted directly.
+        line: Line number in the source it was found in, 1-based.
+    """
+
+    query: str
+    kind: str | None
+    index: int
+    via: str | None = None
+    line: int = 0
+
+    @property
+    def call(self) -> str:
+        """The query as it reads in source."""
+        if self.query != "by_kind":
+            return "ctx.see.all()"
+        return f"ctx.see.by_kind({self.kind!r})" if self.kind else "ctx.see.by_kind(...)"
+
+    @property
+    def position(self) -> str:
+        """The index in words: ``"number 2"``, or ``"1 from the end"``."""
+        return f"number {self.index + 1}" if self.index >= 0 else f"{abs(self.index)} from the end"
+
+    def __str__(self) -> str:
+        if self.via:
+            return f"{self.via}[{self.index}], from {self.call}"
+        return f"{self.call}[{self.index}]"
 
 
 # --------------------------------------------------------------------------------------
@@ -170,15 +259,12 @@ def _action_points(action: Any) -> tuple[Point, ...]:
     return ()
 
 
-def element_at(trajectory: Trajectory, x: int, y: int) -> Element | None:
-    """The element the RECORDING shows at logical point ``(x, y)``, or ``None``.
+def _locate(trajectory: Trajectory, x: int, y: int) -> tuple[Element, Observation] | None:
+    """:func:`element_at`, and the screen the element was found on.
 
-    A step whose own action targeted exactly this point is consulted first, using
-    the screen as it was BEFORE that action - that is the element the model meant.
-    Failing that, every observation in the run is searched. Among candidates the
-    smallest box wins, so a button inside a row beats the row.
-
-    Coordinates are LOGICAL pixels, like everything else in this codebase.
+    The screen matters to the anchoring pass: an element with no readable text can
+    only be described by what sits around it, and "around it" is a fact about one
+    observation, not about the run.
     """
     point = Point(x, y)
 
@@ -190,12 +276,69 @@ def element_at(trajectory: Trajectory, x: int, y: int) -> Element | None:
         if any(p == point for p in _action_points(step.action)):
             found = smallest(step.before.elements)
             if found is not None:
-                return found
+                return found, step.before
     for step in trajectory.steps:
         for observation in (step.before, step.after):
             found = smallest(observation.elements)
             if found is not None:
-                return found
+                return found, observation
+    return None
+
+
+def element_at(trajectory: Trajectory, x: int, y: int) -> Element | None:
+    """The element the RECORDING shows at logical point ``(x, y)``, or ``None``.
+
+    A step whose own action targeted exactly this point is consulted first, using
+    the screen as it was BEFORE that action - that is the element the model meant.
+    Failing that, every observation in the run is searched. Among candidates the
+    smallest box wins, so a button inside a row beats the row.
+
+    Coordinates are LOGICAL pixels, like everything else in this codebase.
+    """
+    found = _locate(trajectory, x, y)
+    return found[0] if found is not None else None
+
+
+def _reach(box: Box, point: Point) -> float:
+    """Distance in LOGICAL pixels from ``point`` to ``box``; ``0.0`` when inside."""
+    dx = max(box.x - point.x, 0, point.x - (box.x + box.w))
+    dy = max(box.y - point.y, 0, point.y - (box.y + box.h))
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def _labelled_neighbour(observation: Observation, element: Element) -> Element | None:
+    """The labelled thing a textless ``element`` can be found FROM, or ``None``.
+
+    A checkbox with no text is still findable when it sits in a row that reads
+    something: "the checkbox nearest that row" survives the row moving, which its
+    position in the checkbox list does not. Containment beats proximity - the row
+    the control is IN is a stronger claim than the caption beside it - and past
+    :data:`_ANCHOR_REACH` nothing is claimed at all.
+    """
+    centre = element.box.center
+    best: tuple[int, float, int, Element] | None = None
+    for other in observation.elements:
+        if other is element or not other.text.strip():
+            continue
+        if other.box == element.box:
+            continue
+        inside = other.box.contains(centre)
+        distance = 0.0 if inside else _reach(other.box, centre)
+        if not inside and distance > _ANCHOR_REACH:
+            continue
+        key = (0 if inside else 1, distance, other.box.area, other)
+        if best is None or key[:3] < best[:3]:
+            best = key
+    return best[3] if best is not None else None
+
+
+def _at_position(observation: Observation, kind: str | None, index: int) -> Element | None:
+    """What ``by_kind(kind)[index]`` - or ``all()[index]`` when ``kind`` is ``None`` -
+    would have picked on this screen. ``Observation.elements`` is already in reading
+    order, which is the order ``ctx.see`` returns these two queries in."""
+    matching = [e for e in observation.elements if kind is None or e.kind.value == kind]
+    if -len(matching) <= index < len(matching):
+        return matching[index]
     return None
 
 
@@ -378,6 +521,142 @@ def _bound_names(fn: ast.FunctionDef) -> set[str]:
     return names
 
 
+_BLOCK_FIELDS = ("body", "orelse", "finalbody")
+"""Statement lists a compound statement owns. A prefix belongs in the block the
+statement that needs it lives in, not hoisted to the top of ``run``: hoisting a
+lookup out of an ``if`` makes it run when it should not, and out of a ``for`` makes
+it run once when the screen changes every pass."""
+
+
+def _see_query(node: ast.expr) -> tuple[str, str | None] | None:
+    """``("by_kind", "row")`` for ``ctx.see.by_kind("row")``; ``None`` for anything
+    that is not a ``ctx.see`` call. The kind is ``None`` when it is not a literal."""
+    if not isinstance(node, ast.Call):
+        return None
+    method = _ctx_method(node.func, "see")
+    if method is None:
+        return None
+    kind: str | None = None
+    if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+        kind = node.args[0].value
+    return method, kind
+
+
+def _blocks(statement: ast.stmt) -> Iterator[tuple[object, str, list[ast.stmt]]]:
+    """Every statement list ``statement`` owns, as ``(owner, field name, block)``.
+    Assigning back through ``setattr(owner, name, ...)`` replaces it in place."""
+    for name in _BLOCK_FIELDS:
+        block = getattr(statement, name, None)
+        if isinstance(block, list) and block and all(isinstance(s, ast.stmt) for s in block):
+            yield statement, name, block
+    for handler in getattr(statement, "handlers", ()):
+        yield handler, "body", handler.body
+
+
+def _own_nodes(statement: ast.stmt) -> list[ast.AST]:
+    """Every node ``statement`` owns, stopping at the blocks it merely contains."""
+    found: list[ast.AST] = []
+    for name, value in ast.iter_fields(statement):
+        if name in _BLOCK_FIELDS or name == "handlers":
+            continue
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, ast.AST):
+                found.extend(ast.walk(item))
+    return found
+
+
+def _track_sources(statement: ast.stmt, sources: dict[str, tuple[str, str | None]]) -> None:
+    """Record what each local was last bound to, so ``rows[2]`` can be read as the
+    query that filled ``rows``. A name bound to anything else stops being tracked -
+    a stale entry would make this pass rewrite the wrong expression."""
+    if not isinstance(statement, ast.Assign):
+        for node in _own_nodes(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                sources.pop(node.id, None)
+        return
+    query = _see_query(statement.value)
+    for target in statement.targets:
+        if not isinstance(target, ast.Name):
+            for node in ast.walk(target):
+                if isinstance(node, ast.Name):
+                    sources.pop(node.id, None)
+            continue
+        if query is not None:
+            sources[target.id] = query
+        else:
+            sources.pop(target.id, None)
+
+
+def _positional_subscript(
+    node: ast.AST, sources: Mapping[str, tuple[str, str | None]]
+) -> PositionalLookup | None:
+    """``node`` read as a bare positional pick out of a perception result, or ``None``.
+
+    Both shapes the model writes are the same defect: ``ctx.see.by_kind("text")[1]``
+    and ``rows = ctx.see.all()`` followed by ``rows[1]``. A subscript of a NAMED query
+    (``find_text(...)[0]``) is not one - that index means "the best match" - and
+    neither is a slice or a computed index, which are not fixed positions at all.
+    """
+    if not isinstance(node, ast.Subscript):
+        return None
+    index = _number(node.slice)
+    if index is None:
+        return None
+    query = _see_query(node.value)
+    if query is not None:
+        method, kind = query
+        if method in _POSITIONAL_QUERIES:
+            return PositionalLookup(method, kind, index, line=getattr(node, "lineno", 0))
+        return None
+    if isinstance(node.value, ast.Name):
+        source = sources.get(node.value.id)
+        if source is not None and source[0] in _POSITIONAL_QUERIES:
+            return PositionalLookup(
+                source[0], source[1], index, via=node.value.id, line=getattr(node, "lineno", 0)
+            )
+    return None
+
+
+def _scan_block(
+    body: Sequence[ast.stmt],
+    sources: dict[str, tuple[str, str | None]],
+    found: list[PositionalLookup],
+) -> None:
+    """Collect positional lookups in source order, descending into nested blocks."""
+    for statement in body:
+        for node in _own_nodes(statement):
+            lookup = _positional_subscript(node, sources)
+            if lookup is not None:
+                found.append(lookup)
+        for _, _, block in _blocks(statement):
+            _scan_block(block, dict(sources), found)
+        _track_sources(statement, sources)
+
+
+def positional_lookups(code: str) -> tuple[PositionalLookup, ...]:
+    """Every place ``code``'s ``run`` reaches for an element by position, in order.
+
+    This is the detector on its own, with no trajectory and no rewriting, so a test -
+    or a reviewer - can ask one question of a skill: does it navigate by meaning?
+    An empty tuple is the answer that matters. Source that does not parse, or that
+    defines no ``run``, has no lookups to report rather than being an error; judging
+    it is the admission gate's job.
+
+    See :data:`_POSITIONAL_QUERIES` for what counts and :data:`_NAMED_QUERIES` for
+    what deliberately does not.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ()
+    fn = _run_function(tree)
+    if fn is None:
+        return ()
+    found: list[PositionalLookup] = []
+    _scan_block(fn.body, {}, found)
+    return tuple(found)
+
+
 # --------------------------------------------------------------------------------------
 # Building the replacement code
 # --------------------------------------------------------------------------------------
@@ -411,27 +690,109 @@ def _lookup_call(element: Element) -> tuple[ast.expr, str]:
     return call, f"a {element.kind.value}"
 
 
+def _expect_found(name: str, why: str) -> ast.stmt:
+    """``ctx.expect(bool(name), why)`` - what makes an empty lookup honest instead of
+    an ``IndexError`` two lines later."""
+    return ast.Expr(
+        value=ast.Call(
+            func=_attr("ctx", "expect"),
+            args=[
+                ast.Call(
+                    func=ast.Name(id="bool", ctx=ast.Load()),
+                    args=[ast.Name(id=name, ctx=ast.Load())],
+                    keywords=[],
+                ),
+                ast.Constant(value=why),
+            ],
+            keywords=[],
+        )
+    )
+
+
 def _lookup_statements(name: str, element: Element, verb: str) -> list[ast.stmt]:
     """``name = ctx.see...`` followed by the ``ctx.expect`` that makes a miss honest."""
     call, described = _lookup_call(element)
-    why = f"no {described} on screen to {verb}"
     return [
         ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=call),
-        ast.Expr(
-            value=ast.Call(
-                func=_attr("ctx", "expect"),
-                args=[
-                    ast.Call(
-                        func=ast.Name(id="bool", ctx=ast.Load()),
-                        args=[ast.Name(id=name, ctx=ast.Load())],
-                        keywords=[],
-                    ),
-                    ast.Constant(value=why),
-                ],
-                keywords=[],
-            )
-        ),
+        _expect_found(name, f"no {described} on screen to {verb}"),
     ]
+
+
+def _first(name: str) -> ast.expr:
+    """``name[0]`` - the best match of a query that said what it was looking for."""
+    return ast.Subscript(
+        value=ast.Name(id=name, ctx=ast.Load()), slice=ast.Constant(value=0), ctx=ast.Load()
+    )
+
+
+def _nearest_statements(target: str, anchor: str, kind: ElementKind) -> list[ast.stmt]:
+    """``target = ctx.see.nearest(anchor[0].box.center, kind)``, checked.
+
+    This is how an element with no text of its own is still addressed by meaning: by
+    the labelled thing it sits in. ``anchor`` must already be bound and checked.
+    """
+    centre = ast.Attribute(
+        value=ast.Attribute(value=_first(anchor), attr="box", ctx=ast.Load()),
+        attr="center",
+        ctx=ast.Load(),
+    )
+    call = ast.Call(
+        func=_attr("ctx", "see", "nearest"),
+        args=[centre, ast.Constant(value=kind.value)],
+        keywords=[],
+    )
+    return [
+        ast.Assign(targets=[ast.Name(id=target, ctx=ast.Store())], value=call),
+        _expect_found(target, f"no {kind.value} beside the element it belongs to"),
+    ]
+
+
+def _log_statement(message: str) -> ast.stmt:
+    """``ctx.log(message)`` - one line into the run trace."""
+    return ast.Expr(
+        value=ast.Call(func=_attr("ctx", "log"), args=[ast.Constant(value=message)], keywords=[])
+    )
+
+
+def _announces_position(statement: ast.stmt) -> bool:
+    """Whether ``statement`` is a ``ctx.log`` that owns up to a positional lookup."""
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+        return False
+    match statement.value.func:
+        case ast.Attribute(value=ast.Name(id="ctx"), attr="log"):
+            pass
+        case _:
+            return False
+    for argument in statement.value.args:
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            if _ANNOUNCES_POSITION.search(argument.value):
+                return True
+    return False
+
+
+def _replace_child(root: ast.AST, old: ast.AST, new: ast.expr) -> bool:
+    """Swap ``old`` for ``new`` wherever it hangs off ``root``, by identity."""
+    for parent in ast.walk(root):
+        for name, value in ast.iter_fields(parent):
+            if value is old:
+                setattr(parent, name, new)
+                return True
+            if isinstance(value, list):
+                for position, item in enumerate(value):
+                    if item is old:
+                        value[position] = new
+                        return True
+    return False
+
+
+def _verb_of(statement: ast.stmt) -> str:
+    """The ``ctx.ctl`` method a statement is for, to name it in a failure message."""
+    for node in ast.walk(statement):
+        if isinstance(node, ast.Call):
+            method = _ctl_method(node.func)
+            if method is not None:
+                return method
+    return "use"
 
 
 # --------------------------------------------------------------------------------------
@@ -452,6 +813,10 @@ class _Hardener:
         self.coordinates = 0
         self.lookups = 0
         self.taken: set[str] = set()
+        self.grounded: dict[str, tuple[Element, Observation]] = {}
+        self.anchored = 0
+        self.announced: list[str] = []
+        self.owned_up = False
 
     # -- navigation ---------------------------------------------------------------------
 
@@ -500,17 +865,17 @@ class _Hardener:
                 point = _literal_point(node.args[position])
                 if point is None:
                     continue
-                element = element_at(self.trajectory, *point)
-                if element is None:
+                found = _locate(self.trajectory, *point)
+                if found is None:
                     log.debug("harden.unknown_point", x=point[0], y=point[1])
                     continue
+                element = found[0]
                 name = _variable_name(element, self.taken)
                 prefix.extend(_lookup_statements(name, element, method))
-                node.args[position] = ast.Subscript(
-                    value=ast.Name(id=name, ctx=ast.Load()),
-                    slice=ast.Constant(value=0),
-                    ctx=ast.Load(),
-                )
+                # Remembered for the anchoring pass: when the element had no text,
+                # the lookup just written is a `by_kind` and so is itself positional.
+                self.grounded[name] = (element, found[1])
+                node.args[position] = _first(name)
                 self.coordinates += 1
                 self.lookups += 1
                 self.changes.append(
@@ -591,8 +956,131 @@ class _Hardener:
             if isinstance(node, ast.Name) and node.id in renames:
                 node.id = renames[node.id]
         self.renamed.update(renames)
+        self.grounded = {renames.get(k, k): v for k, v in self.grounded.items()}
         for old, new in renames.items():
             self.changes.append(f"renamed the local {old!r} to {new!r}")
+
+    # -- positions ----------------------------------------------------------------------
+
+    def anchor_positions(self, fn: ast.FunctionDef) -> None:
+        """Re-anchor every positional pick onto something nameable, or make it say so.
+
+        Runs LAST, after renaming, so the locals it reasons about are the ones that
+        survive, and after :meth:`replace_coordinates`, so the ``by_kind`` fallback
+        that pass writes for a textless element is judged by the same rule as the
+        model's own code.
+        """
+        self.taken |= _bound_names(fn)
+        fn.body = self._anchor_block(fn.body, {})
+
+    def _anchor_block(
+        self, body: list[ast.stmt], sources: dict[str, tuple[str, str | None]]
+    ) -> list[ast.stmt]:
+        rewritten: list[ast.stmt] = []
+        for statement in body:
+            rewritten.extend(self._anchor_statement(statement, sources))
+            for owner, name, block in _blocks(statement):
+                setattr(owner, name, self._anchor_block(block, dict(sources)))
+            rewritten.append(statement)
+            if _announces_position(statement):
+                self.owned_up = True
+            _track_sources(statement, sources)
+        return rewritten
+
+    def _anchor_statement(
+        self, statement: ast.stmt, sources: Mapping[str, tuple[str, str | None]]
+    ) -> list[ast.stmt]:
+        """What has to run before ``statement`` for its positional picks to be honest."""
+        prefix: list[ast.stmt] = []
+        for node in _own_nodes(statement):
+            lookup = _positional_subscript(node, sources)
+            if lookup is None:
+                continue
+            assert isinstance(node, ast.Subscript)
+            resolved = self._resolve(lookup)
+            replacement = (
+                self._anchor_statements(*resolved, _verb_of(statement))
+                if resolved is not None
+                else None
+            )
+            if replacement is None:
+                if not self.owned_up:
+                    prefix.append(_log_statement(self._confession(lookup)))
+                    self.owned_up = True
+                self.announced.append(str(lookup))
+                self.changes.append(
+                    f"kept {lookup} - the recording names nothing it could be anchored "
+                    "on - and made the skill log that it navigates by position"
+                )
+                continue
+            statements, name, described = replacement
+            prefix.extend(statements)
+            _replace_child(statement, node, _first(name))
+            self.anchored += 1
+            self.lookups += 1
+            self.changes.append(f"anchored {lookup} on {described} instead of its position")
+        return prefix
+
+    def _resolve(self, lookup: PositionalLookup) -> tuple[Element, Observation] | None:
+        """Which element the recording says that position denotes, and on what screen.
+
+        Two kinds of evidence, and nothing else. The run ACTED on the element that
+        index picks out - that is what the model meant, and it is how a click the
+        hardener itself grounded on a coordinate is recognized again. Or every screen
+        in the run that has an element at that index shows the SAME labelled element,
+        so the index is not doing any work. Anything less is a guess, and a guess
+        rewritten into a skill is worse than the index it replaced.
+        """
+        if lookup.via is not None and lookup.via in self.grounded:
+            return self.grounded[lookup.via]
+        if lookup.query == "by_kind" and lookup.kind is None:
+            return None
+        kind = lookup.kind if lookup.query == "by_kind" else None
+        seen: list[tuple[Element, Observation]] = []
+        for step in self.trajectory.steps:
+            points = _action_points(step.action)
+            for observation, acted_on in ((step.before, points), (step.after, ())):
+                element = _at_position(observation, kind, lookup.index)
+                if element is None:
+                    continue
+                if any(element.box.contains(p) for p in acted_on):
+                    return element, observation
+                seen.append((element, observation))
+        if not seen:
+            return None
+        first, where = seen[0]
+        text = first.text.strip().casefold()
+        if not text:
+            return None
+        same = all(e.kind is first.kind and e.text.strip().casefold() == text for e, _ in seen)
+        return (first, where) if same else None
+
+    def _anchor_statements(
+        self, element: Element, observation: Observation, verb: str
+    ) -> tuple[list[ast.stmt], str, str] | None:
+        """The lookup that finds ``element`` by meaning, the local it lands in, and
+        how to describe it in the change log. ``None`` when nothing names it."""
+        text = element.text.strip()
+        if text:
+            name = _variable_name(element, self.taken)
+            return _lookup_statements(name, element, verb), name, f"the text {text!r}"
+        label = _labelled_neighbour(observation, element)
+        if label is None or not label.text.strip():
+            return None
+        anchor = _variable_name(label, self.taken)
+        target = _variable_name(element, self.taken)
+        statements = _lookup_statements(anchor, label, f"find the {element.kind.value} beside")
+        statements.extend(_nearest_statements(target, anchor, element.kind))
+        described = f"the {element.kind.value} nearest {label.text.strip()!r}"
+        return statements, target, described
+
+    def _confession(self, lookup: PositionalLookup) -> str:
+        """The ``ctx.log`` line a skill with no alternative has to carry."""
+        what = lookup.kind or "element"
+        return (
+            f"no readable text to anchor on: taking {what} {lookup.position} in reading "
+            "order, which moves if the page layout changes"
+        )
 
 
 def harden(
@@ -635,6 +1123,7 @@ def harden(
     fn.body = rewritten or [ast.Pass()]
     pass_.lift_literals(fn)
     pass_.rename_opaque(fn)
+    pass_.anchor_positions(fn)
 
     ast.fix_missing_locations(tree)
     hardened = Hardening(
@@ -645,6 +1134,8 @@ def harden(
         lookups_added=pass_.lookups,
         navigation_lifted=tuple(pass_.navigation),
         renamed=dict(pass_.renamed),
+        positions_anchored=pass_.anchored,
+        positions_announced=tuple(pass_.announced),
     )
     log.info(
         "skill.harden",
@@ -652,5 +1143,7 @@ def harden(
         changes=len(hardened.changes),
         coordinates=hardened.coordinates_replaced,
         lookups=hardened.lookups_added,
+        anchored=hardened.positions_anchored,
+        positional=hardened.positions_unanchored,
     )
     return hardened
