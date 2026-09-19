@@ -1,0 +1,657 @@
+{
+  "meta": {
+    "appName": "Northwind Console",
+    "today": "Mar 12",
+    "user": {
+      "name": "Avery Quinn",
+      "email": "avery.quinn@northwind.example"
+    }
+  },
+  "mail": {
+    "labels": [
+      "Work",
+      "Personal",
+      "Finance",
+      "Travel"
+    ],
+    "messages": [
+      {
+        "id": "m01",
+        "sender": "Dana Whitfield",
+        "senderEmail": "dana.whitfield@northwind.example",
+        "subject": "Q3 capacity plan needs your sign-off",
+        "preview": "The revised plan moves two racks to the west row. I need an approval before Fr",
+        "body": "The revised plan moves two racks to the west row. I need an approval before Friday so procurement can lock pricing.",
+        "unread": true,
+        "archived": false,
+        "labels": [
+          "Work"
+        ],
+        "date": "Mar 11"
+      },
+      {
+        "id": "m02",
+        "sender": "Priya Raman",
+        "senderEmail": "priya.raman@northwind.example",
+        "subject": "Re: onboarding checklist for the new analyst",
+        "preview": "I added the VPN step and the badge request. Everything else looked right to me",
+        "body": "I added the VPN step and the badge request. Everything else looked right to me. Take a look when you get a chance.",
+        "unread": true,
+        "archived": false,
+        "labels": [
+          "Work"
+        ],
+        "date": "Mar 11"
+      },
+      {
+        "id": "m03",
+        "sender": "Billing",
+        "senderEmail": "billing@meridianhost.example",
+        "subject": "Invoice 4471 is ready",
+        "preview": "Invoice 4471 for the March hosting term is available in your account. The bala",
+        "body": "Invoice 4471 for the March hosting term is available in your account. The balance is due on the first of next month.",
+        "unread": true,
+        "archived": false,
+        "labels": [
+          "Finance"
+        ],
+        "date": "Mar 10"
+      },
+      {
+        "id": "m04",
+        "sender": "Marcus Oyelaran",
+        "senderEmail": "marcus.o@northwind.example",
+        "subject": "Notes from the reliability review",
+        "preview": "Three action items came out of the review: raise the alert threshold, document",
+        "body": "Three action items came out of the review: raise the alert threshold, document the failover drill, and retire the legacy probe.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Work"
+        ],
+        "date": "Mar 10"
+      },
+      {
+        "id": "m05",
+        "sender": "Helen Okafor",
+        "senderEmail": "helen.okafor@bramblewood.example",
+        "subject": "Lunch on Thursday?",
+        "preview": "There is a new place near the transit hub that everyone keeps talking about. T",
+        "body": "There is a new place near the transit hub that everyone keeps talking about. Thursday around noon would work well for me.",
+        "unread": true,
+        "archived": false,
+        "labels": [
+          "Personal"
+        ],
+        "date": "Mar 9"
+      },
+      {
+        "id": "m06",
+        "sender": "Atlas Travel",
+        "senderEmail": "itinerary@atlastravel.example",
+        "subject": "Your itinerary for the Lisbon trip",
+        "preview": "Your outbound flight departs from gate D14. Seat 22A is confirmed. Baggage all",
+        "body": "Your outbound flight departs from gate D14. Seat 22A is confirmed. Baggage allowance is one checked bag and one carry-on.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Travel"
+        ],
+        "date": "Mar 9"
+      },
+      {
+        "id": "m07",
+        "sender": "Sofia Brennan",
+        "senderEmail": "sofia.brennan@northwind.example",
+        "subject": "Draft copy for the landing page",
+        "preview": "First pass at the hero section and the three feature blocks. The pricing table",
+        "body": "First pass at the hero section and the three feature blocks. The pricing table copy is still rough and needs another pass.",
+        "unread": true,
+        "archived": false,
+        "labels": [
+          "Work"
+        ],
+        "date": "Mar 8"
+      },
+      {
+        "id": "m08",
+        "sender": "Tomas Lindqvist",
+        "senderEmail": "tomas.l@fjordworks.example",
+        "subject": "Contract renewal terms",
+        "preview": "Legal proposed a twenty-four month term with a single renewal option. The inde",
+        "body": "Legal proposed a twenty-four month term with a single renewal option. The indexation clause is unchanged from last year.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Work",
+          "Finance"
+        ],
+        "date": "Mar 8"
+      },
+      {
+        "id": "m09",
+        "sender": "Grace Adeyemi",
+        "senderEmail": "grace.adeyemi@northwind.example",
+        "subject": "Design tokens are merged",
+        "preview": "The color and spacing tokens landed this morning. Component teams can start mi",
+        "body": "The color and spacing tokens landed this morning. Component teams can start migrating whenever they are ready.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Work"
+        ],
+        "date": "Mar 7"
+      },
+      {
+        "id": "m10",
+        "sender": "Northwind IT",
+        "senderEmail": "it-notices@northwind.example",
+        "subject": "Scheduled maintenance for the file server",
+        "preview": "The file server will be unavailable during the maintenance window. Please clos",
+        "body": "The file server will be unavailable during the maintenance window. Please close any open documents beforehand.",
+        "unread": true,
+        "archived": false,
+        "labels": [],
+        "date": "Mar 7"
+      },
+      {
+        "id": "m11",
+        "sender": "Ivan Petrov",
+        "senderEmail": "ivan.petrov@northwind.example",
+        "subject": "Budget variance for February",
+        "preview": "We came in under on contractors and over on cloud spend. The net variance is s",
+        "body": "We came in under on contractors and over on cloud spend. The net variance is small but the mix is worth a conversation.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Finance"
+        ],
+        "date": "Mar 6"
+      },
+      {
+        "id": "m12",
+        "sender": "Community Digest",
+        "senderEmail": "digest@greenline.example",
+        "subject": "This week in the neighborhood",
+        "preview": "The library extended its weekend hours, and the footbridge repair is finally s",
+        "body": "The library extended its weekend hours, and the footbridge repair is finally scheduled. Details inside the digest.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Personal"
+        ],
+        "date": "Mar 6"
+      },
+      {
+        "id": "m13",
+        "sender": "Yuki Tanaka",
+        "senderEmail": "yuki.tanaka@northwind.example",
+        "subject": "Test plan for the migration rehearsal",
+        "preview": "I mapped every rollback step to a named owner. The rehearsal should take about",
+        "body": "I mapped every rollback step to a named owner. The rehearsal should take about ninety minutes end to end.",
+        "unread": true,
+        "archived": false,
+        "labels": [
+          "Work"
+        ],
+        "date": "Mar 5"
+      },
+      {
+        "id": "m14",
+        "sender": "Renata Alves",
+        "senderEmail": "renata.alves@northwind.example",
+        "subject": "Photos from the offsite",
+        "preview": "Sharing the group shots and a few candids from the workshop room. Let me know ",
+        "body": "Sharing the group shots and a few candids from the workshop room. Let me know if you want the full resolution files.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Personal"
+        ],
+        "date": "Mar 5"
+      },
+      {
+        "id": "m15",
+        "sender": "Meridian Host",
+        "senderEmail": "alerts@meridianhost.example",
+        "subject": "Region us-west-2 degraded performance resolved",
+        "preview": "Elevated latency in the region has been resolved. No customer action is requir",
+        "body": "Elevated latency in the region has been resolved. No customer action is required and no data was affected.",
+        "unread": false,
+        "archived": false,
+        "labels": [],
+        "date": "Mar 4"
+      },
+      {
+        "id": "m16",
+        "sender": "Owen Delacroix",
+        "senderEmail": "owen.d@fjordworks.example",
+        "subject": "Partnership intro call",
+        "preview": "Happy to set up thirty minutes next week. I will bring our solutions lead so w",
+        "body": "Happy to set up thirty minutes next week. I will bring our solutions lead so we can cover the integration questions.",
+        "unread": false,
+        "archived": false,
+        "labels": [
+          "Work"
+        ],
+        "date": "Mar 4"
+      }
+    ],
+    "sent": []
+  },
+  "records": {
+    "rows": [
+      {
+        "id": "r01",
+        "name": "Aurora Ledger",
+        "owner": "D. Whitfield",
+        "category": "Storage",
+        "status": "Draft",
+        "priority": "Medium",
+        "records": 120,
+        "updated": "Mar 11"
+      },
+      {
+        "id": "r02",
+        "name": "Basalt Pipeline",
+        "owner": "S. Brennan",
+        "category": "Analytics",
+        "status": "Archived",
+        "priority": "Low",
+        "records": 257,
+        "updated": "Mar 04"
+      },
+      {
+        "id": "r03",
+        "name": "Cinder Gateway",
+        "owner": "I. Petrov",
+        "category": "Ingest",
+        "status": "Active",
+        "priority": "High",
+        "records": 394,
+        "updated": "Feb 25"
+      },
+      {
+        "id": "r04",
+        "name": "Driftwood Index",
+        "owner": "P. Raman",
+        "category": "Transport",
+        "status": "Paused",
+        "priority": "Medium",
+        "records": 531,
+        "updated": "Mar 06"
+      },
+      {
+        "id": "r05",
+        "name": "Ember Registry",
+        "owner": "G. Adeyemi",
+        "category": "Security",
+        "status": "Draft",
+        "priority": "Low",
+        "records": 668,
+        "updated": "Feb 27"
+      },
+      {
+        "id": "r06",
+        "name": "Fathom Cache",
+        "owner": "R. Alves",
+        "category": "Storage",
+        "status": "Archived",
+        "priority": "High",
+        "records": 805,
+        "updated": "Mar 08"
+      },
+      {
+        "id": "r07",
+        "name": "Granite Router",
+        "owner": "M. Oyelaran",
+        "category": "Analytics",
+        "status": "Active",
+        "priority": "Medium",
+        "records": 942,
+        "updated": "Mar 01"
+      },
+      {
+        "id": "r08",
+        "name": "Halcyon Queue",
+        "owner": "Y. Tanaka",
+        "category": "Ingest",
+        "status": "Paused",
+        "priority": "Low",
+        "records": 1079,
+        "updated": "Mar 10"
+      },
+      {
+        "id": "r09",
+        "name": "Ironwood Vault",
+        "owner": "D. Whitfield",
+        "category": "Transport",
+        "status": "Draft",
+        "priority": "High",
+        "records": 1216,
+        "updated": "Mar 03"
+      },
+      {
+        "id": "r10",
+        "name": "Juniper Relay",
+        "owner": "S. Brennan",
+        "category": "Security",
+        "status": "Archived",
+        "priority": "Medium",
+        "records": 1353,
+        "updated": "Feb 24"
+      },
+      {
+        "id": "r11",
+        "name": "Kestrel Monitor",
+        "owner": "I. Petrov",
+        "category": "Storage",
+        "status": "Active",
+        "priority": "Low",
+        "records": 1490,
+        "updated": "Mar 05"
+      },
+      {
+        "id": "r12",
+        "name": "Lantern Archive",
+        "owner": "P. Raman",
+        "category": "Analytics",
+        "status": "Paused",
+        "priority": "High",
+        "records": 1627,
+        "updated": "Feb 26"
+      },
+      {
+        "id": "r13",
+        "name": "Marble Scheduler",
+        "owner": "G. Adeyemi",
+        "category": "Ingest",
+        "status": "Draft",
+        "priority": "Medium",
+        "records": 1764,
+        "updated": "Mar 07"
+      },
+      {
+        "id": "r14",
+        "name": "Nimbus Collector",
+        "owner": "R. Alves",
+        "category": "Transport",
+        "status": "Archived",
+        "priority": "Low",
+        "records": 1901,
+        "updated": "Feb 28"
+      },
+      {
+        "id": "r15",
+        "name": "Obsidian Proxy",
+        "owner": "M. Oyelaran",
+        "category": "Security",
+        "status": "Active",
+        "priority": "High",
+        "records": 2038,
+        "updated": "Mar 09"
+      },
+      {
+        "id": "r16",
+        "name": "Pewter Dispatch",
+        "owner": "Y. Tanaka",
+        "category": "Storage",
+        "status": "Paused",
+        "priority": "Medium",
+        "records": 2175,
+        "updated": "Mar 02"
+      },
+      {
+        "id": "r17",
+        "name": "Quarry Sync",
+        "owner": "D. Whitfield",
+        "category": "Analytics",
+        "status": "Draft",
+        "priority": "Low",
+        "records": 2312,
+        "updated": "Mar 11"
+      },
+      {
+        "id": "r18",
+        "name": "Rosewood Broker",
+        "owner": "S. Brennan",
+        "category": "Ingest",
+        "status": "Archived",
+        "priority": "High",
+        "records": 2449,
+        "updated": "Mar 04"
+      },
+      {
+        "id": "r19",
+        "name": "Slate Resolver",
+        "owner": "I. Petrov",
+        "category": "Transport",
+        "status": "Active",
+        "priority": "Medium",
+        "records": 2586,
+        "updated": "Feb 25"
+      },
+      {
+        "id": "r20",
+        "name": "Thistle Indexer",
+        "owner": "P. Raman",
+        "category": "Security",
+        "status": "Paused",
+        "priority": "Low",
+        "records": 2723,
+        "updated": "Mar 06"
+      },
+      {
+        "id": "r21",
+        "name": "Umber Balancer",
+        "owner": "G. Adeyemi",
+        "category": "Storage",
+        "status": "Draft",
+        "priority": "High",
+        "records": 2860,
+        "updated": "Feb 27"
+      },
+      {
+        "id": "r22",
+        "name": "Verdigris Store",
+        "owner": "R. Alves",
+        "category": "Analytics",
+        "status": "Archived",
+        "priority": "Medium",
+        "records": 2997,
+        "updated": "Mar 08"
+      },
+      {
+        "id": "r23",
+        "name": "Willow Tracker",
+        "owner": "M. Oyelaran",
+        "category": "Ingest",
+        "status": "Active",
+        "priority": "Low",
+        "records": 3134,
+        "updated": "Mar 01"
+      },
+      {
+        "id": "r24",
+        "name": "Xenon Auditor",
+        "owner": "Y. Tanaka",
+        "category": "Transport",
+        "status": "Paused",
+        "priority": "High",
+        "records": 3271,
+        "updated": "Mar 10"
+      },
+      {
+        "id": "r25",
+        "name": "Yarrow Compiler",
+        "owner": "D. Whitfield",
+        "category": "Security",
+        "status": "Draft",
+        "priority": "Medium",
+        "records": 3408,
+        "updated": "Mar 03"
+      },
+      {
+        "id": "r26",
+        "name": "Zephyr Notifier",
+        "owner": "S. Brennan",
+        "category": "Storage",
+        "status": "Archived",
+        "priority": "Low",
+        "records": 3545,
+        "updated": "Feb 24"
+      },
+      {
+        "id": "r27",
+        "name": "Amber Warehouse",
+        "owner": "I. Petrov",
+        "category": "Analytics",
+        "status": "Active",
+        "priority": "High",
+        "records": 3682,
+        "updated": "Mar 05"
+      },
+      {
+        "id": "r28",
+        "name": "Birch Validator",
+        "owner": "P. Raman",
+        "category": "Ingest",
+        "status": "Paused",
+        "priority": "Medium",
+        "records": 3819,
+        "updated": "Feb 26"
+      },
+      {
+        "id": "r29",
+        "name": "Copper Sentinel",
+        "owner": "G. Adeyemi",
+        "category": "Transport",
+        "status": "Draft",
+        "priority": "Low",
+        "records": 3956,
+        "updated": "Mar 07"
+      },
+      {
+        "id": "r30",
+        "name": "Dune Aggregator",
+        "owner": "R. Alves",
+        "category": "Security",
+        "status": "Archived",
+        "priority": "High",
+        "records": 4093,
+        "updated": "Feb 28"
+      },
+      {
+        "id": "r31",
+        "name": "Elmwood Parser",
+        "owner": "M. Oyelaran",
+        "category": "Storage",
+        "status": "Active",
+        "priority": "Medium",
+        "records": 4230,
+        "updated": "Mar 09"
+      },
+      {
+        "id": "r32",
+        "name": "Flint Scanner",
+        "owner": "Y. Tanaka",
+        "category": "Analytics",
+        "status": "Paused",
+        "priority": "Low",
+        "records": 4367,
+        "updated": "Mar 02"
+      },
+      {
+        "id": "r33",
+        "name": "Garnet Emitter",
+        "owner": "D. Whitfield",
+        "category": "Ingest",
+        "status": "Draft",
+        "priority": "High",
+        "records": 4504,
+        "updated": "Mar 11"
+      },
+      {
+        "id": "r34",
+        "name": "Hollow Bridge",
+        "owner": "S. Brennan",
+        "category": "Transport",
+        "status": "Archived",
+        "priority": "Medium",
+        "records": 4641,
+        "updated": "Mar 04"
+      },
+      {
+        "id": "r35",
+        "name": "Indigo Mapper",
+        "owner": "I. Petrov",
+        "category": "Security",
+        "status": "Active",
+        "priority": "Low",
+        "records": 4778,
+        "updated": "Feb 25"
+      },
+      {
+        "id": "r36",
+        "name": "Jasper Throttle",
+        "owner": "P. Raman",
+        "category": "Storage",
+        "status": "Paused",
+        "priority": "High",
+        "records": 4915,
+        "updated": "Mar 06"
+      },
+      {
+        "id": "r37",
+        "name": "Kindling Sorter",
+        "owner": "G. Adeyemi",
+        "category": "Analytics",
+        "status": "Draft",
+        "priority": "Medium",
+        "records": 5052,
+        "updated": "Feb 27"
+      },
+      {
+        "id": "r38",
+        "name": "Larkspur Feed",
+        "owner": "R. Alves",
+        "category": "Ingest",
+        "status": "Archived",
+        "priority": "Low",
+        "records": 5189,
+        "updated": "Mar 08"
+      },
+      {
+        "id": "r39",
+        "name": "Moss Partitioner",
+        "owner": "M. Oyelaran",
+        "category": "Transport",
+        "status": "Active",
+        "priority": "High",
+        "records": 5326,
+        "updated": "Mar 01"
+      },
+      {
+        "id": "r40",
+        "name": "Nettle Uploader",
+        "owner": "Y. Tanaka",
+        "category": "Security",
+        "status": "Paused",
+        "priority": "Medium",
+        "records": 5463,
+        "updated": "Mar 10"
+      }
+    ],
+    "exports": []
+  },
+  "settings": {
+    "displayName": "Avery Quinn",
+    "timezone": "UTC",
+    "density": "comfortable",
+    "notifyEmail": true,
+    "notifyDesktop": false,
+    "weeklyDigest": true,
+    "autoArchive": false,
+    "savedCount": 0
+  }
+}

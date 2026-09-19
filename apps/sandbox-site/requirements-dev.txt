@@ -1,0 +1,5 @@
+# Test-only dependencies for apps/sandbox-site.
+# The app itself needs nothing beyond the Python standard library.
+# Install into a throwaway venv inside this directory - see README.md.
+pytest==9.1.1
+playwright==1.63.0
