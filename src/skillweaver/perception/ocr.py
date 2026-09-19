@@ -30,11 +30,72 @@ and detection 0.06s - **84% to 97% of all perception time**, on every real page 
 Two ways of making the read itself cheaper were measured and both lost: cropping to the
 detector's boxes took 53.8s against 7.4s for one full-page read of the same frame (the
 engine's per-call overhead dwarfs the pixel saving), and downscaling showed no reliable
-win. So the saving has to come from not reading at all.
+win. So one saving is to not read at all.
 
 :class:`CachingTextReader` is that saving, and :class:`PerceptionCounters` is how you know
 it worked. Counts, unlike seconds, do not move when the machine is busy, so "this task
 went from 14 reads to 3" is a claim that survives being measured on a loaded laptop.
+It only ever fires on a frame nothing has touched, though, and a replay changes the
+screen at every step, so the other saving had to be inside one read. That one is
+:data:`DEFAULT_REC_BATCH`.
+
+Recognition is the read
+-----------------------
+
+"OCR is expensive" is too coarse to optimize against, because RapidOCR is three models
+and they are not close to equal. Timed by the engine's own per-stage clock on live
+Wikipedia at 1280x800, medians of five, ``rec_batch_num=6`` as shipped::
+
+    frame            lines     det      cls      rec    total
+    Ada Lovelace        70    89 ms    28 ms   899 ms   1033 ms
+    Photosynthesis      75    84 ms    32 ms   804 ms    938 ms
+    dense table         58    87 ms    27 ms   923 ms   1055 ms
+
+**Recognition is ~87% of a read; detection is ~8% and the angle classifier ~3%.**
+Three consequences, each of which kills a plausible idea:
+
+*Resolution cannot help.* Every crop is resized to height 48 before recognition, so
+what sets rec's cost is each line's ASPECT RATIO, and halving the capture's pixel
+density leaves every ratio exactly where it was. Downscaling can only touch det's 8% -
+which is why the measurement above records no reliable win rather than a small one.
+Browser captures are ``scale=1.0`` anyway (``BrowserController``'s default), so there
+is no Retina factor to give back.
+
+*Reading only where the detector looked is what already happens.* RapidOCR IS detect,
+crop, recognize; rec never sees a pixel outside a detected line. Substituting the YOLO
+detector's boxes would not read less, it would only pay the engine's per-call overhead
+once per box - the 53.8s above.
+
+*Skipping the classifier is not worth its 3%*, and it changes one or two lines' text
+per page, so it buys the smallest win on offer at the price of a correctness argument.
+
+What is worth it is how many lines go into one ONNX Runtime call. RapidOCR sorts the
+crops by aspect ratio, batches ``rec_batch_num`` of them, and pads each batch to its
+widest member. Six is its default. Measured on the frames above, speedup against that
+default::
+
+    rec_batch_num      1       2       4       6      12
+    speedup         1.51x   0.84x   1.16x   1.00x    (slower)
+
+**One line per call is ~1.5x on the whole read, and the ordering is not monotone**, so
+the padding arithmetic is not the explanation: sorted crops waste only ~14% on a batch
+of six, nowhere near 1.5x, and padding cannot make batch 2 the worst of the five. What
+fits is memory: a batch of six lines of Wikipedia body text is a 3x48x~1900 input per
+line and the intermediate feature maps are far larger again, so batch 1 stays in cache
+where batch 6 streams. Whatever the mechanism, the number is measured on every page
+tried and in both directions, and :data:`DEFAULT_REC_BATCH` is 1 because of it.
+
+It costs no accuracy. Checked on eight live frames, including three scrolled ones:
+every text element the batch-6 read found is still found by ``find_text`` at the same
+place - 0 lost of 548 - and recall against the DOM's own labels goes from 338/385 to
+340/385, because a batch padded less loses fewer of the spaces between words.
+
+A cheaper read is not the same as a cached one, and the cache cannot be pushed down to
+the line to make up the difference. Keyed on a line's exact pixels, a per-line cache
+saves 3-4% of recognition across a NAVIGATION and 12-13% across a scroll (one pixel of
+difference in a detected box is a different key, so it misses even where the content is
+plainly unchanged); on a re-observation of one screen it would save everything, which is
+the case :class:`CachingTextReader` already serves for free.
 
 Ending a read that has gone wrong
 ---------------------------------
@@ -112,6 +173,7 @@ __all__ = [
     "DEFAULT_MIN_CONFIDENCE",
     "DEFAULT_OCR_THREADS",
     "DEFAULT_READ_TIMEOUT_S",
+    "DEFAULT_REC_BATCH",
     "CachingTextReader",
     "OcrWorker",
     "PerceptionCounters",
@@ -121,6 +183,7 @@ __all__ = [
     "content_key",
     "ocr_threads",
     "read_timeout_s",
+    "rec_batch",
 ]
 
 #: Recognitions below this score are dropped: at that level RapidOCR is reporting
@@ -146,10 +209,21 @@ Explicit rather than inherited: left alone ONNX Runtime sizes its pool from
 number comes from, and ``SKILLWEAVER_OCR_THREADS`` to change it.
 """
 
+DEFAULT_REC_BATCH = 1
+"""Text lines the recognizer is given per ONNX Runtime call.
+
+One, which reads like a mistake and is the fastest setting measured, by a lot. See
+"Recognition is the read" in the module docstring for the table and for why the
+padding arithmetic does not explain it. ``SKILLWEAVER_OCR_REC_BATCH`` changes it,
+which is how the number gets re-derived on a machine that is not this one rather
+than nudged.
+"""
+
 log = get_logger(__name__)
 
 _TIMEOUT_ENV = "SKILLWEAVER_OCR_TIMEOUT_S"
 _THREADS_ENV = "SKILLWEAVER_OCR_THREADS"
+_REC_BATCH_ENV = "SKILLWEAVER_OCR_REC_BATCH"
 
 
 class PerceptionTimeout(PerceptionError):
@@ -191,6 +265,12 @@ def ocr_threads() -> int:
     """The configured ONNX Runtime pool size: ``SKILLWEAVER_OCR_THREADS``, else
     :data:`DEFAULT_OCR_THREADS`. Clamped to at least one thread."""
     return max(1, int(_positive_float(_THREADS_ENV, DEFAULT_OCR_THREADS)))
+
+
+def rec_batch() -> int:
+    """The configured recognizer batch: ``SKILLWEAVER_OCR_REC_BATCH``, else
+    :data:`DEFAULT_REC_BATCH`. Clamped to at least one line."""
+    return max(1, int(_positive_float(_REC_BATCH_ENV, DEFAULT_REC_BATCH)))
 
 
 class RapidOcrReader:
@@ -421,16 +501,20 @@ def _polygon_to_box(polygon: Any, scale: float, width: int, height: int) -> Box 
 # --------------------------------------------------------------------------------------
 
 
-def build_engine(threads: int) -> Any:
-    """Import RapidOCR and build it with an EXPLICIT thread pool.
+def build_engine(threads: int, batch: int | None = None) -> Any:
+    """Import RapidOCR and build it with an EXPLICIT thread pool and batch size.
 
     The one place the engine is constructed, so the parent process (``isolate=False``)
     and the worker child get identical settings and identical failure messages.
 
-    ``intra_op_num_threads`` is the number that matters: ONNX Runtime spawns that many
-    workers per session and spins them while they wait. RapidOCR forwards both values
-    from its global config into the detection, classification and recognition
-    sessions, so passing them here sizes all three.
+    ``intra_op_num_threads`` is the number that matters for the pool: ONNX Runtime
+    spawns that many workers per session and spins them while they wait. RapidOCR
+    forwards both values from its global config into the detection, classification
+    and recognition sessions, so passing them here sizes all three.
+
+    ``rec_batch_num`` is the number that matters for the clock. It defaults to
+    :func:`rec_batch`, which is ONE line per call; RapidOCR ships six. The module
+    docstring has the measurements.
 
     Raises:
         PerceptionError: if RapidOCR is not installed or its models cannot be loaded.
@@ -445,7 +529,11 @@ def build_engine(threads: int) -> Any:
             f"({exc}). Install the project's dependencies with `make install`."
         ) from exc
     try:
-        return RapidOCR(intra_op_num_threads=threads, inter_op_num_threads=threads)
+        return RapidOCR(
+            intra_op_num_threads=threads,
+            inter_op_num_threads=threads,
+            rec_batch_num=rec_batch() if batch is None else max(1, int(batch)),
+        )
     except Exception as exc:  # model files missing, ONNX Runtime broken, ...
         raise PerceptionError(f"OCR engine could not be loaded: {exc}") from exc
 

@@ -43,6 +43,7 @@ from skillweaver.perception.ocr import (
     DEFAULT_MIN_CONFIDENCE,
     DEFAULT_OCR_THREADS,
     DEFAULT_READ_TIMEOUT_S,
+    DEFAULT_REC_BATCH,
     CachingTextReader,
     OcrWorker,
     PerceptionCounters,
@@ -53,6 +54,7 @@ from skillweaver.perception.ocr import (
     content_key,
     ocr_threads,
     read_timeout_s,
+    rec_batch,
 )
 
 SHOTS = Path(__file__).resolve().parents[1] / "fixtures" / "shots"
@@ -755,7 +757,10 @@ engine = build_engine(2)
 parts = (engine.text_det, engine.text_cls, engine.text_rec)
 sessions = [getattr(part, "infer", None) for part in parts]
 options = [s.session.get_session_options() for s in sessions if s is not None]
-print(json.dumps([[o.intra_op_num_threads, o.inter_op_num_threads] for o in options]))
+print(json.dumps({
+    "threads": [[o.intra_op_num_threads, o.inter_op_num_threads] for o in options],
+    "rec_batch": engine.text_rec.rec_batch_num,
+}))
 """
 
 
@@ -784,16 +789,39 @@ def test_the_engine_is_built_with_the_thread_pool_it_was_given() -> None:
         check=False,
     )
     assert done.returncode == 0, done.stderr
-    options = json.loads(done.stdout.strip().splitlines()[-1])
+    probed = json.loads(done.stdout.strip().splitlines()[-1])
+    options = probed["threads"]
     assert options, "rapidocr moved its session attribute; this test needs updating"
     for intra, inter in options:
         assert (intra, inter) == (2, 2)
+
+
+def test_the_recognizer_is_given_one_line_per_call() -> None:
+    """The batch has to reach the RECOGNIZER, not just the constructor.
+
+    Same probe and the same reason for running it in a child as the pool above:
+    ``rec_batch_num`` is read out of RapidOCR's ``Rec`` config into
+    :class:`TextRecognizer`, and the only number that decides how much work one ONNX
+    Runtime call is handed is the one that landed there. Ship the default six and OCR
+    is ~1.5x slower on every real page; the module docstring has the table.
+    """
+    done = subprocess.run(
+        [sys.executable, "-c", POOL_PROBE],
+        capture_output=True,
+        text=True,
+        env=_worker_env(2),
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    probed = json.loads(done.stdout.strip().splitlines()[-1])
+    assert probed["rec_batch"] == DEFAULT_REC_BATCH == 1
 
 
 def test_the_default_pool_is_explicit_rather_than_the_core_count() -> None:
     assert DEFAULT_OCR_THREADS == 4
     assert ocr_threads() == DEFAULT_OCR_THREADS
     assert read_timeout_s() == DEFAULT_READ_TIMEOUT_S
+    assert rec_batch() == DEFAULT_REC_BATCH
 
 
 def test_the_environment_can_change_the_pool_and_the_budget(
@@ -801,8 +829,10 @@ def test_the_environment_can_change_the_pool_and_the_budget(
 ) -> None:
     monkeypatch.setenv("SKILLWEAVER_OCR_THREADS", "2")
     monkeypatch.setenv("SKILLWEAVER_OCR_TIMEOUT_S", "12.5")
+    monkeypatch.setenv("SKILLWEAVER_OCR_REC_BATCH", "6")
     assert ocr_threads() == 2
     assert read_timeout_s() == 12.5
+    assert rec_batch() == 6
     assert RapidOcrReader().timeout_s == 12.5
 
 
@@ -813,8 +843,10 @@ def test_a_malformed_setting_falls_back_instead_of_refusing_to_see(
     """A misspelt variable must not be a reason for perception to have no bound."""
     monkeypatch.setenv("SKILLWEAVER_OCR_TIMEOUT_S", bad)
     monkeypatch.setenv("SKILLWEAVER_OCR_THREADS", bad)
+    monkeypatch.setenv("SKILLWEAVER_OCR_REC_BATCH", bad)
     assert read_timeout_s() == DEFAULT_READ_TIMEOUT_S
     assert ocr_threads() == DEFAULT_OCR_THREADS
+    assert rec_batch() == DEFAULT_REC_BATCH
 
 
 def test_the_child_is_told_the_pool_size_by_every_name_that_reads_one() -> None:
