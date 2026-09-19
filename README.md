@@ -40,6 +40,22 @@ and create an obligation that cannot be withdrawn. The interesting question - ca
 drive six screens of a site nobody built for it, from pixels - is answered without
 any of that.
 
+That demo runs a skill a person wrote. With an `ANTHROPIC_API_KEY` the agent writes it
+itself, against the same storefront:
+
+```sh
+uv run python -m skillweaver.cli --data-dir data/live learn \
+  "Sign in as standard_user with the password secret_sauce, add the Sauce Labs \
+Backpack to the cart, and complete the checkout as Ada Lovelace with postcode SW1A 1AA." \
+  --url https://www.saucedemo.com
+```
+
+It explores the errand in 17 actions and 13 model calls, and the admission gate returns
+the site to its sign-in page, re-runs the Python it wrote and stores it - first attempt,
+no repairs. `run` on the same sentence then replays all six screens in **0 model calls**
+and about 11 seconds, and does it for a different product and a different buyer, because
+what varied between the two runs became parameters rather than literals.
+
 ## What it measures
 
 Three applications, one agent, nothing in it told which it is looking at. A mail
