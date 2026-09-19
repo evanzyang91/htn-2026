@@ -173,6 +173,7 @@
   var COALESCE = {
     "mail.search": 1, "mail.composeField": 1,
     "records.filter": 1, "records.editValue": 1,
+    "order.search": 1, "order.address": 1,
     "settings.field": 1
   };
 
@@ -244,6 +245,7 @@
   var NAV = [
     { id: "mail", label: "Mail", iconName: "mail" },
     { id: "records", label: "Records", iconName: "table" },
+    { id: "order", label: "Order", iconName: "bag" },
     { id: "settings", label: "Settings", iconName: "gear" }
   ];
 

@@ -644,6 +644,582 @@
     ],
     "exports": []
   },
+  "order": {
+    "restaurants": [
+      {
+        "id": "rest-kettle",
+        "name": "Copper Kettle",
+        "cuisine": "Thai",
+        "rating": 4.6,
+        "priceBand": "$$",
+        "eta": "25-35 min",
+        "blurb": "Wok noodles and curries, cooked to order.",
+        "dishes": [
+          {
+            "id": "d-kettle-padthai",
+            "name": "Pad Thai",
+            "desc": "Rice noodles, egg, peanuts, tamarind.",
+            "priceCents": 1450,
+            "options": [
+              {
+                "id": "portion",
+                "label": "Portion",
+                "choices": [
+                  {
+                    "id": "regular",
+                    "label": "Regular",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "large",
+                    "label": "Large",
+                    "deltaCents": 300
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-kettle-greencurry",
+            "name": "Green Curry",
+            "desc": "Coconut curry with bamboo and basil.",
+            "priceCents": 1600,
+            "options": [
+              {
+                "id": "spice",
+                "label": "Spice level",
+                "choices": [
+                  {
+                    "id": "mild",
+                    "label": "Mild",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "hot",
+                    "label": "Thai hot",
+                    "deltaCents": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-kettle-springrolls",
+            "name": "Spring Rolls",
+            "desc": "Crisp vegetable rolls with plum sauce.",
+            "priceCents": 750,
+            "options": [
+              {
+                "id": "count",
+                "label": "Count",
+                "choices": [
+                  {
+                    "id": "four",
+                    "label": "Four",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "eight",
+                    "label": "Eight",
+                    "deltaCents": 600
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-kettle-mangorice",
+            "name": "Mango Sticky Rice",
+            "desc": "Sweet coconut rice with ripe mango.",
+            "priceCents": 850,
+            "options": []
+          }
+        ]
+      },
+      {
+        "id": "rest-lemongrass",
+        "name": "Lemongrass House",
+        "cuisine": "Thai",
+        "rating": 4.1,
+        "priceBand": "$",
+        "eta": "30-40 min",
+        "blurb": "Family kitchen, generous portions.",
+        "dishes": [
+          {
+            "id": "d-lemongrass-drunken",
+            "name": "Drunken Noodles",
+            "desc": "Wide noodles, chilli and holy basil.",
+            "priceCents": 1350,
+            "options": [
+              {
+                "id": "spice",
+                "label": "Spice level",
+                "choices": [
+                  {
+                    "id": "mild",
+                    "label": "Mild",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "medium",
+                    "label": "Medium",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "hot",
+                    "label": "Thai hot",
+                    "deltaCents": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-lemongrass-tomyum",
+            "name": "Tom Yum Soup",
+            "desc": "Hot and sour broth with lemongrass.",
+            "priceCents": 950,
+            "options": []
+          },
+          {
+            "id": "d-lemongrass-satay",
+            "name": "Chicken Satay",
+            "desc": "Grilled skewers with peanut sauce.",
+            "priceCents": 1050,
+            "options": []
+          }
+        ]
+      },
+      {
+        "id": "rest-forno",
+        "name": "Forno Nove",
+        "cuisine": "Italian",
+        "rating": 4.4,
+        "priceBand": "$$",
+        "eta": "30-40 min",
+        "blurb": "Wood-fired pizza and a short pasta list.",
+        "dishes": [
+          {
+            "id": "d-forno-margherita",
+            "name": "Margherita Pizza",
+            "desc": "Tomato, fior di latte, basil.",
+            "priceCents": 1600,
+            "options": [
+              {
+                "id": "size",
+                "label": "Size",
+                "choices": [
+                  {
+                    "id": "ten",
+                    "label": "Ten inch",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "fourteen",
+                    "label": "Fourteen inch",
+                    "deltaCents": 500
+                  }
+                ]
+              },
+              {
+                "id": "crust",
+                "label": "Crust",
+                "choices": [
+                  {
+                    "id": "classic",
+                    "label": "Classic",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "thin",
+                    "label": "Thin",
+                    "deltaCents": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-forno-carbonara",
+            "name": "Carbonara",
+            "desc": "Guanciale, pecorino, black pepper.",
+            "priceCents": 1800,
+            "options": []
+          },
+          {
+            "id": "d-forno-knots",
+            "name": "Garlic Knots",
+            "desc": "Baked in the pizza oven, with herb butter.",
+            "priceCents": 650,
+            "options": [
+              {
+                "id": "count",
+                "label": "Count",
+                "choices": [
+                  {
+                    "id": "six",
+                    "label": "Six",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "twelve",
+                    "label": "Twelve",
+                    "deltaCents": 450
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-forno-tiramisu",
+            "name": "Tiramisu",
+            "desc": "Espresso-soaked sponge, mascarpone.",
+            "priceCents": 900,
+            "options": []
+          }
+        ]
+      },
+      {
+        "id": "rest-sakura",
+        "name": "Sakura Counter",
+        "cuisine": "Japanese",
+        "rating": 4.8,
+        "priceBand": "$$$",
+        "eta": "20-30 min",
+        "blurb": "Eight seats, one menu, cut to order.",
+        "dishes": [
+          {
+            "id": "d-sakura-salmonbowl",
+            "name": "Salmon Rice Bowl",
+            "desc": "Cured salmon over seasoned rice.",
+            "priceCents": 1750,
+            "options": [
+              {
+                "id": "rice",
+                "label": "Rice",
+                "choices": [
+                  {
+                    "id": "white",
+                    "label": "White",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "brown",
+                    "label": "Brown",
+                    "deltaCents": 100
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-sakura-katsu",
+            "name": "Chicken Katsu",
+            "desc": "Panko cutlet with shredded cabbage.",
+            "priceCents": 1550,
+            "options": [
+              {
+                "id": "sauce",
+                "label": "Sauce",
+                "choices": [
+                  {
+                    "id": "katsu",
+                    "label": "Katsu",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "curry",
+                    "label": "Curry",
+                    "deltaCents": 200
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-sakura-veggieroll",
+            "name": "Vegetable Roll",
+            "desc": "Cucumber, avocado, pickled carrot.",
+            "priceCents": 950,
+            "options": []
+          },
+          {
+            "id": "d-sakura-miso",
+            "name": "Miso Soup",
+            "desc": "Dashi, tofu, scallion.",
+            "priceCents": 450,
+            "options": []
+          }
+        ]
+      },
+      {
+        "id": "rest-ember",
+        "name": "Ember Taqueria",
+        "cuisine": "Mexican",
+        "rating": 4.2,
+        "priceBand": "$",
+        "eta": "15-25 min",
+        "blurb": "Charcoal grill, handmade tortillas.",
+        "dishes": [
+          {
+            "id": "d-ember-barbacoa",
+            "name": "Barbacoa Bowl",
+            "desc": "Slow-cooked beef, rice, pickled onion.",
+            "priceCents": 1350,
+            "options": [
+              {
+                "id": "beans",
+                "label": "Beans",
+                "choices": [
+                  {
+                    "id": "black",
+                    "label": "Black",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "pinto",
+                    "label": "Pinto",
+                    "deltaCents": 0
+                  }
+                ]
+              },
+              {
+                "id": "salsa",
+                "label": "Salsa",
+                "choices": [
+                  {
+                    "id": "mild",
+                    "label": "Mild",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "hot",
+                    "label": "Hot",
+                    "deltaCents": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-ember-tacos",
+            "name": "Street Tacos",
+            "desc": "Corn tortillas, onion and coriander.",
+            "priceCents": 1100,
+            "options": [
+              {
+                "id": "count",
+                "label": "Count",
+                "choices": [
+                  {
+                    "id": "three",
+                    "label": "Three",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "five",
+                    "label": "Five",
+                    "deltaCents": 400
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-ember-elote",
+            "name": "Elote",
+            "desc": "Grilled corn, lime, chilli, cotija.",
+            "priceCents": 600,
+            "options": []
+          },
+          {
+            "id": "d-ember-churros",
+            "name": "Churros",
+            "desc": "Cinnamon sugar, chocolate dip.",
+            "priceCents": 550,
+            "options": []
+          }
+        ]
+      },
+      {
+        "id": "rest-northloop",
+        "name": "North Loop Deli",
+        "cuisine": "Sandwiches",
+        "rating": 4.0,
+        "priceBand": "$",
+        "eta": "20-30 min",
+        "blurb": "Counter service, bread baked each morning.",
+        "dishes": [
+          {
+            "id": "d-northloop-turkey",
+            "name": "Turkey Club",
+            "desc": "Roast turkey, bacon, tomato, aioli.",
+            "priceCents": 1250,
+            "options": [
+              {
+                "id": "bread",
+                "label": "Bread",
+                "choices": [
+                  {
+                    "id": "sourdough",
+                    "label": "Sourdough",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "rye",
+                    "label": "Rye",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "multigrain",
+                    "label": "Multigrain",
+                    "deltaCents": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-northloop-reuben",
+            "name": "Reuben",
+            "desc": "Corned beef, kraut, swiss, rye.",
+            "priceCents": 1400,
+            "options": []
+          },
+          {
+            "id": "d-northloop-soup",
+            "name": "Tomato Soup",
+            "desc": "Slow-roasted tomato and basil.",
+            "priceCents": 500,
+            "options": [
+              {
+                "id": "size",
+                "label": "Size",
+                "choices": [
+                  {
+                    "id": "cup",
+                    "label": "Cup",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "bowl",
+                    "label": "Bowl",
+                    "deltaCents": 250
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "rest-greenrow",
+        "name": "Green Row",
+        "cuisine": "Vegetarian",
+        "rating": 4.5,
+        "priceBand": "$$",
+        "eta": "25-35 min",
+        "blurb": "Grain bowls and cold-pressed everything.",
+        "dishes": [
+          {
+            "id": "d-greenrow-harvest",
+            "name": "Harvest Bowl",
+            "desc": "Farro, roast squash, kale, seeds.",
+            "priceCents": 1400,
+            "options": [
+              {
+                "id": "dressing",
+                "label": "Dressing",
+                "choices": [
+                  {
+                    "id": "tahini",
+                    "label": "Tahini",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "miso",
+                    "label": "Miso",
+                    "deltaCents": 0
+                  }
+                ]
+              },
+              {
+                "id": "protein",
+                "label": "Protein",
+                "choices": [
+                  {
+                    "id": "tofu",
+                    "label": "Tofu",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "chickpea",
+                    "label": "Chickpea",
+                    "deltaCents": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "d-greenrow-falafel",
+            "name": "Falafel Wrap",
+            "desc": "Herb falafel, pickles, garlic sauce.",
+            "priceCents": 1150,
+            "options": []
+          },
+          {
+            "id": "d-greenrow-smoothie",
+            "name": "Berry Smoothie",
+            "desc": "Blackberry, banana, oat milk.",
+            "priceCents": 700,
+            "options": [
+              {
+                "id": "size",
+                "label": "Size",
+                "choices": [
+                  {
+                    "id": "small",
+                    "label": "Small",
+                    "deltaCents": 0
+                  },
+                  {
+                    "id": "large",
+                    "label": "Large",
+                    "deltaCents": 200
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "cuisines": [
+      "Italian",
+      "Japanese",
+      "Mexican",
+      "Sandwiches",
+      "Thai",
+      "Vegetarian"
+    ],
+    "deliveryCents": 399,
+    "tipOptions": [
+      0,
+      200,
+      400,
+      600
+    ],
+    "defaultTipCents": 400,
+    "defaultAddress": "18 Alder Street, Apt 4",
+    "cart": [],
+    "orders": []
+  },
   "settings": {
     "displayName": "Avery Quinn",
     "timezone": "UTC",

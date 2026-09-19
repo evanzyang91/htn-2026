@@ -33,6 +33,26 @@ def dirty_everything(page):
     settle(page)
     page.click("[data-testid=export-btn]")
     settle(page)
+    page.click("[data-testid=nav-order]")
+    settle(page)
+    page.click("[data-testid=cuisine-Thai]")
+    settle(page)
+    page.click("[data-testid=restaurant-rest-kettle]")
+    settle(page)
+    page.click("[data-testid=dish-d-kettle-padthai]")
+    settle(page)
+    page.click("[data-testid=choice-portion-large]")
+    settle(page)
+    page.click("[data-testid=add-to-cart]")
+    settle(page)
+    page.click("[data-testid=ord-tab-cart]")
+    settle(page)
+    page.click("[data-testid=tip-600]")
+    settle(page)
+    page.click("[data-testid=checkout-btn]")
+    settle(page)
+    page.click("[data-testid=order-confirm]")
+    settle(page)
     page.click("[data-testid=nav-settings]")
     settle(page)
     page.click("[data-testid=set-autoArchive]")
@@ -49,17 +69,21 @@ def test_reset_restores_the_exact_seed_state(page, base_url, state, seed):
     s = state()
     assert s["mail"]["sent"], "precondition: the app really was mutated"
     assert s["records"]["exports"]
+    assert s["order"]["orders"], "precondition: an order really was placed"
     assert s["settings"]["savedCount"] == 1
 
     after = reset(base_url)["state"]
 
-    data = {k: after[k] for k in ("meta", "mail", "records", "settings")}
+    data = {k: after[k] for k in ("meta", "mail", "records", "order", "settings")}
     assert data == seed
     assert after["ui"]["screen"] == "mail"
     assert after["ui"]["mail"]["search"] == ""
     assert after["ui"]["mail"]["selected"] == []
     assert after["ui"]["mail"]["compose"]["open"] is False
     assert after["ui"]["records"]["filter"] == ""
+    assert after["ui"]["order"]["view"] == "browse"
+    assert after["ui"]["order"]["cuisine"] == ""
+    assert after["ui"]["order"]["dialogOpen"] is False
     assert after["ui"]["settings"]["dialogOpen"] is False
     assert after["ui"]["settings"]["success"] is False
 
@@ -70,12 +94,12 @@ def test_reset_is_idempotent(base_url):
 
 def test_state_endpoint_matches_the_seed_on_a_fresh_server(page, state, seed):
     s = state()
-    assert {k: s[k] for k in ("meta", "mail", "records", "settings")} == seed
+    assert {k: s[k] for k in ("meta", "mail", "records", "order", "settings")} == seed
 
 
 def test_the_same_screen_screenshots_identically_twice(page):
     """No animation, no transition, no blinking caret, no drifting clock."""
-    for testid in ("nav-mail", "nav-records", "nav-settings"):
+    for testid in ("nav-mail", "nav-records", "nav-order", "nav-settings"):
         page.click(f"[data-testid={testid}]")
         settle(page)
         first = page.screenshot()
@@ -103,14 +127,49 @@ def test_reaching_a_screen_twice_produces_the_same_pixels(page, browser, base_ur
     assert walk() == walk()
 
 
-def test_the_three_screens_do_not_look_alike(page):
+def test_the_ordering_flow_reaches_the_same_pixels_after_a_reset(page, browser, base_url):
+    """The longest state-changing flow in the app, twice, byte for byte.
+
+    This is the property the admission gate leans on: a skill is only stored
+    after being RE-RUN from its recorded starting screen, so an ordering task -
+    which places an order and cannot otherwise be undone - is only learnable
+    because /__reset makes the second run see exactly the first run's world.
+    """
+
+    def walk():
+        urllib.request.urlopen(base_url + "/__reset").read()
+        ctx = browser.new_context(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
+        pg = ctx.new_page()
+        pg.goto(base_url + "/")
+        pg.wait_for_selector("body[data-ready='1']")
+        for testid in (
+            "nav-order",
+            "cuisine-Thai",
+            "restaurant-rest-kettle",
+            "dish-d-kettle-padthai",
+            "choice-portion-large",
+            "add-to-cart",
+            "ord-tab-cart",
+            "checkout-btn",
+            "order-confirm",
+        ):
+            pg.click(f"[data-testid={testid}]")
+            settle(pg)
+        shot = pg.screenshot()
+        ctx.close()
+        return shot
+
+    assert walk() == walk()
+
+
+def test_the_four_screens_do_not_look_alike(page):
     """A detector trained here needs screens that fingerprint differently."""
     shots = {}
-    for name in ("mail", "records", "settings"):
+    for name in ("mail", "records", "order", "settings"):
         page.click(f"[data-testid=nav-{name}]")
         settle(page)
         shots[name] = page.screenshot()
-    assert len(set(shots.values())) == 3
+    assert len(set(shots.values())) == 4
 
 
 def test_nothing_renders_a_live_clock(page):
@@ -118,7 +177,7 @@ def test_nothing_renders_a_live_clock(page):
     import datetime
 
     today = datetime.date.today()
-    for name in ("mail", "records", "settings"):
+    for name in ("mail", "records", "order", "settings"):
         page.click(f"[data-testid=nav-{name}]")
         settle(page)
         text = page.inner_text("body")

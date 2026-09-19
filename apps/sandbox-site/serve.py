@@ -28,6 +28,7 @@ STATIC_DIR = os.path.join(HERE, "static")
 
 RECORD_COLUMNS = ("name", "owner", "category", "status", "priority", "records", "updated")
 BULK_STATUSES = ("Active", "Paused", "Draft", "Archived")
+ORDER_VIEWS = ("browse", "restaurant", "cart", "orders")
 
 
 def load_seed():
@@ -38,6 +39,7 @@ def load_seed():
 def initial_ui(data):
     """UI state is part of the state snapshot so that a reset clears it too."""
     settings = data["settings"]
+    order = data["order"]
     return {
         "screen": "mail",
         "mail": {
@@ -58,6 +60,23 @@ def initial_ui(data):
             "editValue": "",
             "bulkMenuOpen": False,
             "banner": None,
+        },
+        "order": {
+            "view": "browse",
+            "search": "",
+            "cuisine": "",
+            "restaurantId": None,
+            "dishId": None,
+            "picks": {},
+            "qty": 1,
+            "address": order["defaultAddress"],
+            "tipCents": order["defaultTipCents"],
+            "dialogOpen": False,
+            "banner": None,
+            "placedId": None,
+            # Monotonic, so removing a line never lets its id be handed out again
+            # to a different dish and leave an eval check pointing at the wrong row.
+            "lineSeq": 0,
         },
         "settings": {
             "draft": {
@@ -82,6 +101,7 @@ def fresh_state():
         "meta": data["meta"],
         "mail": data["mail"],
         "records": data["records"],
+        "order": data["order"],
         "settings": data["settings"],
         "ui": initial_ui(data),
     }
@@ -126,6 +146,51 @@ def _row(state, rid):
     return None
 
 
+def _restaurant(state, rid):
+    for r in state["order"]["restaurants"]:
+        if r["id"] == rid:
+            return r
+    return None
+
+
+def _dish(state, rid, did):
+    r = _restaurant(state, rid)
+    for dish in (r or {}).get("dishes", []):
+        if dish["id"] == did:
+            return dish
+    return None
+
+
+def _line_price(dish, picks):
+    """Base price plus the delta of every chosen option. Integer cents throughout:
+    a float total would round differently in the browser than on the server."""
+    total = dish["priceCents"]
+    for grp in dish["options"]:
+        chosen = picks.get(grp["id"])
+        for choice in grp["choices"]:
+            if choice["id"] == chosen:
+                total += choice["deltaCents"]
+    return total
+
+
+def _choice_labels(dish, picks):
+    out = []
+    for grp in dish["options"]:
+        chosen = picks.get(grp["id"])
+        for choice in grp["choices"]:
+            if choice["id"] == chosen:
+                out.append({"group": grp["label"], "choice": choice["label"]})
+    return out
+
+
+def _complete(dish, picks):
+    """Every option group a dish declares is required. A dish with no groups is
+    complete as soon as it is opened; one with groups cannot be added blindly."""
+    return all(
+        any(c["id"] == picks.get(grp["id"]) for c in grp["choices"]) for grp in dish["options"]
+    )
+
+
 def _toggle(lst, value):
     if value in lst:
         lst.remove(value)
@@ -136,10 +201,11 @@ def _toggle(lst, value):
 def apply_action(state, action, p):
     ui = state["ui"]
     mail, rec, setg = ui["mail"], ui["records"], ui["settings"]
+    ordr = ui["order"]
 
     if action == "nav":
         screen = p.get("screen", "mail")
-        if screen in ("mail", "records", "settings"):
+        if screen in ("mail", "records", "order", "settings"):
             ui["screen"] = screen
             mail["labelMenuOpen"] = False
             rec["bulkMenuOpen"] = False
@@ -283,6 +349,134 @@ def apply_action(state, action, p):
         rec["banner"] = f"Exported {len(ids)} row{'' if len(ids) == 1 else 's'} to CSV"
     elif action == "records.dismissBanner":
         rec["banner"] = None
+
+    # ---- order (Pantry Lane) ----
+    elif action == "order.search":
+        ordr["search"] = str(p.get("q", ""))
+    elif action == "order.cuisine":
+        cuisine = p.get("cuisine") or ""
+        if cuisine in state["order"]["cuisines"] or cuisine == "":
+            ordr["cuisine"] = "" if cuisine == ordr["cuisine"] else cuisine
+    elif action == "order.view":
+        view = p.get("view")
+        if view in ORDER_VIEWS and view != "restaurant":
+            ordr["view"] = view
+            ordr["dishId"] = None
+            ordr["picks"] = {}
+            ordr["qty"] = 1
+            if view == "browse":
+                ordr["restaurantId"] = None
+    elif action == "order.open":
+        r = _restaurant(state, p.get("id"))
+        if r:
+            ordr["restaurantId"] = r["id"]
+            ordr["view"] = "restaurant"
+            ordr["dishId"] = None
+            ordr["picks"] = {}
+            ordr["qty"] = 1
+    elif action == "order.dish":
+        dish = _dish(state, ordr["restaurantId"], p.get("id"))
+        if dish:
+            ordr["dishId"] = dish["id"]
+            ordr["picks"] = {}
+            ordr["qty"] = 1
+    elif action == "order.closeDish":
+        ordr["dishId"] = None
+        ordr["picks"] = {}
+        ordr["qty"] = 1
+    elif action == "order.choose":
+        dish = _dish(state, ordr["restaurantId"], ordr["dishId"])
+        group, choice = p.get("group"), p.get("choice")
+        if dish and any(
+            g["id"] == group and any(c["id"] == choice for c in g["choices"])
+            for g in dish["options"]
+        ):
+            ordr["picks"][group] = choice
+    elif action == "order.qty":
+        ordr["qty"] = max(1, min(9, ordr["qty"] + int(p.get("delta", 0))))
+    elif action == "order.add":
+        dish = _dish(state, ordr["restaurantId"], ordr["dishId"])
+        if dish and _complete(dish, ordr["picks"]):
+            r = _restaurant(state, ordr["restaurantId"])
+            choices = _choice_labels(dish, ordr["picks"])
+            cart = state["order"]["cart"]
+            existing = next(
+                (
+                    line
+                    for line in cart
+                    if line["dishId"] == dish["id"] and line["choices"] == choices
+                ),
+                None,
+            )
+            if existing:
+                existing["qty"] += ordr["qty"]
+            else:
+                ordr["lineSeq"] += 1
+                cart.append(
+                    {
+                        "lineId": f"c{ordr['lineSeq']:02d}",
+                        "restaurantId": r["id"],
+                        "restaurant": r["name"],
+                        "dishId": dish["id"],
+                        "name": dish["name"],
+                        "choices": choices,
+                        "choiceText": ", ".join(c["choice"] for c in choices),
+                        "unitPriceCents": _line_price(dish, ordr["picks"]),
+                        "qty": ordr["qty"],
+                    }
+                )
+            ordr["banner"] = f"Added {ordr['qty']} x {dish['name']} to the cart"
+            ordr["dishId"] = None
+            ordr["picks"] = {}
+            ordr["qty"] = 1
+    elif action == "order.cartQty":
+        for line in state["order"]["cart"]:
+            if line["lineId"] == p.get("lineId"):
+                line["qty"] = max(1, min(9, line["qty"] + int(p.get("delta", 0))))
+                ordr["banner"] = f"{line['name']} quantity is now {line['qty']}"
+    elif action == "order.remove":
+        cart = state["order"]["cart"]
+        gone = [line for line in cart if line["lineId"] == p.get("lineId")]
+        if gone:
+            cart.remove(gone[0])
+            ordr["banner"] = f"Removed {gone[0]['name']} from the cart"
+    elif action == "order.address":
+        ordr["address"] = str(p.get("value", ""))
+    elif action == "order.tip":
+        tip = p.get("cents")
+        if tip in state["order"]["tipOptions"]:
+            ordr["tipCents"] = tip
+    elif action == "order.checkout":
+        if state["order"]["cart"]:
+            ordr["dialogOpen"] = True
+    elif action == "order.cancelCheckout":
+        ordr["dialogOpen"] = False
+    elif action == "order.place":
+        cart = state["order"]["cart"]
+        if ordr["dialogOpen"] and cart and ordr["address"].strip():
+            subtotal = sum(line["unitPriceCents"] * line["qty"] for line in cart)
+            orders = state["order"]["orders"]
+            placed = {
+                "id": f"o{len(orders) + 1:02d}",
+                "items": copy.deepcopy(cart),
+                "itemCount": sum(line["qty"] for line in cart),
+                "restaurants": sorted({line["restaurant"] for line in cart}),
+                "subtotalCents": subtotal,
+                "deliveryCents": state["order"]["deliveryCents"],
+                "tipCents": ordr["tipCents"],
+                "totalCents": subtotal + state["order"]["deliveryCents"] + ordr["tipCents"],
+                "address": ordr["address"].strip(),
+                "placedOn": state["meta"]["today"],
+                "status": "Confirmed",
+            }
+            orders.append(placed)
+            state["order"]["cart"] = []
+            ordr["dialogOpen"] = False
+            ordr["placedId"] = placed["id"]
+            ordr["view"] = "orders"
+            ordr["banner"] = f"Order {placed['id']} confirmed"
+    elif action == "order.dismissBanner":
+        ordr["banner"] = None
 
     # ---- settings ----
     elif action == "settings.field":
