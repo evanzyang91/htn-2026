@@ -59,6 +59,8 @@ log = get_logger(__name__)
 
 __all__ = [
     "ARRIVAL_REST_MS",
+    "BLANK_REST_MS",
+    "BLANK_SIT_OUTS",
     "CHANGED_REST_MS",
     "MAX_CONTROLS",
     "MAX_PAGE_TEXT",
@@ -93,7 +95,22 @@ and the policy was offered ONE control, the modal's close button, because the vi
 inside it had not hydrated yet. It closed the popup it had been asked to play a video in.
 The same page observed after a quiesce offers two. A page answers in PHASES
 (``AGENTS.md``, where Walmart's *Add* button arrives 0.61s after its title), and a frame
-taken between two of them is a skeleton whatever the address bar says."""
+taken between two of them is a skeleton whatever the address bar says.
+
+Upstream has since added this case itself (``1489129``: a dropdown's first frame had 3
+elements and no text, a moment later 14 and its options) at ``(100, 700)``. These numbers
+are kept: they are the pair the splitkb modal was seen to hydrate under, the shorter pair
+has not been run against it, and a page that has finished answering never reaches the cap -
+so what the difference costs is 50ms of quiet window on such a move."""
+
+BLANK_REST_MS: tuple[float, float] = (200.0, 1200.0)
+"""``(quiet, cap)`` for each sit-out of a BLANK page (:attr:`DomSnapshot.blank`).
+Upstream's numbers."""
+
+BLANK_SIT_OUTS = 4
+"""How many times a blank page is waited on before it is handed over as it is. Upstream's
+count: a bot-check or splash shell replaces itself within seconds, and at the cap this is
+~5s, after which blank is the truth about the page and the policy should be told it."""
 
 MAX_CONTROLS = 250
 """Controls reported from one frame, matching Jev's own cap: it bounds the policy's
@@ -173,6 +190,12 @@ class DomControl:
         options: The selectable values, for a ``<select>`` only.
         scope_text: Text of the nearest enclosing row, card or form - what tells a policy
             that this ``Add`` button belongs to THAT product.
+        section: The nearest enclosing landmark, by NAME - ``dialog``, ``search``,
+            ``header``, ``nav``, ``main``, ``footer``, ``aside`` or ``form`` - or ``None``
+            outside all of them. Named and never scored; see :data:`_SNAPSHOT_JS`.
+        opens: The control's ``aria-haspopup`` value (``menu``, ``listbox``, ``dialog``,
+            ``true`` ...): what a click on it is declared to open. ``None`` when the page
+            did not say.
     """
 
     index: int
@@ -188,6 +211,8 @@ class DomControl:
     expanded: bool | None = None
     options: tuple[DomOption, ...] = ()
     scope_text: str = ""
+    section: str | None = None
+    opens: str | None = None
 
     @property
     def label(self) -> str:
@@ -247,6 +272,11 @@ class DomSnapshot:
             own answer from the Navigation API, not ``history.length``. It counts only
             entries contiguous and SAME-ORIGIN with this one, so the ``about:blank`` a run
             starts from does not make it true and a back never leaves the site.
+        can_press_enter: Whether a NON-EMPTY typeable field holds focus, so that an Enter
+            key press has a defined destination. Upstream's ``enter`` action: some
+            searches have no button and submit only on Enter.
+        enter_label: That field's accessible name, for the offer's wording; ``""`` when
+            it has none or nothing is offered.
         by_element_id: The controls keyed by ``element_id``, which is how a policy turns
             the id it chose back into what it knows about that control.
     """
@@ -264,6 +294,8 @@ class DomSnapshot:
     can_go_back: bool = False
     scroller: DomScroller | None = None
     loading: bool = False
+    can_press_enter: bool = False
+    enter_label: str = ""
     by_element_id: dict[str, DomControl] = field(default_factory=dict, compare=False, repr=False)
 
     @property
@@ -285,8 +317,31 @@ class DomSnapshot:
             [(c.element_id, c.value, c.checked, c.selected, c.expanded) for c in self.controls],
             self.scroll_y,
             None if scroller is None else (scroller.can_down, scroller.can_up),
+            # The ENTER offer is IN, as upstream has it (its fingerprint hashes the
+            # action list, and ``enter`` is an action). Deliberate, because of what
+            # ``JevDriver`` keys on this: a click that only FOCUSES a field already
+            # holding a query changes no text and no value, so without this it is
+            # recorded ``page_changed=False`` - "that did nothing" - on the one move that
+            # made the submit available, and the spent-move memory files the new offer
+            # under the screen that did not have it. What a screen OFFERS is part of
+            # which screen it is. ``section`` and ``opens`` are NOT in: they describe a
+            # control the ``element_id`` already names, and do not move when it is used.
+            self.enter_label if self.can_press_enter else None,
         ]
         return hashlib.sha256(json.dumps(content).encode("utf-8")).hexdigest()[:16]
+
+    @property
+    def blank(self) -> bool:
+        """An interstitial with nothing to read and nothing to act on: a bot-check or
+        challenge shell, or a splash, that replaces itself a moment later.
+
+        Upstream's ``Agent.blank``. Deciding here wastes the decision - the only moves
+        left to offer are ``WAIT`` and ``BLOCKED``, and a ``BLOCKED`` ends the run on a
+        page that was about to become the real site. This is NOT a way past a
+        verification page: one that asks a person for something has text and a control,
+        is not blank, and fails the run as ``AGENTS.md`` requires.
+        """
+        return not self.text.strip() and not self.controls
 
     @property
     def can_scroll_down(self) -> bool:
@@ -334,6 +389,7 @@ class DomPerceiver:
     __slots__ = (
         "_acted_ms",
         "_armed",
+        "_blank_waits",
         "_counters",
         "_fingerprinter",
         "_last",
@@ -354,6 +410,7 @@ class DomPerceiver:
         self._armed: tuple[int, DomSnapshot, bool] | None = None
         self._rests = 0
         self._rested_ms = 0.0
+        self._blank_waits = 0
         self._observed_ms = 0.0
         self._acted_ms = 0.0
 
@@ -397,6 +454,12 @@ class DomPerceiver:
         """``(how many times, total milliseconds)`` :meth:`rest_after` made a frame wait."""
         return self._rests, self._rested_ms
 
+    @property
+    def blank_waits(self) -> int:
+        """How many times a blank page was sat out; see :meth:`_sit_out`. Counted apart
+        from :attr:`rests`, which are waits a policy's move armed."""
+        return self._blank_waits
+
     def rest_after(self, actions: int, basis: DomSnapshot, *, waited: bool = False) -> None:
         """Arm ONE coming observation to be taken on a page that has come to rest.
 
@@ -435,6 +498,13 @@ class DomPerceiver:
         if self._rested(controller, snapshot):
             # Capture AGAIN, then read: the frame and the controls must be one moment,
             # and the frame taken before the wait is the moment being replaced.
+            shot = controller.capture()
+            self._counters.captures += 1
+            snapshot = self._read(controller, shot)
+            self._counters.detections += 1
+        for sat_out in range(BLANK_SIT_OUTS):
+            if not snapshot.blank or not self._sit_out(controller, snapshot, sat_out + 1):
+                break
             shot = controller.capture()
             self._counters.captures += 1
             snapshot = self._read(controller, shot)
@@ -485,6 +555,29 @@ class DomPerceiver:
         log.info("dom.rest", why=why, waited_ms=round(spent), controls=len(snapshot.controls))
         return True
 
+    def _sit_out(self, controller: Controller, snapshot: DomSnapshot, attempt: int) -> bool:
+        """Wait once on a BLANK page (:attr:`DomSnapshot.blank`); ``False`` if this
+        controller cannot wait, which hands the blank frame over as it is.
+
+        Unlike :meth:`rest_after` this is NOT armed per move, and that is deliberate: the
+        run's FIRST observation follows a navigation no policy made, and it is the one
+        upstream measured this on - the first complete document was the shell, and the
+        run's first and only decision was taken on it. It taxes no other reader, because
+        it costs nothing on a page that has anything on it, and there is no warm replay,
+        gate rest loop or ``wait_for_text`` for which a page with no text and no control
+        is the frame it wanted. Inside :meth:`observe`, so the wait lands in
+        :attr:`site_ms` with the other rests - the site made us wait, not a model.
+        """
+        quiesce = getattr(controller, "quiesce", None)
+        if not callable(quiesce):
+            return False
+        started = time.monotonic()
+        quiesce(*BLANK_REST_MS)
+        spent = (time.monotonic() - started) * 1000.0
+        self._blank_waits += 1
+        log.info("dom.rest", why="blank", waited_ms=round(spent), attempt=attempt, url=snapshot.url)
+        return True
+
     def _read(self, controller: Controller, shot: Screenshot) -> DomSnapshot:
         """Run :data:`_SNAPSHOT_JS` on the controller's page and parse the result.
 
@@ -533,6 +626,7 @@ def _snapshot_from(raw: dict[str, Any], shot: Screenshot) -> DomSnapshot:
         viewport = Box(0, 0, int(raw.get("w") or shot.width), int(raw.get("h") or shot.height))
         controls: list[DomControl] = []
         seen: dict[str, int] = {}
+        enter = raw.get("enter")
         for position, entry in enumerate(raw.get("controls") or (), start=1):
             control = _control_from(entry, position, viewport, seen)
             if control is not None:
@@ -548,6 +642,8 @@ def _snapshot_from(raw: dict[str, Any], shot: Screenshot) -> DomSnapshot:
             can_go_back=bool(raw.get("canGoBack")),
             scroller=_scroller_from(raw.get("scroller")),
             loading=bool(raw.get("loading")),
+            can_press_enter=isinstance(enter, dict),
+            enter_label=_clean(enter.get("label"))[:200] if isinstance(enter, dict) else "",
             page_height=float(raw.get("pageHeight") or 0.0),
             omitted_controls=int(raw.get("omitted") or 0),
             covered_controls=int(raw.get("covered") or 0),
@@ -607,6 +703,8 @@ def _control_from(
         expanded=_tri(entry.get("expanded")),
         options=options,
         scope_text=_clean(entry.get("scope"))[:600],
+        section=_clean(entry.get("section"))[:40] or None,
+        opens=_clean(entry.get("opens"))[:40] or None,
     )
 
 
@@ -764,6 +862,29 @@ _SNAPSHOT_JS = (
     return null;
   };
 
+  // Where a control sits, NAMED and never scored, as upstream has it: a control in the
+  // open dialog, the header or a form means something different from the same label in
+  // the footer, and the policy can weigh that itself - a positional prior computed here
+  // would be a guess baked into the observation. The NEAREST landmark wins, so a search
+  // form inside a header is 'form', not 'header'.
+  const LANDMARKS = '[role="dialog"],[role="search"],[role="banner"],[role="navigation"],' +
+    '[role="main"],[role="contentinfo"],[role="complementary"],' +
+    'dialog,header,nav,main,aside,footer,form';
+  const ROLE_NAMES = {banner: 'header', navigation: 'nav', contentinfo: 'footer',
+    complementary: 'aside'};
+  const section = (el) => {
+    const landmark = el.closest(LANDMARKS);
+    if (!landmark) return null;
+    const explicit = landmark.getAttribute('role');
+    return explicit ? (ROLE_NAMES[explicit] || explicit) : landmark.tagName.toLowerCase();
+  };
+
+  // Whether text can be typed into it. One definition, because the ENTER offer below
+  // has to mean by "a field" exactly what the control list means by it.
+  const typeable = (el, rname) => !el.readOnly && el.getAttribute('aria-readonly') !== 'true' &&
+    (['textbox', 'searchbox', 'spinbutton'].includes(rname) ||
+      (rname === 'combobox' && ['INPUT', 'TEXTAREA'].includes(el.tagName)));
+
   const controls = [];
   let covered = 0;
   for (const el of document.querySelectorAll(SELECTOR)) {
@@ -794,9 +915,7 @@ _SNAPSHOT_JS = (
       continue;
     }
 
-    const editable = !el.readOnly && el.getAttribute('aria-readonly') !== 'true' &&
-      (['textbox', 'searchbox', 'spinbutton'].includes(rname) ||
-        (rname === 'combobox' && ['INPUT', 'TEXTAREA'].includes(el.tagName)));
+    const editable = typeable(el, rname);
     const scope = el.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]');
     const control = {
       role: rname,
@@ -807,6 +926,9 @@ _SNAPSHOT_JS = (
         (el.isContentEditable ? el.innerText.trim() : ''),
       scope: scope ? (scope.innerText || '').slice(0, 600) : '',
     };
+    const where = section(el);
+    if (where) control.section = where;
+    if (el.getAttribute('aria-haspopup')) control.opens = el.getAttribute('aria-haspopup');
     for (const key of ['checked', 'selected', 'expanded']) {
       const value = el.getAttribute('aria-' + key);
       if (value !== null) control[key] = value;
@@ -875,6 +997,20 @@ _SNAPSHOT_JS = (
     }
   }
 
+  // Some searches have no button at all and submit only on Enter, so a run can type a
+  // query and then have no way to run it (upstream: GitHub, 120 steps and an exhausted
+  // budget, 5 with this). Offered only when a NON-EMPTY field holds focus, so the key
+  // press has a defined destination, and only past the same filters a field has to pass
+  // to be listed at all: safe (never a password), enabled, and TYPEABLE. That last one
+  // is narrower than upstream's bare INPUT/TEXTAREA test on purpose: a focused checkbox
+  // is an INPUT whose value is "on", and Enter there is an implicit form submission
+  // offered under the name of a field nobody typed in.
+  const focused = document.activeElement;
+  const enter = focused && ['INPUT', 'TEXTAREA'].includes(focused.tagName) &&
+    focused.value && safe(focused) && !focused.matches(':disabled') &&
+    !focused.closest('[aria-disabled="true"]') && typeable(focused, role(focused))
+    ? {label: name(focused) || ''} : null;
+
   return {
     url: location.href,
     title: document.title,
@@ -883,6 +1019,7 @@ _SNAPSHOT_JS = (
     scrollY: scrollY,
     canGoBack: canGoBack,
     scroller: scroller,
+    enter: enter,
     loading: document.readyState !== 'complete' ||
       !!document.querySelector('[aria-busy="true"],[role="progressbar"]'),
     pageHeight: document.documentElement.scrollHeight,
@@ -907,6 +1044,10 @@ executor to here: upstream reports a covered control and refuses the click
 whatever is on top and says nothing. Measured on an option dialog scrolled to its end:
 8 of 18 checkboxes reported sat outside the list's visible box, and a click on the one
 the task wanted was delivered to the backdrop - 0 ticked, no error anywhere.
+
+Upstream's ``enter`` and ``back`` ACTIONS are facts here (``enter``, ``canGoBack``), not
+entries in a list: what is offered is the policy's business (:mod:`skillweaver.llm.jev_`),
+and this script says only what is true of the page.
 
 Text nodes come back WITH their rectangles, because this path needs ``Element``s. And
 select options are carried although no select action exists - see
