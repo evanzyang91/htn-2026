@@ -18,7 +18,9 @@ class Agent:
         plan = [task]
         self.pending_text = None
         self.speculation = None
-        self.workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jev-text")
+        # Two, so a value the run is waiting for never queues behind a guess that has already
+        # started and can no longer be cancelled.
+        self.workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jev-text")
         self.stale_streak, self.stale_at, self.stale_known = 0, None, 0
         self.covered = {}
         self.done_seen = False
@@ -76,6 +78,11 @@ class Agent:
         value does not depend on which operation wins. Starting it as soon as the page settles
         overlaps it with the frame capture and the next decision instead of following them.
         """
+        # Drop the outstanding guess first. Its page is gone, so its value can no longer be reused,
+        # and leaving it queued makes the next value wait behind work nobody will read: one run
+        # spent 10.8 s on a typing step whose own helper call took 1.1 s.
+        if self.speculation:
+            self.speculation[1].cancel()
         self.speculation = None
         fields = [a for a in state["page"]["actions"] if a["kind"] == "fill"]
         # Speculate whenever exactly one field can be typed into, even one holding a value: a search
@@ -282,7 +289,9 @@ class Agent:
                     raise
                 state["browser"].act(action, current, text=text, page_level=False)
             self.pending_text = None
-            self.speculation = None  # Its page is gone; the settled page below gets a fresh one.
+            if self.speculation:  # Its page is gone; cancel it so it cannot block the next value.
+                self.speculation[1].cancel()
+            self.speculation = None
             self.stale_streak = 0
             self.done_seen = False  # A new action means the next DONE claim is about a new page.
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
@@ -323,22 +332,21 @@ class Agent:
             # grace period to show the action's effect before recording "no change observed".
             load_started = time.perf_counter()
             after = page if noop else state["browser"].observe(screenshot=False)
-            if not noop and action["kind"] != "wait" and after["fingerprint"] == page["fingerprint"]:
-                # The effect may land asynchronously (cart badges, toasts): wait for the page to
-                # go quiet, then look once more before recording "no change observed".
-                state["browser"].settle(quiet_ms=120, cap_ms=1000)
-                after = state["browser"].observe(screenshot=False)
-                if after["fingerprint"] == page["fingerprint"] and action["kind"] in {"click", "select"}:
-                    # Quiet is not the same as finished. A page waiting on a cart request makes no
-                    # mutations, so settle returns in ~150 ms while the badge updates a second or
-                    # more later — and a wrongly recorded "no change" makes the run add the item
-                    # again. Only mutations pay this, and only when they look like they failed.
-                    deadline = time.perf_counter() + 2.0
-                    while time.perf_counter() < deadline:
-                        time.sleep(0.2)
-                        after = state["browser"].observe(screenshot=False)
-                        if after["fingerprint"] != page["fingerprint"]:
-                            break
+            mutation = not noop and action["kind"] in {"click", "select", "fill"}
+            if mutation and after["fingerprint"] == page["fingerprint"]:
+                # Watch for the effect rather than waiting for the page to fall silent. Waiting for
+                # quiet costs the full cap on a page that animates its cart update, even once the
+                # badge has changed; and it ends too early on a page that is quiet only because it
+                # is waiting on a request. Polling stops the moment there is an answer, so a fast
+                # effect costs what it costs and only a genuine no-op pays the whole budget.
+                # Scroll and wait are excluded: their effect is immediate, so there is nothing to
+                # wait for and a dead scroll would pay the budget for no reason.
+                deadline = time.perf_counter() + (3.0 if action["kind"] in {"click", "select"} else 1.0)
+                while time.perf_counter() < deadline:
+                    time.sleep(0.1)
+                    after = state["browser"].observe(screenshot=False)
+                    if after["fingerprint"] != page["fingerprint"]:
+                        break
             elif after["url"] != page["url"]:
                 # A navigation may still be materializing content (skeleton results pages).
                 # Decide on a quiet page, not on whatever happened to be rendered first.
