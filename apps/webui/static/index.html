@@ -78,6 +78,11 @@
   button:disabled { opacity: .35; cursor: default; }
   .hint { text-align: center; color: var(--muted); font-size: 13px; margin-top: 16px; min-height: 1.2em; }
   .runs { margin: 26px auto 0; max-width: 720px; width: 100%; }
+  .phone { position: fixed; right: 18px; bottom: 18px; z-index: 2; display: none; text-align: center; }
+  .phone.on { display: block; }
+  .phone .qr { background: #fff; padding: 8px; border-radius: 10px; display: inline-block; opacity: .9; }
+  .phone .qr img, .phone .qr canvas { display: block; }
+  .phone .cap { color: var(--muted); font-size: 11px; margin-top: 6px; }
   .run { padding: 10px 14px; border-top: 1px solid var(--pill-border); position: relative; }
   /* A faint shine that glides along the bar above a live run, back and forth. */
   .run.busy::before {
@@ -126,6 +131,8 @@
     <div class="hint" id="hint">Just say what to do; the agent picks the website and works in a tab of your Chrome.</div>
     <div class="runs" id="runs"></div>
   </div>
+  <div class="phone" id="phone"><div class="qr" id="qr"></div><div class="cap">scan to talk from your phone</div></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
   const form = document.getElementById('f');
   const input = document.getElementById('task');
@@ -224,6 +231,14 @@
     } catch (e) { setTimeout(poll, 5000); }
   }
   poll();
+
+  // The phone page, as a QR code, when the server was started with --phone.
+  fetch('/api/phone').then(r => r.json()).then(({url}) => {
+    if (!url || !window.QRCode) return;
+    new QRCode(document.getElementById('qr'), {text: url, width: 96, height: 96, correctLevel: QRCode.CorrectLevel.M});
+    document.getElementById('phone').classList.add('on');
+    document.getElementById('phone').title = url;
+  }).catch(() => {});
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
