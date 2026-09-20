@@ -83,7 +83,16 @@
     height: 2px; width: 12%;
     border-radius: 2px;
     background: linear-gradient(90deg, transparent, rgba(138, 180, 255, 0.6), transparent);
-    box-shadow: 0 0 6px 1px rgba(90, 140, 255, 0.35), 0 0 14px 2px rgba(60, 110, 230, 0.18);
+    animation: shine 2.6s ease-in-out infinite alternate;
+    pointer-events: none;
+  }
+  /* Its glow: a soft oval centred on the shine, same width so it rides the same path. */
+  .run.busy::after {
+    content: "";
+    position: absolute;
+    top: -8px; left: 0;
+    height: 16px; width: 12%;
+    background: radial-gradient(ellipse 45% 50% at 50% 50%, rgba(90, 140, 255, 0.32), rgba(60, 110, 230, 0.10) 55%, transparent 75%);
     animation: shine 2.6s ease-in-out infinite alternate;
     pointer-events: none;
   }
