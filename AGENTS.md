@@ -404,21 +404,24 @@ longer verifier over the same chrome words, so `_A_VERIFIER_MUST_BE_ABLE_TO_FAIL
 that moved, a row carrying the parameter's own value, a changed URL - and say that `verify`
 sees only `ctx` and `result`, so a parameter reaches it by being RETURNED from `run`.
 
-On live walmart.com the HOMEPAGE cannot anchor a skill's precondition and the empty cart
-page can, measured 2026-09-19 through the DOM perceiver - but only once it has RENDERED,
-and how you arrived decides how long that takes. A homepage read right after `_settle`
-still shows the previous page (0.045 to a settled reference), is a 36-part skeleton at 1s
-(0.181) and only reaches 0.48 from 2s on; the admission gate rejected two genuinely
-successful cold runs on it at stage `precondition`. Signed-out `/cart` scores 1.000 - and
-the first measurement of that was WRONG in the way that matters: reloading `/cart` from
-`/cart` is 1.000 at 0s, arriving from a SEARCH, as the gate does, is 0.24-0.40 at 0s and
-1.000 by 1.5s, and those are the exact numbers the gate then rejected a third run with. So
-measure a screen by the route the gate takes to it. A `--reset-steps` recipe owns where the
-SCREEN ends as well as the world: `undo/walmart-empty-cart.json` ends on a fresh `/cart`
-and waits for "Shop Grocery", which the skeleton lacks (4 of 4 at 1.000 from a search).
-This machine also geolocates to Canada, so walmart.com pins `fulfillment_method:Shipping`
-and anything store-fulfilled (all of Great Value) returns "We couldn't find a match" - pick
-a product that ships.
+On live walmart.com a page is not the page when its load event fires, and the admission
+gate reads it then - so NO Walmart skill has been stored, across five cold runs whose task
+the critic confirmed, measured 2026-09-19 through the DOM perceiver. The gate's environment
+factory (`NavigatingEnvironment` in `orchestrator.py`) resets the world, then does its OWN
+`Navigate(url)`, and `_attempt` in `skills/synthesize.py` observes at once; nothing a
+`--reset-steps` recipe does at its tail can settle that screen, which cost one wrong fix
+here. What it reads: the homepage still shows the PREVIOUS page at 0s (0.045 to a settled
+reference), is a 36-part skeleton at 1s (0.181) and reaches only 0.48 from 2s; signed-out
+`/cart` is 1.000 by 1.5s but 0.24-0.40 at 0s, so against the 0.26 cut its precondition
+went 0.40, 1.00, 0.238, 0.238, 1.00, 0.40 over six gate attempts - a coin flip. The end
+of the run has the same disease: a candidate that ran correctly in 3.6s, verifier passing
+and discriminating, was rejected at stage `critic` at 0.064 against an end screen recorded
+at model speed. Measure a screen by the ROUTE and the MOMENT the gate takes to it - a
+`/cart` reloaded from `/cart` after 4s says 1.000 and tells you nothing. Start a Walmart
+task at `/cart` regardless; it is the only anchor that ever reaches 1.000. This machine
+also geolocates to Canada, so walmart.com pins `fulfillment_method:Shipping` and anything
+store-fulfilled (all of Great Value) returns "We couldn't find a match" - pick a product
+that ships.
 
 A run's model client is built with `computer_use=True`, which appends the computer tool to
 EVERY request it makes, helpers included. A helper that wants text back can get a
