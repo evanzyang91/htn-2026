@@ -56,14 +56,15 @@ def validate_choice(answer, ids):
     return answer
 
 
-def progress(history, window=20):
+def progress(history, window=20, limit=60):
     """Every action that changed the page, plus the recent tail.
 
     A plain tail loses completed work on long runs and the policy restarts finished items. Actions
     that changed nothing are only useful as immediate context, so older ones are dropped instead.
+    The oldest completed work goes first past `limit`, to bound the request on a long run.
     """
     kept = [h for h in history[:-window] if h.get("page_changed")] + history[-window:]
-    return [{k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in kept]
+    return [{k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in kept[-limit:]]
 
 
 def action_space(actions):
@@ -79,7 +80,8 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            keep = ("role", "value", "checked", "selected", "expanded", "section", "opens")
+            element = {k: action[k] for k in keep if k in action}
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -99,8 +101,14 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history, covered=(), inert=()):
-    elements, targets, controls = action_space(state["actions"])
+def choose(state, goal, history, covered=(), inert=(), limit=None):
+    actions = state["actions"]
+    if limit is not None:
+        # An oversized page cannot be answered at all, so a narrowed question beats no answer.
+        # Keep every control (scroll, wait, back) and the first `limit` observed elements.
+        elements_first = [a for a in actions if a["kind"] in {"click", "fill", "select"}][:limit]
+        actions = elements_first + [a for a in actions if a["kind"] not in {"click", "fill", "select"}]
+    elements, targets, controls = action_space(actions)
     # Do not re-offer actions that observably changed nothing since the page last changed:
     # repeating them invites a dead loop (including alternating pairs), and re-executing a
     # mutation whose effect was not observed is never safe. A WAIT resets the streak — time
@@ -108,13 +116,18 @@ def choose(state, goal, history, covered=(), inert=()):
     # Action ids are positional per snapshot, so a streak entry only speaks about THIS page state.
     # Targets the executor refused as covered on this same page: offering them again only repeats
     # the refusal, because nothing about the page has changed.
-    dead = set(covered)
+    streak = []
     for h in reversed(history):
-        if h.get("page_changed") is not False or h.get("kind") == "wait":
+        if h.get("page_changed") is not False:
             break
         if h.get("page_fingerprint") != state["fingerprint"]:
             break
-        dead.add(h["choice"])
+        streak.append(h["choice"])
+    dead = set(covered) | set(streak)
+    # A control is not dead on its first miss: results really can arrive during a second WAIT, and
+    # a SCROLL can reveal content the first one did not. Two misses in a row on an unchanged page
+    # is a loop, not patience.
+    repeated = {choice for choice in streak if streak.count(choice) >= 2}
     if dead or inert:
         for operation in list(targets):
             candidates = targets[operation]
@@ -133,7 +146,11 @@ def choose(state, goal, history, covered=(), inert=()):
         "SELECT": "Select an observed dropdown value.",
     }
     operations = {key: labels[key] for key in targets}
-    operations.update({key: value["label"] for key, value in controls.items()})
+    # Controls need the same pruning as targets: scroll, wait and back are re-offered every step,
+    # so one that provably changed nothing can otherwise be chosen until the budget runs out.
+    operations.update(
+        {key: v["label"] for key, v in controls.items() if v["id"] not in repeated and v["label"] not in inert}
+    )
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
     questions = {
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
@@ -145,25 +162,37 @@ def choose(state, goal, history, covered=(), inert=()):
                 index: {
                     "element": f"[{index}] {a['label']}",
                     "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+                    **{k: a[k] for k in ("role", "checked", "selected", "expanded", "section", "opens") if k in a},
                 }
                 for index, a in candidates.items()
             },
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
+    page = {k: state.get(k) for k in ("url", "title", "text", "loading")}
+    if limit is not None:
+        page["text"] = (page.get("text") or "")[:1500]
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
-            "page": {k: state.get(k) for k in ("url", "title", "text", "loading")},
+            "page": page,
             "elements": elements,
             # The whole run must stay visible: with multi-item goals, a short window hides completed
             # items and the policy restarts them.
-            "recent_actions": progress(history),
+            "recent_actions": progress(history, limit=20 if limit is not None else 60),
         },
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    try:
+        result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    except RuntimeError as error:
+        # A page too large to answer is not a dead end: nothing executed, so ask a smaller question.
+        # Both limits — total input size and the per-question choice cap — have the same remedy.
+        oversized = "max_tokens_exceeded" in str(error) or "Too many choices" in str(error)
+        smaller = len(elements) // 2 if limit is None else limit // 2
+        if not oversized or smaller < 20:
+            raise
+        return choose(state, goal, history, covered, inert, limit=smaller)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -199,7 +228,9 @@ def field_context(goal, action, page, history):
     return {
         "goal": goal,
         "field": {k: action.get(k) for k in ("label", "role", "value")},
-        "page": {"title": page["title"], "text": page["text"][:6000], "loading": page.get("loading")},
+        # 2,000 chars measured ~200 ms faster per call than 6,000 with identical answers: the value
+        # comes from the goal and the field, not from the bulk of the page.
+        "page": {"title": page["title"], "text": page["text"][:2000], "loading": page.get("loading")},
         # The helper writes the value, so it needs the same full progress record as the policy:
         # a short window hides finished items and the helper types the first goal item again.
         "recent_actions": progress(history),

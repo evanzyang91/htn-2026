@@ -57,6 +57,18 @@
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
   };
+  // Where an element sits, named rather than scored. A control in an open dialog, the header or a
+  // form means something different from the same label in a footer, and the model can weigh that
+  // itself — a fixed positional prior here would be a guess baked into the observation.
+  const LANDMARKS='[role="dialog"],[role="search"],[role="banner"],[role="navigation"],[role="main"],'+
+    '[role="contentinfo"],[role="complementary"],dialog,header,nav,main,aside,footer,form';
+  const ROLE_NAMES={banner:'header',navigation:'nav',contentinfo:'footer',complementary:'aside'};
+  const section=e=>{
+    const l=e.closest(LANDMARKS);
+    if (!l) return null;
+    const r=l.getAttribute('role');
+    return r ? (ROLE_NAMES[r]||r) : l.tagName.toLowerCase();
+  };
   const actions=[];
   for (const e of document.querySelectorAll(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
@@ -65,6 +77,9 @@
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    const where=section(e);
+    if (where) base.section=where;
+    if (e.getAttribute('aria-haspopup')) base.opens=e.getAttribute('aria-haspopup');
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -127,6 +142,12 @@
   // wall reached by a mis-click: every remaining action keeps it there.
   // >2 because entry 1 is the about:blank the tab opens on: never offer a way back to a blank page.
   if (history.length>2) actions.push({id:'back',kind:'back',label:'Go back to the previous page'});
+  // Some searches have no button at all and submit only on Enter. Without this the agent can type a
+  // query and then have no way to run it. Offered only when a non-empty text field actually holds
+  // focus, so the key press has a defined destination.
+  const focused=document.activeElement;
+  if (focused && (focused.tagName==='INPUT'||focused.tagName==='TEXTAREA') && focused.value && safe(focused))
+    actions.push({id:'enter',kind:'enter',label:'Press Enter to submit '+(name(focused)||'the focused field')});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   // Advisory only (not part of the fingerprint): lets the model choose WAIT deliberately.
   const loading=document.readyState!=='complete' ||

@@ -56,11 +56,16 @@ class Browser:
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.frame_misses, self.frame_skip = 0, 0
         started = time.perf_counter()
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
+        # The tab still holds about:blank for a moment after Page.navigate, and that document is
+        # already "complete" — polling readiness alone returns instantly and the first decision is
+        # made on a blank page. Require the new document to have replaced it.
+        ready = "(() => location.href !== 'about:blank' && document.readyState === 'complete')()"
         while time.monotonic() < deadline:
-            if self.evaluate("document.readyState") == "complete":
+            if self.evaluate(ready):
                 break
             time.sleep(0.02)
         # The first load happens before the run clock starts, so record it or it is invisible.
@@ -74,6 +79,22 @@ class Browser:
         if response.get("exceptionDetails"):
             raise StalePage("Document changed during evaluation")
         return response.get("result", {}).get("value")
+
+    def capture(self):
+        """A frame for the inspector, or None. Never re-reads the page.
+
+        Some pages block the compositor for long stretches, so a frame costs the full timeout and
+        returns nothing. Back off after repeated misses and retry periodically: the agent must not
+        pay for frames it cannot get.
+        """
+        if self.frame_skip > 0:
+            self.frame_skip -= 1
+            return None
+        data = capture_frame(self.session)
+        self.frame_misses = 0 if data else self.frame_misses + 1
+        if self.frame_misses >= 3:
+            self.frame_misses, self.frame_skip = 0, 5
+        return data
 
     def observe(self, screenshot=True):
         if getattr(self, "after_input", None):
@@ -179,6 +200,23 @@ class Browser:
                 pass  # The tab or browser is already gone; reset must still proceed.
 
 
+def capture_frame(session):
+    """The frame dominates observation cost on heavy pages: the default encoder measured ~1,000 ms
+    against ~40 ms for the speed-optimised one, and a healthy capture 28-56 ms. A blocked compositor
+    never delivers at all, so bound the wait tightly and let a lost frame cost nothing."""
+    try:
+        return cdp(
+            "Page.captureScreenshot",
+            session_id=session,
+            _response_timeout=0.5,
+            format="jpeg",
+            quality=72,
+            optimizeForSpeed=True,
+        )["data"]
+    except (RuntimeError, TimeoutError):
+        return None
+
+
 def fingerprint(state):
     content = {k: state[k] for k in ("url", "text", "actions", "scroll")}
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
@@ -215,6 +253,18 @@ def browser_operation(request):
         elif kind == "back":
             # A fixed, code-owned navigation. The model selects the operation, never its content.
             call("Runtime.evaluate", expression="history.back()")
+        elif kind == "enter":
+            # A fixed key, sent to whatever holds focus. The model chooses the operation, not the key.
+            for event, extra in (("keyDown", {"text": "\r"}), ("keyUp", {})):
+                call(
+                    "Input.dispatchKeyEvent",
+                    type=event,
+                    key="Enter",
+                    code="Enter",
+                    windowsVirtualKeyCode=13,
+                    nativeVirtualKeyCode=13,
+                    **extra,
+                )
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -268,11 +318,5 @@ def browser_operation(request):
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)
     if request.get("screenshot", True):
-        # Heavy pages sometimes never deliver a frame; bound the wait and let a lost frame cost nothing.
-        try:
-            info["screenshot"] = cdp(
-                "Page.captureScreenshot", session_id=session, _response_timeout=2, format="jpeg", quality=72
-            )["data"]
-        except (RuntimeError, TimeoutError):
-            info["screenshot"] = None
+        info["screenshot"] = capture_frame(session)
     return info

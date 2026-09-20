@@ -2,6 +2,7 @@
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from unittest.mock import Mock
 
@@ -162,6 +163,8 @@ def runner():
     a = loop.Agent.__new__(loop.Agent)
     a.screenshots = False
     a.pending_text = None
+    a.speculation = None
+    a.workers = ThreadPoolExecutor(max_workers=1)
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -176,6 +179,7 @@ def runner():
         "text_calls": [],
         "model_ms": 0,
         "load_ms": 0,
+        "frame_ms": 0,
     }
     a.stale_streak, a.stale_at, a.stale_known = 0, None, 0
     a.covered = {}
@@ -200,6 +204,8 @@ def test_generated_text_reused_only_for_identical_retry_context(runner, monkeypa
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     runner.state["decision"] = decision()
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    # One value, generated once and reused across the retry. No speculative call follows, because
+    # the step that just ran was itself a fill.
     assert helper.call_count == 1
     assert runner.state["browser"].act.call_count == 2  # The first call rejects before any browser input.
     assert runner.pending_text is None
@@ -214,7 +220,9 @@ def test_changed_field_context_does_not_reuse_generated_text(runner, monkeypatch
     runner.state["page"]["text"] = "Different page context"
     runner.state["decision"] = decision()
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    # Regenerated because the context changed, so two generations for two differing contexts.
     assert helper.call_count == 2
+    assert helper.call_args_list[1].args[0]["page"]["text"] == "Different page context"
 
 
 def test_loading_waits_do_not_trigger_no_progress_stop(runner):
@@ -299,3 +307,25 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def steps(labels):
+    return [{"action": label, "kind": "click", "page_changed": True} for label in labels]
+
+
+def test_churning_between_a_few_actions_is_detected_as_a_cycle():
+    # Every step changes the page, so no page_changed or fingerprint rule can see these. The real
+    # Amazon loop doubles back (open, go, open, open, go), so strict alternation must not be required.
+    assert loop.Agent.cycling(steps(["Open Search", "Go", "Open Search", "Open Search", "Go", "Open Search"])) == {
+        "Open Search",
+        "Go",
+    }
+    assert loop.Agent.cycling(steps(["Search", "Open Search", "Clear"] * 3)) == {"Search", "Open Search", "Clear"}
+
+
+def test_progress_is_not_mistaken_for_a_cycle():
+    # One action repeating is usually progress: quantity steppers, "Load more", pagination.
+    assert loop.Agent.cycling(steps(["Increase quantity by 1"] * 8)) == set()
+    # A varied multi-item flow must never be pruned.
+    assert loop.Agent.cycling(steps(["Search", "Go", "Item A", "Add to cart", "Search", "Go", "Item B"])) == set()
+    assert loop.Agent.cycling(steps(["Open Search", "Go"])) == set()  # too short to conclude

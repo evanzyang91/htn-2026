@@ -51,6 +51,7 @@ function controls() {
   $("goal").disabled = busy;
   $("url").disabled = busy;
   $("refine").disabled = busy;
+  $("text-model").disabled = busy;
   $("refine-model").disabled = busy || !$("refine").checked;
   $("refine-effort").disabled = busy || !$("refine").checked;
   $("choose").disabled = busy || !live;
@@ -84,10 +85,11 @@ async function perform(fn, label) {
     controls();
   }
 }
-function renderModels() {
-  const select = $("refine-model"),
-    models = state?.refine_models || [];
-  if (!models.length || select.dataset.filled === models.join()) return;
+function fillModels(select, models, current) {
+  if (!models.length || select.dataset.filled === models.join()) {
+    if (current && !select.dataset.dirty) select.value = current;
+    return;
+  }
   select.dataset.filled = models.join();
   select.replaceChildren(
     ...models.map((m) => {
@@ -96,8 +98,12 @@ function renderModels() {
       return option;
     }),
   );
-  select.value = state.refine_model || models[0];
-  if (state.refine_effort) $("refine-effort").value = state.refine_effort;
+  select.value = current || models[0];
+}
+function renderModels() {
+  fillModels($("refine-model"), state?.refine_models || [], state?.refine_model);
+  fillModels($("text-model"), state?.text_models || [], state?.text_model);
+  if (state?.refine_effort) $("refine-effort").value = state.refine_effort;
 }
 function renderRefinement() {
   const r = state?.refinement,
@@ -172,13 +178,14 @@ function render() {
     ? state.history
         .map(
           (h) =>
-            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text ? ` <b>“${escape(h.text)}”</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.model_ms ?? h.latency_ms} ms model · ${h.load_ms ?? "—"} ms load<small>${percent(h.probability)}</small></span><span class="effect">${h.page_changed ? "Page changed" : "No change observed"}</span></div>`,
+            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text ? ` <b>“${escape(h.text)}”</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.model_ms ?? h.latency_ms} ms model · ${h.load_ms ?? "—"} ms load${h.frame_ms ? ` · ${h.frame_ms} ms frame` : ""}<small>${percent(h.probability)}</small></span><span class="effect">${h.page_changed ? "Page changed" : "No change observed"}</span></div>`,
         )
         .join("")
     : '<p class="muted">Each executed action leaves an observed result.</p>';
   $("step-count").textContent =
     `${state.history.length} actions · ${(state.elapsed_ms / 1000).toFixed(2)} s total · ` +
     `${((state.model_ms || 0) / 1000).toFixed(2)} s model · ${((state.load_ms || 0) / 1000).toFixed(2)} s load` +
+    (state.frame_ms ? ` · ${(state.frame_ms / 1000).toFixed(2)} s frames` : "") +
     (state.initial_load_ms ? ` · ${(state.initial_load_ms / 1000).toFixed(2)} s first load` : "");
   $("model-state").textContent = JSON.stringify(
     d?.request || {
@@ -207,6 +214,8 @@ $("task-form").addEventListener("submit", (event) => {
         refine_effort: $("refine-effort").value,
       });
       if (refine && state?.goal) $("goal").value = state.goal;
+      // Same perform(), so the run starts without waiting for a second click.
+      if ($("autorun").checked) await runAutomatically();
     },
     refine ? "Refining the goal, then opening a browser…" : "Opening a fresh browser…",
   );
@@ -225,30 +234,35 @@ $("execute").addEventListener("click", () =>
     "Executing the choice…",
   ),
 );
-$("auto").addEventListener("click", () =>
-  perform(async () => {
-    automatic = true;
-    controls();
-    for (let i = 0; i < state.max_steps * 2 && automatic; i++) {
-      $("status").textContent = "Running…";
-      if ($("pace").checked) {
-        await call("predict");
-        await new Promise(resolve => setTimeout(resolve, 450));
-        if (!automatic) break;
-        await call("act", {fingerprint: state.page.fingerprint});
-      } else {
-        await call("tick");
-      }
-      if (["done", "blocked"].includes(state.status)) break;
+async function runAutomatically() {
+  automatic = true;
+  controls();
+  for (let i = 0; i < state.max_steps * 2 && automatic; i++) {
+    $("status").textContent = "Running…";
+    if ($("pace").checked) {
+      await call("predict");
+      await new Promise(resolve => setTimeout(resolve, 450));
+      if (!automatic) break;
+      await call("act", {fingerprint: state.page.fingerprint});
+    } else {
+      await call("tick");
     }
-    automatic = false;
-  }, "Running the browser…"),
+    if (["done", "blocked"].includes(state.status)) break;
+  }
+  automatic = false;
+}
+$("auto").addEventListener("click", () =>
+  perform(runAutomatically, "Running the browser…"),
 );
 $("stop").addEventListener("click", () => {
   automatic = false;
   $("status").textContent = "Pausing after the current request…";
   controls();
 });
+$("text-model").addEventListener("change", () =>
+  // Applies to the next TYPE_TEXT, so it can be switched while a run is going.
+  perform(() => call("model", { text_model: $("text-model").value }), "Switching the agent's model…"),
+);
 $("refine").addEventListener("change", controls);
 $("overlays").addEventListener("change", () => {
   $("targets").hidden = !$("overlays").checked;

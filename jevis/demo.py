@@ -30,23 +30,31 @@ def load_environment():
                 os.environ.setdefault(key, value)
 
 
-DEFAULT_REFINE_MODELS = "gpt-6-astra,gpt-5.6-luna,gpt-5.6-sol,gpt-4o-mini"
+DEFAULT_REFINE_MODELS = "gpt-5.6-luna,gpt-4o-mini,gpt-4.1-nano,gpt-6-astra,gpt-5.6-sol"
+
+
+def model_options(current):
+    """Offered in the inspector and used as the allowlist for a requested model."""
+    names = [m.strip() for m in os.environ.get("REFINE_MODELS", DEFAULT_REFINE_MODELS).split(",") if m.strip()]
+    return ([current] + [m for m in names if m != current]) if current not in names else names
+
+
+def text_model():
+    return os.environ.get("TEXT_MODEL", "deepseek-chat")
 
 
 def refine_models():
-    """Offered in the inspector and used as the allowlist for the requested model."""
-    names = [m.strip() for m in os.environ.get("REFINE_MODELS", DEFAULT_REFINE_MODELS).split(",") if m.strip()]
-    current = os.environ.get("REFINE_MODEL") or os.environ.get("TEXT_MODEL", "deepseek-chat")
-    return ([current] + [m for m in names if m != current]) if current not in names else names
+    return model_options(os.environ.get("REFINE_MODEL") or text_model())
 
 
 def response_state():
     state = AGENT.snapshot() if AGENT else {"page": None, "status": "idle", "history": [], "decision": None}
     return {
         **state,
-        "text_model": os.environ.get("TEXT_MODEL", "deepseek-chat"),
+        "text_model": text_model(),
+        "text_models": model_options(text_model()),
         "refine_models": refine_models(),
-        "refine_model": os.environ.get("REFINE_MODEL") or os.environ.get("TEXT_MODEL", "deepseek-chat"),
+        "refine_model": os.environ.get("REFINE_MODEL") or text_model(),
         "refine_effort": os.environ.get("REFINE_EFFORT", ""),
         "efforts": list(EFFORTS),
         "max_steps": MAX_STEPS,
@@ -96,6 +104,13 @@ def command(name, body):
         )
         AGENT.state["scenario"] = scenario
         AGENT.state["refinement"] = refinement
+    elif name == "model":
+        # The helper reads TEXT_MODEL per call, so this takes effect on the next TYPE_TEXT of a
+        # run already in progress, and persists as the default for the next one.
+        chosen = body.get("text_model", "")
+        if chosen not in model_options(text_model()):
+            raise ValueError("Unknown model")
+        os.environ["TEXT_MODEL"] = chosen
     else:
         if AGENT is None:
             raise ValueError("Start a demo first")
@@ -160,10 +175,28 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def serve_on(port):
+    """Bind the first free port at or above `port`, so a leftover server is not a dead end.
+
+    The Host and Origin checks read these globals per request, so both must follow the real port.
+    """
+    global PORT, ORIGIN
+    for candidate in range(port, port + 10):
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", candidate), Handler)
+        except OSError:
+            continue
+        if candidate != port:
+            print(f"Port {port} is in use; serving on {candidate} instead.", flush=True)
+        PORT, ORIGIN = candidate, f"http://127.0.0.1:{candidate}"
+        return server
+    raise SystemExit(f"Ports {port}-{port + 9} are all in use. Free one, or set TYPESAFE_DEMO_PORT.")
+
+
 def main():
     load_environment()
     atexit.register(close_browser)
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = serve_on(PORT)
     print(f"Jevis: {ORIGIN}", flush=True)
     try:
         server.serve_forever()

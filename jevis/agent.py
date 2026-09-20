@@ -2,6 +2,7 @@
 
 import base64
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .browser import Browser, CoveredTarget, StalePage
@@ -16,8 +17,11 @@ class Agent:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        self.speculation = None
+        self.workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jev-text")
         self.stale_streak, self.stale_at, self.stale_known = 0, None, 0
         self.covered = {}
+        self.done_seen = False
         # Controls whose label promises nothing this run: a label like "Make 2 required selections"
         # can never advance the goal, and it is re-offered after any reopen because the page
         # fingerprint resets. The label changes once the control becomes usable, so it returns then.
@@ -31,6 +35,13 @@ class Agent:
         self.screenshots = screenshots or bool(record_dir)
         try:
             page = self.browser.observe(screenshot=self.screenshots)
+            # A bot check or splash can be the first complete document and replace itself seconds
+            # later. Without this the run's first and only decision is made on an empty page.
+            for _ in range(4):
+                if not self.blank(page):
+                    break
+                self.browser.settle(quiet_ms=200, cap_ms=1200)
+                page = self.browser.observe(screenshot=self.screenshots)
         except Exception:
             self.browser.close()
             raise
@@ -48,6 +59,7 @@ class Agent:
             elapsed_ms=0,
             model_ms=0,
             load_ms=0,
+            frame_ms=0,
             initial_load_ms=self.browser.load_ms,
             started_at=None,
             record=bool(self.record_dir),
@@ -57,10 +69,67 @@ class Agent:
             if page.get("screenshot"):
                 (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
 
+    def speculate(self, state):
+        """Start the only typeable field's value beside the work that follows.
+
+        The helper is the long pole on a typing step (~1.3 s against ~0.3 s for the policy), and its
+        value does not depend on which operation wins. Starting it as soon as the page settles
+        overlaps it with the frame capture and the next decision instead of following them.
+        """
+        self.speculation = None
+        fields = [a for a in state["page"]["actions"] if a["kind"] == "fill"]
+        # Speculate whenever exactly one field can be typed into, even one holding a value: a search
+        # box keeps the previous query, and a multi-item run types over it for every item. Gating on
+        # an empty field measured 1.4-5.4 s of unhidden helper latency per item against ~0.5 s here.
+        if len(fields) != 1 or state["status"] in {"done", "blocked"}:
+            return
+        if state["history"] and state["history"][-1]["kind"] == "fill":
+            return  # A query was just typed; the next action submits it rather than typing again.
+        context = field_context(state["goal"], fields[0], state["page"], state["history"])
+        self.speculation = (context, self.workers.submit(field_text, context))
+
+    @staticmethod
+    def cycling(history, window=8, repeats=6):
+        """Labels caught in a repeating cycle, judged on the action sequence alone.
+
+        The fingerprint-keyed memory cannot see these. A page that varies between laps — search
+        suggestions, timestamps, a re-rendered overlay — looks new every time, so two or three
+        actions can alternate until the budget runs out even though each one "changes the page".
+        Only cycles of two or more are counted: a single action repeated (Scroll down, Next page,
+        Increase quantity) is usually real progress, and a dead one is already handled elsewhere.
+        """
+        labels = [h["action"] for h in history[-window:]]
+        if len(labels) < repeats:
+            return set()
+        distinct = set(labels)
+        # Churn, not a strict alternation: a real loop doubles back on itself (open, go, open, open,
+        # go), so requiring an exact repeating pattern misses it. A handful of labels filling the
+        # whole window is the signal. Two or more, because one action repeating — "Increase quantity
+        # by 1", "Load more" — is usually progress.
+        return distinct if 2 <= len(distinct) <= 3 else set()
+
+    @staticmethod
+    def blank(page):
+        """An interstitial with nothing to act on: a bot check or challenge shell that self-replaces.
+
+        Deciding here wastes the decision — the only offered operations are WAIT and BLOCKED, and a
+        BLOCKED ends the run on a page that was about to become the real site.
+        """
+        return not page["text"].strip() and not any(
+            a["kind"] in {"click", "fill", "select"} for a in page["actions"]
+        )
+
     def observed(self, screenshot=None):
         """Observe outside the act path, attributing the wait to the site rather than the models."""
         started = time.perf_counter()
-        page = self.state["browser"].observe(screenshot=self.screenshots if screenshot is None else screenshot)
+        browser = self.state["browser"]
+        shot = self.screenshots if screenshot is None else screenshot
+        page = browser.observe(screenshot=shot)
+        for _ in range(4):
+            if not self.blank(page):
+                break
+            browser.settle(quiet_ms=200, cap_ms=1200)
+            page = browser.observe(screenshot=shot)
         self.state["load_ms"] += round((time.perf_counter() - started) * 1000)
         return page
 
@@ -102,6 +171,9 @@ class Agent:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
                 state["page"] = self.observed()
+                # The speculation was built on the page we just replaced, so its input no longer
+                # matches and it could not be reused. Start one for the page we will decide on.
+                self.speculate(state)
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
@@ -113,8 +185,11 @@ class Agent:
                 state["history"],
                 self.covered.get(state["page"]["fingerprint"], set())
                 | self.taken.get(state["page"]["fingerprint"], set()),
-                {label for label, misses in self.inert.items() if misses >= 3},
+                {label for label, misses in self.inert.items() if misses >= 3}
+                | self.cycling(state["history"]),
             )
+            if self.speculation is None:
+                self.speculate(state)
             try:
                 state["decision"] = choose(*ask)
             except ValueError as invalid:
@@ -142,6 +217,17 @@ class Agent:
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
+                if selected == "DONE" and not self.done_seen:
+                    # DONE is judged on the snapshot the last action produced, which is often taken
+                    # before the effect lands: a cart badge, a navigation, an availability notice.
+                    # Require the claim to survive one fresh look, so success is confirmed against
+                    # the settled page rather than the optimistic one.
+                    self.done_seen = True
+                    state["browser"].settle(quiet_ms=150, cap_ms=1200)
+                    state["page"] = self.observed()
+                    state["status"] = "ready"
+                    state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                    return self.snapshot()
                 state["status"] = "done" if selected == "DONE" else "blocked"
                 state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
@@ -150,7 +236,7 @@ class Agent:
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
-            text, helper = None, None
+            text, helper, overlapped = None, None, False
             if action["kind"] == "fill":
                 # Check the target, not the whole document: unrelated churn elsewhere on a live
                 # page must not veto typing into a field that is still the same field.
@@ -161,7 +247,13 @@ class Agent:
                     _, text, helper = self.pending_text
                 else:
                     try:
-                        text, helper = field_text(context)
+                        # Reuse the speculative value only when its entire input is identical,
+                        # exactly as a stale retry does.
+                        if self.speculation and self.speculation[0] == context:
+                            text, helper = self.speculation[1].result()
+                            overlapped = True
+                        else:
+                            text, helper = field_text(context)
                     except NoFieldValue as decline:
                         # A declined field is unusable on this page, not a reason to end the run:
                         # drop it from the next decision and let the policy choose differently.
@@ -190,7 +282,9 @@ class Agent:
                     raise
                 state["browser"].act(action, current, text=text, page_level=False)
             self.pending_text = None
+            self.speculation = None  # Its page is gone; the settled page below gets a fresh one.
             self.stale_streak = 0
+            self.done_seen = False  # A new action means the next DONE claim is about a new page.
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
             state["history"].append(
@@ -211,8 +305,11 @@ class Agent:
                     "url": page["url"],
                     "page_fingerprint": page["fingerprint"],
                     # Time the models owned, against time the site owned. Filled after observing.
-                    "model_ms": decision["latency_ms"] + (helper["latency_ms"] if helper else 0),
+                    # A speculative helper call ran beside the decision, so counting it would make
+                    # the parts exceed the whole.
+                    "model_ms": decision["latency_ms"] + (0 if overlapped or not helper else helper["latency_ms"]),
                     "load_ms": None,
+                    "frame_ms": None,
                     "usage": decision["usage"],
                     "executed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
                     "elapsed_ms": state["elapsed_ms"],
@@ -233,22 +330,45 @@ class Agent:
                 # Decide on a quiet page, not on whatever happened to be rendered first.
                 state["browser"].settle(quiet_ms=150, cap_ms=1500)
                 after = state["browser"].observe(screenshot=False)
-            if self.screenshots:
-                if after["fingerprint"] == page["fingerprint"]:
-                    after["screenshot"] = page.get("screenshot")  # Unchanged page, unchanged picture.
-                else:
-                    after = state["browser"].observe(screenshot=True)
+            elif not noop and action["kind"] != "wait":
+                # The page changed in place: an overlay, dropdown or in-page result swap. Its first
+                # frame is half-built — a menu measured 3 elements and no text at once, then 14
+                # elements and its options a moment later — so let it finish before deciding.
+                state["browser"].settle(quiet_ms=100, cap_ms=700)
+                after = state["browser"].observe(screenshot=False)
             state["page"] = after
+            # Record the outcome BEFORE speculating. The helper's input includes the action history,
+            # so speculating while this entry still reads page_changed=None guarantees a context
+            # that cannot match the one act() builds later — every speculation was discarded.
+            state["history"][-1]["page_changed"] = after["fingerprint"] != page["fingerprint"]
+            # Start the next value before the frame, not after it: the capture is for the inspector
+            # and can cost hundreds of milliseconds that the helper can be working through.
+            self.speculate(state)
+            frame_ms = 0
+            if self.screenshots:
+                # Unchanged page, unchanged picture. Otherwise take only the frame: re-reading the
+                # page would cost a second full read and invalidate the speculation above.
+                frame_started = time.perf_counter()
+                after["screenshot"] = (
+                    page.get("screenshot")
+                    if after["fingerprint"] == page["fingerprint"]
+                    else state["browser"].capture() or page.get("screenshot")
+                )
+                frame_ms = round((time.perf_counter() - frame_started) * 1000)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-            load_ms = round((time.perf_counter() - load_started) * 1000)
+            # Keep the inspector's frame out of "load": it is viewer overhead, not the site
+            # responding, and reporting them together makes a scroll look like a page load.
+            load_ms = round((time.perf_counter() - load_started) * 1000) - frame_ms
             state["history"][-1].update(
                 page_changed=state["page"]["fingerprint"] != page["fingerprint"],
                 url=state["page"]["url"],
                 elapsed_ms=state["elapsed_ms"],
                 load_ms=load_ms,
+                frame_ms=frame_ms,
             )
             state["model_ms"] += state["history"][-1]["model_ms"]
             state["load_ms"] += load_ms
+            state["frame_ms"] += frame_ms
             if action["kind"] in {"click", "select", "fill"}:
                 changed = state["history"][-1]["page_changed"]
                 self.inert[action["label"]] = 0 if changed else self.inert.get(action["label"], 0) + 1
@@ -277,6 +397,7 @@ class Agent:
             yield self.command("tick")
 
     def close(self):
+        self.workers.shutdown(wait=False, cancel_futures=True)
         self.browser.close()
 
     def __enter__(self):
