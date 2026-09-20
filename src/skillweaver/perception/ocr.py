@@ -737,11 +737,16 @@ class PerceptionCounts:
         ocr_hits: Text reads answered from cache.
         ocr_timeouts: Reads abandoned. A SUBSET of ``ocr_reads``, and should be zero:
             one means eyes that stopped working, not skills that did.
+        detections: Runs of the pixel path's DETECTOR, and of nothing else.
+        dom_reads: Times the DOM perceiver asked the page for its controls. It used to be
+            counted as a detection, so a ``--perception dom`` run, which builds no detector
+            and no OCR engine, reported "7 detection(s)" and read as if it had run one.
     """
 
     observations: int = 0
     captures: int = 0
     detections: int = 0
+    dom_reads: int = 0
     ocr_reads: int = 0
     ocr_hits: int = 0
     ocr_timeouts: int = 0
@@ -762,6 +767,7 @@ class PerceptionCounts:
             observations=self.observations + other.observations,
             captures=self.captures + other.captures,
             detections=self.detections + other.detections,
+            dom_reads=self.dom_reads + other.dom_reads,
             ocr_reads=self.ocr_reads + other.ocr_reads,
             ocr_hits=self.ocr_hits + other.ocr_hits,
             ocr_timeouts=self.ocr_timeouts + other.ocr_timeouts,
@@ -774,6 +780,7 @@ class PerceptionCounts:
             observations=max(self.observations - other.observations, 0),
             captures=max(self.captures - other.captures, 0),
             detections=max(self.detections - other.detections, 0),
+            dom_reads=max(self.dom_reads - other.dom_reads, 0),
             ocr_reads=max(self.ocr_reads - other.ocr_reads, 0),
             ocr_hits=max(self.ocr_hits - other.ocr_hits, 0),
             ocr_timeouts=max(self.ocr_timeouts - other.ocr_timeouts, 0),
@@ -781,13 +788,29 @@ class PerceptionCounts:
 
     def __bool__(self) -> bool:
         """Whether anything was counted, so a report can stay silent otherwise."""
-        return bool(self.observations or self.captures or self.detections or self.text_reads)
+        return bool(
+            self.observations
+            or self.captures
+            or self.detections
+            or self.dom_reads
+            or self.text_reads
+        )
+
+    @property
+    def looks(self) -> str:
+        """How the elements were found, in the words of the path that found them: the
+        pixel path's wording is unchanged, and the DOM path stops borrowing it."""
+        if self.dom_reads and not self.detections:
+            return f"{self.dom_reads} DOM read(s)"
+        if self.dom_reads:
+            return f"{self.detections} detection(s), {self.dom_reads} DOM read(s)"
+        return f"{self.detections} detection(s)"
 
     def __str__(self) -> str:
         abandoned = f", {self.ocr_timeouts} ABANDONED" if self.ocr_timeouts else ""
         return (
             f"{self.observations} observation(s), {self.ocr_reads} OCR read(s) "
-            f"+ {self.ocr_hits} cached, {self.detections} detection(s){abandoned}"
+            f"+ {self.ocr_hits} cached, {self.looks}{abandoned}"
         )
 
 
@@ -802,6 +825,7 @@ class PerceptionCounters:
     observations: int = 0
     captures: int = 0
     detections: int = 0
+    dom_reads: int = 0
     ocr_reads: int = 0
     ocr_hits: int = 0
     ocr_timeouts: int = 0
@@ -812,6 +836,7 @@ class PerceptionCounters:
             observations=self.observations,
             captures=self.captures,
             detections=self.detections,
+            dom_reads=self.dom_reads,
             ocr_reads=self.ocr_reads,
             ocr_hits=self.ocr_hits,
             ocr_timeouts=self.ocr_timeouts,
@@ -823,7 +848,7 @@ class PerceptionCounters:
 
     def reset(self) -> None:
         """Zero every field."""
-        self.observations = self.captures = self.detections = 0
+        self.observations = self.captures = self.detections = self.dom_reads = 0
         self.ocr_reads = self.ocr_hits = self.ocr_timeouts = 0
 
     def __str__(self) -> str:
