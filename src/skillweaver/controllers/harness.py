@@ -26,6 +26,7 @@ a release at a logical pixel, and ``evaluate`` is the same read-only hook.
 from __future__ import annotations
 
 import base64
+import os
 import re
 import sys
 import time
@@ -52,7 +53,7 @@ from skillweaver.contracts import (
     Wait,
     utcnow,
 )
-from skillweaver.controllers import _coords
+from skillweaver.controllers import _coords, _daemon_reaper
 from skillweaver.controllers._quiesce import QUIESCE_JS
 from skillweaver.errors import ControllerError
 from skillweaver.logging_ import get_logger
@@ -179,6 +180,7 @@ class HarnessBrowserController:
         self._session: str | None = None
         self._closed = False
         self._acted_ms = 0.0
+        self._daemon = os.environ.get("BU_NAME", "default")
         try:
             from browser_harness.admin import ensure_daemon
             from browser_harness.helpers import cdp
@@ -197,6 +199,8 @@ class HarnessBrowserController:
                 note="if Chrome asks to allow remote debugging, allow it; the run waits",
             )
             ensure_daemon()
+            # The daemon outlives this run; a named one is stopped once it has sat unused.
+            _daemon_reaper.watch(self._daemon)
             # In the BACKGROUND: the person's visible tab stays theirs.
             self._target = cdp("Target.createTarget", url="about:blank", background=True)[
                 "targetId"
@@ -383,6 +387,7 @@ class HarnessBrowserController:
             raise ControllerError("browser controller is closed")
 
     def _call(self, method: str, **params: Any) -> dict[str, Any]:
+        _daemon_reaper.beat(self._daemon)
         return self._cdp(method, session_id=self._session, **params)
 
     def _expression(self, expression: str) -> Any:
