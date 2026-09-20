@@ -46,6 +46,7 @@ from skillweaver.contracts import (
     Budget,
     Candidate,
     Controller,
+    Critic,
     Detector,
     Element,
     Fingerprint,
@@ -1495,6 +1496,7 @@ def build_agent(
     recorder: TrajectoryRecorder | None = None,
     environment: EnvironmentFor | None = None,
     policy: ActingPolicy | None = None,
+    move_critic: Critic | None = None,
     budget: Budget | None = None,
     compose: bool = True,
     learn: bool = True,
@@ -1522,6 +1524,8 @@ def build_agent(
         policy: ``None`` (the default) is ``llm`` through the acting prompt. A policy
             replaces that ONE step; the planner, critics, gate and store are the same
             objects either way.
+        move_critic: Who judges each cold MOVE; ``None`` (the default) is the cold critic.
+            It never judges the ``done`` claim - :func:`_open_move_critic`.
         compose: Whether the planner may spend one model call chaining known skills for a
             task no single skill covers. ``False`` keeps it strictly model-free.
         max_repairs: How many times the gate may ask for the code to be rewritten.
@@ -1565,6 +1569,7 @@ def build_agent(
         runner=runner,
         policy=policy,
         library=store.list,
+        move_critic=move_critic,
     )
 
     synthesis: SynthesisFactory | None = None
@@ -1681,6 +1686,7 @@ def build_workbench(config: Settings | None = None) -> Workbench:
                 perceiver=perceiver,
                 llm=llm,
                 policy=_open_policy(resolved, perceiver, llm),
+                move_critic=_open_move_critic(resolved, perceiver),
                 store=store,
                 retriever=build_retriever(store),
                 graph=graph,
@@ -1846,6 +1852,26 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
         return writer.rewrite_goal(goal, url, CATEGORY_RULES[category] if applied else "")
 
     return JevDriver(policy, perceiver, refine=refine)
+
+
+def _open_move_critic(config: Settings, perceiver: Perceiver) -> Critic | None:
+    """The per-move judge of a cold run, or ``None`` for the cold critic itself.
+
+    Literal page change (:class:`~skillweaver.agent.move_critic.LiteralMoveCritic`) ONLY
+    on the Jev path and only when ``fast_moves`` is set: the default explorer's prompt
+    is handed the per-move verdict as its rejection and is calibrated against it, while
+    ``JevDriver._settle`` already keeps the policy's history on the literal digest and
+    ignores that verdict. The ``done`` claim is judged by the full critic either way.
+    """
+    if config.policy != "jev" or not config.fast_moves:
+        return None
+    from skillweaver.agent.move_critic import LiteralMoveCritic
+    from skillweaver.perception.dom import DomPerceiver
+
+    if not isinstance(perceiver, DomPerceiver):
+        return None
+    log.info("agent.move_critic", kind="literal")
+    return LiteralMoveCritic(perceiver)
 
 
 def budget_from(
