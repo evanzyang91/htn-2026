@@ -80,6 +80,7 @@ from skillweaver.contracts import (
     Action,
     ActionKind,
     ActionResult,
+    Back,
     Box,
     Click,
     Drag,
@@ -110,6 +111,15 @@ __all__ = [
 
 LIVE_ENV_VAR = "SKILLWEAVER_LIVE_DESKTOP"
 """Set this to ``1`` to enable the tests that touch the real screen and cursor."""
+
+_UNSUPPORTED_ACTIONS: frozenset[str] = frozenset({"navigate", "back"})
+"""The action kinds a desktop cannot perform, named rather than inferred.
+
+Both are session history: there is no address bar to load a URL from and no stack to
+pop. Naming them is what makes a NEW action kind land here as unsupported-until-taught
+rather than as silently supported, which is how a controller comes to claim a move it
+would then have to fake.
+"""
 
 SCROLL_PIXELS_PER_CLICK = 40
 """Logical pixels of content movement one wheel 'click' is taken to be.
@@ -544,8 +554,14 @@ class DesktopController:
         return self._bounds
 
     def supports(self, action_kind: ActionKind) -> bool:
-        """Every action kind but ``"navigate"``: a desktop has no address bar."""
-        return action_kind != "navigate"
+        """Every action kind but the two that need a session history.
+
+        A desktop has no address bar to ``navigate`` with and no history stack to go
+        ``back`` through. Both are named rather than the set being "everything except
+        navigate", so a controller that cannot do a thing says so instead of a new
+        action kind arriving here as supported by default.
+        """
+        return action_kind not in _UNSUPPORTED_ACTIONS
 
     def url(self) -> str | None:
         """Always ``None``. A desktop has no notion of a URL."""
@@ -667,6 +683,8 @@ class DesktopController:
                 return None
             case Navigate():  # pragma: no cover - refused by supports() before here
                 return "a desktop controller cannot navigate"
+            case Back():  # pragma: no cover - refused by supports() before here
+                return "a desktop controller has no session history to go back through"
         return f"unhandled action kind {action.kind!r}"  # pragma: no cover
 
     def _press(self, keys: tuple[str, ...]) -> str | None:

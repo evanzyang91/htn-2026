@@ -413,6 +413,8 @@ def action_label(action: Action) -> tuple[str, str]:
             return "wait", human_ms(float(action.ms))  # type: ignore[union-attr]
         case "navigate":
             return "navigate", strip_scheme(action.url)  # type: ignore[union-attr]
+        case "back":
+            return "back", "to the previous page"
     return str(action.kind), ""  # pragma: no cover - the union above is closed
 
 

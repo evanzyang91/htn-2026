@@ -93,6 +93,7 @@ from skillweaver.contracts import (
     Action,
     ActionKind,
     ActionResult,
+    Back,
     Box,
     Budget,
     Candidate,
@@ -173,7 +174,9 @@ DEFAULT_MAX_TOKENS = 1024
 """Cap on an acting reply. The answer is a small JSON object; a long one is a symptom."""
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
-_TARGETLESS: frozenset[ActionKind] = frozenset({"type_text", "press_key", "wait", "navigate"})
+_TARGETLESS: frozenset[ActionKind] = frozenset(
+    {"type_text", "press_key", "wait", "navigate", "back"}
+)
 
 
 @cache
@@ -1454,6 +1457,10 @@ def _resolve(spec: Any, catalog: ElementCatalog, controller: Controller) -> tupl
             if not isinstance(url, str) or not url:
                 raise _Invalid("'navigate' needs a 'url' string")
             return Navigate(url), f"navigate:{url}", f"navigate to {url}"
+        case "back":
+            if not controller.supports("back"):
+                raise _Invalid(f"{controller.describe()} has no session history to go back")
+            return Back(), "back", "go back to the previous page"
     raise _Invalid(f"action kind {kind!r} is not supported here")  # pragma: no cover
 
 

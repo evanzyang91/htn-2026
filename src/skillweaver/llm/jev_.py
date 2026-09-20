@@ -42,10 +42,19 @@ is a real check on the policy, not a formality.
 The action space, and the one operation deliberately missing
 ------------------------------------------------------------
 
-Offered: ``CLICK``, ``TYPE_TEXT``, ``SCROLL_UP``, ``SCROLL_DOWN``, ``WAIT``, ``DONE``,
-``BLOCKED``. Each is offered only when it is available on the screen in front of the
-policy, exactly as upstream does it - there is no ``TYPE_TEXT`` head when nothing is
-editable, and no ``SCROLL_DOWN`` when the page ends at the fold.
+Offered: ``CLICK``, ``TYPE_TEXT``, ``SCROLL_UP``, ``SCROLL_DOWN``, ``BACK``, ``WAIT``,
+``DONE``, ``BLOCKED``. Each is offered only when it is available on the screen in front
+of the policy, exactly as upstream does it - there is no ``TYPE_TEXT`` head when nothing
+is editable, no ``SCROLL_DOWN`` when the page ends at the fold, and no ``BACK`` on the
+first page of a session.
+
+``BACK`` is this project's addition to the upstream action space, and it is the browser's
+own history that moves, not a ``Navigate`` to an address the agent happened to remember.
+A wrong turn is the commonest way exploration wastes a step, and a page that offers no
+way back - a product page whose only link home is an icon, a search result that replaced
+the results - leaves the alternative of guessing a URL, which is a different page from
+the one the run was actually on. It has no target head: there is nothing on the screen to
+pick. See :class:`~skillweaver.contracts.Back` for why it is its own action kind.
 
 **``SELECT`` is NOT offered, and that is a deviation from the upstream action space that
 should be read before it is removed.** Upstream implements it by writing
@@ -112,6 +121,10 @@ OPERATIONS: Mapping[str, str] = {
     ),
     "SCROLL_DOWN": "Scroll the page down to bring what is below the fold into view.",
     "SCROLL_UP": "Scroll the page up to bring what is above the fold back into view.",
+    "BACK": (
+        "Return to the previous page using the browser's own history, when this page "
+        "cannot advance the goal and the page before it could."
+    ),
     "WAIT": "Wait for the page to update.",
     "DONE": "Every requirement is visibly satisfied.",
     "BLOCKED": "No supported operation can make progress.",
@@ -120,6 +133,9 @@ OPERATIONS: Mapping[str, str] = {
 
 Copied in substance from ``jev_ultrafast/model.py`` so the policy meets the wording it
 was trained against; ``SELECT`` is absent on purpose, and the module docstring says why.
+``BACK`` is this project's addition and has no target head - there is nothing on the
+screen to choose, which is exactly why it is offered from the page's history rather than
+from :func:`_targets`.
 """
 
 _RULES = """Advance the user's entire goal from the CURRENT page using one operation.
@@ -131,6 +147,8 @@ prove a requested filter was set.
 Do not toggle a checkbox, switch, or radio already in the requested state.
 Submit populated search fields before opening a result; a populated field alone is not
 an applied search.
+BACK returns to the previous page and is for a wrong turn: this page cannot advance the
+goal and the page before it could. Do not BACK to reach something this page already shows.
 WAIT only when the needed control is absent/disabled, or submitted results are still loading.
 If Search/Submit is visible and the required fields are ready, CLICK it immediately.
 Recent WAIT actions are not evidence of loading. Prefer a useful visible control over WAIT.
@@ -666,15 +684,22 @@ def _offered(
     """The operations this screen actually supports, with their instructions.
 
     Offering an operation that has no target - ``CLICK`` on a page with no controls,
-    ``SCROLL_DOWN`` at the bottom - is offering a move that cannot be executed, and a
-    policy that picks it has been set up to fail. ``DONE`` and ``BLOCKED`` are always
-    there because a run must always be able to stop.
+    ``SCROLL_DOWN`` at the bottom, ``BACK`` on the first page of a session - is offering
+    a move that cannot be executed, and a policy that picks it has been set up to fail.
+    ``DONE`` and ``BLOCKED`` are always there because a run must always be able to stop.
+
+    ``BACK`` is offered from :attr:`~skillweaver.perception.dom.DomSnapshot.can_go_back`
+    for the same reason scrolling is offered from the scroll position: it is the page's
+    own account of what it can do, read in the same ``page.evaluate`` as everything else,
+    so it costs nothing extra and cannot disagree with the screen the policy is shown.
     """
     offered = {name: OPERATIONS[name] for name in targets}
     if snapshot.can_scroll_down:
         offered["SCROLL_DOWN"] = OPERATIONS["SCROLL_DOWN"]
     if snapshot.can_scroll_up:
         offered["SCROLL_UP"] = OPERATIONS["SCROLL_UP"]
+    if snapshot.can_go_back:
+        offered["BACK"] = OPERATIONS["BACK"]
     offered["WAIT"] = OPERATIONS["WAIT"]
     offered["DONE"] = OPERATIONS["DONE"]
     offered["BLOCKED"] = OPERATIONS["BLOCKED"]

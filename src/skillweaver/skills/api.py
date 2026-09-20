@@ -65,6 +65,7 @@ from skillweaver.contracts import (
     Action,
     ActionKind,
     ActionResult,
+    Back,
     Box,
     Click,
     Controller,
@@ -437,6 +438,8 @@ def describe_action(action: Action) -> str:
             return f"wait {ms}ms"
         case Navigate(url=url):
             return f"navigate {url}"
+        case Back():
+            return "back"
     return str(action)  # pragma: no cover - Action is a closed union
 
 

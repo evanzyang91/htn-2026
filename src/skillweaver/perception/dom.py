@@ -241,6 +241,12 @@ class DomSnapshot:
         scroll_y / page_height: Where the page is scrolled to and how tall it is,
             which is what decides whether scrolling up or down is even offered.
         omitted_controls: How many controls :data:`MAX_CONTROLS` cut. See that constant.
+        can_go_back: Whether this tab has a previous session-history entry, which is
+            what decides whether going back is offered at all. The page's own answer,
+            from the Navigation API; see the script for why ``history.length`` is not
+            that answer. It counts only entries contiguous and SAME-ORIGIN with this
+            one, so the ``about:blank`` a run starts from does not make it true and a
+            back is never offered as a way off the site being explored.
         by_element_id: The controls again, keyed by
             :attr:`DomControl.element_id`. This is the lookup a policy does to turn the
             id it chose back into what it knows about that control.
@@ -255,6 +261,7 @@ class DomSnapshot:
     scroll_y: float = 0.0
     page_height: float = 0.0
     omitted_controls: int = 0
+    can_go_back: bool = False
     by_element_id: dict[str, DomControl] = field(default_factory=dict, compare=False, repr=False)
 
     @property
@@ -416,6 +423,7 @@ def _snapshot_from(raw: dict[str, Any], shot: Screenshot) -> DomSnapshot:
             texts=_texts_from(raw.get("texts") or (), viewport, seen),
             viewport=viewport,
             scroll_y=float(raw.get("scrollY") or 0.0),
+            can_go_back=bool(raw.get("canGoBack")),
             page_height=float(raw.get("pageHeight") or 0.0),
             omitted_controls=int(raw.get("omitted") or 0),
             by_element_id={control.element_id: control for control in controls},
@@ -699,12 +707,24 @@ _SNAPSHOT_JS = (
     }
   }
 
+  // Whether there is a previous entry in this tab's session history. The Navigation
+  // API answers exactly that; history.length cannot, because it counts entries in
+  // BOTH directions and never says where in the stack we are - a page reached by two
+  // backs still reports 3, so it would offer a back that has nothing behind it.
+  // Measured on live en.wikipedia.org: false on the run's first page, true after one
+  // in-site click INCLUDING a fragment link, false again once that back is taken.
+  // A missing API answers false rather than guessing: never offering a move costs a
+  // capability, offering one that cannot be made costs a step and a FAILED edge.
+  const nav = window.navigation;
+  const canGoBack = !!(nav && nav.canGoBack);
+
   return {
     url: location.href,
     title: document.title,
     w: innerWidth,
     h: innerHeight,
     scrollY: scrollY,
+    canGoBack: canGoBack,
     pageHeight: document.documentElement.scrollHeight,
     text: words.join('\\n').slice(0, MAX_PAGE_TEXT),
     controls: controls,

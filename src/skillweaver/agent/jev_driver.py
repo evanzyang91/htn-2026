@@ -28,6 +28,17 @@ moments, and on a real page they are not always the same moment; upstream Jev gu
 with DOM node identity and a re-check immediately before input, and this project guards it
 by re-observing after every action and refusing an id that is no longer there.
 
+BACK is one action and has no target
+------------------------------------
+
+``BACK`` grounds to :class:`~skillweaver.contracts.Back`, which takes no argument, so it
+skips the catalogue entirely - there is no element id to check against the screen. It is
+still a step like any other: the explorer performs it, re-observes, records the graph
+edge and asks the critic, exactly as it does for a click. That is the point of grounding
+it as an ACTION rather than as a code block; a move the graph cannot see would make a
+second run no cheaper than the first.
+
+
 TYPE_TEXT is three actions, so it is a code block
 -------------------------------------------------
 
@@ -287,6 +298,13 @@ def _answer(
             "expect": "the page finishes loading and the control it needs appears",
             "done": False,
             "action": {"kind": "wait", "ms": WAIT_MS},
+        }
+    if operation == "BACK":
+        return {
+            "thought": f"the policy is going back to the previous page {_odds(decision)}",
+            "expect": "the page before this one is showing again",
+            "done": False,
+            "action": {"kind": "back"},
         }
     if operation in ("SCROLL_DOWN", "SCROLL_UP"):
         down = operation == "SCROLL_DOWN"

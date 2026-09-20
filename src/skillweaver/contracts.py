@@ -336,7 +336,7 @@ class Observation:
 # --------------------------------------------------------------------------------------
 
 ActionKind = Literal[
-    "click", "move", "drag", "type_text", "press_key", "scroll", "wait", "navigate"
+    "click", "move", "drag", "type_text", "press_key", "scroll", "wait", "navigate", "back"
 ]
 """The ``kind`` tag of every action, as used by ``Controller.supports``."""
 
@@ -431,12 +431,35 @@ class Navigate:
     url: str
 
 
-Action = Click | Move | Drag | TypeText | PressKey | Scroll | Wait | Navigate
+@dataclass(frozen=True, slots=True)
+class Back:
+    """Go back one entry in the browser's own session history.
+
+    NOT a ``Navigate`` to a remembered address, and deliberately not a mode of one.
+    ``Navigate`` takes a URL and always lands on it; this takes no argument and lands
+    wherever the history stack says, which is a different thing to record, to replay
+    and to refuse. Folding it into ``Navigate`` would leave ``url`` meaningless in one
+    mode, and every reader that already trusts ``Navigate.url`` - the dashboard's edge
+    labels, the hardcoded-navigation pass in ``skills.refactor`` - would read that
+    empty string as an address.
+
+    OPTIONAL, like ``Navigate``: only a controller with session history supports it (a
+    browser does, a raw desktop controller does not). Check
+    ``controller.supports("back")`` first; an unsupporting controller returns
+    ``ActionResult(ok=False, ...)``. A browser with nothing behind the current page
+    refuses it the same way, which is why it is only ever OFFERED to a policy that has
+    been told this page has somewhere to go back to - see ``DomSnapshot.can_go_back``.
+    """
+
+    kind: ClassVar[Literal["back"]] = "back"
+
+
+Action = Click | Move | Drag | TypeText | PressKey | Scroll | Wait | Navigate | Back
 """The closed set of things a controller can be asked to do. Match on ``.kind`` or
 with ``match``/``isinstance``; do not add a member without updating every controller."""
 
 ACTION_TYPES: Mapping[str, type] = {
-    cls.kind: cls for cls in (Click, Move, Drag, TypeText, PressKey, Scroll, Wait, Navigate)
+    cls.kind: cls for cls in (Click, Move, Drag, TypeText, PressKey, Scroll, Wait, Navigate, Back)
 }
 """Maps each ``kind`` tag to its action class."""
 
@@ -545,7 +568,8 @@ class Controller(Protocol):
 
     def supports(self, action_kind: ActionKind) -> bool:
         """Whether this controller can perform actions of ``action_kind``.
-        ``"navigate"`` is the one kind commonly unsupported."""
+        ``"navigate"`` and ``"back"`` are the kinds commonly unsupported: both need a
+        session history, which only a browser has."""
         ...
 
     def url(self) -> str | None:

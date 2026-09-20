@@ -50,6 +50,7 @@ from skillweaver.contracts import (
     Action,
     ActionKind,
     ActionResult,
+    Back,
     Box,
     Click,
     Drag,
@@ -156,10 +157,11 @@ scale, blocking and start URL every other run gets. Whether a particular site th
 that browser is the site's business."""
 
 _SUPPORTED_ACTIONS: frozenset[str] = frozenset(
-    {"click", "move", "drag", "type_text", "press_key", "scroll", "wait", "navigate"}
+    {"click", "move", "drag", "type_text", "press_key", "scroll", "wait", "navigate", "back"}
 )
-"""Every action kind in the contract. A browser can do all of them, ``navigate``
-included - that is the one thing it has that a raw desktop controller does not."""
+"""Every action kind in the contract. A browser can do all of them, ``navigate`` and
+``back`` included - those are the two a raw desktop controller does not have, because
+both are session history and a desktop has none."""
 
 
 class _ThreadDriver(threading.local):
@@ -723,6 +725,8 @@ class BrowserController:
                 return None  # an explicit wait is its own settle
             case Navigate():
                 return self._navigate(page, action.url)
+            case Back():
+                return self._go_back(page)
             case _:
                 return f"action kind {action.kind!r} is not supported"
 
@@ -753,6 +757,30 @@ class BrowserController:
                 return f"navigate failed: {message}"
             self._settle(page)
             return None
+        return None
+
+    def _go_back(self, page: Page) -> str | None:
+        """Pop one entry off the page's session history.
+
+        Playwright answers ``None`` when there was nothing behind the current page, and
+        that is the only authority on the question - a page's own ``history.length``
+        counts entries in both directions and never says where in the stack you are. So
+        an empty stack is REFUSED here rather than reported as a move that happened,
+        which is what keeps a policy from being told a back succeeded onto the same
+        screen it was already on.
+        """
+        before = page.url
+        try:
+            response = page.go_back(timeout=self._navigation_timeout_ms, wait_until="load")
+        except PlaywrightTimeoutError as exc:
+            self._settle(page)
+            return f"back timed out: {_brief(exc)}"
+        except PlaywrightError as exc:
+            self._settle(page)
+            return f"back failed: {_brief(exc)}"
+        self._settle(page)
+        if response is None and page.url == before:
+            return "there is nothing behind this page to go back to"
         return None
 
     def _press_chord(self, page: Page, keys: tuple[str, ...]) -> str | None:
