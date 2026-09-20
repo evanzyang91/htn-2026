@@ -482,6 +482,23 @@ ended three cold runs at step 0 and read exactly like a truncated reply until th
 reason was printed. `_TEXT_ASKS` in `llm/jev_.py` carries the fix and the measurement. The
 critic's "(empty reply)" degradations are the same shape and are NOT fixed.
 
+`skillweaver inspect` is a LIVE control surface, not `dashboard build`'s static report:
+a loopback page that drives the real agent one move at a time (`src/skillweaver/inspector/`).
+It is `Explorer`'s own loop split at its seam - `_ask`/`_ground`/`_refuse_repeat` is
+"choose", `_make_move` is "execute" - so it calls PRIVATE explorer methods on purpose, from
+`LiveSession._decide` and `_perform` only; rename one and `_check_explorer_seam` says so at
+startup. Three facts each cost a live run. ONE thread owns the browser (Playwright's sync
+driver is thread-affine and the HTTP server is threaded), so handlers post jobs to `_Worker`
+and polls read a PUBLISHED snapshot. Anything that wraps a controller must pass through what
+it does not record: `DomPerceiver` reads `controller.evaluate`, which is outside the
+`Controller` protocol, and a wrapper without it killed every typed move at its second line.
+And a stepped loop has no `return`, so every ending must call `_conclude` or the `Recorder`
+refuses the next run. Binding `127.0.0.1:<port>` does NOT fail when another process holds
+`*:<port>` (measured on macOS) - open the printed `127.0.0.1` URL, never `localhost`.
+Every `/api` request needs the startup token, the frame included: it is a photograph of a
+browser that may be logged in. Per-target odds are absent because `PolicyDecision` carries
+only the chosen target's; wire them in `_decision_json` when it carries more.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
