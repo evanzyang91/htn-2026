@@ -404,24 +404,29 @@ longer verifier over the same chrome words, so `_A_VERIFIER_MUST_BE_ABLE_TO_FAIL
 that moved, a row carrying the parameter's own value, a changed URL - and say that `verify`
 sees only `ctx` and `result`, so a parameter reaches it by being RETURNED from `run`.
 
-On live walmart.com a page is not the page when its load event fires, and the admission
-gate reads it then - so NO Walmart skill has been stored, across five cold runs whose task
-the critic confirmed, measured 2026-09-19 through the DOM perceiver. The gate's environment
-factory (`NavigatingEnvironment` in `orchestrator.py`) resets the world, then does its OWN
-`Navigate(url)`, and `_attempt` in `skills/synthesize.py` observes at once; nothing a
-`--reset-steps` recipe does at its tail can settle that screen, which cost one wrong fix
-here. What it reads: the homepage still shows the PREVIOUS page at 0s (0.045 to a settled
-reference), is a 36-part skeleton at 1s (0.181) and reaches only 0.48 from 2s; signed-out
-`/cart` is 1.000 by 1.5s but 0.24-0.40 at 0s, so against the 0.26 cut its precondition
-went 0.40, 1.00, 0.238, 0.238, 1.00, 0.40 over six gate attempts - a coin flip. The end
-of the run has the same disease: a candidate that ran correctly in 3.6s, verifier passing
-and discriminating, was rejected at stage `critic` at 0.064 against an end screen recorded
-at model speed. Measure a screen by the ROUTE and the MOMENT the gate takes to it - a
-`/cart` reloaded from `/cart` after 4s says 1.000 and tells you nothing. Start a Walmart
-task at `/cart` regardless; it is the only anchor that ever reaches 1.000. This machine
-also geolocates to Canada, so walmart.com pins `fulfillment_method:Shipping` and anything
-store-fulfilled (all of Great Value) returns "We couldn't find a match" - pick a product
-that ships.
+On live walmart.com a page is not the page when its load event fires, and three layers
+read it then, measured 2026-09-19 through the DOM perceiver. (1) THE GATE, fixed:
+`NavigatingEnvironment` resets the world and then does its OWN `Navigate(url)`, and
+`_attempt` observed at once, so one recorded `/cart` start screen read 0.40, 1.00, 0.238,
+0.238, 1.00, 0.40 against the 0.26 cut, and the end screen - reached as the skill reaches
+it - read 0.011 in 4 of 4, still the search page. `_observe_at_rest` in
+`skills/synthesize.py` waits for the fingerprint to hold EQUAL and is never told the
+score; at rest those reads are 1.000 (6 of 6) and 0.901 (4 of 4), and the first Walmart
+skill was stored with the cut and the critic untouched. Nothing a `--reset-steps` recipe
+does at its tail can settle that screen, which cost one wrong fix here. (2) THE RECORDING,
+not fixed: a run that goes on past its goal - Jev re-typed the product on the cart page at
+confidence 0.30 before DONE - records an end screen no correct skill reaches (0.064 to
+the cart it had just opened), and the admission critic demands that screen. (3) THE SKILL,
+not fixed, and why there is still NO warm Walmart number: a result's TITLE paints before
+its Add button hydrates, the stored skill waits for the title and then looks for the
+button ONCE, and its `ctx.see.best` fallback - a ranking with a winner when nothing fits -
+hands it the header cart button. It passed one gate attempt and then 0 of 3 replays, with
+Walmart's cart empty each time. `awaited_reads` does not rewrite that read because
+fallbacks, not a `ctx.expect`, follow it. Measure a screen by the ROUTE and the MOMENT it
+is read at - `/cart` reloaded from `/cart` after 4s says 1.000 and tells you nothing - and
+start a Walmart task at `/cart`, the only anchor that reaches 1.000. This machine also
+geolocates to Canada, so walmart.com pins `fulfillment_method:Shipping` and anything
+store-fulfilled (all of Great Value) returns "We couldn't find a match".
 
 A run's model client is built with `computer_use=True`, which appends the computer tool to
 EVERY request it makes, helpers included. A helper that wants text back can get a
