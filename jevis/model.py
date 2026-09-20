@@ -68,7 +68,7 @@ def validate_choice(answer, ids):
 def action_name(action):
     """What distinguishes this control. Several may share a label, so the context decides."""
     context = action.get("context")
-    return f"{action['label']} — {context}" if context else action["label"]
+    return f"{action['label']} · {context}" if context else action["label"]
 
 
 def progress(history, window=20, limit=60):

@@ -135,8 +135,8 @@ function render() {
     idle: "Ready",
     ready: "Reading the page",
     predicted: "Ready to act",
-    done: "Finished — check the result",
-    blocked: "Stopped — it could not find a way forward",
+    done: "Finished. Check the result.",
+    blocked: "Stopped. It could not find a way forward.",
   };
   $("status").textContent = labels[state.status] || state.status;
   if (!page) {
@@ -153,9 +153,9 @@ function render() {
   const chosen = page.actions.find((a) => a.id === d?.choice);
   const doing = d ? chosen?.label || d.choice : "Choose an action";
   $("choice-detail").textContent = doing;
-  $("latency").textContent = d ? `${d.latency_ms} ms` : "—";
-  $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "—";
-  $("completion").textContent = d ? d.operation : "—";
+  $("latency").textContent = d ? `${d.latency_ms} ms` : "–";
+  $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "–";
+  $("completion").textContent = d ? d.operation : "–";
   $("ranking-note").textContent = d ? "Ranked" : "Unranked";
   const op = Object.entries(d?.operation_probabilities || {}).sort((a,b)=>b[1]-a[1]);
   $("operation-choices").innerHTML = op.map(([name,p]) =>
@@ -167,7 +167,7 @@ function render() {
   if (d) elements.sort((a,b)=>probability(b)-probability(a));
   $("choices").innerHTML = elements.map(e => {
     const p = probability(e);
-    return `<div class="choice ${selectedIndex === e.index ? 'best' : ''}" data-action="${escape(e.index)}"><span class="choice-id">[${escape(e.index)}]</span><div class="choice-label">${escape(e.label)}<small>${escape(e.role)} · ${escape(e.operations.join(' / '))}${e.value ? ' · '+escape(e.value) : ''}${e.checked !== undefined ? ' · checked '+escape(e.checked) : ''}</small>${p >= 0 ? `<div class="bar" style="--probability:${p*100}%"></div>` : ''}</div><span class="probability">${p >= 0 ? percent(p) : '—'}</span></div>`;
+    return `<div class="choice ${selectedIndex === e.index ? 'best' : ''}" data-action="${escape(e.index)}"><span class="choice-id">[${escape(e.index)}]</span><div class="choice-label">${escape(e.label)}<small>${escape(e.role)} · ${escape(e.operations.join(' / '))}${e.value ? ' · '+escape(e.value) : ''}${e.checked !== undefined ? ' · checked '+escape(e.checked) : ''}</small>${p >= 0 ? `<div class="bar" style="--probability:${p*100}%"></div>` : ''}</div><span class="probability">${p >= 0 ? percent(p) : '–'}</span></div>`;
   }).join('');
   const targets = new Map();
   for (const a of page.actions) if (a.rect && !targets.has(a.node)) targets.set(a.node, a);
@@ -180,7 +180,7 @@ function render() {
     ? state.history
         .map(
           (h) =>
-            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text ? ` <b>“${escape(h.text)}”</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.model_ms ?? h.latency_ms} ms model · ${h.load_ms ?? "—"} ms load${h.frame_ms ? ` · ${h.frame_ms} ms frame` : ""}<small>${percent(h.probability)}</small></span><span class="effect">${h.page_changed ? "Page changed" : "No change observed"}</span></div>`,
+            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text ? ` <b>“${escape(h.text)}”</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.model_ms ?? h.latency_ms} ms model · ${h.load_ms ?? "–"} ms load${h.frame_ms ? ` · ${h.frame_ms} ms frame` : ""}<small>${percent(h.probability)}</small></span><span class="effect">${h.page_changed ? "Page changed" : "No change observed"}</span></div>`,
         )
         .join("")
     : '<p class="muted">Each executed action leaves an observed result.</p>';
@@ -334,7 +334,7 @@ fetch("/api/state")
 // written for screen readers ("Add to cart - Robin Hood Flour"): precise, but not for reading.
 function plainly(action, decision) {
   if (!action) return decision?.operation === "DONE" ? "Finished" : "Thinking";
-  const label = (action.label || "").split(" — ")[0].trim();
+  const label = (action.label || "").split(" · ")[0].trim();
   switch (action.kind) {
     case "fill": return `Typing “${decision?.text ?? "…"}”`;
     case "scroll": return "Looking further down the page";
@@ -350,11 +350,12 @@ function stepText(h) {
   if (h.kind === "wait") return "Waited for the page";
   if (h.kind === "back") return "Went back";
   if (h.kind === "enter") return "Submitted the search";
-  return `Clicked ${(h.action || "").split(" — ")[0]}`;
+  return `Clicked ${(h.action || "").split(" · ")[0]}`;
 }
 let turn = null;
 function startTurn(request) {
   $("intro").hidden = true;
+  document.body.classList.remove("idle");
   const thread = $("thread");
   const you = document.createElement("div");
   you.className = "turn user";
@@ -405,7 +406,7 @@ function renderTurn() {
     const done = state.status === "done";
     turn.verdict.className = `verdict ${done ? "ok" : "bad"}`;
     turn.verdict.textContent = done
-      ? "Done — the browser window shows the result."
+      ? "Done. The browser window shows the result."
       : "I could not finish this one. The browser window shows where I stopped.";
   }
   document.body.classList.toggle("running", running);
@@ -457,7 +458,7 @@ if (!Recogniser) {
   recogniser.addEventListener("start", () => {
     listening = true;
     $("mic").classList.add("listening");
-    say("Listening — speak your request.");
+    say("Listening. Speak your request.");
   });
   recogniser.addEventListener("result", (event) => {
     let heard = "";
@@ -501,3 +502,21 @@ for (const example of document.querySelectorAll(".example"))
     grow();
     $("goal").focus();
   });
+
+
+/* ---- Theme -------------------------------------------------------------- */
+
+// Follow the system unless the reader says otherwise, and remember that choice.
+const THEME_KEY = "agent-theme";
+function applyTheme(theme) {
+  if (theme) document.body.dataset.theme = theme;
+  else delete document.body.dataset.theme;
+  localStorage.setItem(THEME_KEY, theme || "");
+}
+applyTheme(localStorage.getItem(THEME_KEY) || "");
+$("theme").addEventListener("click", () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const current = document.body.dataset.theme || (dark ? "dark" : "light");
+  applyTheme(current === "dark" ? "light" : "dark");
+});
+document.body.classList.add("idle");
