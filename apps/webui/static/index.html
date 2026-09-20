@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SkillWeaver</title>
+<style>
+  :root {
+    --bg: #0d0d0d;
+    --fg: #ececec;
+    --muted: #8e8e8e;
+    --pill: #1b1b1b;
+    --pill-border: #2a2a2a;
+    --accent: #e0a24a;
+    --accent-soft: rgba(224, 162, 74, 0.32);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    position: relative;
+    color: var(--fg);
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* A low-key glow behind the box: two soft radial layers, fixed to the viewport. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(ellipse 34% 26% at 50% 50%, rgba(200, 132, 48, 0.22), transparent 70%),
+      radial-gradient(ellipse 60% 48% at 50% 54%, rgba(120, 76, 28, 0.14), transparent 72%);
+  }
+  .stage {
+    position: relative;
+    z-index: 1;
+    flex: 1;
+    width: 100%;
+    max-width: 980px;
+    padding: 0 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    /* The heading and the box sit where a centred layout put them, and stay there:
+       runs stack below and scroll, instead of pushing the box up. */
+    padding-top: calc(50vh - 110px);
+    padding-bottom: 40px;
+  }
+  h1 { font-family: Georgia, "Iowan Old Style", "Times New Roman", serif; font-weight: 400; font-size: 34px; letter-spacing: -0.01em; text-align: center; margin: 0 0 28px; }
+  form {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--pill);
+    border: 0;
+    border-radius: 18px;
+    padding: 12px 12px 12px 20px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.45);
+  }
+  form:focus-within { box-shadow: 0 8px 30px rgba(0,0,0,.45); }
+  input {
+    flex: 1; min-width: 0;
+    background: transparent; border: 0; outline: 0;
+    color: var(--fg); font-size: 18px; font-family: inherit;
+  }
+  input::placeholder { color: var(--muted); }
+  button {
+    width: 44px; height: 44px; border-radius: 12px; border: 0; flex: none;
+    background: var(--accent); color: #1a1206;
+    display: grid; place-items: center; cursor: pointer;
+  }
+  button:disabled { opacity: .35; cursor: default; }
+  .hint { text-align: center; color: var(--muted); font-size: 13px; margin-top: 16px; min-height: 1.2em; }
+  .runs { margin: 26px auto 0; max-width: 720px; width: 100%; }
+  /* The phone QR code: a small tab in the corner, and a card that pops on and off above it. */
+  .phone { position: fixed; right: 18px; bottom: 18px; z-index: 2; display: none; text-align: center; }
+  .phone.on { display: block; }
+  .phone .tab {
+    width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--pill-border);
+    background: var(--pill); color: var(--muted); margin-left: auto;
+    display: grid; place-items: center; cursor: pointer; transition: color .15s, border-color .15s;
+  }
+  .phone .tab:hover, .phone.open .tab { color: var(--fg); border-color: #3a3a3a; }
+  /* An arrow: up when the card is down, and it turns over as the card pops up. */
+  .phone .tab svg { transition: transform .22s ease; }
+  .phone.open .tab svg { transform: rotate(180deg); }
+  .phone .card {
+    position: absolute; right: 0; bottom: 46px;
+    background: var(--pill); border: 1px solid var(--pill-border); border-radius: 14px;
+    padding: 10px 10px 8px; box-shadow: 0 8px 30px rgba(0,0,0,.45);
+    opacity: 0; transform: translateY(18px); transform-origin: bottom right;
+    pointer-events: none; transition: opacity .22s ease, transform .22s cubic-bezier(.2,.9,.3,1.1);
+  }
+  .phone.open .card { opacity: 1; transform: none; pointer-events: auto; }
+  .phone .qr { background: #fff; padding: 8px; border-radius: 10px; display: inline-block; opacity: .9; }
+  .phone .qr img, .phone .qr canvas { display: block; }
+  .phone .cap { color: var(--muted); font-size: 11px; margin-top: 6px; white-space: nowrap; }
+  .run { padding: 10px 14px; border-top: 1px solid var(--pill-border); position: relative; }
+  /* A faint shine that glides along the bar above a live run, back and forth. */
+  .run.busy::before {
+    content: "";
+    position: absolute;
+    top: -1px; left: 0;
+    height: 2px; width: 12%;
+    border-radius: 2px;
+    background: linear-gradient(90deg, transparent, rgba(255, 220, 160, 0.85), transparent);
+    animation: shine 2.6s ease-in-out infinite alternate;
+    pointer-events: none;
+  }
+  /* Its glow: a soft oval centred on the shine, same width so it rides the same path. */
+  .run.busy::after {
+    content: "";
+    position: absolute;
+    top: -8px; left: 0;
+    height: 16px; width: 12%;
+    background: radial-gradient(ellipse 45% 50% at 50% 50%, rgba(255, 200, 120, 0.3), rgba(224, 162, 74, 0.1) 55%, transparent 75%);
+    animation: shine 2.6s ease-in-out infinite alternate;
+    pointer-events: none;
+  }
+  @keyframes shine { from { transform: translateX(0); } to { transform: translateX(733%); } }
+  .run .title { display: flex; gap: 10px; align-items: baseline; font-size: 14px; }
+  .run .title .n { color: var(--muted); flex: none; }
+  .run .title .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .run .state { color: var(--muted); font-size: 13px; margin-top: 4px; padding-left: 8px; border-left: 2px solid #333; }
+  .run.done .state { border-left-color: #3ccf7a; }
+  .run.failed .state { border-left-color: #e05a5a; }
+  .run.busy .state { border-left-color: var(--accent); }
+  .run a { color: #e8b866; text-decoration: none; font-size: 12px; cursor: pointer; }
+  .run .stop { color: #e08a8a; margin-left: 8px; }
+  .run .trash { color: var(--muted); margin-left: 8px; opacity: .6; }
+  .run .trash:hover { opacity: 1; color: #e08a8a; }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <h1>What should the agent do?</h1>
+    <form id="f">
+      <input id="task" autofocus autocomplete="off" spellcheck="false" placeholder="Ask anything">
+      <button id="go" type="submit" title="Run">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg>
+      </button>
+    </form>
+    <div class="hint" id="hint">Just say what to do; the agent picks the website and works in a tab of your Chrome.</div>
+    <div class="runs" id="runs"></div>
+  </div>
+  <div class="phone" id="phone">
+    <div class="card"><div class="qr" id="qr"></div><div class="cap">scan to talk from your phone</div></div>
+    <button class="tab" id="phone-tab" type="button" title="Scan to talk from your phone" aria-expanded="false">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg>
+    </button>
+  </div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+  const form = document.getElementById('f');
+  const input = document.getElementById('task');
+  const go = document.getElementById('go');
+  const hint = document.getElementById('hint');
+  const list = document.getElementById('runs');
+
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+  // Phrasings for each live state. Every line in a group means the same thing and
+  // describes the same moment; the page rotates through them so a long stage reads as
+  // alive rather than stuck. A state not listed here (a chosen site, a refined task, an
+  // error) is shown verbatim.
+  const PHRASES = {
+    'starting': ['starting', 'getting ready', 'setting up the run'],
+    'choosing a website': ['choosing a website', 'deciding where to go', 'picking the right site', 'working out which website fits'],
+    'refining the request': ['refining the request', 'turning the request into steps', 'writing out concrete steps', 'making the task precise'],
+    'launching the agent': ['launching the agent', 'starting the agent', 'handing the task to the agent'],
+    'connecting to your Chrome': ['connecting to your Chrome', 'reaching your browser', 'opening a tab in your Chrome'],
+    'waiting for you to click Allow in Chrome': ['waiting for you to click Allow in Chrome', 'Chrome is asking to allow remote debugging', 'needs your Allow in Chrome'],
+    'checking the skill library': ['checking the skill library', 'looking for a skill it already knows', 'seeing if it has done this before'],
+    'exploring the site': ['exploring the site', 'looking at the page', 'reading the screen', 'working out the next move'],
+    'acting on the page': ['acting on the page', 'clicking and typing', 'carrying out the steps', 'moving through the site'],
+    'task done - checking what it learned': ['task done - checking what it learned', 'finished - reviewing the run', 'done - deciding what to keep'],
+    'stored a new skill': ['stored a new skill', 'saved what it learned', 'wrapping up'],
+  };
+  let tick = 0;
+  let known = [];
+
+  function liveText(state) {
+    const group = PHRASES[state];
+    const phrase = group ? group[Math.floor(tick / 8) % group.length] : state;
+    return phrase + '.'.repeat(1 + (tick % 3));
+  }
+
+  function rowHtml(r) {
+    const stop = r.done ? '' : `<a class="stop" data-stop="${r.id}">stop</a>`;
+    const trash = `<a class="trash" data-trash="${r.id}" title="remove from this list">&#128465;</a>`;
+    return `<div class="title"><span class="n">run ${r.id}</span><span class="t">${esc(r.text)}</span>
+        <a href="/run/${r.id}" target="_blank">debug</a>${stop}${trash}</div>
+      <div class="state"></div>`;
+  }
+
+  // Rows are updated in place: rebuilding them on every poll restarted the shine
+  // animation from the left each time, which read as the bar teleporting.
+  function render(runs) {
+    known = runs;
+    const seen = new Set();
+    let prev = null;
+    for (const r of runs) {
+      seen.add(String(r.id));
+      let el = list.querySelector(`.run[data-id="${r.id}"]`);
+      if (!el) {
+        el = document.createElement('div');
+        el.dataset.id = r.id;
+        el.innerHTML = rowHtml(r);
+        list.insertBefore(el, prev ? prev.nextSibling : list.firstChild);
+      }
+      const cls = 'run ' + (r.done ? (r.state === 'done' ? 'done' : 'failed') : 'busy');
+      if (el.className !== cls) { el.className = cls; el.innerHTML = rowHtml(r); }
+      el.querySelector('.state').textContent = r.done ? r.state : liveText(r.state);
+      prev = el;
+    }
+    for (const el of [...list.children]) if (!seen.has(el.dataset.id)) el.remove();
+  }
+
+  // The dots and the phrasing move between polls, without rebuilding the list.
+  setInterval(() => {
+    tick += 1;
+    for (const r of known) {
+      if (r.done) continue;
+      const el = list.querySelector(`.run[data-id="${r.id}"] .state`);
+      if (el) el.textContent = liveText(r.state);
+    }
+  }, 500);
+
+  list.addEventListener('click', (e) => {
+    const d = e.target.dataset || {};
+    if (d.stop) { e.preventDefault(); fetch(`/api/runs/${d.stop}/stop`, {method: 'POST'}); }
+    if (d.trash) {
+      e.preventDefault();
+      const row = e.target.closest('.run');
+      if (row) row.remove();
+      known = known.filter(x => String(x.id) !== d.trash);
+      fetch(`/api/runs/${d.trash}/delete`, {method: 'POST'}).then(poll);
+    }
+  });
+
+  async function poll() {
+    try {
+      const r = await fetch('/api/runs');
+      const runs = await r.json();
+      render(runs);
+      const busy = runs.some(x => !x.done);
+      setTimeout(poll, busy ? 1500 : 5000);
+    } catch (e) { setTimeout(poll, 5000); }
+  }
+  poll();
+
+  // The phone page, as a QR code, when the server was started with --phone.
+  fetch('/api/phone').then(r => r.json()).then(({url}) => {
+    if (!url || !window.QRCode) return;
+    new QRCode(document.getElementById('qr'), {text: url, width: 96, height: 96, correctLevel: QRCode.CorrectLevel.M});
+    const phone = document.getElementById('phone');
+    const tab = document.getElementById('phone-tab');
+    phone.querySelector('.card').title = url;
+    // The card pops on and off from its tab; the choice is remembered, and Escape hides it.
+    const show = (on) => {
+      phone.classList.toggle('open', on);
+      tab.setAttribute('aria-expanded', String(on));
+      try { localStorage.setItem('phone-qr', on ? 'open' : 'closed'); } catch (e) {}
+    };
+    let open = true;
+    try { open = localStorage.getItem('phone-qr') !== 'closed'; } catch (e) {}
+    show(open);
+    phone.classList.add('on');
+    tab.addEventListener('click', () => show(!phone.classList.contains('open')));
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && phone.classList.contains('open')) show(false); });
+  }).catch(() => {});
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    // Only the agent's own tab appears, in your Chrome; each run keeps a debug link.
+    go.disabled = true;
+    try {
+      const r = await fetch('/api/run', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+      });
+      const info = await r.json();
+      if (!r.ok) { hint.textContent = info.error || 'could not start'; return; }
+      input.value = '';
+      poll();
+    } finally {
+      go.disabled = false;
+      input.focus();
+    }
+  });
+</script>
+</body>
+</html>
