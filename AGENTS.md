@@ -405,20 +405,27 @@ that moved, a row carrying the parameter's own value, a changed URL - and say th
 sees only `ctx` and `result`, so a parameter reaches it by being RETURNED from `run`.
 
 On live walmart.com the HOMEPAGE cannot anchor a skill's precondition and the empty cart
-page can, both measured 2026-09-19 through the DOM perceiver: a homepage observed right
-after `_settle` still shows the previous page (0.045 to a settled reference), is a 36-part
-skeleton at 1s (0.181), and only reaches 0.48 from 2s on, so the admission gate rejected
-two genuinely successful cold runs at stage `precondition` (0.24, 0.10); signed-out
-`/cart` scores 1.000 at every delay from 0s. A `--reset-steps` recipe therefore owns where
-the SCREEN ends as well as the world - `undo/walmart-empty-cart.json` ends on a fresh
-`/cart` for that reason. Two more facts from the same session: this machine geolocates to
-Canada, so walmart.com pins `fulfillment_method:Shipping` and store-fulfilled items
-(anything Great Value) return "We couldn't find a match" - pick a product that ships; and
-NO Walmart skill has been stored since, because one unusable model reply aborts a cold
-run: the text writer in `llm/jev_.py` returned nothing for the Search field twice running
-from a `/cart` start, the critic returned empty replies, and `_validate_choice` has no
-re-ask. Both caps are 512 tokens (`_MAX_TEXT_TOKENS`, the critic's `max_tokens`), which is
-the SUSPECT and was not proven. Settle that before budgeting a Walmart demo.
+page can, measured 2026-09-19 through the DOM perceiver - but only once it has RENDERED,
+and how you arrived decides how long that takes. A homepage read right after `_settle`
+still shows the previous page (0.045 to a settled reference), is a 36-part skeleton at 1s
+(0.181) and only reaches 0.48 from 2s on; the admission gate rejected two genuinely
+successful cold runs on it at stage `precondition`. Signed-out `/cart` scores 1.000 - and
+the first measurement of that was WRONG in the way that matters: reloading `/cart` from
+`/cart` is 1.000 at 0s, arriving from a SEARCH, as the gate does, is 0.24-0.40 at 0s and
+1.000 by 1.5s, and those are the exact numbers the gate then rejected a third run with. So
+measure a screen by the route the gate takes to it. A `--reset-steps` recipe owns where the
+SCREEN ends as well as the world: `undo/walmart-empty-cart.json` ends on a fresh `/cart`
+and waits for "Shop Grocery", which the skeleton lacks (4 of 4 at 1.000 from a search).
+This machine also geolocates to Canada, so walmart.com pins `fulfillment_method:Shipping`
+and anything store-fulfilled (all of Great Value) returns "We couldn't find a match" - pick
+a product that ships.
+
+A run's model client is built with `computer_use=True`, which appends the computer tool to
+EVERY request it makes, helpers included. A helper that wants text back can get a
+`screenshot` tool call and no text instead: 1 reply in 12 for the Jev text writer, which
+ended three cold runs at step 0 and read exactly like a truncated reply until the stop
+reason was printed. `_TEXT_ASKS` in `llm/jev_.py` carries the fix and the measurement. The
+critic's "(empty reply)" degradations are the same shape and are NOT fixed.
 
 ## Maintaining this file
 
