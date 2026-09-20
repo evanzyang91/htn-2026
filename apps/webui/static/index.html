@@ -78,11 +78,29 @@
   button:disabled { opacity: .35; cursor: default; }
   .hint { text-align: center; color: var(--muted); font-size: 13px; margin-top: 16px; min-height: 1.2em; }
   .runs { margin: 26px auto 0; max-width: 720px; width: 100%; }
+  /* The phone QR code: a small tab in the corner, and a card that pops on and off above it. */
   .phone { position: fixed; right: 18px; bottom: 18px; z-index: 2; display: none; text-align: center; }
   .phone.on { display: block; }
+  .phone .tab {
+    width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--pill-border);
+    background: var(--pill); color: var(--muted); margin-left: auto;
+    display: grid; place-items: center; cursor: pointer; transition: color .15s, border-color .15s;
+  }
+  .phone .tab:hover, .phone.open .tab { color: var(--fg); border-color: #3a3a3a; }
+  /* An arrow: up when the card is down, and it turns over as the card pops up. */
+  .phone .tab svg { transition: transform .22s ease; }
+  .phone.open .tab svg { transform: rotate(180deg); }
+  .phone .card {
+    position: absolute; right: 0; bottom: 46px;
+    background: var(--pill); border: 1px solid var(--pill-border); border-radius: 14px;
+    padding: 10px 10px 8px; box-shadow: 0 8px 30px rgba(0,0,0,.45);
+    opacity: 0; transform: translateY(18px); transform-origin: bottom right;
+    pointer-events: none; transition: opacity .22s ease, transform .22s cubic-bezier(.2,.9,.3,1.1);
+  }
+  .phone.open .card { opacity: 1; transform: none; pointer-events: auto; }
   .phone .qr { background: #fff; padding: 8px; border-radius: 10px; display: inline-block; opacity: .9; }
   .phone .qr img, .phone .qr canvas { display: block; }
-  .phone .cap { color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .phone .cap { color: var(--muted); font-size: 11px; margin-top: 6px; white-space: nowrap; }
   .run { padding: 10px 14px; border-top: 1px solid var(--pill-border); position: relative; }
   /* A faint shine that glides along the bar above a live run, back and forth. */
   .run.busy::before {
@@ -131,7 +149,12 @@
     <div class="hint" id="hint">Just say what to do; the agent picks the website and works in a tab of your Chrome.</div>
     <div class="runs" id="runs"></div>
   </div>
-  <div class="phone" id="phone"><div class="qr" id="qr"></div><div class="cap">scan to talk from your phone</div></div>
+  <div class="phone" id="phone">
+    <div class="card"><div class="qr" id="qr"></div><div class="cap">scan to talk from your phone</div></div>
+    <button class="tab" id="phone-tab" type="button" title="Scan to talk from your phone" aria-expanded="false">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg>
+    </button>
+  </div>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
   const form = document.getElementById('f');
@@ -236,8 +259,21 @@
   fetch('/api/phone').then(r => r.json()).then(({url}) => {
     if (!url || !window.QRCode) return;
     new QRCode(document.getElementById('qr'), {text: url, width: 96, height: 96, correctLevel: QRCode.CorrectLevel.M});
-    document.getElementById('phone').classList.add('on');
-    document.getElementById('phone').title = url;
+    const phone = document.getElementById('phone');
+    const tab = document.getElementById('phone-tab');
+    phone.querySelector('.card').title = url;
+    // The card pops on and off from its tab; the choice is remembered, and Escape hides it.
+    const show = (on) => {
+      phone.classList.toggle('open', on);
+      tab.setAttribute('aria-expanded', String(on));
+      try { localStorage.setItem('phone-qr', on ? 'open' : 'closed'); } catch (e) {}
+    };
+    let open = true;
+    try { open = localStorage.getItem('phone-qr') !== 'closed'; } catch (e) {}
+    show(open);
+    phone.classList.add('on');
+    tab.addEventListener('click', () => show(!phone.classList.contains('open')));
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && phone.classList.contains('open')) show(false); });
   }).catch(() => {});
 
   form.addEventListener('submit', async (e) => {
