@@ -23,12 +23,11 @@ from __future__ import annotations
 
 import base64
 import random
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final
-
-import anthropic
 
 from skillweaver.config import settings
 from skillweaver.contracts import LLMMessage, LLMResponse, ToolCall, ToolSpec, Usage
@@ -103,6 +102,8 @@ def is_retryable(exc: BaseException) -> bool:
     """True for a transient failure worth another attempt: a connection or timeout
     error, a rate limit, or a 5xx/408/409 from the API. A 400, 401, 403 or 404 is
     a bug in the request and is never retried."""
+    import anthropic  # already imported whenever the SDK is what raised ``exc``
+
     if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
         return True
     if isinstance(exc, anthropic.RateLimitError):
@@ -163,9 +164,10 @@ class AnthropicClient:
         self._sleep = sleep
         self._jitter = jitter
         self._meter = UsageMeter()
-        if client is not None:
-            self._client = client
-        else:
+        self._building = threading.Lock()
+        self._sdk_kwargs: dict[str, Any] | None = None
+        self._client: Any | None = client
+        if client is None:
             kwargs: dict[str, Any] = {"max_retries": 0}
             # settings() resolves ANTHROPIC_API_KEY from the process environment
             # AND from .env; the SDK only looks at the environment, so a key that
@@ -180,7 +182,9 @@ class AnthropicClient:
                 kwargs["default_headers"] = {"anthropic-workspace-id": workspace_id}
             if timeout is not None:
                 kwargs["timeout"] = timeout
-            self._client = anthropic.Anthropic(**kwargs)
+            # Built OFF the constructing thread, and awaited by the first call: see _sdk.
+            self._sdk_kwargs = kwargs
+            threading.Thread(target=self._prebuild, name="anthropic-sdk", daemon=True).start()
         if computer_use and self._model not in COMPUTER_USE_MODELS:
             log.warning(
                 "anthropic.computer_use_unsupported",
@@ -228,6 +232,33 @@ class AnthropicClient:
 
     # -- internals ---------------------------------------------------------
 
+    def _sdk(self) -> Any:
+        """The SDK client, built once - by the thread the constructor started, or by the
+        first caller to get here, whichever is first; the other waits on the lock.
+
+        ``import anthropic`` is the most expensive import a run makes (0.30s, and 1.26s on
+        the first run after a ``uv sync``; measured 2026-09-20), and it used to be paid at
+        module scope, on the way to a first move that on the Jev path does not call this
+        client at all - its first request is the critic's, seconds later. Nothing about the
+        client changes: the SDK's constructor reads no network and accepts a missing key
+        (checked against 1.7.0: it constructs, and the REQUEST is what fails), so no error
+        moved from construction to first use. A build that does fail is retried by the next
+        caller and raises there, on the caller's thread.
+        """
+        with self._building:
+            if self._client is None:
+                import anthropic
+
+                self._client = anthropic.Anthropic(**(self._sdk_kwargs or {}))
+            return self._client
+
+    def _prebuild(self) -> None:
+        """:meth:`_sdk` for the background thread, which has nobody to raise to."""
+        try:
+            self._sdk()
+        except Exception:  # noqa: BLE001 - the first real call builds again and raises it
+            return
+
     def _build_tools(self, tools: Sequence[ToolSpec] | None) -> list[Any]:
         wire: list[Any] = [
             {
@@ -248,7 +279,7 @@ class AnthropicClient:
         last: BaseException | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
-                return self._client.messages.create(**request)
+                return self._sdk().messages.create(**request)
             except Exception as exc:  # noqa: BLE001 - re-raised as ProviderError below
                 last = exc
                 if not is_retryable(exc) or attempt == self._max_attempts:

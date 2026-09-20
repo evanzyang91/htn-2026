@@ -32,12 +32,19 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
-
-import numpy as np
 
 from skillweaver.contracts import Element, Fingerprint, Screenshot
 from skillweaver.errors import PerceptionError
+
+if TYPE_CHECKING:
+    # At RUN time numpy is imported by the three functions that compute with it. This
+    # module is imported by every command, ``skills ls`` and ``--help`` included, and none
+    # of them fingerprints anything: 35ms of their start, and 390ms on the first command
+    # after a ``uv sync`` (measured 2026-09-20). A run pays it once, at its first fingerprint -
+    # or not at all, when the controller had it imported while it waited on the browser.
+    import numpy as np
 
 SAME_STATE_THRESHOLD = 0.26
 """Recommended cut for "these two frames are the same UI state".
@@ -130,6 +137,8 @@ def _area_downsample(gray: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     Averaging rather than sampling is what makes the hash ignore antialiasing and a few
     pixels of scroll.
     """
+    import numpy as np
+
     height, width = gray.shape
     if height < out_h or width < out_w:
         # Tiny frame: repeat pixels up to at least the grid size, then average down.
@@ -150,6 +159,8 @@ def _smooth_rows(fine: np.ndarray, half: float) -> np.ndarray:
     Dividing by the same convolution of ones renormalizes the ends, so the top and bottom
     bands average over what is there rather than over an implied field of black.
     """
+    import numpy as np
+
     reach = max(int(np.ceil(half)), 1)
     kernel = np.clip(1.0 - np.abs(np.arange(-reach, reach + 1)) / half, 0.0, None)
     # Zero-padded ``valid`` rather than ``same``: numpy returns max(len) for ``same``,
@@ -173,6 +184,8 @@ def _bands(screenshot: Screenshot) -> list[str]:
     Raises:
         PerceptionError: the screenshot cannot be decoded or hashed.
     """
+    import numpy as np
+
     try:
         image = screenshot.to_array()
         if image.size == 0:

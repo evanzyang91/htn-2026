@@ -494,21 +494,21 @@ class DomPerceiver:
         shot: Screenshot = controller.capture()
         self._counters.captures += 1
         snapshot = self._read(controller, shot)
-        self._counters.detections += 1
+        self._counters.dom_reads += 1
         if self._rested(controller, snapshot):
             # Capture AGAIN, then read: the frame and the controls must be one moment,
             # and the frame taken before the wait is the moment being replaced.
             shot = controller.capture()
             self._counters.captures += 1
             snapshot = self._read(controller, shot)
-            self._counters.detections += 1
+            self._counters.dom_reads += 1
         for sat_out in range(BLANK_SIT_OUTS):
             if not snapshot.blank or not self._sit_out(controller, snapshot, sat_out + 1):
                 break
             shot = controller.capture()
             self._counters.captures += 1
             snapshot = self._read(controller, shot)
-            self._counters.detections += 1
+            self._counters.dom_reads += 1
         self._last = snapshot
         elements = _elements_of(snapshot)
         url = controller.url()

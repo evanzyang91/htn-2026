@@ -33,6 +33,7 @@ from collections.abc import Sequence
 from types import TracebackType
 from typing import Any
 
+from skillweaver._prefetch import prefetch
 from skillweaver.contracts import (
     Action,
     ActionKind,
@@ -186,6 +187,10 @@ class HarnessBrowserController:
                 "driving your own Chrome needs the browser-harness package; run `uv sync`"
             ) from exc
         self._cdp = cdp
+        # What READS this controller's captures, imported while this thread sleeps on the
+        # daemon and the first page load (0.7-1.1s, measured). The first fingerprint
+        # otherwise stops for both; see ``_prefetch`` for what that was measured to cost.
+        prefetch("numpy", "PIL.Image", "PIL.PngImagePlugin")
         try:
             log.info(
                 "harness.connect",
