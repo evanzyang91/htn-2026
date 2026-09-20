@@ -1753,12 +1753,17 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
 
     ``--policy jev`` without ``--perception dom`` raises: Jev answers with an index into a
     table of named controls, and OCR gives a box some text was near, not a control with a
-    role and a value. A missing Jev credential also raises, before a browser opens.
+    role and a value. A missing Jev credential also raises, before a browser opens - and
+    so does a missing ``OPENAI_API_KEY``, because what the policy types is written by an
+    OpenAI-compatible text model and there is no fall-back writer
+    (:class:`~skillweaver.llm.openai_.OpenAITextWriter` says why the role left ``llm``,
+    which is kept in the signature for the callers that pass it and is no longer used).
     """
     if config.policy != "jev":
         return None
     from skillweaver.agent.jev_driver import JevDriver
-    from skillweaver.llm.jev_ import JevPolicy, LLMTextWriter
+    from skillweaver.llm.jev_ import JevPolicy
+    from skillweaver.llm.openai_ import OpenAITextWriter
     from skillweaver.perception.dom import DomPerceiver
 
     if not isinstance(perceiver, DomPerceiver):
@@ -1766,7 +1771,13 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
             "--policy jev needs --perception dom: the policy chooses an index into the "
             "page's own list of named controls, which only the DOM path produces."
         )
-    return JevDriver(JevPolicy(LLMTextWriter(llm), api_key=config.typesafe_api_key), perceiver)
+    writer = OpenAITextWriter(
+        api_key=config.openai_api_key,
+        model=config.text_model,
+        base_url=config.text_base_url,
+        effort=config.text_effort,
+    )
+    return JevDriver(JevPolicy(writer, api_key=config.typesafe_api_key), perceiver)
 
 
 def budget_from(

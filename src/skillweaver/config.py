@@ -56,6 +56,33 @@ indexed control table and needs a perceiver that produces one."""
 
 POLICIES = ("claude", "jev")
 
+DEFAULT_TEXT_MODEL = "gpt-5.4-mini"
+"""The model that writes what ``--policy jev`` types (``SKILLWEAVER_TEXT_MODEL``), over an
+OpenAI-compatible endpoint. A SETTING because the model belongs in ``.env`` and not in
+code, and the id was read from the account's own model listing rather than from memory.
+
+Chosen by measurement through ``OpenAITextWriter``, 2026-09-20. The case that decides it
+is an errand's SECOND item, the first already in the cart: a wrong query there is a wrong
+product. Right answers of 15, and median latency:
+
+==============  =====  ======  ==================================================
+``gpt-5.4-mini``  15/15  650ms   (also 5/5 declining a newsletter field)
+``gpt-4.1-nano``  13/15  412ms   both misses typed the field's own LABEL into it
+``gpt-5.4-nano``  10/15  526ms   five replies with no usable value
+``gpt-4.1-mini``   5/5   432ms   but declined the newsletter field only 2 times in 5
+``gpt-5-nano``     4/5  4288ms   reasons first: 9613 output tokens for a few words
+==============  =====  ======  ==================================================
+
+The 240ms over the fastest is not the cost that matters; a value nobody asked for,
+typed into a real form, is."""
+
+DEFAULT_TEXT_BASE_URL = "https://api.openai.com/v1"
+"""Any OpenAI-compatible endpoint works; ``SKILLWEAVER_TEXT_BASE_URL`` names another."""
+
+TEXT_EFFORTS = ("low", "medium", "high")
+"""What ``SKILLWEAVER_TEXT_EFFORT`` may say. Sent only to a model that reasons, and left
+unset by default: it is a latency knob and the default model does not need it."""
+
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _TARGETS = ("browser", "desktop")
 _TRUE = ("1", "true", "yes", "on")
@@ -82,6 +109,10 @@ class Settings:
     anthropic_api_key: str | None = field(default=None, repr=False)
     gemini_api_key: str | None = field(default=None, repr=False)
     typesafe_api_key: str | None = field(default=None, repr=False)
+    openai_api_key: str | None = field(default=None, repr=False)
+    text_model: str = DEFAULT_TEXT_MODEL
+    text_base_url: str = DEFAULT_TEXT_BASE_URL
+    text_effort: str | None = None
     default_budget: Budget = field(default_factory=Budget)
 
     @property
@@ -190,6 +221,12 @@ def load_settings(
     if policy not in POLICIES:
         raise ConfigError(f"SKILLWEAVER_POLICY={policy!r} must be one of {POLICIES}")
 
+    text_effort = (merged.get("SKILLWEAVER_TEXT_EFFORT") or "").strip().lower() or None
+    if text_effort is not None and text_effort not in TEXT_EFFORTS:
+        raise ConfigError(
+            f"SKILLWEAVER_TEXT_EFFORT={text_effort!r} must be one of {TEXT_EFFORTS}, or unset"
+        )
+
     defaults = Budget()
     budget = Budget(
         max_steps=_number(merged, "SKILLWEAVER_MAX_STEPS", defaults.max_steps, int),
@@ -220,6 +257,10 @@ def load_settings(
         anthropic_api_key=merged.get("ANTHROPIC_API_KEY") or None,
         gemini_api_key=merged.get("GEMINI_API_KEY") or merged.get("GOOGLE_API_KEY") or None,
         typesafe_api_key=merged.get("TYPESAFE_API_KEY") or None,
+        openai_api_key=merged.get("OPENAI_API_KEY") or None,
+        text_model=merged.get("SKILLWEAVER_TEXT_MODEL") or DEFAULT_TEXT_MODEL,
+        text_base_url=merged.get("SKILLWEAVER_TEXT_BASE_URL") or DEFAULT_TEXT_BASE_URL,
+        text_effort=text_effort,
         default_budget=budget,
     )
     return check_settings(settings)
