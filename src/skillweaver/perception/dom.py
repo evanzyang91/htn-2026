@@ -62,7 +62,12 @@ __all__ = [
     "BLANK_REST_MS",
     "BLANK_SIT_OUTS",
     "CHANGED_REST_MS",
+    "EFFECT_BUDGET_MS",
+    "EFFECT_POLL_MS",
+    "IMMEDIATE_OPERATIONS",
+    "MAX_CONTEXT_CHARS",
     "MAX_CONTROLS",
+    "MAX_DESCRIBED",
     "MAX_PAGE_TEXT",
     "MAX_TEXT_NODES",
     "NO_CHANGE_REST_MS",
@@ -82,9 +87,48 @@ materializing its content, and a decision belongs on a quiet page rather than on
 whatever rendered first. Upstream's numbers. See :meth:`DomPerceiver.rest_after`."""
 
 NO_CHANGE_REST_MS: tuple[float, float] = (120.0, 1000.0)
-"""``(quiet, cap)`` for a move after which the page reads EXACTLY as before: the effect may
-land asynchronously - a cart badge, a toast - so look once more before "no change" is
-what the policy is told. Upstream's numbers."""
+"""``(quiet, cap)`` for a move after which the page reads EXACTLY as before, when that move
+is NOT one whose effect is watched for (:data:`EFFECT_BUDGET_MS`): a ``BACK``, the driver's
+fresh look at a ``DONE`` claim, or a caller that did not say what its move was. One quiet
+window and one more look. Upstream's numbers for this case until ``0da4053``, which took
+the MUTATIONS out of it; what is left here is what a quiet window is still right for."""
+
+EFFECT_POLL_MS = 100.0
+"""How often an unchanged page is re-read while a mutation's effect is watched for.
+Upstream's number (``0da4053``)."""
+
+EFFECT_BUDGET_MS: dict[str, float] = {"CLICK": 3000.0, "ENTER": 3000.0, "TYPE_TEXT": 1000.0}
+"""How long a MUTATION that shows no change is watched before "no change" is what the
+policy is told, by operation. Upstream's numbers: 3.0s for a click or select, 1.0s for a
+fill. ``ENTER`` is this project's operation and takes the click's budget, because what it
+does is submit - its effect is a request being answered, which is the slow kind - where a
+fill's effect is the field's own value, which is there at once or not at all.
+
+This REPLACES the quiet window for these moves and is not added to it, because waiting for
+quiet is wrong in BOTH directions (upstream, measured on Walmart). A page awaiting a cart
+request makes no mutation and has no completed resource entry, so it reads quiet after one
+window while the badge moves a second later: every add-to-cart recorded
+``page_changed=False``, which tells the policy the item was not added and sends it to add
+another - 40 steps and 89s against 10 and 16.8s. And a page that animates its cart update
+never goes quiet, so the full cap was paid after the badge had already changed (1094ms of
+load against 231ms). A poll stops the moment there is an answer, so a fast effect costs
+what it costs and only a genuine no-op pays the whole budget."""
+
+IMMEDIATE_OPERATIONS: frozenset[str] = frozenset({"SCROLL_DOWN", "SCROLL_UP", "WAIT"})
+"""Moves whose effect is immediate, so an unchanged page after one is simply the answer:
+nothing is polled and nothing is rested. Upstream excludes both from the watch - a dead
+scroll would pay the budget for no reason - and the scroll offset is in
+:attr:`DomSnapshot.digest`, so an unchanged page after a scroll is a wheel that moved
+nothing. (Upstream still gives an unchanged scroll its 100/700 in-place quiet window, by
+the fall-through of its ``elif``; not taken, because there is nothing for it to wait on.)"""
+
+MAX_DESCRIBED = 30
+"""Controls given a :attr:`DomControl.context` in one snapshot. Upstream's cap: the lookup
+reads ``innerText``, which forces layout, and past this many the page is a list of
+near-identical rows whose index carries the same information."""
+
+MAX_CONTEXT_CHARS = 80
+"""Characters of one :attr:`DomControl.context`. Upstream's cap."""
 
 CHANGED_REST_MS: tuple[float, float] = (150.0, 1500.0)
 """``(quiet, cap)`` for a move after which the page CHANGED IN PLACE. This one is not
@@ -196,6 +240,13 @@ class DomControl:
         opens: The control's ``aria-haspopup`` value (``menu``, ``listbox``, ``dialog``,
             ``true`` ...): what a click on it is declared to open. ``None`` when the page
             did not say.
+        context: The text of the row or card around a control whose LABEL IS SHARED with
+            another control on this screen - seven *Add item to cart* buttons, thirty
+            *hide* links - with the label itself taken out. ``None`` for a control whose
+            label is its own, and for one past :data:`MAX_DESCRIBED`. Upstream's
+            ``context`` (``cbf517a``); narrower than :attr:`scope_text`, which every
+            control carries and which is never shown as part of a name. It is NOT part of
+            :attr:`element_id`; see :func:`_element_id` for why.
     """
 
     index: int
@@ -213,12 +264,20 @@ class DomControl:
     scope_text: str = ""
     section: str | None = None
     opens: str | None = None
+    context: str | None = None
 
     @property
     def label(self) -> str:
         """The name, or the role - never empty, so a target table can quote an icon-only
         control."""
         return self.name or self.role
+
+    @property
+    def action_name(self) -> str:
+        """What DISTINGUISHES this control: upstream's ``action_name``, the label and then
+        the context when there is one. What loop guards and a policy's history key on, so
+        that withholding one *Add item to cart* does not withhold all seven."""
+        return f"{self.label} \u2014 {self.context}" if self.context else self.label
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +338,9 @@ class DomSnapshot:
             it has none or nothing is offered.
         by_element_id: The controls keyed by ``element_id``, which is how a policy turns
             the id it chose back into what it knows about that control.
+        context_ms: What the shared-label pass cost inside the page script, by the page's
+            own clock. A measurement and part of no identity: ``innerText`` forces layout,
+            so this is the number to read before raising :data:`MAX_DESCRIBED`.
     """
 
     url: str
@@ -297,6 +359,7 @@ class DomSnapshot:
     can_press_enter: bool = False
     enter_label: str = ""
     by_element_id: dict[str, DomControl] = field(default_factory=dict, compare=False, repr=False)
+    context_ms: float = field(default=0.0, compare=False)
 
     @property
     def digest(self) -> str:
@@ -314,7 +377,18 @@ class DomSnapshot:
         content = [
             self.url,
             self.text,
-            [(c.element_id, c.value, c.checked, c.selected, c.expanded) for c in self.controls],
+            # ``context`` is IN, as upstream has it (its fingerprint hashes the action
+            # list, which carries it). It is the text of the card around a shared-label
+            # control, so it is where a card answers its own button - "1 in cart" beside
+            # the seventh *Add* - and on a long page that text can sit past the
+            # ``MAX_PAGE_TEXT`` cut of ``text`` above, where nothing else here would see
+            # it. It cannot make the digest unstable: it is a pure function of the DOM,
+            # capped in document order, so an unchanged page re-reads to the same value
+            # (checked on Hacker News and on local cards, ``scripts/check_k_dom.py``).
+            [
+                (c.element_id, c.value, c.checked, c.selected, c.expanded, c.context)
+                for c in self.controls
+            ],
             self.scroll_y,
             None if scroller is None else (scroller.can_down, scroller.can_up),
             # The ENTER offer is IN, as upstream has it (its fingerprint hashes the
@@ -394,6 +468,7 @@ class DomPerceiver:
         "_fingerprinter",
         "_last",
         "_observed_ms",
+        "_polls",
         "_rested_ms",
         "_rests",
     )
@@ -407,8 +482,9 @@ class DomPerceiver:
         self._fingerprinter = fingerprinter if fingerprinter is not None else StateFingerprinter()
         self._counters = counters if counters is not None else PerceptionCounters()
         self._last: DomSnapshot | None = None
-        self._armed: tuple[int, DomSnapshot, bool] | None = None
+        self._armed: tuple[int, DomSnapshot, bool, str | None] | None = None
         self._rests = 0
+        self._polls = 0
         self._rested_ms = 0.0
         self._blank_waits = 0
         self._observed_ms = 0.0
@@ -455,24 +531,51 @@ class DomPerceiver:
         return self._rests, self._rested_ms
 
     @property
+    def polls(self) -> int:
+        """How many times an unchanged page was re-read while a mutation's effect was
+        watched for (:data:`EFFECT_BUDGET_MS`). Page-script reads with no capture, so
+        they are in ``counters.detections`` and not in ``counters.captures``."""
+        return self._polls
+
+    @property
     def blank_waits(self) -> int:
         """How many times a blank page was sat out; see :meth:`_sit_out`. Counted apart
         from :attr:`rests`, which are waits a policy's move armed."""
         return self._blank_waits
 
-    def rest_after(self, actions: int, basis: DomSnapshot, *, waited: bool = False) -> None:
-        """Arm ONE coming observation to be taken on a page that has come to rest.
+    def rest_after(
+        self,
+        actions: int,
+        basis: DomSnapshot,
+        *,
+        waited: bool = False,
+        operation: str | None = None,
+    ) -> None:
+        """Arm ONE coming observation to be taken once the move has been ANSWERED.
 
         An acting policy calls this as it answers: ``basis`` is the screen it decided
-        on, and ``actions`` how many controller actions its move performs - the explorer
+        on, ``actions`` how many controller actions its move performs - the explorer
         observes after each, and the one worth waiting for is the LAST, which is the
-        frame the next decision is made on. That frame is taken on a page at rest,
-        whichever of three things the move did to it: changed the address
-        (:data:`ARRIVAL_REST_MS`), left it reading exactly as ``basis`` did
-        (:data:`NO_CHANGE_REST_MS`, skipped when the move WAS a wait), or changed it in
-        place (:data:`CHANGED_REST_MS`). The first two are upstream's; the third is the
-        one a live run added, and its constant says what that cost. On a page that has
-        finished answering, the wait is one quiet window and no more.
+        frame the next decision is made on - and ``operation`` what the move was. What
+        happens to that frame is upstream's three-way split (``0da4053``), by what the
+        move did to the page:
+
+        * it reads EXACTLY as ``basis`` did, after a mutation (:data:`EFFECT_BUDGET_MS`):
+          the page is WATCHED - re-read every :data:`EFFECT_POLL_MS` until it differs or
+          the operation's budget is spent. No quiet window; that constant says why.
+        * the ADDRESS changed (:data:`ARRIVAL_REST_MS`): one quiet window, because a
+          navigation may still be materializing its content. Also applied to a frame the
+          watch landed on, when what landed was a redirect.
+        * it changed IN PLACE (:data:`CHANGED_REST_MS`): one quiet window, because an
+          overlay's first frame is half-built.
+
+        An unchanged page after a scroll or a wait (:data:`IMMEDIATE_OPERATIONS`, or
+        ``waited``) is handed over as it is. ``operation=None`` is a caller that did not
+        say - every call site written before the watch existed - and gets what it got
+        then: one :data:`NO_CHANGE_REST_MS` quiet window on an unchanged page. That is
+        deliberately also what the driver's fresh look at a ``DONE`` claim wants, which is
+        a wait armed as not one: an unchanged page there is the ORDINARY case, and
+        watching it would cost every finished run three seconds.
 
         Armed per move rather than switched on, because every other reader of this
         perceiver must stay untaxed: a warm replay, the admission gate's rest loop and a
@@ -480,7 +583,7 @@ class DomPerceiver:
         read is what ``AGENTS.md`` forbids ``_settle`` for. Re-arming replaces whatever
         was armed, so a move that stopped early cannot leave a wait behind for long.
         """
-        self._armed = (max(int(actions), 1), basis, waited)
+        self._armed = (max(int(actions), 1), basis, waited, operation)
 
     def observe(self, controller: Controller) -> Observation:
         """One frame: capture, ask the page, index, fingerprint.
@@ -495,9 +598,10 @@ class DomPerceiver:
         self._counters.captures += 1
         snapshot = self._read(controller, shot)
         self._counters.detections += 1
-        if self._rested(controller, snapshot):
+        if self._rested(controller, snapshot, shot):
             # Capture AGAIN, then read: the frame and the controls must be one moment,
-            # and the frame taken before the wait is the moment being replaced.
+            # and the frame taken before the wait - or the watch - is the moment being
+            # replaced.
             shot = controller.capture()
             self._counters.captures += 1
             snapshot = self._read(controller, shot)
@@ -527,33 +631,86 @@ class DomPerceiver:
             self._acted_ms = float(acted)
         return observation
 
-    def _rested(self, controller: Controller, snapshot: DomSnapshot) -> bool:
-        """Whether this frame was the armed one AND the page was then made to rest."""
+    def _rested(self, controller: Controller, snapshot: DomSnapshot, shot: Screenshot) -> bool:
+        """Whether this frame was the armed one AND time was then spent on the page, so
+        that the caller must capture and read again."""
         if self._armed is None:
             return False
-        remaining, basis, waited = self._armed
+        remaining, basis, waited, operation = self._armed
         if remaining > 1:
-            self._armed = (remaining - 1, basis, waited)
+            self._armed = (remaining - 1, basis, waited, operation)
             return False
         self._armed = None
+        started = time.monotonic()
+        watched = False
+        if snapshot.url == basis.url and snapshot.digest == basis.digest:
+            budget = None if waited else EFFECT_BUDGET_MS.get(operation or "")
+            if budget is not None:
+                snapshot = self._watch(controller, basis, shot, budget, started)
+                watched = True
+                if snapshot.url == basis.url:
+                    # Upstream's shape: what the watch found is handed over at once. A
+                    # quiet window here is the wait the watch replaced - on a page that
+                    # animates its answer it is the whole cap, after the answer.
+                    return True
+            elif waited or operation in IMMEDIATE_OPERATIONS:
+                return False
         if snapshot.url != basis.url:
             why, (quiet, cap) = "arrived", ARRIVAL_REST_MS
         elif snapshot.digest != basis.digest:
             why, (quiet, cap) = "changed", CHANGED_REST_MS
-        elif not waited:
-            why, (quiet, cap) = "unchanged", NO_CHANGE_REST_MS
         else:
-            return False
+            why, (quiet, cap) = "unchanged", NO_CHANGE_REST_MS
         quiesce = getattr(controller, "quiesce", None)
         if not callable(quiesce):
-            return False
-        started = time.monotonic()
+            return watched
+        began = time.monotonic()
         quiesce(quiet, cap)
-        spent = (time.monotonic() - started) * 1000.0
+        spent = (time.monotonic() - began) * 1000.0
         self._rests += 1
         self._rested_ms += spent
         log.info("dom.rest", why=why, waited_ms=round(spent), controls=len(snapshot.controls))
         return True
+
+    def _watch(
+        self,
+        controller: Controller,
+        basis: DomSnapshot,
+        shot: Screenshot,
+        budget_ms: float,
+        started: float,
+    ) -> DomSnapshot:
+        """Re-read an unchanged page until it differs from ``basis`` or ``budget_ms`` is
+        spent; the last snapshot read. Upstream's effect poll.
+
+        Each look is the page script ALONE - no capture, as upstream polls with
+        ``screenshot=False``: the digest is what is being asked about, and the one frame
+        that matters is the one :meth:`observe` captures after this returns, together with
+        a read of its own, so the frame and the controls handed over are still one moment.
+        ``shot`` only supplies a viewport size if the page omits its own. A read that
+        FAILS mid-watch is a document being replaced, which is an answer: the watch stops
+        and the read after it reports whatever is there.
+        """
+        deadline = started + budget_ms / 1000.0
+        snapshot, polls, landed = basis, 0, False
+        while time.monotonic() < deadline:
+            time.sleep(EFFECT_POLL_MS / 1000.0)
+            polls += 1
+            try:
+                snapshot = self._read(controller, shot)
+            except (ControllerError, PerceptionError):
+                landed = True
+                break
+            self._counters.detections += 1
+            if snapshot.url != basis.url or snapshot.digest != basis.digest:
+                landed = True
+                break
+        spent = (time.monotonic() - started) * 1000.0
+        self._polls += polls
+        self._rests += 1
+        self._rested_ms += spent
+        log.info("dom.rest", why="effect", waited_ms=round(spent), polls=polls, landed=landed)
+        return snapshot
 
     def _sit_out(self, controller: Controller, snapshot: DomSnapshot, attempt: int) -> bool:
         """Wait once on a BLANK page (:attr:`DomSnapshot.blank`); ``False`` if this
@@ -648,6 +805,7 @@ def _snapshot_from(raw: dict[str, Any], shot: Screenshot) -> DomSnapshot:
             omitted_controls=int(raw.get("omitted") or 0),
             covered_controls=int(raw.get("covered") or 0),
             by_element_id={control.element_id: control for control in controls},
+            context_ms=float(raw.get("contextMs") or 0.0),
         )
     except PerceptionError:
         raise
@@ -705,6 +863,7 @@ def _control_from(
         scope_text=_clean(entry.get("scope"))[:600],
         section=_clean(entry.get("section"))[:40] or None,
         opens=_clean(entry.get("opens"))[:40] or None,
+        context=_clean(entry.get("context"))[:MAX_CONTEXT_CHARS] or None,
     )
 
 
@@ -782,6 +941,17 @@ def _element_id(role: str, text: str, box: Box, seen: dict[str, int]) -> str:
     rather than colliding, because ``ElementCatalog`` falls back to a POSITIONAL id on a
     duplicated ``stable_id`` and that would break the join with the policy's choice; two
     ``Add`` buttons 16 pixels apart in a product grid is an ordinary page.
+
+    :attr:`DomControl.context` is deliberately NOT in the seed. Seven *Add item to cart*
+    buttons never collided here: each sits in its own card, so the position grid already
+    tells them apart, and the counter catches two in one cell. What they lacked was a NAME
+    a policy could read, and that is what context is. As an identity it would be worse
+    than position on the one axis that matters: it is the text of the card, and a card
+    ANSWERS its button - "Add" becomes a stepper, "1 in cart" appears - so an id built on
+    it would rename the control for having been used, and every memory keyed on the id
+    (the explorer's dead ends, ``JevDriver``'s spent moves) would file the same button
+    twice. It is also capped per snapshot (:data:`MAX_DESCRIBED`), so which controls have
+    one moves with the scroll offset. The id stays where the control IS.
     """
     seed = f"{role}|{text}|{box.x // 16}|{box.y // 16}"
     base = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
@@ -816,6 +986,8 @@ _SNAPSHOT_JS = (
   const MAX_CONTROLS = %(max_controls)d;
   const MAX_TEXT_NODES = %(max_text_nodes)d;
   const MAX_PAGE_TEXT = %(max_page_text)d;
+  const MAX_DESCRIBED = %(max_described)d;
+  const MAX_CONTEXT_CHARS = %(max_context_chars)d;
 
   const safe = (el) => !['password', 'file', 'hidden'].includes(el.type);
   const visible = (el) => !el.closest('[aria-hidden="true"],[inert]') &&
@@ -885,7 +1057,25 @@ _SNAPSHOT_JS = (
     (['textbox', 'searchbox', 'spinbutton'].includes(rname) ||
       (rname === 'combobox' && ['INPUT', 'TEXTAREA'].includes(el.tagName)));
 
+  // What surrounds a control, for when its own name does not identify it: upstream's
+  // describe(). A store listing can show seven buttons all named "Add item to cart"; the
+  // product name lives in the card around each one. Reads innerText, which forces
+  // layout, so it runs only for the ambiguous ones and is capped.
+  const describe = (el, label) => {
+    for (let p = el.parentElement, i = 0; p && i < 4; p = p.parentElement, i++) {
+      // Stop at the row or card holding this control. A container full of other controls
+      // is a header or a list, and its text describes all of them equally - no help.
+      if (p.querySelectorAll('a,button,input,select,textarea,[role="button"]').length > 3) break;
+      const whole = (p.innerText || '').replace(/\\s+/g, ' ').trim();
+      if (whole.length <= label.length + 3 || whole.length > 300) continue;
+      const rest = whole.split(label).join(' ').replace(/\\s+/g, ' ').trim();
+      if (rest.length > 2) return rest.slice(0, MAX_CONTEXT_CHARS);
+    }
+    return null;
+  };
+
   const controls = [];
+  const nodes = [];
   let covered = 0;
   for (const el of document.querySelectorAll(SELECTOR)) {
     if (!safe(el) || !visible(el) || el.matches(':disabled') ||
@@ -941,9 +1131,31 @@ _SNAPSHOT_JS = (
         .map((o) => ({label: o.label, value: o.value}));
     }
     controls.push(control);
+    nodes.push(el);
   }
   const omitted = Math.max(0, controls.length - MAX_CONTROLS);
   controls.splice(MAX_CONTROLS);
+
+  // Only labels shared by several controls need disambiguating, and only the first few:
+  // past that the page is a list of near-identical rows and the index carries the same
+  // information. Upstream counts its click and fill actions and not its selects; here
+  // that is every control but a <select>. The label is the one Python will show
+  // (DomControl.label: the name, else the role), whitespace-collapsed as _clean does it,
+  // because it is compared against innerText collapsed the same way.
+  const contextStart = performance.now();
+  const labelOf = (c) => (c.name || c.role).replace(/\\s+/g, ' ').trim();
+  const shared = {};
+  controls.forEach((c, i) => {
+    if (nodes[i].tagName !== 'SELECT') shared[labelOf(c)] = (shared[labelOf(c)] || 0) + 1;
+  });
+  let described = 0;
+  for (let i = 0; i < controls.length && described < MAX_DESCRIBED; i++) {
+    const label = labelOf(controls[i]);
+    if (nodes[i].tagName === 'SELECT' || (shared[label] || 0) < 2) continue;
+    const context = describe(nodes[i], label);
+    if (context) { controls[i].context = context; described++; }
+  }
+  const contextMs = performance.now() - contextStart;
 
   // Visible text, with the rectangle of each run, so it can become an Element. A Range
   // is the only way to get the box of a bare text node.
@@ -1028,11 +1240,14 @@ _SNAPSHOT_JS = (
     texts: texts,
     omitted: omitted,
     covered: covered,
+    contextMs: contextMs,
   };
 }
 """.replace("%(max_controls)d", str(MAX_CONTROLS))
     .replace("%(max_text_nodes)d", str(MAX_TEXT_NODES))
     .replace("%(max_page_text)d", str(MAX_PAGE_TEXT))
+    .replace("%(max_described)d", str(MAX_DESCRIBED))
+    .replace("%(max_context_chars)d", str(MAX_CONTEXT_CHARS))
 )
 """The one page script this perceiver runs, adapted from ``jev-ultrafast/snapshot.js``.
 
@@ -1048,6 +1263,10 @@ the task wanted was delivered to the backdrop - 0 ticked, no error anywhere.
 Upstream's ``enter`` and ``back`` ACTIONS are facts here (``enter``, ``canGoBack``), not
 entries in a list: what is offered is the policy's business (:mod:`skillweaver.llm.jev_`),
 and this script says only what is true of the page.
+
+``describe()`` and the shared-label pass are upstream's (``cbf517a``) unchanged in every
+number; the one adaptation is that upstream's pass reads nodes back out of its identity
+cache and this one keeps them in an array beside the controls, having no such cache.
 
 Text nodes come back WITH their rectangles, because this path needs ``Element``s. And
 select options are carried although no select action exists - see
