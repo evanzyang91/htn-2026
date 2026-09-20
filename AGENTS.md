@@ -347,6 +347,26 @@ would have changed the order of the candidates and nothing else.
 `test_the_ordering_miss_of_2026_09_19_was_the_gate_and_not_the_ranking` holds the
 arithmetic.
 
+Reuse is also keyed on what a skill DOES. The admission gate stores an action signature
+(`TYPE_TEXT(text_field) -> CLICK(button) -> ...`, labels and values abstracted) and the
+sentence-plus-arguments it proved, a `Precedent`, and ONLY for a skill that carries a
+verifier; `skills/family.py` holds the signature, the family cut (`MAX_FAMILY_DISTANCE`,
+with the twelve-signature table showing the two populations TOUCH at 0.50, so re-measure
+with `scripts/measure_families.py`, do not nudge) and `same_intent`. Three things there
+were each paid for in a live run. Test a gate against a skill the gate actually STORED: a
+synthesized parameter often carries a schema `default`, which binds `{}` without reading
+the sentence, so a check that lives in the text binder never runs - *Remove "X" from the
+cart* accounted for 0.86 of itself on the add skill and was cleared to run until intent
+became a gate every candidate passes (`asks_for`, `agent/planner.py`). The critic's
+PER-MOVE verdict is wrong on pages that answer without repainting (a filled field, an
+AJAX add-to-cart), so nothing may be keyed on it: borrowed roles and skeleton-following
+both were, and both broke (`derive_signature`, `Explorer._follow`). And the cold-run
+skeleton is followed 4 of 4 steps on splitkb yet bought NOTHING there - 7 actions and 11
+calls with it and without, n=3 each - so do not quote it as a saving until it is measured
+where the waste was (Walmart). An older checkout that touches a newer library silently
+strips `action_signature` and `precedents` from `meta.json`; give each code version its
+own data directory when comparing them.
+
 And a fall-through is not a success. A warm attempt that missed and was rescued by
 exploration reports the miss in its headline (`RunReport.warm_missed` and `rescued`,
 `orchestrator.py`); `SOLVED by the cold path` on its own is the sentence that hid the
