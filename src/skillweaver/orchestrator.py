@@ -240,6 +240,13 @@ class RunReport:
     ``decision`` names the path that produced the answer and ``attempts`` holds every path
     tried, failures included, in order. ``outcome`` is the winner's, or the last failure
     when nothing worked; ``learning_note`` says why nothing was learned.
+
+    ``solved_ms`` is the wall clock from ``Agent.run`` being asked to the ANSWER - every
+    attempt, and nothing after it - and ``learning_ms`` is what synthesis and the admission
+    gate then took. They are separate because they are owed to different people: measured
+    on live splitkb.com, a task solved at 14s printed its result at 38-59s, after a gate
+    the person asking never needed to wait for. ``learning_pending`` marks the report
+    ``on_solved`` is handed, which is this one before learning has run.
     """
 
     ok: bool
@@ -251,6 +258,9 @@ class RunReport:
     admission: Admission | None = None
     learned: Skill | None = None
     learning_note: str = ""
+    solved_ms: float = 0.0
+    learning_ms: float = 0.0
+    learning_pending: bool = False
 
     @property
     def warm(self) -> AttemptRecord | None:
@@ -358,15 +368,28 @@ class RunReport:
                 f"observation(s) - {eyes.ocr_hits} served from cache "
                 f"({eyes.hit_rate:.0%}), {eyes.detections} detection(s)"
             )
+        lines.append(self.headline())
+        return "\n".join(lines)
+
+    def headline(self) -> str:
+        """The last line of :meth:`explain`, and the WHOLE of what is said the moment a
+        task is solved: the verdict, the path, and the wall clock to the answer with
+        learning's time named apart from it."""
         verdict = "SOLVED" if self.ok else "NOT SOLVED"
         # "SOLVED by the cold path" alone reads as a plain success, and after a warm miss
         # it is the most misleading sentence this report can end on.
         after = " AFTER A WARM MISS" if (self.rescued or self.warm_missed) else ""
-        lines.append(
+        line = (
             f"{verdict} by the {self.decision} path{after} "
             f"in {self.steps} action(s) and {self.llm_calls} model call(s)"
         )
-        return "\n".join(lines)
+        if self.solved_ms > 0:
+            line += f", {self.solved_ms / 1000:.1f}s to the answer"
+        if self.learning_pending:
+            line += " - learning it now, which the answer does not wait for"
+        elif self.learning_ms > 0:
+            line += f" (+{self.learning_ms / 1000:.1f}s learning, after it)"
+        return line
 
 
 class Agent:
@@ -453,14 +476,28 @@ class Agent:
         return self._budget
 
     def run(
-        self, task: TaskSpec, *, learn: bool = True, warm: bool = True, cold: bool = True
+        self,
+        task: TaskSpec,
+        *,
+        learn: bool = True,
+        warm: bool = True,
+        cold: bool = True,
+        on_solved: Callable[[RunReport], None] | None = None,
     ) -> RunReport:
         """Do ``task`` and report which path did it; a failure is a report, not an exception.
 
         ``warm=False`` forces exploration, which is what the ``learn`` command wants;
         ``cold=False`` makes this library-only and reports honestly when the library falls
         short.
+
+        ``on_solved`` is called ONCE, with the report as it stands, the moment a cold run
+        is solved and BEFORE it is offered to the admission gate - the answer is not made
+        to wait for synthesis and the gate's re-runs. Nothing about learning changes: it
+        runs next, in this call, on this browser, through the same gate, and the report
+        RETURNED is the complete one. It is not called when there is nothing to wait for
+        (a warm answer, a failed run, learning switched off).
         """
+        began = time.monotonic()
         candidates = self._retrieve(task)
         attempts: list[AttemptRecord] = []
 
@@ -480,6 +517,7 @@ class Agent:
                     candidates=candidates,
                     outcome=outcome,
                     learning_note="the skill was already in the library",
+                    solved_ms=(time.monotonic() - began) * 1000.0,
                 )
             if record.stage == "budget":
                 # The planner lets BudgetExceeded escape so an exhausted run STOPS:
@@ -507,18 +545,27 @@ class Agent:
         record = self._charge_model(self._charge_eyes(record, mark), spent)
         record = self._charge_clock(record, clock)
         attempts.append(record)
-        learned, admission, note = self._learn(task, outcome, enabled=learn)
-        self._persist()
-        return RunReport(
+        answered = RunReport(
             ok=record.ok,
             task=task,
             decision="cold" if record.ok else "none",
             attempts=tuple(attempts),
             candidates=candidates,
             outcome=outcome,
+            solved_ms=(time.monotonic() - began) * 1000.0,
+        )
+        learns = record.ok and learn
+        if on_solved is not None and learns:
+            on_solved(replace(answered, learning_pending=True))
+        learning = time.monotonic()
+        learned, admission, note = self._learn(task, outcome, enabled=learn)
+        self._persist()
+        return replace(
+            answered,
             admission=admission,
             learned=learned,
             learning_note=note,
+            learning_ms=(time.monotonic() - learning) * 1000.0 if learns else 0.0,
         )
 
     def _charge_eyes(self, record: AttemptRecord, mark: PerceptionCounts) -> AttemptRecord:
