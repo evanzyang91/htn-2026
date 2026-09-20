@@ -361,8 +361,43 @@ Rules:
 - Return the site's entry point, for example "https://www.example.com". Never a deep link,
   a search-results address, or any query string.
 - Prefer a well-known mainstream site for this kind of task.
+- The user is in Canada. Where a site runs a separate Canadian storefront, return that one
+  ("https://www.walmart.ca", not "https://www.walmart.com"). Where it does not, return the
+  ordinary site; never invent a ".ca" that does not exist.
 - Use only a domain you know exists. Never invent a domain.
 Return a JSON object with exactly one key, url: {"url": "https://www.example.com"}."""
+
+# The prompt above asks for the Canadian storefront; this enforces it, because price, stock and
+# checkout all differ from the US site. Only hosts with a real Canadian equivalent are listed: a
+# retailer that left Canada (target.com) must be left alone. Set JEVIS_COUNTRY to anything else to
+# take whichever site is suggested.
+CANADIAN = {
+    "amazon.com": "amazon.ca",
+    "walmart.com": "walmart.ca",
+    "bestbuy.com": "bestbuy.ca",
+    "costco.com": "costco.ca",
+    "homedepot.com": "homedepot.ca",
+    "staples.com": "staples.ca",
+    "newegg.com": "newegg.ca",
+    "ebay.com": "ebay.ca",
+    "indeed.com": "ca.indeed.com",
+}
+
+
+def localise(url):
+    """Point an address at its Canadian storefront, leaving an unlisted site untouched."""
+    if os.environ.get("JEVIS_COUNTRY", "CA") != "CA":
+        return url
+    parts = urlparse(url)
+    host = (parts.hostname or "").lower()
+    canadian = CANADIAN.get(host.removeprefix("www."))
+    if not canadian:
+        return url
+    # A bare domain keeps the www the suggestion had; one that is already a subdomain
+    # ("ca.indeed.com") carries its own prefix and must not gain a second.
+    if host.startswith("www.") and canadian.count(".") == 1:
+        canadian = f"www.{canadian}"
+    return parts._replace(netloc=canadian).geturl()
 
 
 def suggest_url(goal):
@@ -378,7 +413,7 @@ def suggest_url(goal):
             raise ValueError()
     except (ValueError, KeyError, TypeError):
         raise ValueError("Site suggestion returned no usable address; enter a starting address.") from None
-    return url
+    return localise(url)
 
 
 class NoFieldValue(ValueError):

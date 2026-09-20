@@ -329,7 +329,21 @@ body.idle .composer-wrap { padding-top: 22px; }
 .send { background: var(--iris); border-color: var(--iris); color: #fff; }
 .send:hover:not(:disabled) { filter: brightness(1.08); }
 .send:disabled, .icon:disabled { opacity: .4; cursor: default; }
-.icon.listening {
+/* Named, not a bare glyph: nobody hunts for an unlabelled circle. */
+.mic {
+  flex: none; display: inline-flex; align-items: center; gap: 7px;
+  height: 34px; padding: 0 14px 0 11px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--iris-line); background: var(--iris-soft); color: var(--iris);
+  font-size: 13px; font-weight: 500; white-space: nowrap;
+  transition: background .15s, color .15s, border-color .15s, transform .12s;
+}
+.mic svg {
+  fill: none; stroke: currentColor; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.mic:hover { border-color: var(--iris); }
+.mic:active { transform: scale(.94); }
+.mic.listening {
   background: var(--red-soft); border-color: var(--red); color: var(--red);
   animation: pulse 1.6s ease-out infinite;
 }

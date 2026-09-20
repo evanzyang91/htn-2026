@@ -417,3 +417,20 @@ def test_the_comparison_charges_the_rival_for_a_screenshot_of_every_step(monkeyp
 
 def test_nothing_spent_means_nothing_to_compare():
     assert pricing.rival({}, pricing.spend({})) is None
+
+
+def test_a_suggested_site_opens_on_its_canadian_storefront():
+    assert model.localise("https://www.walmart.com") == "https://www.walmart.ca"
+    assert model.localise("https://amazon.com/") == "https://amazon.ca/"
+    # Already a subdomain, so it must not collect a second prefix.
+    assert model.localise("https://www.indeed.com") == "https://ca.indeed.com"
+
+
+def test_a_site_with_no_canadian_storefront_is_left_alone():
+    assert model.localise("https://www.target.com") == "https://www.target.com"
+    assert model.localise("https://en.wikipedia.org/wiki/Main_Page") == "https://en.wikipedia.org/wiki/Main_Page"
+
+
+def test_another_country_takes_the_site_it_was_given(monkeypatch):
+    monkeypatch.setenv("JEVIS_COUNTRY", "US")
+    assert model.localise("https://www.walmart.com") == "https://www.walmart.com"

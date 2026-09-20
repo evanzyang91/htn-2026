@@ -138,7 +138,8 @@ function render() {
     done: "Finished. Check the result.",
     blocked: "Stopped. It could not find a way forward.",
   };
-  $("status").textContent = labels[state.status] || state.status;
+  // A known state with a blank label says nothing on purpose, so it must not fall through.
+  $("status").textContent = state.status in labels ? labels[state.status] : state.status;
   if (!page) {
     controls();
     return;
@@ -556,7 +557,8 @@ if (!Recogniser) {
   recogniser.addEventListener("start", () => {
     listening = true;
     $("mic").classList.add("listening");
-    say("Listening. Speak your request.");
+    $("mic-label").textContent = "Listening";
+    say("Listening. Speak your request, then press the button again to stop.");
   });
   recogniser.addEventListener("result", (event) => {
     let heard = "";
@@ -574,6 +576,7 @@ if (!Recogniser) {
   recogniser.addEventListener("end", () => {
     listening = false;
     $("mic").classList.remove("listening");
+    $("mic-label").textContent = "Speak";
     if ($("voice-status").textContent.startsWith("Listening")) say("");
   });
 }
