@@ -55,6 +55,46 @@ If a required value is missing, return {"text": null}. Otherwise return \
 """Upstream's ``TEXT_VALUE`` as of ``e8f6894``. The progress paragraph is what stops a
 multi-item errand from typing its first item's query a second time."""
 
+REFINE_SYSTEM = """Rewrite the user's browser-task goal so a small action-choosing agent can \
+execute it.
+The agent works on one visible page at a time using only CLICK, TYPE_TEXT, SCROLL and BACK,
+has no memory beyond its action history, and must verify completion from what is visible. Rules:
+- Keep every part of the user's intent and every explicit constraint. Weaken nothing: a request
+  to add items must still put those items in the cart. Never invent personal, login,
+  or payment details.
+- Turn vague requests into a concrete ordered list: name the exact items, quantities, or filters
+  to act on, choosing sensible specifics where the user left them open.
+- On large catalog or store sites, instruct a separate search of the site for each item by its own
+  name, finishing one item before starting the next. Never one combined search for several items.
+- Give each item as a short generic search term plus what to accept, because site search matches
+  short terms best while the qualifier decides which result is correct: "search 'flour' and add
+  one bag of all-purpose flour", not "search 'all-purpose flour'" and not a bare "search 'flour'".
+- Include one fallback sentence: if an item has no matching result, add the closest equivalent
+  and continue, so a single missing product cannot strand the remaining items.
+- The final sentence must be the only "Stop when ..." in the goal, checkable on the page and
+  covering every item. Never write a stop condition per item.
+- Never include a purchase, checkout, payment or account-creation step, whatever the user
+  asked: the task ends at the cart. Say "Do not place the order." when money could be spent.
+- Write in ASD-STE100 simplified technical English, because a small model reads this at every
+  decision: one instruction per sentence, active voice, present tense, at most 20 words per
+  sentence. Use one word for one meaning and never a synonym for a word used earlier. Keep the
+  verbs to the ones the agent performs - search, open, click, type, scroll, add. Delete
+  every word that is not a requirement: no preamble, no purpose, no praise, no restatement.
+- Add no requirement the user did not state. Quantities and product kinds are requirements;
+  brands, sizes, and standards are not, unless the user named them.
+- Plain text, at most 100 words. No markdown, no selectors, no code, no site-specific UI paths.
+Example - user goal "get me stuff for tacos" on a grocery site becomes:
+"Search the site for 'ground beef' and add one pack to the cart. Then search for 'taco shells'
+and add one box. Then search for 'salsa' and add one jar. Then search for 'shredded cheese'
+and add one bag. Do not place the order. Stop when all four items are in the cart."
+Return a JSON object with exactly one key, goal: {"goal": "the rewritten goal"}."""
+"""Upstream's ``REFINE_GOAL`` as of ``e8f6894``, with two changes that are this project's.
+``SELECT`` is out of the verb list and ``BACK`` is in, to match what is offered here. And
+the purchase step is forbidden UNCONDITIONALLY where upstream forbids it "unless the user
+explicitly asked": the policy's own rules end every errand at the cart
+(``_RULES`` in :mod:`skillweaver.llm.jev_`), and a goal that says "buy" handed to a policy
+that must not is two instructions fighting at every decision."""
+
 _MAX_TEXT_TOKENS = 1024
 _PAGE_TEXT_SHOWN = 6000
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 529})
@@ -72,6 +112,9 @@ class OpenAITextWriter:
         model: ``Settings.text_model``.
         base_url: ``Settings.text_base_url``.
         effort: ``Settings.text_effort``, or ``None`` to leave the model's default.
+        refine_model: ``Settings.refine_model`` for :meth:`rewrite_goal`, which runs once
+            per errand and can afford a slower model than the per-field one. ``None``
+            uses ``model``.
 
     Raises:
         ProviderError: at construction when there is no credential. There is NO quiet
@@ -80,7 +123,16 @@ class OpenAITextWriter:
             failing here is failing before a browser opens or anything is paid for.
     """
 
-    __slots__ = ("_base", "_effort", "_key", "_meter", "_model", "_session", "_token_key")
+    __slots__ = (
+        "_base",
+        "_effort",
+        "_key",
+        "_meter",
+        "_model",
+        "_refine_model",
+        "_session",
+        "_token_key",
+    )
 
     def __init__(
         self,
@@ -89,6 +141,7 @@ class OpenAITextWriter:
         model: str = DEFAULT_TEXT_MODEL,
         base_url: str = DEFAULT_TEXT_BASE_URL,
         effort: str | None = None,
+        refine_model: str | None = None,
     ) -> None:
         if not api_key:
             raise ProviderError(
@@ -99,6 +152,7 @@ class OpenAITextWriter:
         self._key = api_key
         register_secret(api_key)
         self._model = model
+        self._refine_model = refine_model or model
         self._base = base_url.rstrip("/")
         self._effort = effort
         self._meter = UsageMeter()
@@ -148,11 +202,7 @@ class OpenAITextWriter:
             "recent_actions": progress(history),
         }
         started = time.perf_counter()
-        payload = self._complete(json.dumps(context))
-        try:
-            reply = payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            reply = None
+        reply = self._complete(TEXT_SYSTEM, json.dumps(context), self._model)
         value = _field_value(reply, field.label)
         log.info(
             "jev.text",
@@ -162,16 +212,37 @@ class OpenAITextWriter:
         )
         return value
 
+    def rewrite_goal(self, goal: str, url: str, guidance: str = "") -> str:
+        """``goal`` rewritten for a small one-page-at-a-time policy. Upstream's
+        ``refine_goal``, minus the classification, which is the policy's to do.
+
+        The result is for the POLICY'S EYES ONLY. See ``JevDriver`` for where that is
+        enforced and why it is not negotiable.
+
+        Raises:
+            ProviderError: nothing usable came back.
+        """
+        system = REFINE_SYSTEM + ("\n" + guidance if guidance else "")
+        reply = self._complete(system, json.dumps({"goal": goal, "site": url}), self._refine_model)
+        try:
+            value = json.loads(reply or "")["goal"]
+        except (ValueError, KeyError, TypeError):
+            value = None
+        if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+            raise ProviderError("goal refinement returned no usable goal")
+        return value.strip()
+
     # -- the wire ----------------------------------------------------------------------
 
-    def _complete(self, content: str) -> Mapping[str, Any]:
+    def _complete(self, system: str, content: str, model: str) -> str | None:
+        """One chat completion; the reply's text, or ``None`` when it carried none."""
         body: dict[str, Any] = {
-            "model": self._model,
+            "model": model,
             self._token_key: _MAX_TEXT_TOKENS,
             "response_format": {"type": "json_object"},
             **self._reasoning(),
             "messages": [
-                {"role": "system", "content": TEXT_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": content},
             ],
         }
@@ -187,12 +258,16 @@ class OpenAITextWriter:
         usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
         self._meter.add(
             usage_for(
-                self._model,
+                model,
                 _count(usage, "prompt_tokens", "input_tokens"),
                 _count(usage, "completion_tokens", "output_tokens"),
             )
         )
-        return payload
+        try:
+            reply = payload["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        return reply if isinstance(reply, str) else None
 
     def _reasoning(self) -> dict[str, Any]:
         """The reasoning knob, spelled the way this endpoint takes it.

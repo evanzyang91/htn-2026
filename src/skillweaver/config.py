@@ -76,6 +76,26 @@ product. Right answers of 15, and median latency:
 The 240ms over the fastest is not the cost that matters; a value nobody asked for,
 typed into a real form, is."""
 
+DEFAULT_REFINE_GOAL = False
+"""``SKILLWEAVER_REFINE_GOAL``: rewrite the errand, once, into the short ordered sentences
+a small policy follows best, and show THE POLICY that instead. Off by default because it
+is one more model call before the first move and it changes what every decision sees, so
+it should be measurable against a run without it rather than switched on invisibly.
+
+MEASURED, and on the one kind of task it could be measured on it did not pay. Live
+Wikipedia, a deliberately vague single-item request ("the article about how plants make
+food from light"), cold, n=2 per arm, 2026-09-20: solved 2 of 2 BOTH ways by the same
+``TYPE_TEXT > CLICK > DONE`` in 4 actions, and refinement cost 2-3 more model calls and
+1.6-8.6s of wall. What it is FOR is a vague MULTI-item errand on a store, which needs a
+cart that can be put back between the gate's re-runs and was not run. Turn it on for that
+and measure it there; do not quote it as a saving before then.
+
+The rewrite never reaches the recorder or a stored precedent - verified on a learn run:
+the refined wording in 0 stored files, and the trajectory, the provenance and the
+``Precedent`` all carrying the user's own sentence. ``JevDriver._goal_shown`` holds that
+line and says why. ``SKILLWEAVER_REFINE_MODEL`` names a slower, more careful model
+for it, and defaults to the text model."""
+
 DEFAULT_TEXT_BASE_URL = "https://api.openai.com/v1"
 """Any OpenAI-compatible endpoint works; ``SKILLWEAVER_TEXT_BASE_URL`` names another."""
 
@@ -113,6 +133,8 @@ class Settings:
     text_model: str = DEFAULT_TEXT_MODEL
     text_base_url: str = DEFAULT_TEXT_BASE_URL
     text_effort: str | None = None
+    refine_goal: bool = DEFAULT_REFINE_GOAL
+    refine_model: str | None = None
     default_budget: Budget = field(default_factory=Budget)
 
     @property
@@ -261,6 +283,8 @@ def load_settings(
         text_model=merged.get("SKILLWEAVER_TEXT_MODEL") or DEFAULT_TEXT_MODEL,
         text_base_url=merged.get("SKILLWEAVER_TEXT_BASE_URL") or DEFAULT_TEXT_BASE_URL,
         text_effort=text_effort,
+        refine_goal=_flag(merged, "SKILLWEAVER_REFINE_GOAL", DEFAULT_REFINE_GOAL),
+        refine_model=merged.get("SKILLWEAVER_REFINE_MODEL") or None,
         default_budget=budget,
     )
     return check_settings(settings)

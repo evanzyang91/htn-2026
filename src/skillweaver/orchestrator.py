@@ -1812,7 +1812,7 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
     if config.policy != "jev":
         return None
     from skillweaver.agent.jev_driver import JevDriver
-    from skillweaver.llm.jev_ import JevPolicy
+    from skillweaver.llm.jev_ import CATEGORY_RULES, MIN_CATEGORY_CONFIDENCE, JevPolicy
     from skillweaver.llm.openai_ import OpenAITextWriter
     from skillweaver.perception.dom import DomPerceiver
 
@@ -1826,8 +1826,21 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
         model=config.text_model,
         base_url=config.text_base_url,
         effort=config.text_effort,
+        refine_model=config.refine_model,
     )
-    return JevDriver(JevPolicy(writer, api_key=config.typesafe_api_key), perceiver)
+    policy = JevPolicy(writer, api_key=config.typesafe_api_key)
+    if not config.refine_goal:
+        return JevDriver(policy, perceiver)
+
+    def refine(goal: str, url: str) -> str:
+        # Upstream's refine_goal: one Jev choice picks the kind of task, which only selects
+        # WORDING guidance and only above its confidence floor; then one rewrite.
+        category, confidence = policy.classify(goal, url)
+        applied = category is not None and confidence >= MIN_CATEGORY_CONFIDENCE
+        log.info("jev.goal.category", category=category, confidence=confidence, applied=applied)
+        return writer.rewrite_goal(goal, url, CATEGORY_RULES[category] if applied else "")
+
+    return JevDriver(policy, perceiver, refine=refine)
 
 
 def budget_from(

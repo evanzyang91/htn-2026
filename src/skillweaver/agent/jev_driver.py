@@ -19,7 +19,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
-from collections.abc import Collection, Mapping, Sequence
+import time
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any
 
 from skillweaver.agent.explorer import (
@@ -96,6 +97,10 @@ A real pause, not a reflex one: the policy saying the control it needs is not on
 YET, which no load event covers. Not the kind ``strip_reflex_waits`` removes, though a
 learned skill that keeps one will be told to justify it by the same gate."""
 
+_ERRAND_MARKER = "The errand: "
+"""How ``Explorer._aimed`` introduces the task inside a borrowed step's goal. Read, never
+written, here; see :meth:`JevDriver._goal_shown` for what happens if it stops matching."""
+
 _ACTIONS_IN: Mapping[str, int] = {"TYPE_TEXT": 3}
 """Controller actions in the move this driver writes for an operation, when not one:
 :func:`_type_into` is click, chord, type. The explorer observes after each, and
@@ -119,17 +124,29 @@ class JevDriver:
         perceiver: The DOM perceiver driving the same run. The driver reads ``.last``
             from it, because the roles, values and states a policy needs are not on
             Element and putting them there would change the shared surface.
+        refine: ``(goal, url) -> goal``, a rewrite of the errand into the short ordered
+            sentences a small policy follows best, or ``None`` - the DEFAULT - for the
+            user's own words. See :meth:`_goal_shown`, which is the only place its
+            result is ever used, for why that is a hard rule.
 
     Raises:
         SkillWeaverError: from :meth:`propose` if the perceiver has no snapshot for the
             observation asked about, which means the two were not driving the same run.
     """
 
-    __slots__ = ("_decided_ms", "_perceiver", "_policy", "_steps", "_taken")
+    __slots__ = ("_decided_ms", "_perceiver", "_policy", "_refine", "_refined", "_steps", "_taken")
 
-    def __init__(self, policy: BrowserPolicy, perceiver: DomPerceiver) -> None:
+    def __init__(
+        self,
+        policy: BrowserPolicy,
+        perceiver: DomPerceiver,
+        *,
+        refine: Callable[[str, str], str] | None = None,
+    ) -> None:
         self._policy = policy
         self._perceiver = perceiver
+        self._refine = refine
+        self._refined: dict[str, str] = {}
         self._steps: list[dict[str, Any]] = []
         self._taken: dict[str, set[str]] = {}
         self._decided_ms = 0.0
@@ -176,7 +193,7 @@ class JevDriver:
         snapshot = self._snapshot_for(observation)
         if not history and self._steps:
             # No moves yet and steps on file: the explorer has begun another run.
-            self._steps, self._taken = [], {}
+            self._steps, self._taken, self._refined = [], {}, {}
         state = snapshot.digest
         self._settle(snapshot, state, rejection)
         self._stop_if_inert(observation)
@@ -184,7 +201,8 @@ class JevDriver:
         asked = snapshot
         if snapshot.can_go_back and any(a.signature == BACK_SIGNATURE for a in dead_ends):
             asked = dataclasses.replace(snapshot, can_go_back=False)
-        decision = self._policy.decide(task.text, asked, self._steps, exclude)
+        goal = self._goal_shown(task.text, observation.url or snapshot.url)
+        decision = self._policy.decide(goal, asked, self._steps, exclude)
         self._remember(decision, state)
         if decision.operation not in ("DONE", "BLOCKED"):
             self._perceiver.rest_after(
@@ -209,6 +227,42 @@ class JevDriver:
                 f"the policy found no supported operation on {observation.url or 'this screen'}"
             )
         return json.dumps(_answer(decision, catalog, snapshot, _note(exclude, restored)))
+
+    def _goal_shown(self, text: str, url: str) -> str:
+        """The goal as THE POLICY is shown it: refined when refinement is on, and the
+        refinement goes nowhere else.
+
+        That is a hard rule, not a preference. ``task`` is what the explorer hands the
+        recorder, so its text becomes ``Trajectory.task`` and then the stored skill's
+        ``Precedent`` - and the warm path is decided by gates that count WORDS
+        (``bind_args``, ``MIN_ACCOUNTED_FOR``, ``asks_for``). A rewrite into simplified
+        technical English that reached the store would leave the user's own next request
+        matched against prose they never typed. So this returns a string for one call and
+        ``task`` is never touched, replaced or re-created here: the explorer's own
+        ``_aimed`` draws the same line, showing a policy a goal the store never sees.
+
+        The explorer may hand over an AIMED goal - a borrowed step, then
+        ``"The errand: <the task>"`` - and the step changes every move while the errand
+        does not. Only the errand is rewritten, once per run, and put back where it was;
+        if that wording ever changes this rewrites the whole text instead, which costs
+        calls and nothing else. A failed rewrite falls back to the user's own words, and
+        says so: it is an optimization, and the run is not worth less without it.
+        """
+        if self._refine is None:
+            return text
+        head, marker, errand = text.rpartition(_ERRAND_MARKER)
+        errand = errand if marker else text
+        if errand not in self._refined:
+            began = time.perf_counter()
+            try:
+                self._refined[errand] = self._refine(errand, url)
+                log.info("jev.goal.refined", asked=errand, shown=self._refined[errand])
+            except SkillWeaverError as exc:
+                log.warning("jev.goal.unrefined", why=str(exc))
+                self._refined[errand] = errand
+            # The rewrite is this policy's models at work, so it is this policy's time.
+            self._decided_ms += (time.perf_counter() - began) * 1000.0
+        return f"{head}{marker}{self._refined[errand]}"
 
     # -- odds and ends -----------------------------------------------------------------
 
@@ -341,12 +395,25 @@ class JevDriver:
         if len(recent) < NO_CHANGE_LIMIT:
             return
         inert = all(s.get("page_changed") is False and s["kind"] != "WAIT" for s in recent)
-        if inert and len({s.get("url") for s in recent}) == 1:
-            tried = "; ".join(str(s["action"]) for s in recent)
+        if not inert or len({s.get("url") for s in recent}) != 1:
+            return
+        where = observation.url or "this screen"
+        if all(s["kind"] == "DONE" for s in recent):
+            # Not the page's fault and must not read as if it were. Measured: a correctly
+            # finished errand whose DONE the critic answered four times with an EMPTY
+            # reply - the computer-tool hazard AGENTS.md records as unfixed in the critic.
+            # Asking a fifth time buys another such call; the claim and its refusals are
+            # the finding, so they are what is reported.
             raise PolicyBlocked(
-                f"{observation.url or 'this screen'} did not change across the last "
-                f"{NO_CHANGE_LIMIT} moves ({tried}), so nothing more is spent on it"
+                f"the policy reported DONE {NO_CHANGE_LIMIT} times on {where} and the claim "
+                "was not accepted once, with nothing changing in between; read the critic's "
+                "reasons before concluding the task was not done"
             )
+        tried = "; ".join(str(s["action"]) for s in recent)
+        raise PolicyBlocked(
+            f"{where} did not change across the last {NO_CHANGE_LIMIT} moves ({tried}), "
+            "so nothing more is spent on it"
+        )
 
 
 # --------------------------------------------------------------------------------------
