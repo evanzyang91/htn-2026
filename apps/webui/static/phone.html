@@ -113,11 +113,17 @@
     rec.continuous = true;
     finalText = '';
     rec.onresult = (ev) => {
+      // Rebuilt from the whole list every time, never appended: Android Chrome
+      // re-sends results it already marked final, and appending stacked each one
+      // ("add to cartadd to cartadd to cart the").
       let interim = '';
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      finalText = '';
+      for (let i = 0; i < ev.results.length; i++) {
         const r = ev.results[i];
-        if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript;
+        if (r.isFinal) finalText += r[0].transcript + ' '; else interim += r[0].transcript + ' ';
       }
+      finalText = finalText.replace(/\s+/g, ' ').trim();
+      interim = interim.trim();
       heard.innerHTML = '';
       heard.append(finalText);
       if (interim) { const s = document.createElement('span'); s.className = 'interim'; s.textContent = ' ' + interim; heard.append(s); }
