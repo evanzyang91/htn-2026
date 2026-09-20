@@ -1,119 +1,28 @@
-"""The concrete :class:`~skillweaver.contracts.Embedder` retrieval has always been
-written for, and the factory that decides whether there is one.
+"""A local Embedder for retrieval, and the factory that decides whether there is one.
 
-``skills/retrieve.py`` has accepted an ``embedder`` since it was written, computes the
-cosine, caches the vectors and reports which backend ranked. Nothing ever constructed
-one, so every run in this project's history took the ``None`` branch and ranked on word
-overlap alone. This module is that missing piece.
+**OFF by default, because it was measured and did not pay. Do not "finish" it by
+turning it on.** all-MiniLM-L6-v2 through onnxruntime, already a dependency, so no new
+package and no API key; ~14 ms for five short texts, ~0.1 s to load, ~90 MB on disk.
 
-Local, not hosted
------------------
+``scripts/bench_retrieval.py``, 48 requests over both libraries this repo carries:
+recall improved (top-1 18/24 -> 21/24), RUNNABLE did not move at all (3/24 and 9/24
+both ways), and precision got WORSE (irrelevant requests answered 1/6 -> 5/6, because a
+cosine is almost never zero). No cut-off separates those populations - the best
+irrelevant request scores 0.198 against correct paraphrases at 0.191 and 0.198 - so
+there is nothing to tune. Re-measured 2026-09-20 after binding and the content gate
+both moved: every number unchanged.
 
-The backend is **all-MiniLM-L6-v2 run locally through onnxruntime**, which is already a
-dependency (RapidOCR brings it) - so this adds NO package to ``pyproject.toml``, which
-is shared surface, and no API key to the demo.
+WHY: a candidate must still BIND and then account for the request, and both count
+WORDS, so a request worded differently fails them for the reason it ranked badly.
+WHAT WOULD HAVE TO CHANGE: those two gates, not this module. Then re-run the bench and
+read ``runnable``.
 
-The alternative considered was a hosted embedding API. Anthropic does not serve one, so
-that would have meant Gemini's ``embed_content`` over ``google-genai``. It was rejected
-on the project's own terms rather than on taste:
-
-* retrieval runs on the fast path, and the whole claim of a warm run is that it answers
-  in single-digit seconds with zero model calls - a network round trip before the first
-  action spends the saving the feature exists to produce (the ordering suite's warm hits
-  ran in 4.3 to 5.7 seconds END TO END);
-* it would make a laptop with the wifi off, or a provider having a bad afternoon, a
-  demo that ranks worse than it did before;
-* and it puts a per-call price on a ranking that happens on every single run.
-
-Measured here, the local read costs ~14 ms for five short texts and ~0.1 s to load the
-session once, against ~90 MB on disk. See :data:`MEASURED_TIMINGS`.
-
-What it is worth, measured
---------------------------
-
-Less than it looks, and the number that says so is not the one this was built to move.
-``scripts/bench_retrieval.py`` scores both rankings over the two libraries this
-repository carries, 48 requests in two shapes:
-
-    ranking    top-1 recall    runnable    irrelevant requests answered
-    keywords      18/24         3 or 9/24            1/6
-    embedder      21/24         3 or 9/24            5/6
-
-Recall is what an embedder is for and it really does improve: three paraphrases that
-word overlap ranked wrongly - *save this table to a comma separated file*, *find the
-rows belonging to Acme Corp*, *answer the open thread* - now rank their own skill
-first. Not one of them becomes a warm run. A candidate still has to BIND
-(:func:`~skillweaver.agent.planner.bind_args`) and then account for the request
-(:data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR`), and both of those are counted
-in words, so a request worded differently fails them for the same reason it ranked
-badly. Better ranking arrives at a door that is locked in the same language.
-
-And the third column is the one to weigh against the first, because it moved in the
-wrong direction: five of six requests that NOTHING in the library can do came back
-with a candidate anyway, against one of six on keywords. A cosine is almost never
-zero, so "nothing is relevant" stops being expressible as an empty list. Raising
-``min_score`` is the obvious answer and does not work: on these corpora the best
-irrelevant request scores 0.198 while two correct paraphrases score 0.191 and 0.198,
-so no cut-off separates the populations and tuning one would be fitting the cut to
-this bench. Nothing downstream ran a wrong skill - the content gate refused all of
-them, which is the same gate that refuses the gains - but that is the gate's credit,
-not the ranking's.
-
-So :data:`~skillweaver.config.DEFAULT_EMBEDDER_ENABLED` is ``False``, and only that
-switch can change it: the weights being on disk is deliberately NOT an implicit yes,
-because a laptop that ran ``make embedder`` once must not quietly rank differently
-from a clean clone. This module is kept, not deleted, because the finding is about
-where the bottleneck IS: the next person to work on warm-path reuse should spend it on
-binding and on the content gate, and re-run the bench with ``SKILLWEAVER_EMBEDDER=true``
-once either has moved.
-
-Re-measured after both moved, and it still does not pay
--------------------------------------------------------
-
-Both moved on 2026-09-20: binding reads a value through the slot a proven request left
-(:func:`~skillweaver.agent.planner._through_slot`), and the content gate lets relatives
-that perform the same workflow vouch in their own words
-(:func:`~skillweaver.agent.planner.account_of`, :mod:`skillweaver.skills.family`). The
-same bench, the same 48 requests, scored through the planner's own new gate:
-
-    ranking    top-1 recall    runnable    irrelevant requests answered
-    keywords      18/24         3 or 9/24            1/6
-    embedder      21/24         3 or 9/24            5/6
-
-Every number is where it was, so the switch stays off. (One intermediate build did
-move a number, downwards: an intent gate that treated every UNKNOWN verb as a refusal
-cost *Bring up the list of records* its warm run, 9/24 -> 8/24. That gate now refuses
-only a known conflict when the caller supplied the values; see
-:func:`~skillweaver.skills.family.same_intent`.) WHY nothing moved is the useful
-part, because the new readers demonstrably do convert rewordings into warm runs on a
-live site (*Buy the "..."* against a skill learned as *Add the "..." to the cart*: 0
-model calls). This bench's paraphrases were written to avoid each skill's own nouns AND
-its sentence shape - *look up Grace Hopper on Wikipedia and bring up her page* for
-*search Wikipedia for "..." and open her article* - and the slot reader deliberately
-refuses those: every content word outside the value must agree, because the alternative
-is running a skill on a guess. And neither library here was admitted after signatures
-existed, so neither holds a family to vouch. What the new gates reach is the request
-that keeps the errand's shape and changes its verb, its value or its tail; what this
-bench asks for is a request that shares nothing but meaning, and no model-free reader
-in this project binds an argument out of one of those. An embedder would have to be
-paired with a binder that can - which is the composer, and it already costs a model
-call. The precision loss (1/6 -> 5/6) is unchanged too, and by itself still decides it.
-
-What is deliberately NOT here
------------------------------
-
-The weights are not committed. ``data/`` is git-ignored except for the UI detector, and
-a 90 MB file in a repository that a demo clones is a cost with no payoff when the thing
-degrades honestly without it. ``scripts/fetch_embedder.py`` downloads them; until it has
-been run, :func:`load_embedder` returns ``None`` **with a reason**, retrieval ranks on
-word overlap exactly as it does today, and the reason is printed in the candidate's
-``why``. That is what keeps ``make test`` free of any network call.
-
-Tokenization is done here rather than by ``tokenizers``/``transformers`` for the same
-reason: the dependency list is shared surface. WordPiece over a 30k ``vocab.txt`` is a
-small, exactly specified algorithm, and :class:`WordPiece` implements the BERT-uncased
-one including its punctuation and CJK splitting - which matters, because a skill's
-searchable text is full of ``snake_case`` names and ``_`` is BERT punctuation.
+Reachable ONLY through ``SKILLWEAVER_EMBEDDER``: weights on disk are deliberately not an
+implicit yes. They are not committed; until ``scripts/fetch_embedder.py`` has run,
+:func:`load_embedder` returns ``None`` WITH A REASON that reaches every candidate's
+``why``. Tokenization is here rather than from ``tokenizers`` because the dependency
+list is shared surface, and ``_`` is BERT punctuation, which ``snake_case`` skill names
+depend on.
 """
 
 from __future__ import annotations
@@ -151,24 +60,18 @@ VOCAB_FILE = "vocab.txt"
 DEFAULT_MAX_TOKENS = 256
 """Longest token sequence one text is cut to, the ``[CLS]``/``[SEP]`` pair included.
 
-all-MiniLM-L6-v2 was trained with a 256-token window and its position table stops at
-512, so this is the model's own limit rather than a budget. It also bounds the one
-native call in this module: attention is quadratic in the sequence length, so a
-skill whose docstring runs long costs a fixed ceiling rather than an open one. Skill
-text measured on the shipped Wikipedia library runs 60 to 130 tokens, so nothing real
-is truncated today; a longer docstring loses its tail, which is the part a summary
-already repeats.
-"""
+all-MiniLM-L6-v2 was trained with a 256-token window, so this is the model's own limit
+rather than a budget. It also bounds the one native call here - attention is quadratic
+in the sequence length. Skill text on the shipped Wikipedia library runs 60 to 130
+tokens, so nothing real is truncated today."""
 
 DEFAULT_THREADS = 1
 """onnxruntime threads for the embedding session.
 
 Set EXPLICITLY, for the reason written up in :mod:`skillweaver.perception.ocr`: left
-alone, onnxruntime sizes its pool from the core count and its workers spin. One thread
-is not a compromise here - the batch is a handful of short sentences and the session
-measured 14 ms for five of them single-threaded, so there is nothing to parallelize
-that the pool would not spend more time waking up for.
-"""
+alone, onnxruntime sizes its pool from the core count and its workers spin. One is not a
+compromise - the batch is a handful of short sentences and measured 14 ms for five of
+them single-threaded."""
 
 MEASURED_TIMINGS = {
     "session_load_ms": 92.0,
@@ -176,11 +79,9 @@ MEASURED_TIMINGS = {
     "model_bytes": 90_405_214,
 }
 """Measured 2026-09-19 on the demo laptop (macOS arm64, onnxruntime 1.30, 1 thread).
-
-Quoted so the hosted-versus-local decision in the module docstring can be re-checked
-rather than re-argued: a whole library re-embeds in the time one network round trip
-spends on its TLS handshake.
-"""
+Quoted so the hosted-versus-local decision above can be re-checked rather than
+re-argued: a whole library re-embeds in the time one round trip spends on its TLS
+handshake."""
 
 _UNK = "[UNK]"
 _CLS = "[CLS]"
@@ -223,11 +124,7 @@ class WordPiece:
 
     Faithful to the reference implementation in the ways that change token ids:
     lower-casing, NFD accent stripping, control-character removal, punctuation and CJK
-    splitting, then greedy longest-match-first WordPiece with ``##`` continuations and
-    ``[UNK]`` for anything the vocabulary cannot spell.
-
-    Args:
-        vocab: token to id, in file order.
+    splitting, then greedy longest-match-first WordPiece with ``##`` continuations.
 
     Raises:
         ProviderError: if the vocabulary is missing a special token the encoder needs.
@@ -313,19 +210,12 @@ class WordPiece:
 
 class OnnxTextEmbedder:
     """all-MiniLM-L6-v2 through onnxruntime: 384 dimensions, mean-pooled over the
-    attention mask and L2-normalized, which is what ``sentence-transformers`` does
-    with the same checkpoint and what :class:`~skillweaver.contracts.Embedder`
-    promises.
+    attention mask and L2-normalized, which is what ``sentence-transformers`` does with
+    the same checkpoint and what Embedder promises.
 
     The session is opened on the FIRST ``embed`` rather than in ``__init__``, because
-    ``skillweaver skills ls`` builds a retriever and never ranks anything; the files
-    are checked for existence up front by :func:`load_embedder`, which is cheap.
-
-    Args:
-        model_path: the ``model.onnx`` to run.
-        vocab_path: the ``vocab.txt`` beside it.
-        max_tokens: sequence ceiling; see :data:`DEFAULT_MAX_TOKENS`.
-        threads: onnxruntime thread count; see :data:`DEFAULT_THREADS`.
+    ``skillweaver skills ls`` builds a retriever and never ranks anything; the files are
+    checked for existence up front by :func:`load_embedder`, which is cheap.
     """
 
     def __init__(
@@ -424,13 +314,11 @@ class OnnxTextEmbedder:
 def embedder_for(config: Settings) -> tuple[OnnxTextEmbedder | None, str]:
     """``(embedder, reason it is absent)`` for these settings - never both.
 
-    A reason is returned rather than ``None`` alone because a silent fall-back to word
-    overlap is a feature nobody can measure: the reason travels into every candidate's
-    ``why``, so a run that ranked on keywords says which of the three ways it got there
-    - turned off, weights never fetched, or files half present.
+    A reason rather than ``None`` alone because a silent fall-back to word overlap is a
+    feature nobody can measure: it travels into every candidate's ``why``, so a run that
+    ranked on keywords says which of the three ways it got there.
 
-    Nothing here loads a model: it is two ``exists`` calls, so a command that never
-    ranks anything pays nothing.
+    Nothing here loads a model: two ``exists`` calls.
     """
     if not config.embedder_enabled:
         return None, "turned off by SKILLWEAVER_EMBEDDER"
@@ -447,12 +335,9 @@ def embedder_for(config: Settings) -> tuple[OnnxTextEmbedder | None, str]:
 
 @lru_cache(maxsize=1)
 def load_embedder() -> tuple[OnnxTextEmbedder | None, str]:
-    """:func:`embedder_for` over the process-wide settings, resolved once.
-
-    Cached because it is called wherever a retriever is built and the answer cannot
-    change without the process's settings changing; tests that move the weights call
-    ``load_embedder.cache_clear()``.
-    """
+    """:func:`embedder_for` over the process-wide settings, resolved once. Cached because
+    the answer cannot change without the process's settings changing. A caller that
+    moves the weights afterwards calls ``load_embedder.cache_clear()``."""
     return embedder_for(settings())
 
 

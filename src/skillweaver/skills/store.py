@@ -1,45 +1,16 @@
-"""``FileSkillStore``: the skill library on disk.
+"""``FileSkillStore``: the skill library on disk, at ``<data>/skills/<domain>/<name>/v<N>/``
+holding ``skill.py``, ``meta.json`` and ``recorded-in``, with ``manifest.json`` indexing
+the latest version of each.
 
-Layout, rooted at :attr:`~skillweaver.config.Settings.skills_dir`::
+*Versions are append-only*: ``put`` claims ``v<N+1>`` with ``os.mkdir``, which fails if
+it exists, so two writers cannot agree to overwrite one. *Writes are atomic*: temporary
+sibling then ``os.replace``. *The manifest is a cache, not the truth*:
+:meth:`FileSkillStore.rebuild_manifest` recovers it from the directories.
 
-    <data>/skills/manifest.json                       index: latest version per skill
-    <data>/skills/<domain>/<name>/v1/skill.py         the source, byte for byte
-    <data>/skills/<domain>/<name>/v1/meta.json        everything else
-    <data>/skills/<domain>/<name>/v1/recorded-in      the render mode, when known
-    <data>/skills/<domain>/<name>/v2/...              the next version; v1 stays
-
-Three properties make this safe to grow into:
-
-*Versions are append-only.* ``put`` claims ``v<N+1>`` with ``os.mkdir``, which fails
-if the directory exists, so two writers can never agree to overwrite one version. A
-regression is one ``put`` away from being reverted, because the old code is still
-there.
-
-*Writes are atomic.* Every file is written to a temporary sibling and then
-``os.replace``d into place, so a reader never sees half a ``meta.json``.
-
-*The manifest is a cache, not the truth.* It makes ``list`` skip the directory walk;
-if it is missing, stale or corrupt, :meth:`FileSkillStore.rebuild_manifest` recovers
-it from the directories, which are the real record.
-
-``record_run`` rewrites only ``meta.json`` - the code file is never touched by
-statistics - and ``demote`` writes a reason that keeps the skill out of listing and
-retrieval while leaving every byte of it on disk.
-
-Why ``recorded-in`` is a file of its own
-----------------------------------------
-
-It answers "which renderer produced the screen this skill starts on", which decides
-whether a later run can compare against that screen at all - see
-:mod:`skillweaver.render_mode`. It is deliberately NOT a key in ``meta.json``, for two
-reasons. ``meta.json`` is regenerated wholesale from ``skills.model.to_dict`` on every
-``record_run`` and every ``demote``, and ``to_dict`` serializes a
-:class:`~skillweaver.contracts.Skill`, which has no field for the mode and cannot grow
-one here: ``contracts`` is shared surface. A key written beside that output would
-therefore survive the ``put`` and vanish on the skill's first recorded run, which is a
-worse record than none. So the mode lives beside ``skill.py`` as its own small file,
-written once when the version is claimed and never rewritten - the same shape, and for
-the same reason, as the source it describes.
+``recorded-in`` is its own file because ``meta.json`` is regenerated wholesale from
+``to_dict`` on every ``record_run``, and ``to_dict`` serializes a Skill, which has no
+field for the render mode and cannot grow one (``contracts`` is shared surface) - so a
+key written beside it would survive the ``put`` and vanish on the first recorded run.
 """
 
 from __future__ import annotations
@@ -77,9 +48,9 @@ MANIFEST_VERSION = 1
 _VERIFIER_FILE = "verify.py"
 
 MAX_PRECEDENTS = 12
-"""How many proven requests one skill keeps. Each is a template the binder tries, so
-the list is a cost on every warm lookup; a dozen wordings of one errand is already
-more than a person uses."""
+"""How many proven requests one skill keeps. Each is a template the binder tries, so the
+list is a cost on every warm lookup; a dozen wordings of one errand is already more than
+a person uses."""
 
 
 def _fold_mean(mean: float, count_before: int, value: float) -> float:
@@ -120,21 +91,18 @@ def _dump_json(data: Any) -> bytes:
 
 
 class FileSkillStore:
-    """A :class:`~skillweaver.contracts.SkillStore` backed by a directory tree.
+    """A SkillStore backed by a directory tree.
 
     Args:
-        root: the skills directory. ``None`` means
-            :attr:`~skillweaver.config.Settings.skills_dir`, so nothing is hardcoded.
-        render_mode: the mode the browser of THIS process renders in
-            (:data:`~skillweaver.render_mode.HEADED` or
-            :data:`~skillweaver.render_mode.HEADLESS`), stamped on every version this
-            store writes. ``None`` means "no claim" and writes nothing, which is the
-            honest answer for a store opened by a command that never opens a world -
+        root: The skills directory. ``None`` means ``Settings.skills_dir``.
+        render_mode: The mode the browser of THIS process renders in, stamped on every
+            version this store writes. ``None`` means "no claim" and writes nothing,
+            which is the honest answer for a command that never opens a world -
             ``skills ls`` must not assert a mode it did not render in.
 
     Raises:
-        SkillWeaverError: if ``render_mode`` is not one of the known modes. A mode
-            misspelled here would be written to every skill stored afterwards.
+        SkillWeaverError: if ``render_mode`` is not a known mode. A mode misspelled here
+            would be written to every skill stored afterwards.
     """
 
     def __init__(self, root: Path | str | None = None, *, render_mode: str | None = None) -> None:
@@ -282,16 +250,12 @@ class FileSkillStore:
     ) -> str | None:
         """The mode this version's screens were rendered in, or ``None`` when unknown.
 
-        ``None`` covers every honest way the answer can be missing and they are all the
-        same answer to a caller: a version stored before this was recorded, a store that
-        was opened with no claim, a file that says something this build does not
-        recognize. Never raises and never guesses - a wrong mode in a report is worse
-        than an absent one, because it accuses a working library of a mismatch it does
-        not have.
+        ``None`` covers every honest way the answer can be missing, and they are the same
+        answer to a caller. Never raises and never guesses - a wrong mode in a report
+        accuses a working library of a mismatch it does not have.
 
         ``version=None`` means the latest, and an unknown skill is ``None`` rather than
-        :exc:`~skillweaver.errors.SkillNotFound`: this is a question asked while
-        deciding whether to bother comparing, not a read of the library.
+        SkillNotFound: this is asked while deciding whether to bother comparing.
         """
         try:
             resolved = self._latest_version(name, domain) if version is None else int(version)
@@ -308,9 +272,7 @@ class FileSkillStore:
         """``{skill name: mode}`` for the latest version of every skill that says.
 
         Skills whose mode is unknown are LEFT OUT rather than mapped to ``None``, so a
-        caller can ask "did anything here claim a mode?" by looking at the mapping and
-        "do they all disagree with me?" without filtering first. ``domain=None`` spans
-        the library; a name appears once, because only latest versions are consulted.
+        caller can ask "did anything here claim a mode?" without filtering first.
         """
         found: dict[str, str] = {}
         for (name, entry_domain), _entry in self._entries().items():
@@ -336,13 +298,12 @@ class FileSkillStore:
     # -- writing -----------------------------------------------------------------
 
     def put(self, skill: Skill) -> Skill:
-        """Store ``skill`` as the NEXT version of ``(name, domain)`` and return the
-        stored copy. The incoming ``version`` is ignored: the first ``put`` yields
-        version ``1``, each later one increments. Older versions are kept and stay
-        readable through :meth:`get`.
+        """Store ``skill`` as the NEXT version of ``(name, domain)`` and return the stored
+        copy. The incoming ``version`` is ignored; older versions stay readable via
+        :meth:`get`.
 
-        Admission checks belong before ``put``; the only thing checked here is that
-        the name and domain can be a path at all.
+        Admission checks belong before ``put``; the only thing checked here is that the
+        name and domain can be a path at all.
 
         Raises:
             InvalidSkillName, InvalidSkillDomain: if the key is unusable on disk.
@@ -407,12 +368,12 @@ class FileSkillStore:
         return skill
 
     def record_run(self, name: str, domain: str, ok: bool, ms: float) -> Skill:
-        """Fold one execution into the latest version's
-        :class:`~skillweaver.contracts.SkillStats` and return the updated skill.
+        """Fold one execution into the latest version's SkillStats and return the updated
+        skill.
 
-        ``mean_ms`` is the mean of SUCCESSFUL runs only - a failure that gave up after
-        a timeout would otherwise make a good skill look slow. Only ``meta.json`` is
-        rewritten; the code file is untouched.
+        ``mean_ms`` is the mean of SUCCESSFUL runs only - a failure that gave up after a
+        timeout would otherwise make a good skill look slow. Only ``meta.json`` is
+        rewritten.
 
         Raises:
             SkillNotFound: if the skill does not exist.
@@ -440,11 +401,9 @@ class FileSkillStore:
     def record_precedent(self, name: str, domain: str, precedent: Precedent) -> Skill:
         """Append one PROVEN request to the latest version and return the updated skill.
 
-        The caller owns the proof - see :class:`~skillweaver.contracts.Precedent` for
-        what counts - and this only writes it down. A sentence already on record is
-        not recorded twice, and the list is capped at :data:`MAX_PRECEDENTS`, oldest
-        reuse dropped first and the admission run (the first entry) always kept,
-        because every one of them is a template binding is tried against.
+        The caller owns the proof; this only writes it down. A sentence already on record
+        is not recorded twice, and the list is capped at :data:`MAX_PRECEDENTS`, oldest
+        reuse dropped first and the admission run always kept.
 
         Raises:
             SkillNotFound: if the skill does not exist.
@@ -468,13 +427,13 @@ class FileSkillStore:
 
     def demote(self, name: str, domain: str, reason: str) -> Skill:
         """Retire the latest version from listing and retrieval by setting
-        ``demoted_reason``, and return the updated skill. Nothing is deleted: ``get``
-        still returns it, and a later ``put`` of a fixed version is healthy again.
+        ``demoted_reason``. Nothing is deleted: ``get`` still returns it, and a later
+        ``put`` of a fixed version is healthy again.
 
         Raises:
             SkillNotFound: if the skill does not exist.
-            SkillWeaverError: if ``reason`` is empty - a demotion a human cannot read
-                is worse than none.
+            SkillWeaverError: if ``reason`` is empty - a demotion a human cannot read is
+                worse than none.
         """
         if not reason or not reason.strip():
             raise SkillWeaverError("demote() needs a non-empty reason")

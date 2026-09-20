@@ -1,67 +1,28 @@
 """``SkillRetriever``: which stored skills are worth showing the planner.
 
-Two signals, deliberately:
+Two signals blended (``lexical_weight``, 0.3), not switched between, because the cheap
+one sanity-checks the expensive one. *Cosine* over an Embedder's vectors knows "pay a
+bill" and "settle an invoice" are one errand; *token overlap* needs no model, so the
+library still works with the wifi off, and with no embedder it is the whole score.
 
-*Cosine* over an :class:`~skillweaver.contracts.Embedder`'s vectors of each skill's
-summary and docstring. It understands that "pay a bill" and "settle an invoice" are
-the same errand.
+The sentence the skill was LEARNED from is in the overlap text and is measurably the
+most useful part of it: a summary is written by a model, the learned sentence is what a
+PERSON typed, and asking again tends to reuse the person's words. Over the four skills
+the live Wikipedia suite builds, adding it left the top-ranked skill unchanged on all
+six tasks and widened the margin on four.
 
-*Token overlap* between the task and the skill's name, summary, docstring, parameter
-names and - measurably the most useful of them - the sentence the skill was learned
-from. It is crude, but it needs no model, no network and no API key - so the library
-is still useful on a laptop with the wifi off, and the demo still works when a
-provider is down. With no embedder configured this signal is the whole score.
+**Which signal actually ranked is always stated** (``why``, ``ranked_by``): a silent
+fall-back would make a degraded run indistinguishable from one that never had an
+embedder, which is exactly the comparison every measurement of its worth depends on.
+A failing embedder falls back only when asked (``degrade_on_error``).
 
-The learned sentence (``provenance.task_text``) is in there because a summary is
-written by a model to describe a skill, while the learned sentence is what a PERSON
-actually typed to get it; asking for the same errand again tends to reuse the
-person's words, not the model's. Measured over the four skills the live Wikipedia
-suite builds, adding it left the top-ranked skill unchanged on all six tasks and
-widened the margin to the runner-up on four of them - most sharply on a verbatim
-repeat, which now scores a clean 1.0.
-
-They are blended (``lexical_weight``, 0.3 by default) rather than switched between,
-because the cheap signal is a good sanity check on the expensive one: a skill the
-embedder likes but that shares no word with the task is usually a near-miss.
-
-Which of the two actually ranked is always stated
--------------------------------------------------
-
-An embedder can be absent (nobody fetched the weights, someone turned it off) or break
-mid-run, and in both cases this class keeps working on token overlap alone. That is the
-right behaviour and a silent version of it would be a defect: every measurement of what
-the embedder is worth compares two runs whose ONLY difference is supposed to be the
-embedder, and a run that quietly fell back is indistinguishable from one that never had
-one. So ``why`` names the state in words - ``cosine 0.62 ...``, ``no embedder (<why
-not>): keyword and token overlap only`` - and ``ranked_by`` says the same thing to code.
-
-A failing embedder is a fall-back only when the caller asked for one
-(``degrade_on_error``). Injected directly it still raises
-:class:`~skillweaver.errors.ProviderError`, which is what
-:class:`~skillweaver.contracts.SkillRetriever` promises and what a test that hands in a
-broken backend is entitled to see.
-
-Every :class:`~skillweaver.contracts.Candidate` carries a ``why`` built from what
-actually matched - the shared words, the cosine, the name hit - and ends with what the
-skill has NO account of, because a score on its own reads as agreement.
-
-A ranking has a winner even when nothing fits
----------------------------------------------
-
-One measured property of the name term, because it is not obvious and it has already
-cost a suite its most dangerous wrong answer. ``name_hit`` is divided by the length of
-the SKILL'S name, so a short generic name is easy to match completely. On 2026-09-19
-``open_order_screen`` - three stems, all of which appear in any sentence about the
-Order screen - topped a composite ordering task at 0.618 with ``name_hit`` of 1.00,
-while its coverage of that task was 0.364, the LOWEST of any candidate. The skills
-that could actually do the errand carry long specific names (five stems for
-``add_two_dishes_then_remove_one``, of which the task matched one) and scored 0.20 to
-0.33 on the same term.
-
-The ranking is left as it is: it is calibrated against the live Wikipedia suite above,
-and being closest is all it claims. What that measurement argues is that CLOSEST must
-not be read as GOOD ENOUGH TO RUN, which is a decision and belongs to the planner -
-see :data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR` and :func:`unaddressed`.
+**A ranking has a winner even when nothing fits.** ``name_hit`` divides by the length of
+the SKILL'S name, so a short generic name matches completely: on 2026-09-19
+``open_order_screen`` topped a composite ordering task at 0.618 with ``name_hit`` 1.00
+while covering 0.364 of it, the LOWEST of any candidate. The ranking is left alone -
+being closest is all it claims - but CLOSEST is not GOOD ENOUGH TO RUN, which is the
+planner's decision (:data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR`,
+:func:`unaddressed`).
 """
 
 from __future__ import annotations
@@ -141,40 +102,24 @@ def unaddressed(
 ) -> list[str]:
     """The words of ``task`` that ``skill`` neither talks about nor was handed.
 
-    Ranking answers "which of these is closest?", which always has a winner. This
-    answers the other question, the one a closest-match ranking cannot: *is there
-    anything in the request this skill has no account of at all?*
+    Ranking answers "which of these is closest?", which always has a winner. This answers
+    the other question: is there anything in the request this skill has no account of?
 
-    A word is accounted for when it appears in the skill's own text - its name,
-    summary, docstring, parameter names and the sentence it was learned from - or in
-    the VALUES it is about to be called with. The second half is what keeps this from
-    rejecting correct reuse: a skill learned from *order two Vegetable Rolls from
-    Sakura Counter* says nothing about falafel, and ordering a falafel wrap through it
-    is exactly what it is for, because "falafel" arrives as an argument.
+    A word is accounted for when it appears in the skill's own text - name, summary,
+    docstring, parameter names, the sentence it was learned from - or in the VALUES it is
+    about to be called with. That second half is what keeps this from rejecting correct
+    reuse: a skill learned from *order two Vegetable Rolls* says nothing about falafel,
+    and ordering a falafel wrap through it is exactly what it is for.
 
-    What is left over is the part of the errand nobody has promised to do.
-
-    Two more things may speak for a word, and both are EARNED rather than claimed.
-    The requests this skill is proven to have served
-    (:attr:`~skillweaver.contracts.Skill.precedents`) are part of its own text: a
-    skill learned as *add a box of ...* that then served *buy me a box of ...* and
-    passed its verifier has an account of *buy*. And ``family`` - skills that perform
-    the same workflow (:mod:`skillweaver.skills.family`), usually on other sites - may
-    vouch in their own words, because what one shop calls *purchase* is what another
-    learned as *add to cart*. The CALLER decides who is family and must have checked
-    intent as well as shape; this function only counts. The threshold it is compared
-    against does not move for either.
-
-    Args:
-        task: The request, in the words it was asked in.
-        skill: The candidate.
-        args: The arguments the skill would be called with, if they are known.
-            ``None`` means judge the skill's text alone, which is stricter.
-        family: Relatives allowed to vouch for the request in their own words.
+    Two more things may speak for a word, both EARNED rather than claimed: the requests
+    this skill is proven to have served (its ``precedents``), and ``family`` - skills
+    performing the same workflow, usually on other sites - vouching in their own words,
+    because what one shop calls *purchase* another learned as *add to cart*. The CALLER
+    decides who is family and must have checked intent as well as shape; this only counts,
+    and the threshold does not move for either.
 
     Returns:
-        The unaccounted words, in the order the task used them and without
-        duplicates. Empty means every word of the request is spoken for.
+        The unaccounted words, in the order the task used them and without duplicates.
     """
     known = _stems(tokenize(_own_words(skill)))
     for relative in family:
@@ -195,15 +140,10 @@ def _own_words(skill: Skill) -> str:
 def _has_account(stem: str, known: set[str]) -> bool:
     """Whether ``stem`` is spoken for by anything in ``known``, near misses included.
 
-    :func:`_stem` is deliberately blunt and, as a result, not symmetric: ``invoices``
-    becomes ``invoic`` while ``invoice`` is left alone, so the two do not compare
-    equal. Ranking survives that - a near miss only costs a skill some score - but
-    here it would be the difference between "spoken for" and "nobody has promised to
-    do this", and a plural is not a missing promise.
-
-    So a stem also counts as accounted for when a known one extends it by at most two
-    characters. Generosity is the safe direction for THIS question: the check exists
-    to catch words with no account at all, and being wrong here means declining a
+    :func:`_stem` is blunt and not symmetric - ``invoices`` becomes ``invoic`` while
+    ``invoice`` is left alone - which ranking survives but this would not: a plural is not
+    a missing promise. So a stem also counts when a known one extends it by at most two
+    characters. Generosity is the safe direction here, since being wrong means declining a
     skill that would have worked.
     """
     if stem in known:
@@ -236,28 +176,21 @@ def accounted_for(
 
 
 class SkillRetriever:
-    """A :class:`~skillweaver.contracts.SkillRetriever` over any
-    :class:`~skillweaver.contracts.SkillStore`.
+    """A SkillRetriever over any SkillStore.
 
     Args:
-        store: where the skills come from. Demoted skills never leave it, because
-            ``store.list()`` omits them by default.
-        embedder: optional. ``None`` means pure token overlap - a fully working
-            retriever with no model behind it.
-        lexical_weight: how much of the score the token overlap contributes when an
-            embedder is present, in ``0.0..1.0``.
-        min_score: candidates at or below this are dropped, so "nothing is relevant"
-            comes back as an empty list rather than a page of noise.
-        unavailable_reason: why ``embedder`` is ``None``, in a few words, when
-            something tried to build one and could not. It is quoted in every
-            candidate's ``why``, so a keyword-ranked run says whether the model was
-            turned off, never fetched, or simply not asked for.
-        degrade_on_error: whether an embedder that FAILS disables itself and lets the
-            search finish on token overlap. ``False`` - the default, and what the
-            :class:`~skillweaver.contracts.SkillRetriever` protocol documents - lets
-            the :class:`~skillweaver.errors.ProviderError` out. The orchestrator asks
-            for ``True``: on a live run a broken backend should cost the ranking its
-            second signal, not cost the agent its whole library.
+        embedder: ``None`` means pure token overlap - a fully working retriever with no
+            model behind it.
+        min_score: Candidates at or below this are dropped, so "nothing is relevant" comes
+            back as an empty list rather than a page of noise.
+        unavailable_reason: Why ``embedder`` is ``None``, quoted in every candidate's
+            ``why``, so a keyword-ranked run says whether the model was turned off, never
+            fetched, or simply not asked for.
+        degrade_on_error: Whether an embedder that FAILS disables itself and lets the
+            search finish on token overlap. ``False`` (the default, and what the protocol
+            documents) lets the ProviderError out; the orchestrator asks for ``True``,
+            because a broken backend should cost the ranking its second signal, not cost
+            the agent its whole library.
     """
 
     def __init__(
@@ -298,16 +231,13 @@ class SkillRetriever:
     def _lexical(task_tokens: Sequence[str], skill: Skill) -> tuple[float, list[str], list[str]]:
         """``(score, shared words, name words the task also used)``.
 
-        Coverage of the *task* drives the score - a skill that speaks to every word of
-        the request beats a sprawling one that happens to contain them - with a name
-        hit worth as much as the rest of the text together, because a skill called
-        ``search_invoice`` really is what "search for an invoice" wants.
+        Coverage of the TASK drives the score - a skill that speaks to every word of the
+        request beats a sprawling one that happens to contain them - with a name hit worth
+        as much as the rest of the text together.
 
-        The body is the skill's summary, docstring, parameter names AND the sentence
-        it was learned from; see the module docstring for why the last one earns its
-        place. Every later request the skill is PROVEN to have served
-        (:attr:`~skillweaver.contracts.Skill.precedents`) counts the same way and for
-        the same reason - it is what a person typed to get this skill, and it worked.
+        The body is the summary, docstring, parameter names AND the sentence it was
+        learned from; every later request the skill is PROVEN to have served counts the
+        same way and for the same reason.
         """
         if not task_tokens:
             return 0.0, [], []
@@ -339,9 +269,9 @@ class SkillRetriever:
         except ProviderError as exc:
             if not self.degrade_on_error:
                 raise
-            # Once, and then never again this run: a backend that failed on one batch
-            # of short strings is not going to succeed on the next, and a retriever
-            # that retried it would pay the timeout on every task.
+            # Once, and then never again this run: a backend that failed on one batch of
+            # short strings will not succeed on the next, and retrying pays the timeout
+            # on every task.
             self.embedder = None
             self._absent = f"embedder failed and was dropped: {exc}"
             log.warning("skills.embedder_dropped", error=str(exc))
@@ -373,10 +303,9 @@ class SkillRetriever:
     def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
         """Cosine similarity, clamped to ``0.0..1.0``.
 
-        The contract says vectors arrive L2-normalized, so a dot product is already
-        the cosine; the norms below only keep a sloppy embedder from wrecking the
-        ranking. A negative cosine means "less related than unrelated", which is not a
-        distinction worth ranking on, so it clamps to zero.
+        The contract says vectors arrive L2-normalized, so the norms below only keep a
+        sloppy embedder from wrecking the ranking. A negative cosine is not a distinction
+        worth ranking on, so it clamps to zero.
         """
         if len(left) != len(right):
             raise ProviderError(
@@ -401,13 +330,11 @@ class SkillRetriever:
     ) -> str:
         """The sentence a human reads next to the candidate.
 
-        It ends with what the skill has NO account of, when there is anything, because
-        a score alone reads as agreement. Measured on 2026-09-19: the trivial
-        ``open_order_screen`` topped a composite ordering task at 0.618 on a perfect
-        name hit - every stem of its three-word name appears in any sentence about the
-        Order screen - while speaking to 4 of the task's 11 meaning-words. The score
-        said "best"; the leftovers said "vegetable, rolls, sakura, counter, confirm",
-        which is the sentence a reader needed.
+        It ends with what the skill has NO account of, because a score alone reads as
+        agreement. Measured 2026-09-19: ``open_order_screen`` topped a composite ordering
+        task at 0.618 on a perfect name hit while speaking to 4 of the task's 11
+        meaning-words. The score said "best"; the leftovers said "vegetable, rolls,
+        sakura, counter, confirm".
         """
         parts: list[str] = []
         if verbatim:
@@ -434,10 +361,9 @@ class SkillRetriever:
     def search(self, task: str, domain: str | None = None, k: int = 5) -> list[Candidate]:
         """At most ``k`` candidates for ``task``, best score first.
 
-        ``domain`` restricts the search to one site or app. Demoted skills are never
-        returned. Candidates scoring at or below ``min_score`` are dropped, so an
-        irrelevant task gives an empty list. Ties break on ``(domain, name)``, so the
-        same library and task always give the same order.
+        Demoted skills are never returned, and candidates at or below ``min_score`` are
+        dropped. Ties break on ``(domain, name)``, so the same library and task always
+        give the same order.
 
         Raises:
             ProviderError: if the embedding backend fails.

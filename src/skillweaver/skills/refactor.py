@@ -1,93 +1,34 @@
-"""The hardening pass: what turns a model's first draft into a skill worth keeping.
+"""The hardening pass: rewriting a model's draft against the run it was written from,
+before the admission gate runs it. AST-to-AST, re-emitted with ``ast.unparse``, which
+DROPS COMMENTS - a uniform, re-parseable library beats a model's commentary.
 
-A model that has just watched a successful run writes that run back literally - the
-pixel it clicked, the URL it happened to start from, the company name it was given
-this once. Code like that works exactly once: the next release moves the button four
-pixels and the skill is a liability. This module rewrites the draft against the
-trajectory it was written from, BEFORE the admission gate in
-:mod:`skillweaver.skills.synthesize` ever runs it::
+Seven rewrites, in this order:
 
-    hardened = harden(draft_code, trajectory, params={"company": {"type": "string"}})
-    hardened.code             # the rewritten source
-    hardened.changes          # one readable line per rewrite, for the run log
-    hardened.added_params     # params to merge into the skill's schema
+* **Fixed sleeps removed.** The controller SETTLES every action before returning, so a
+  following ``ctx.ctl.wait`` sleeps on top of a wait that already happened; on live
+  Wikipedia three of them were 38% of a stored skill's run time. The capability is not
+  removed, only the reflex: a wait an adjacent ``ctx.log`` NAMES survives
+  (:func:`reflex_waits`).
+* **A read the skill INSISTS on may look twice.** ``_settle`` waits for the LOAD EVENT,
+  which a control answered without navigating fired long ago - on live splitkb.com the
+  "Add to cart" click returned in 130ms with the document complete while the cart
+  committed at 1170ms. A ``find_text`` immediately required by ``ctx.expect`` becomes
+  ``ctx.wait_for_text``; a read that merely branches is left alone, or every run pays
+  the budget for something it hoped was absent (:func:`awaited_reads`).
+* **Hardcoded navigation lifted** into the precondition. Deliberately NOT routing:
+  that belongs to the planner, and a skill called as a step must act from where it was
+  put. Do not add ``ctx.graph`` here.
+* **Literal coordinates become perception lookups** - a skill full of raw pixels is a
+  screenshot.
+* **Typed literals become parameters**, defaulting to the recorded value.
+* **Opaque locals are renamed** after what they hold.
+* **Positions become meanings.** ``by_kind("text")[1]`` changes the moment an advert
+  loads, the commonest reason a stored skill fails to replay live. With no anchor in
+  the recording the lookup is KEPT and a ``ctx.log`` says so
+  (:func:`positional_lookups`).
 
-Seven rewrites, applied in this order:
-
-*Fixed sleeps are removed.* ``ctx.ctl.press("Enter")`` followed by
-``ctx.ctl.wait(2000)`` does not wait for the page: every action is SETTLED by the
-controller before it returns - ``BrowserController._settle`` pauses and then waits for
-the page to finish loading - so the wait sleeps on top of a wait that has already
-happened. Measured on live Wikipedia, three such sleeps were 38% of a stored skill's
-whole run time, and removing them halved warm replay while changing nothing else (the
-measurement is in ``AGENTS.md``). The capability is not removed, only the reflex: a
-wait for something no load event covers - an animation, a debounce, a spinner - is KEPT
-when an adjacent ``ctx.log`` NAMES that thing, which is the same bargain a positional
-lookup gets below. See :func:`reflex_waits`, which is the detector on its own.
-
-*A read the skill INSISTS on is allowed to look twice.* The pass above removes a sleep
-because the controller already settled the action; this one adds the wait that settle
-cannot give. ``BrowserController._settle`` waits for the page's LOAD EVENT, and a
-control the page answers without navigating fired that long ago - measured on live
-splitkb.com, the click on "Add to cart" returned in 130ms with the document complete
-and the old url still showing, while the cart it redirects to did not commit until
-1170ms. A recording made at model speed never meets that gap; the skill replayed at code
-speed walks straight into it and reads the page it is still standing on.
-
-    So ``NAME = ctx.see.find_text(...)`` immediately followed by a ``ctx.expect`` on
-    ``NAME`` - and only that shape, only after an action, and only once per action -
-    becomes ``ctx.wait_for_text(...)``. The ``expect`` is the whole warrant: it is the
-    skill declaring that the text MUST be there, which is exactly when looking again is
-    right and never when the skill is merely asking what is on screen. A read that
-    branches (``if ctx.see.find_text("Error"): ...``) expects nothing and is left alone,
-    because waiting four seconds for something you hope is absent is a tax on every run.
-    On the happy path the rewrite costs NOTHING: the first look is the observation the
-    skill was about to make. See :func:`awaited_reads`, which is the detector on its own,
-    and :data:`~skillweaver.skills.api.AWAIT_BUDGET_MS` for the measurement.
-
-*Hardcoded navigation is lifted out.* A ``run`` that begins by typing a URL, or by
-performing a ``Navigate``, is a skill that insists on arriving its own way. The
-prologue is REMOVED from the body and reported; the screen it was reaching for is
-recorded as the skill's precondition instead.
-
-    Deliberately, this pass does NOT make the skill route itself through the site
-    graph. Routing to a skill's precondition belongs to the planner, which already
-    does it before invoking one (``Plan.steps`` interleaves route actions between
-    ``SkillCall``s). A skill that re-routed inside its own body would duplicate that
-    work and break composition - a skill called as a step must act from where it was
-    put, not go somewhere first. Lifting navigation into the precondition is the
-    architecture, not a shortcut; do not add ``ctx.graph`` routing here.
-
-*Literal coordinates become perception lookups.* ``ctx.ctl.click(Point(400, 140))``
-becomes a ``ctx.see`` query for the element the RECORDING shows at that point, a
-``ctx.expect`` that it is on screen, and a click on what was found. This is the
-rewrite that matters most: a skill full of raw pixels is a screenshot, not a skill.
-
-*Values that clearly vary become parameters.* A string literal typed into a field,
-which the trajectory shows was this run's data, becomes a parameter with the recorded
-value as its default - so the skill generalizes without breaking its own replay.
-
-*Names become readable.* A local bound to a perception lookup and called ``e`` or
-``tmp`` is renamed after what it holds (``confirm_payment_button``).
-
-*Positions become meanings.* ``ctx.see.by_kind("text")[1]`` is a skill that reaches
-its search box by counting, and the count changes the moment an advert loads or OCR
-reads one extra caption - this is the single commonest reason a stored skill fails to
-replay on a real site. Every bare positional subscript into a perception result is
-found (including through an intermediate variable) and re-anchored on something
-nameable: the element's own text where the recording shows some, otherwise the
-nearest labelled thing it sits in or beside. Where the recording genuinely offers no
-anchor - an unlabelled checkbox on a page of unlabelled checkboxes - the lookup is
-KEPT and a ``ctx.log`` line is injected saying so, because a skill that works
-positionally and announces it is worth more than no skill. See
-:func:`positional_lookups`, which is the detector on its own.
-
-Everything here is AST-to-AST and the result is re-emitted with ``ast.unparse``,
-which normalizes formatting and DROPS COMMENTS. That is the deliberate trade: a
-uniform, re-parseable library beats a model's commentary. Nothing here validates or
-executes the result - :func:`~skillweaver.skills.synthesize.Synthesizer.admit` does
-that, and code this pass could not improve is passed through unchanged rather than
-raised on, because the gate is what decides whether it is any good.
+Nothing here validates or executes the result, and a draft it cannot improve is passed
+through unchanged.
 """
 
 from __future__ import annotations
@@ -151,9 +92,9 @@ _INTERACTIVE = frozenset(
         ElementKind.menu,
     }
 )
-"""Kinds specific enough to be worth passing to ``find_text`` as a filter. For a
-bare label or an unclassified blob the kind is as likely to be wrong at replay time
-as right, and a wrong filter finds nothing where the text alone would have found it."""
+"""Kinds specific enough to be worth passing to ``find_text`` as a filter. For a bare
+label or an unclassified blob the kind is as likely to be wrong at replay time as right,
+and a wrong filter finds nothing where the text alone would have found it."""
 
 _URL = re.compile(r"^(?:https?://|www\.|file://)\S+$", re.IGNORECASE)
 
@@ -194,11 +135,9 @@ _ANNOUNCES_WAIT = re.compile(
 )
 """What an adjacent ``ctx.log`` has to NAME for a fixed wait to survive this pass.
 
-Every one of these is something the load event does not cover, which is the whole
-question: the page arriving is already waited for, a menu finishing its slide is not.
+Every one is something the load event does not cover, which is the whole question.
 Deliberately absent are "load", "navigate" and "page" - a wait explained by the thing
-that has demonstrably already happened is the reflex this pass exists to remove, not an
-exception to it."""
+that has demonstrably already happened is the reflex this pass exists to remove."""
 
 
 _ANCHOR_REACH = 240
@@ -216,28 +155,19 @@ class Hardening:
     """What the pass produced, and what it did.
 
     Attributes:
-        code: The rewritten source. Always parseable when the input was; the
-            original string when the input did not parse or defined no ``run``.
-        changes: One human-readable line per rewrite, in the order they were made.
-            Empty when the draft was already hard.
+        code: The rewritten source, or the original when it did not parse or defined
+            no ``run``.
         added_params: Parameters lifted out of literals, as ``name -> JSON schema``
             with the recorded value as ``default``. Merge into ``Skill.params``.
-        coordinates_replaced: Literal coordinates that became perception lookups.
-        lookups_added: ``ctx.see`` queries introduced.
-        navigation_lifted: The navigation targets removed from the body.
-        renamed: Opaque local names mapped to what they became.
-        positions_anchored: Positional subscripts rewritten onto a named element.
         positions_announced: Positional subscripts the recording gave no anchor for,
-            which were KEPT and made to announce themselves with a ``ctx.log`` line.
-            A non-empty tuple is not a failure; it is the skill saying where it is
-            thin, and :attr:`positions_unanchored` counts it.
-        waits_removed: Fixed sleeps dropped because the action before them had
-            already been settled. A caller that reports a rejection to the model must
-            report these too: the model cannot see the code that was run, and a wait
-            it needs and never learns was deleted is a repair loop with no exit.
-        awaits_added: Reads that were allowed to look again while the page answers.
-            The counterpart of :attr:`waits_removed`, and the opposite trade: a
-            duration was taken away, a condition was put in.
+            KEPT and made to announce themselves. Not a failure - the skill saying
+            where it is thin.
+        waits_removed: Fixed sleeps dropped because the action before them had already
+            been settled. A caller reporting a rejection to the model must report these
+            too: the model cannot see the code that ran, and a wait it needs and never
+            learns was deleted is a repair loop with no exit.
+        awaits_added: Reads allowed to look again while the page answers - the opposite
+            trade to :attr:`waits_removed`: a duration out, a condition in.
     """
 
     code: str
@@ -274,14 +204,10 @@ class PositionalLookup:
     """One place a skill reaches for an element by counting instead of by naming.
 
     Attributes:
-        query: The ``ctx.see`` method that produced the list - ``"by_kind"`` or
-            ``"all"``. Both say nothing about WHICH element is wanted.
-        kind: The kind ``by_kind`` was given, when it was a literal; ``None`` for
-            ``all()`` and for a kind computed at runtime.
+        query: ``"by_kind"`` or ``"all"``. Both say nothing about WHICH element.
+        kind: The kind ``by_kind`` was given when it was a literal.
         index: The constant subscript. Negative counts from the end.
-        via: The local the list was held in, when the subscript went through one
-            (``rows = ctx.see.by_kind("row")`` ... ``rows[2]``); ``None`` when the
-            query was subscripted directly.
+        via: The local the list was held in, when the subscript went through one.
         line: Line number in the source it was found in, 1-based.
     """
 
@@ -313,12 +239,9 @@ class PositionalLookup:
 class ReflexWait:
     """One fixed sleep a skill takes for something it has already been given.
 
-    Attributes:
-        ms: The literal duration, in milliseconds.
-        after: The ``ctx.ctl`` action the wait follows, whose settle already waited
-            for the page. This is what makes the wait redundant rather than merely
-            long, and it is what the model is told when a repair is asked for.
-        line: Line number in the source it was found at, 1-based.
+    ``after`` is the ``ctx.ctl`` action whose settle already waited for the page - what
+    makes the wait redundant rather than merely long, and what the model is told when a
+    repair is asked for.
     """
 
     ms: int
@@ -333,12 +256,8 @@ class ReflexWait:
 class AwaitedRead:
     """One read a skill required, which was allowed to look again while the page answers.
 
-    Attributes:
-        query: The text the read is looking for, when it was a literal; ``None`` when
-            it was computed - a parameter, or a string the skill built.
-        after: The ``ctx.ctl`` action the read follows. This is the control whose
-            answer is being waited for, and the reason the read races at all.
-        line: Line number in the source it was found at, 1-based.
+    ``query`` is ``None`` when the text was computed. ``after`` is the control whose
+    answer is being waited for, and the reason the read races at all.
     """
 
     query: str | None
@@ -364,12 +283,9 @@ def _action_points(action: Any) -> tuple[Point, ...]:
 
 
 def _locate(trajectory: Trajectory, x: int, y: int) -> tuple[Element, Observation] | None:
-    """:func:`element_at`, and the screen the element was found on.
-
-    The screen matters to the anchoring pass: an element with no readable text can
-    only be described by what sits around it, and "around it" is a fact about one
-    observation, not about the run.
-    """
+    """:func:`element_at`, and the screen the element was found on. The screen matters to
+    the anchoring pass: an element with no readable text can only be described by what
+    sits around it, which is a fact about one observation, not about the run."""
     point = Point(x, y)
 
     def smallest(elements: Sequence[Element]) -> Element | None:
@@ -392,12 +308,9 @@ def _locate(trajectory: Trajectory, x: int, y: int) -> tuple[Element, Observatio
 def element_at(trajectory: Trajectory, x: int, y: int) -> Element | None:
     """The element the RECORDING shows at logical point ``(x, y)``, or ``None``.
 
-    A step whose own action targeted exactly this point is consulted first, using
-    the screen as it was BEFORE that action - that is the element the model meant.
-    Failing that, every observation in the run is searched. Among candidates the
-    smallest box wins, so a button inside a row beats the row.
-
-    Coordinates are LOGICAL pixels, like everything else in this codebase.
+    A step whose own action targeted exactly this point is consulted first, using the
+    screen BEFORE that action - that is the element the model meant. Among candidates
+    the smallest box wins, so a button inside a row beats the row.
     """
     found = _locate(trajectory, x, y)
     return found[0] if found is not None else None
@@ -413,11 +326,9 @@ def _reach(box: Box, point: Point) -> float:
 def _labelled_neighbour(observation: Observation, element: Element) -> Element | None:
     """The labelled thing a textless ``element`` can be found FROM, or ``None``.
 
-    A checkbox with no text is still findable when it sits in a row that reads
-    something: "the checkbox nearest that row" survives the row moving, which its
-    position in the checkbox list does not. Containment beats proximity - the row
-    the control is IN is a stronger claim than the caption beside it - and past
-    :data:`_ANCHOR_REACH` nothing is claimed at all.
+    "The checkbox nearest that row" survives the row moving, which its position in the
+    checkbox list does not. Containment beats proximity, and past :data:`_ANCHOR_REACH`
+    nothing is claimed at all.
     """
     centre = element.box.center
     best: tuple[int, float, int, Element] | None = None
@@ -437,9 +348,9 @@ def _labelled_neighbour(observation: Observation, element: Element) -> Element |
 
 
 def _at_position(observation: Observation, kind: str | None, index: int) -> Element | None:
-    """What ``by_kind(kind)[index]`` - or ``all()[index]`` when ``kind`` is ``None`` -
-    would have picked on this screen. ``Observation.elements`` is already in reading
-    order, which is the order ``ctx.see`` returns these two queries in."""
+    """What ``by_kind(kind)[index]`` - or ``all()[index]`` when ``kind`` is ``None`` - would
+    have picked on this screen. ``Observation.elements`` is already in reading order, which
+    is the order ``ctx.see`` returns these two queries in."""
     matching = [e for e in observation.elements if kind is None or e.kind.value == kind]
     if -len(matching) <= index < len(matching):
         return matching[index]
@@ -543,12 +454,9 @@ def _number(node: ast.expr) -> int | None:
 
 
 def _literal_point(node: ast.expr) -> tuple[int, int] | None:
-    """The logical point a coordinate literal denotes, in any shape a model writes it.
-
-    ``Point(400, 140)``, ``(400, 140)``, ``[400, 140]`` and ``Box(20, 120, 760, 40)``
-    (its center, as ``ActionSurface`` would take it) are all recognized. Anything
-    else - a name, an expression, a lookup - is left alone: it is not a literal.
-    """
+    """The logical point a coordinate literal denotes, in any shape a model writes it:
+    ``Point(400, 140)``, ``(400, 140)``, ``[400, 140]`` and ``Box(...)`` (its center).
+    Anything else - a name, an expression, a lookup - is not a literal and is left alone."""
     match node:
         case ast.Call(func=ast.Name(id="Point"), args=args, keywords=[]) if len(args) == 2:
             x, y = _number(args[0]), _number(args[1])
@@ -571,9 +479,8 @@ def _literal_point(node: ast.expr) -> tuple[int, int] | None:
 def _navigation_target(node: ast.stmt) -> str | None:
     """The URL a statement navigates to, when it is hardcoded navigation.
 
-    Two shapes: typing a URL into whatever has focus (an address bar), and
-    performing a ``Navigate`` - which skill code cannot even construct, but models
-    write it anyway because it is what the trajectory shows.
+    Two shapes: typing a URL into whatever has focus, and performing a ``Navigate`` -
+    which skill code cannot construct, but models write it because the trajectory shows it.
     """
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
         return None
@@ -696,10 +603,9 @@ def _positional_subscript(
 ) -> PositionalLookup | None:
     """``node`` read as a bare positional pick out of a perception result, or ``None``.
 
-    Both shapes the model writes are the same defect: ``ctx.see.by_kind("text")[1]``
-    and ``rows = ctx.see.all()`` followed by ``rows[1]``. A subscript of a NAMED query
-    (``find_text(...)[0]``) is not one - that index means "the best match" - and
-    neither is a slice or a computed index, which are not fixed positions at all.
+    Both ``ctx.see.by_kind("text")[1]`` and ``rows = ctx.see.all()`` then ``rows[1]``. A
+    subscript of a NAMED query is not one - that index means "the best match" - and
+    neither is a slice or a computed index.
     """
     if not isinstance(node, ast.Subscript):
         return None
@@ -740,14 +646,12 @@ def _scan_block(
 def positional_lookups(code: str) -> tuple[PositionalLookup, ...]:
     """Every place ``code``'s ``run`` reaches for an element by position, in order.
 
-    This is the detector on its own, with no trajectory and no rewriting, so a test -
-    or a reviewer - can ask one question of a skill: does it navigate by meaning?
-    An empty tuple is the answer that matters. Source that does not parse, or that
-    defines no ``run``, has no lookups to report rather than being an error; judging
-    it is the admission gate's job.
+    The detector on its own, with no trajectory and no rewriting, so one question can be
+    asked of a skill: does it navigate by meaning? Source that does not parse, or defines
+    no ``run``, has no lookups rather than being an error.
 
-    See :data:`_POSITIONAL_QUERIES` for what counts and :data:`_NAMED_QUERIES` for
-    what deliberately does not.
+    See :data:`_POSITIONAL_QUERIES` for what counts and :data:`_NAMED_QUERIES` for what
+    deliberately does not.
     """
     try:
         tree = ast.parse(code)
@@ -769,11 +673,9 @@ def positional_lookups(code: str) -> tuple[PositionalLookup, ...]:
 def _settling_action(statement: ast.stmt) -> str | None:
     """The ``ctx.ctl`` action ``statement`` performs, or ``None``.
 
-    An action is anything the controller delivers and then SETTLES: a click, a type,
-    a press, a scroll, a navigate. The settle is what makes the wait after it
-    redundant, so ``wait`` and ``supports`` do not count (:data:`_NOT_AN_ACTION`),
-    and neither does an action buried in a larger statement - a result that was
-    assigned or tested is a shape this pass declines to reason about.
+    Anything the controller delivers and then SETTLES. The settle is what makes a
+    following wait redundant, so :data:`_NOT_AN_ACTION` does not count, and neither does
+    an action buried in a larger statement.
     """
     if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
         return None
@@ -784,11 +686,8 @@ def _settling_action(statement: ast.stmt) -> str | None:
 
 
 def _wait_ms(statement: ast.stmt) -> int | None:
-    """The duration of ``ctx.ctl.wait(<literal>)`` in milliseconds, or ``None``.
-
-    A wait whose duration is COMPUTED is not a literal and is left alone: a number
-    the skill worked out is a decision, and this pass only removes reflexes.
-    """
+    """The duration of ``ctx.ctl.wait(<literal>)`` in milliseconds, or ``None``. A COMPUTED
+    duration is a decision, not a reflex, and is left alone."""
     if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
         return None
     call = statement.value
@@ -804,12 +703,9 @@ def _wait_ms(statement: ast.stmt) -> int | None:
 
 
 def _announces_wait(statement: ast.stmt) -> bool:
-    """Whether ``statement`` is a ``ctx.log`` that names what a wait is FOR.
-
-    The message is searched whole, so a line built from pieces
-    (``ctx.log("waiting for the " + name + " animation")``) counts. What has to be
-    in it is :data:`_ANNOUNCES_WAIT`.
-    """
+    """Whether ``statement`` is a ``ctx.log`` that names what a wait is FOR. The message is
+    searched whole, so a line built from pieces counts; what has to be in it is
+    :data:`_ANNOUNCES_WAIT`."""
     if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
         return False
     match statement.value.func:
@@ -827,11 +723,9 @@ def _announces_wait(statement: ast.stmt) -> bool:
 def _page_neutral(statement: ast.stmt) -> bool:
     """Whether the settle of the action before ``statement`` still stands after it.
 
-    Reading the screen, checking a condition and writing the trace all leave the page
-    exactly where the last action left it, so a wait further down is still a wait for
-    something that has already been waited for. Anything that reaches the page -
-    ``ctx.ctl`` in any form, ``ctx.call`` running another skill - and any compound
-    statement, whose branches this pass does not follow, ends that.
+    Reading the screen, checking a condition and writing the trace leave the page where
+    the last action left it. Anything that reaches the page - ``ctx.ctl``, ``ctx.call`` -
+    and any compound statement, whose branches this pass does not follow, ends that.
     """
     if not isinstance(statement, ast.Expr | ast.Assign | ast.AnnAssign | ast.AugAssign | ast.Pass):
         return False
@@ -845,11 +739,10 @@ def _page_neutral(statement: ast.stmt) -> bool:
 def _reflex_waits_in(body: Sequence[ast.stmt]) -> dict[int, ReflexWait]:
     """Which statements of ONE block are reflex waits, keyed by index in that block.
 
-    A block is walked in order carrying the last action the controller settled.
-    :func:`_page_neutral` statements are crossed without losing it; anything else
-    clears it, and a block starts with nothing settled - a wait first inside an
-    ``if`` is judged on its own branch, not on what ran before the branch was taken.
-    A wait a neighbouring ``ctx.log`` explains is never a reflex, wherever it sits.
+    Walked in order carrying the last settled action; :func:`_page_neutral` statements are
+    crossed without losing it. A block starts with nothing settled, so a wait first inside
+    an ``if`` is judged on its own branch. A wait a neighbouring ``ctx.log`` explains is
+    never a reflex.
     """
     found: dict[int, ReflexWait] = {}
     settled: str | None = None
@@ -881,20 +774,16 @@ def _is_expect(call: ast.Call) -> bool:
 def _required_read(statement: ast.stmt, following: ast.stmt | None) -> ast.Call | None:
     """The ``ctx.see.find_text`` call ``statement`` makes and then INSISTS on, or ``None``.
 
-    Two shapes count here, and :func:`_acted_on_read` holds the third::
+    Two shapes; :func:`_acted_on_read` holds the third::
 
         found = ctx.see.find_text("Subtotal")        # bound, then
         ctx.expect(bool(found), "no cart")           # required by the very next line
-
         ctx.expect(bool(ctx.see.find_text("Subtotal")), "no cart")   # required inline
 
-    The ``ctx.expect`` is what makes the read a requirement rather than a question,
-    and a requirement is the only read worth looking twice for. A read whose result is
-    branched on, logged, counted or returned is asking what is on screen right now, and
-    the honest answer to that is what is on screen right now.
-
-    A call that passes ``fuzzy`` is declined: ``ctx.wait_for_text`` does not take it,
-    on purpose - a near match answers on the screen the wait was supposed to outlast.
+    The ``ctx.expect`` makes the read a requirement rather than a question, and only a
+    requirement is worth looking twice for. A call passing ``fuzzy`` is declined:
+    ``ctx.wait_for_text`` does not take it, because a near match answers on the screen the
+    wait was meant to outlast.
     """
 
     def usable(call: ast.Call) -> ast.Call | None:
@@ -930,11 +819,8 @@ def _required_read(statement: ast.stmt, following: ast.stmt | None) -> ast.Call 
 
 def _acts(statement: ast.stmt) -> str | None:
     """The last ``ctx.ctl`` action anywhere inside ``statement``, or ``None``.
-
-    :func:`_settling_action` asks whether a statement IS an action; this asks whether
-    one happens anywhere within it, a loop's body included, which is the question "has
-    this skill touched the page yet?" needs answered.
-    """
+    :func:`_settling_action` asks whether a statement IS an action; this asks whether one
+    happens anywhere within it, a loop body included."""
     last: str | None = None
     for node in ast.walk(statement):
         if isinstance(node, ast.Call):
@@ -947,26 +833,17 @@ def _acts(statement: ast.stmt) -> str | None:
 def _acted_on_read(statement: ast.stmt, rest: Sequence[ast.stmt]) -> ast.Call | None:
     """The ``ctx.see.find_text`` call whose result ``rest`` goes on to ACT on, or ``None``.
 
-    The third shape, beside the two :func:`_required_read` accepts::
-
-        adds = ctx.see.find_text("Add to cart - " + product, "button")   # bound, then
-        if not adds:                                                     # maybe replaced,
-            adds = ctx.see.best("Add to cart button for " + product)
-        ctx.ctl.click(adds[0])                                           # and PRESSED
-
     Handing a read's result to ``ctx.ctl`` proves it is required as surely as a
-    ``ctx.expect`` does - nothing can be pressed that was not found - and it is the shape
-    that needs the second look most, because what follows an empty first look is a
-    FALLBACK. Measured on live walmart.com, traced lookup by lookup: a result's title was
-    on screen at +2.32s, this read for its button found nothing at +2.33s because the
-    button had not hydrated, ``ctx.see.best`` - a ranking with a winner when nothing fits -
-    answered with the header's "Cart contains 0 items" at +2.42s, and the skill clicked
-    that. It passed one gate attempt and then 0 of 3 replays, the cart empty every time.
+    ``ctx.expect`` does, and it is the shape that needs the second look most, because what
+    follows an empty first look is a FALLBACK. Measured on live walmart.com: a result's
+    title was on screen at +2.32s, this read for its button found nothing at +2.33s
+    because the button had not hydrated, ``ctx.see.best`` - a ranking with a winner when
+    nothing fits - answered with the header's "Cart contains 0 items" at +2.42s, and the
+    skill clicked that. It passed one gate attempt and then 0 of 3 replays.
 
-    The ``ctx.expect`` rule missed it twice over. Its expect was four fallbacks further
-    down, not on the next line; and the read followed a wait that had already been
-    converted, after which "every later read is a read of a screen that has arrived" -
-    which is false of a page that answers in PHASES, titles and then buttons.
+    The ``ctx.expect`` rule missed it twice over: the expect was four fallbacks down, not
+    on the next line, and the read followed an already-converted wait, after which "every
+    later read is of a screen that has arrived" - false of a page answering in PHASES.
     """
     match statement:
         case ast.Assign(targets=[ast.Name(id=name)], value=ast.Call() as call):
@@ -991,17 +868,14 @@ def _awaited_reads_in(
 ) -> dict[int, tuple[AwaitedRead, ast.Call]]:
     """Which reads of ONE block race the control before them, keyed by index.
 
-    ``acted`` is the last action the skill performed BEFORE this block, anywhere above
-    it. Only :func:`_acted_on_read` consults it: a read about to be pressed is looked
-    for again whenever the page has been touched at all, because a page that answers in
-    phases is still answering after the first thing it said.
+    ``acted`` is the last action performed BEFORE this block. Only :func:`_acted_on_read`
+    consults it: a read about to be pressed is looked for again whenever the page has been
+    touched at all, because a page that answers in phases is still answering after the
+    first thing it said.
 
-    The block is walked in order carrying the last action the controller settled,
-    exactly as :func:`_reflex_waits_in` does, and for the same reason: a read is only
-    racing if something just acted. Crossing a :func:`_page_neutral` statement keeps
-    that action; anything else clears it, and so does converting a read - one action
-    is answered once, and every later read on that screen is a read of a screen that
-    has already arrived.
+    Otherwise walked exactly as :func:`_reflex_waits_in` is, and for the same reason - a
+    read is only racing if something just acted. Converting a read also clears the action:
+    one action is answered once.
     """
     found: dict[int, tuple[AwaitedRead, ast.Call]] = {}
     settled: str | None = None
@@ -1044,10 +918,8 @@ def _string(node: ast.expr) -> str | None:
 def awaited_reads(code: str) -> tuple[AwaitedRead, ...]:
     """Every read in ``code``'s ``run`` that would race the control before it.
 
-    The detector on its own, with no trajectory and no rewriting, so one question can
-    be asked of a skill: does it read the screen straight after acting on a control
-    whose answer has not arrived? Source that does not parse, or that defines no
-    ``run``, has no reads to report rather than being an error.
+    The detector on its own. Source that does not parse, or defines no ``run``, has no
+    reads to report rather than being an error.
     """
     try:
         tree = ast.parse(code)
@@ -1072,12 +944,9 @@ def awaited_reads(code: str) -> tuple[AwaitedRead, ...]:
 def reflex_waits(code: str) -> tuple[ReflexWait, ...]:
     """Every fixed sleep in ``code``'s ``run`` that an action's settle already covers.
 
-    This is the detector on its own, with no trajectory and no rewriting, so a test -
-    or a reviewer - can ask one question of a skill: does it sleep for time the
-    browser has already spent? An empty tuple is the answer that matters, and it is
-    also the answer for a wait that was explained, which is a wait this project wants
-    skills to keep. Source that does not parse, or that defines no ``run``, has no
-    waits to report rather than being an error.
+    The detector on its own. An empty tuple is also the answer for a wait that was
+    explained, which is a wait this project wants skills to keep. Source that does not
+    parse, or defines no ``run``, has no waits rather than being an error.
     """
     try:
         tree = ast.parse(code)
@@ -1111,12 +980,9 @@ def _attr(root: str, *path: str) -> ast.expr:
 
 
 def _lookup_call(element: Element) -> tuple[ast.expr, str]:
-    """A ``ctx.see`` query for ``element``, and how to describe it in a failure.
-
-    Text is the query when there is any, with the element's kind as a filter only
-    when that kind is specific enough to help (see :data:`_INTERACTIVE`). With no
-    text at all the kind is all there is to go on.
-    """
+    """A ``ctx.see`` query for ``element``, and how to describe it in a failure. Text is the
+    query when there is any, with the kind as a filter only when it is specific enough to
+    help (:data:`_INTERACTIVE`)."""
     text = element.text.strip()
     if text:
         args: list[ast.expr] = [ast.Constant(value=text)]
@@ -1167,11 +1033,9 @@ def _first(name: str) -> ast.expr:
 
 
 def _nearest_statements(target: str, anchor: str, kind: ElementKind) -> list[ast.stmt]:
-    """``target = ctx.see.nearest(anchor[0].box.center, kind)``, checked.
-
-    This is how an element with no text of its own is still addressed by meaning: by
-    the labelled thing it sits in. ``anchor`` must already be bound and checked.
-    """
+    """``target = ctx.see.nearest(anchor[0].box.center, kind)``, checked. How an element
+    with no text of its own is still addressed by meaning: by the labelled thing it sits
+    in. ``anchor`` must already be bound and checked."""
     centre = ast.Attribute(
         value=ast.Attribute(value=_first(anchor), attr="box", ctx=ast.Load()),
         attr="center",
@@ -1266,12 +1130,10 @@ class _Hardener:
     def strip_reflex_waits(self, body: list[ast.stmt]) -> list[ast.stmt]:
         """Drop every fixed sleep the action before it had already been settled for.
 
-        Runs FIRST, before navigation is lifted, for two reasons. A wait between a
-        typed URL and the Enter that submitted it would otherwise hide that pair from
-        :meth:`strip_navigation`, which reads them as adjacent. And a wait after a
-        lifted navigation would, once the navigation is gone, look like the first
-        statement of the block and be kept - a sleep for a page the skill no longer
-        loads is the emptiest one there is.
+        Runs FIRST: a wait between a typed URL and its Enter would otherwise hide that
+        pair from :meth:`strip_navigation`, which reads them as adjacent; and a wait
+        after a lifted navigation would look like the first statement of the block and
+        be kept.
         """
         for statement in body:
             for owner, name, block in _blocks(statement):
@@ -1294,13 +1156,10 @@ class _Hardener:
         """Let a read the skill REQUIRES look again while the control answers.
 
         Runs straight after the sleeps are stripped, and the pairing is the point: the
-        sleep went because the controller had already waited for the page's load event,
-        and this goes in because that event is exactly what a control answering in the
-        background does not fire. A duration out, a condition in.
+        sleep went because the controller had waited for the load event, and this goes in
+        because that event is what a control answering in the background never fires.
 
-        Only the shapes :func:`_required_read` and :func:`_acted_on_read` accept, and
-        only after an action - see :func:`_awaited_reads_in`. Statements are rewritten in
-        place: nothing is added, nothing is removed, and the read's arguments are
+        Statements are rewritten in place - nothing added, nothing removed, arguments
         carried across untouched, so a parameterized query stays parameterized.
         """
         before = acted
@@ -1336,8 +1195,8 @@ class _Hardener:
                 just_lifted = True
                 continue
             if just_lifted and _is_enter_press(statement):
-                # The Enter belonged to the URL that has just gone; on its own it
-                # would submit whatever the caller left in the field.
+                # The Enter belonged to the URL that has just gone; alone it would
+                # submit whatever the caller left in the field.
                 self.changes.append("dropped the Enter that submitted the lifted URL")
                 just_lifted = False
                 continue
@@ -1348,8 +1207,8 @@ class _Hardener:
     # -- coordinates --------------------------------------------------------------------
 
     def replace_coordinates(self, statement: ast.stmt) -> list[ast.stmt]:
-        """``statement`` with every literal coordinate replaced by a lookup, preceded
-        by the lookups themselves."""
+        """``statement`` with every literal coordinate replaced by a lookup, preceded by
+        the lookups themselves."""
         prefix: list[ast.stmt] = []
 
         def visit(node: ast.AST) -> None:
@@ -1466,9 +1325,8 @@ class _Hardener:
     def anchor_positions(self, fn: ast.FunctionDef) -> None:
         """Re-anchor every positional pick onto something nameable, or make it say so.
 
-        Runs LAST, after renaming, so the locals it reasons about are the ones that
-        survive, and after :meth:`replace_coordinates`, so the ``by_kind`` fallback
-        that pass writes for a textless element is judged by the same rule as the
+        Runs LAST, after renaming and after :meth:`replace_coordinates`, so the ``by_kind``
+        fallback that pass writes for a textless element is judged by the same rule as the
         model's own code.
         """
         self.taken |= _bound_names(fn)
@@ -1525,12 +1383,10 @@ class _Hardener:
     def _resolve(self, lookup: PositionalLookup) -> tuple[Element, Observation] | None:
         """Which element the recording says that position denotes, and on what screen.
 
-        Two kinds of evidence, and nothing else. The run ACTED on the element that
-        index picks out - that is what the model meant, and it is how a click the
-        hardener itself grounded on a coordinate is recognized again. Or every screen
-        in the run that has an element at that index shows the SAME labelled element,
-        so the index is not doing any work. Anything less is a guess, and a guess
-        rewritten into a skill is worse than the index it replaced.
+        Two kinds of evidence and nothing else: the run ACTED on the element that index
+        picks out, or every screen in the run with an element at that index shows the SAME
+        labelled element, so the index is doing no work. A guess rewritten into a skill is
+        worse than the index it replaced.
         """
         if lookup.via is not None and lookup.via in self.grounded:
             return self.grounded[lookup.via]
@@ -1593,16 +1449,10 @@ def harden(
     """Rewrite a generated skill's source against the run it was written from.
 
     Args:
-        code: The model's draft. Source that does not parse, or that defines no
-            module-level ``run``, is returned unchanged with no changes recorded -
-            the admission gate is what rejects it, not this pass.
-        trajectory: The recorded run. Every rewrite is grounded in it: the element
-            at a coordinate, the text that was typed, the URL that was navigated to.
+        code: The model's draft. Source that does not parse, or defines no module-level
+            ``run``, is returned unchanged - the gate rejects it, not this pass.
+        trajectory: The recorded run. Every rewrite is grounded in it.
         params: The parameters the model declared, so lifted ones do not collide.
-
-    Returns:
-        A :class:`Hardening`. ``code`` is always a string of Python source, and
-        ``changed`` says whether anything happened.
 
     Never raises: a draft this pass cannot improve is a draft the gate will judge.
     """

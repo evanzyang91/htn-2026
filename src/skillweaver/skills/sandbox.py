@@ -1,55 +1,21 @@
 """``SkillRunner``: compiling and executing the code a model wrote for us.
 
-**This is not a security boundary.** It is a guard rail against a careless
-generation - a model that reaches for ``import os`` because that is how it has seen
-a thousand scripts start, or writes a ``while`` loop with no exit. A determined
-attacker who can choose the source text can get out of a restricted namespace in
-CPython; that is a known property of the language, not a bug to be fixed here. If
-skill code ever comes from somewhere we do not trust, this module is the wrong tool
-and a real sandbox - a separate process with an OS-level jail - is the right one.
-Against the failure mode we actually have, three cheap mechanisms are enough:
+**Not a security boundary** - a guard rail against a careless generation. A determined
+attacker who chooses the source text can get out of a restricted namespace in CPython;
+untrusted skill code needs a separate process with an OS-level jail instead.
 
-*A static scan before anything runs* (:func:`scan_code`). Imports, ``open``,
-``eval``, ``exec``, ``getattr``, private and dunder attributes, ``global``, and any
-free name that is not an allowlisted builtin are rejected with a
-:class:`~skillweaver.errors.SandboxViolation` that NAMES what was attempted and the
-line it was on, because that message goes straight back to the model that will
-rewrite the skill.
+Three mechanisms. A *static scan* before anything runs (:func:`scan_code`): imports,
+``open``, ``eval``, ``exec``, ``getattr``, private and dunder attributes, ``global`` and
+any free name that is not an allowlisted builtin are rejected with a SandboxViolation
+NAMING the attempt and its line, because that message goes back to the model that will
+rewrite it. A *namespace* holding only the skill's own definitions and
+:data:`SAFE_BUILTINS`. And *hard limits* (:class:`~skillweaver.skills.api.SkillLimits`).
 
-*A namespace with nothing in it.* Execution globals hold the executing skill's own
-definitions and :data:`SAFE_BUILTINS` - arithmetic, strings, sequences, comparison,
-a handful of exceptions. No module globals of this file, no ``__import__``, no file
-access. The static scan makes this belt-and-braces: nothing should ever reach it.
-
-*Hard limits* (:class:`~skillweaver.skills.api.SkillLimits`). A step budget charged
-by every action, a wall-clock timeout enforced by a line tracer so a ``while True``
-is interrupted rather than hung, and a composition-depth cap so two skills calling
-each other stop at depth three instead of exhausting the interpreter's stack.
-
-    The tracer's reach ends at Python. It fires on Python frames, so it bounds skill
-    code and nothing else: a call that has wedged inside a native library executes no
-    frames, fires no events, and the clock is simply never read again. That is not a
-    hole to be patched here - a limit enforced from an interpreter cannot interrupt a
-    call that has left it - so each native thing the sandbox reaches through bounds
-    its own work and reports failing to. See
-    :class:`~skillweaver.perception.ocr.OcrWorker`, which kills its process, and
-    :meth:`~skillweaver.skills.api.SkillAPI.observe`, which records the failure on the
-    ledger so this module does not then blame the skill for it.
-
-Everything else about a run is reporting. A failure of any kind comes back as
-``SkillResult(ok=False, error=..., trace=...)`` with the failing line and its source
-text, and every execution - nested calls included - is folded into the store's
-statistics through ``record_run``, so the library learns which skills are worth
-keeping simply by being used::
-
-    runner = SkillRunner(store)
-    ctx = runner.context(controller, perceiver, graph=graph, domain="example.com")
-    result = runner.run(store.get("pay_invoice", "example.com"), {"company": "Acme"}, ctx)
-    result.ok, result.steps, result.ms, result.trace
-
-Note on the tracer: installing it calls ``sys.settrace`` for the duration of a
-top-level run, so a debugger or ``coverage`` attached to the same thread does not see
-skill code. The previous trace function is restored afterwards.
+The wall-clock tracer's reach ends at Python: a call wedged inside a native library
+executes no frames, so the clock is never read again. Structural, not a hole to patch
+here - each native thing the sandbox reaches through bounds its own work and reports
+failing to. Installing the tracer calls ``sys.settrace`` for a top-level run, so a
+debugger on the same thread does not see skill code; the previous function is restored.
 """
 
 from __future__ import annotations
@@ -99,11 +65,9 @@ log = get_logger(__name__)
 NOT_THE_SKILL = "perception failed, not the skill: "
 """Opens the ``error`` of a run that failed while an observation was failing.
 
-A fixed prefix rather than a new field on
-:class:`~skillweaver.contracts.SkillResult`, which is shared surface. Everything that
-reads an error - a repair prompt, an admission report, a log line - gets the cause in
-the first six words, and a reader that only pattern-matches can test for this string.
-"""
+A fixed prefix rather than a new field on ``SkillResult``, which is shared surface.
+Everything that reads an error gets the cause in the first six words, and a reader that
+only pattern-matches can test for this string."""
 
 _SAFE_BUILTIN_NAMES = (
     # arithmetic and numbers
@@ -122,14 +86,12 @@ _SAFE_BUILTIN_NAMES = (
 )  # fmt: skip
 
 SAFE_BUILTINS: Mapping[str, Any] = {name: getattr(builtins, name) for name in _SAFE_BUILTIN_NAMES}
-"""The only builtins skill code can see, plus the ``True``/``False``/``None``
-keywords the compiler handles itself.
+"""The only builtins skill code can see, plus the ``True``/``False``/``None`` keywords
+the compiler handles itself.
 
-Chosen by asking what a short UI procedure genuinely needs: compute a number,
-compare it, slice a list of elements, format a string, raise or catch an ordinary
-error. Conspicuously absent are ``print`` (use ``ctx.log``, which lands in the
-trace), ``type``, ``object`` and ``super`` (each a step away from the class
-hierarchy), ``getattr``/``setattr``/``hasattr`` (attribute access by computed name
+Chosen by asking what a short UI procedure genuinely needs. Conspicuously absent are
+``print`` (use ``ctx.log``), ``type``, ``object`` and ``super`` (each a step from the
+class hierarchy), ``getattr``/``setattr``/``hasattr`` (attribute access by computed name
 would defeat the static scan) and everything touching files, imports or code."""
 
 BANNED_BUILTINS: Mapping[str, str] = {
@@ -167,13 +129,11 @@ Rejected with that phrasing so the repair prompt says *why*, not just *no*."""
 
 
 def _bound_names(tree: ast.AST) -> set[str]:
-    """Every name the source itself binds anywhere: module-level and nested defs,
-    classes, parameters, assignments, loop and ``with`` targets, comprehension
-    variables, ``except ... as``, and match patterns.
+    """Every name the source itself binds anywhere.
 
-    A deliberate over-approximation - it ignores scope, so a name bound in one
-    function counts as bound in another. Being too permissive here can only produce a
-    plain ``NameError`` at runtime, while being too strict would reject working code.
+    A deliberate over-approximation that ignores scope, so a name bound in one function
+    counts as bound in another: being too permissive here can only produce a plain
+    ``NameError`` at runtime, while being too strict would reject working code.
     """
     bound: set[str] = set()
     for node in ast.walk(tree):
@@ -205,8 +165,7 @@ def _reject(what: str, node: ast.AST) -> SandboxViolation:
 def scan_code(code: str, *, what: str = "skill code") -> ast.Module:
     """Parse ``code`` and reject everything skill code may not do, returning the tree.
 
-    Useful on its own: skill synthesis can scan a generated skill before storing it,
-    so a skill that could never run never enters the library.
+    Useful on its own: synthesis can scan a generated skill before storing it.
 
     Raises:
         SandboxViolation: naming the attempt and its line number.
@@ -284,19 +243,16 @@ def _skill_frames(exc: BaseException) -> list[traceback.FrameSummary]:
 
 
 class SkillRunner:
-    """A :class:`~skillweaver.contracts.SkillRunner`: compile a skill, execute it
-    against a :class:`~skillweaver.skills.api.SkillAPI`, report what happened.
+    """A SkillRunner: compile a skill, execute it against a SkillAPI, report what happened.
 
     Args:
-        store: Where skills are read from for ``ctx.call`` and where each run's
-            outcome is recorded. ``None`` runs skills that are not in a library yet -
-            what synthesis does while it is still repairing one - in which case
-            ``ctx.call`` raises ``SkillNotFound`` and nothing is recorded.
+        store: Where skills are read from for ``ctx.call`` and where each run's outcome
+            is recorded. ``None`` runs skills not in a library yet - what synthesis does
+            while repairing one - so ``ctx.call`` raises and nothing is recorded.
         limits: Defaults for every context this runner builds.
 
-    One runner is reusable across runs and caches compiled code objects. Each
-    execution still gets a fresh globals dict, so a skill cannot leave state behind
-    for the next run of itself.
+    Reusable across runs and caches compiled code objects. Each execution still gets a
+    fresh globals dict, so a skill cannot leave state behind for the next run of itself.
     """
 
     __slots__ = ("_cache", "_limits", "_store")
@@ -345,24 +301,14 @@ class SkillRunner:
     def run(self, skill: Skill, args: Mapping[str, Any], ctx: SkillContext) -> SkillResult:
         """Execute ``skill.code`` with ``args``, and its verifier when it has one.
 
-        Every skill-level failure - a sandbox violation, a failed ``ctx.expect``, a
-        limit, an exception, a verifier saying no - is REPORTED in the result rather
-        than raised, because the caller is usually a planner that wants to try
-        something else and a synthesizer that wants the trace.
+        Never raises for a failing skill: every outcome, including a SandboxViolation or a
+        blown limit, comes back as a :class:`~skillweaver.contracts.SkillResult` carrying
+        the error, the failing line and the trace. The exception is an agent-level
+        BudgetExceeded, which is re-raised because it is about the RUN, not the skill.
 
-        ``steps`` and ``ms`` cover nested calls too, and ``trace`` is this skill's
-        slice of the run: its log lines, its actions and, on failure, the skill
-        frames with their source.
-
-        A run the EYES broke during is reported differently: its ``error`` opens with
-        :data:`NOT_THE_SKILL` and names the perception failure, because "the OCR read
-        was abandoned" and "this skill does not work" are different pieces of news and
-        only one of them is about the skill. Such a run is also kept out of the
-        library's statistics entirely - see :meth:`_execute`.
-
-        Raises:
-            BudgetExceeded: the one exception allowed out, so an exhausted agent run
-                stops instead of starting the next skill.
+        A run whose observation failed is reported with the :data:`NOT_THE_SKILL` prefix
+        and kept out of the skill's statistics: a skill whose eyes broke has not failed
+        its task.
         """
         ledger = getattr(ctx, "ledger", None)
         if not isinstance(ledger, RunLedger):
@@ -489,11 +435,9 @@ class SkillRunner:
         return run(ctx, **dict(args))
 
     def _verify(self, skill: Skill, value: Any, ctx: SkillContext) -> None:
-        """Run ``skill.verifier_code`` when it has one.
-
-        A verifier saying no is an ``ExpectationFailed``, the same clean failure as
-        ``ctx.expect``: the code ran, the world did not end up as promised.
-        """
+        """Run ``skill.verifier_code`` when it has one. A verifier saying no is an
+        ``ExpectationFailed``, the same clean failure as ``ctx.expect``: the code ran, the
+        world did not end up as promised."""
         if not skill.verifier_code:
             return
         namespace = self._namespace(skill, skill.verifier_code, suffix=" verify")
@@ -554,18 +498,15 @@ def _deadline_tracer(ledger: RunLedger) -> Any:
     """A ``sys.settrace`` function that interrupts skill code once the ledger's
     wall-clock limit is spent.
 
-    This is what makes the timeout real FOR SKILL CODE: a budget checked only when a
-    skill acts cannot stop ``while True: pass``, and a watchdog thread cannot
-    interrupt CPython bytecode. The clock is read every ``_TRACE_STRIDE`` events
-    rather than every one, which keeps a tight loop cheap while still noticing within
-    microseconds of work.
+    What makes the timeout real FOR SKILL CODE: a budget checked only when a skill acts
+    cannot stop ``while True: pass``, and a watchdog thread cannot interrupt CPython
+    bytecode. The clock is read every ``_TRACE_STRIDE`` events, which keeps a tight loop
+    cheap while still noticing within microseconds of work.
 
-    It is also the whole of what this mechanism can do, and the limit is structural.
-    Tracing is driven by the interpreter's own frame events, so a thread that has
-    entered a native call produces none until it comes back: zero events, zero clock
-    reads, no limit. A 12-task evaluation once sat at 98.8% CPU for 36 minutes inside
-    ONNX Runtime's thread pool with this tracer installed and never fired once. The
-    bound on such a call has to live where the call is made, not here.
+    It is also the whole of what this can do. Tracing is driven by the interpreter's own
+    frame events, so a thread inside a native call produces none: a 12-task evaluation
+    once sat at 98.8% CPU for 36 minutes inside ONNX Runtime's thread pool with this
+    installed and never fired once. The bound on such a call lives where the call is made.
     """
     counter = 0
 
