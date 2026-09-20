@@ -25,7 +25,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from skillweaver.agent.critic import TieredCritic
+from skillweaver.agent.critic import CriticVerdict, TieredCritic
 from skillweaver.contracts import (
     ACTION_TYPES,
     Action,
@@ -594,6 +594,8 @@ class _Run:
     at: int = 0
     strays: int = 0
     history: list[str] = field(default_factory=list)
+    # What was literally DONE, with no verdict attached: what a final judge is shown.
+    actions: list[str] = field(default_factory=list)
     rejection: str | None = None
     steps: int = 0
     moves: int = 0
@@ -656,6 +658,9 @@ class Explorer:
         self._llm = llm
         self._perceiver = perceiver
         self._critic: Critic = critic if critic is not None else TieredCritic(llm)
+        # The free tiers alone, for the one move that has nothing else to be judged on:
+        # see _judge_wait.
+        self._wait_critic = TieredCritic(None)
         self._graph = graph
         self._retriever = retriever
         self._runner = runner if runner is not None else SkillRunner(None)
@@ -683,6 +688,11 @@ class Explorer:
         self._recorder.start(task.text, task.domain)
         self._go_to_start(task, controller)
         observation = self._perceiver.observe(controller)
+        # A critic that judges from the page's own text is told where the run began;
+        # see agent/critic_final.py. The default critic has no such method.
+        open_run = getattr(self._critic, "open_run", None)
+        if callable(open_run):
+            open_run(observation)
         run = _Run(
             task=task,
             spend=spend,
@@ -765,6 +775,12 @@ class Explorer:
                 f"{run.moves}. {move.summary} -> "
                 f"{'ok' if verdict.ok else 'FAILED'}: {_short(verdict.reason)}"
             )
+            literal = (
+                move.summary
+                if move.action is not None
+                else "; ".join(describe_action(step.action) for step in performed)
+            )
+            run.actions.append(f"{run.moves}. {literal}")
             if not verdict.ok:
                 run.memory.remember(
                     before.fingerprint, move.signature, move.summary, verdict.reason
@@ -785,10 +801,19 @@ class Explorer:
 
     def _settle(self, task: TaskSpec, move: Move, run: _Run) -> None:
         """Test the model's claim that the task is finished, and believe only the critic."""
+        brief = getattr(self._critic, "brief_final", None)
+        if callable(brief):
+            brief(tuple(run.actions))
         verdict = self._judge(task.text, run.first, run.current, move, run)
         if verdict.ok:
             run.ok, run.verdict, run.stopped_by = True, verdict, "solved"
-            log.info("explore.solved", task=task.text, steps=run.steps, moves=run.moves)
+            log.info(
+                "explore.solved",
+                task=task.text,
+                steps=run.steps,
+                moves=run.moves,
+                judged_by=getattr(verdict, "policy", "") or verdict.source,
+            )
             return
         run.memory.remember(
             run.current.fingerprint,
@@ -1208,10 +1233,50 @@ class Explorer:
         ``per_move`` is the ONLY door to ``move_critic``: a ``done`` claim never passes
         it, so the run's final verdict is the full critic's under every configuration.
         """
+        if per_move and self._move_critic is None and self._policy_waited(move):
+            return self._judge_wait(goal, before, after, move)
         critic = self._move_critic if per_move and self._move_critic is not None else self._critic
         verdict = critic.judge(goal, before, after, move.expect or None)
         self._charge(run, at_least=1 if getattr(verdict, "escalated", False) else 0)
         return verdict
+
+    def _policy_waited(self, move: Move) -> bool:
+        """Whether ``move`` is an acting policy letting time pass, and nothing else.
+
+        The default explorer is excluded on purpose: its model WRITES an expectation for
+        its wait and its prompt is calibrated against the full critic's answer to it.
+        """
+        return self._policy is not None and not move.done and isinstance(move.action, Wait)
+
+    def _judge_wait(
+        self, goal: str, before: Observation, after: Observation, move: Move
+    ) -> Verdict:
+        """A policy's bare wait, judged by the free checks alone - never by the model.
+
+        A wait claims nothing about the task, so the only honest question is whether the
+        screen moved while time passed, and the vetoes answer that for free. The full
+        critic answered the same thing for one escalated call: measured on live splitkb
+        (2026-09-20, slow moves), the ``wait 150ms`` fresh look a ``DONE`` is answered
+        with cost 6.3s and 5.6s of vision model to be told "the pending add-to-cart
+        completed" - on the way to a ``done`` claim the full critic then judges anyway,
+        on the very screen this wait produced. An unchanged or error screen still fails
+        exactly as before, by the same checks.
+        """
+        verdict = self._wait_critic.judge(goal, before, after, move.expect or None)
+        if verdict.policy != "inconclusive-no-model":
+            return verdict
+        return CriticVerdict(
+            ok=True,
+            reason=(
+                "the screen changed while the policy waited and shows no error (a wait "
+                "claims nothing about the task, so nothing more was judged)"
+            ),
+            confidence=1.0,
+            source="programmatic",
+            escalated=False,
+            policy="wait-changed",
+            checks=verdict.checks,
+        )
 
     def _write_down(
         self,

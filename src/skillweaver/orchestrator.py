@@ -1544,6 +1544,7 @@ def build_agent(
     environment: EnvironmentFor | None = None,
     policy: ActingPolicy | None = None,
     move_critic: Critic | None = None,
+    done_critic: Callable[[TieredCritic | None, bool], Critic] | None = None,
     budget: Budget | None = None,
     compose: bool = True,
     learn: bool = True,
@@ -1599,7 +1600,7 @@ def build_agent(
         retriever=retriever,
         graph=graph,
         runner=runner,
-        critic=_warm_critic(llm, recalled),
+        critic=_warm_critic(llm, recalled, done_critic),
         controller=controller,
         perceiver=perceiver,
         composer=Composer(llm, store, graph=graph) if compose else None,
@@ -1609,7 +1610,7 @@ def build_agent(
     explorer = Explorer(
         llm,
         perceiver,
-        critic=TieredCritic(llm),
+        critic=done_critic(None, False) if done_critic is not None else TieredCritic(llm),
         graph=graph,
         recorder=recorder,
         retriever=retriever,
@@ -1649,7 +1650,11 @@ def build_agent(
     )
 
 
-def _warm_critic(llm: LLMClient, recalled: Recollection) -> TieredCritic:
+def _warm_critic(
+    llm: LLMClient,
+    recalled: Recollection,
+    done_critic: Callable[[TieredCritic | None, bool], Critic] | None = None,
+) -> Critic:
     """How much authority the recalled end screen gets - the difference between a library
     that improves and one that eats itself.
 
@@ -1662,10 +1667,19 @@ def _warm_critic(llm: LLMClient, recalled: Recollection) -> TieredCritic:
 
     Either way the vetoes still run (``state_changed``, ``no_error_state``) and a missed
     corroboration escalates to a paid model call. A skill's own say-so is never enough.
+
+    With a ``done_critic`` (:func:`_open_done_critic`, the Jev path) the same three roles
+    are built with NO model behind them and handed over as its free checks: the end screen
+    is then read AT REST, the checks decide what they can, and what they cannot goes to
+    Jev - never to Claude. That is the fix for the Walmart replays ``AGENTS.md`` records,
+    judged on the spinner a code-speed skill had just left.
     """
+    model = None if done_critic is not None else llm
     if recalled.self_checking:
-        return TieredCritic(llm, corroborating_state=recalled.state)
-    return TieredCritic(llm, expected_state=recalled.state)
+        free = TieredCritic(model, corroborating_state=recalled.state)
+    else:
+        free = TieredCritic(model, expected_state=recalled.state)
+    return done_critic(free, True) if done_critic is not None else free
 
 
 def build_retriever(store: SkillStore, config: Settings | None = None) -> SkillRetriever:
@@ -1727,13 +1741,15 @@ def build_workbench(config: Settings | None = None) -> Workbench:
         try:
             graph.load(task.domain)
             llm = _open_model(resolved)
+            policy = _open_policy(resolved, perceiver, llm)
             yield build_agent(
                 task,
                 controller=controller,
                 perceiver=perceiver,
                 llm=llm,
-                policy=_open_policy(resolved, perceiver, llm),
+                policy=policy,
                 move_critic=_open_move_critic(resolved, perceiver),
+                done_critic=_open_done_critic(resolved, perceiver, controller, policy),
                 store=store,
                 retriever=build_retriever(store),
                 graph=graph,
@@ -1919,6 +1935,35 @@ def _open_move_critic(config: Settings, perceiver: Perceiver) -> Critic | None:
         return None
     log.info("agent.move_critic", kind="literal")
     return LiteralMoveCritic(perceiver)
+
+
+def _open_done_critic(
+    config: Settings, perceiver: Perceiver, controller: Controller, policy: Any | None
+) -> Callable[[TieredCritic | None, bool], Critic] | None:
+    """Who judges that a TASK is complete on the Jev path, or ``None`` for ``TieredCritic``.
+
+    ``--policy jev`` over a ``DomPerceiver`` only, and only while
+    ``agent.critic_final.ENV_SWITCH`` leaves it on (the default): Jev answers one question
+    over the end page's DOM text and Claude is never asked - cold ``done`` claim and warm
+    replay alike. Every other path returns ``None`` here and is exactly what it was. The
+    result is a factory because the two callers want different free checks and only the
+    warm one re-reads the screen at rest; see :func:`_warm_critic`.
+    """
+    if config.policy != "jev" or policy is None:
+        return None
+    from skillweaver.agent.critic_final import JevDoneCritic, enabled
+    from skillweaver.perception.dom import DomPerceiver
+
+    judge = getattr(policy, "_policy", None)
+    if not enabled() or not isinstance(perceiver, DomPerceiver) or not hasattr(judge, "judge_done"):
+        return None
+    log.info("agent.done_critic", judge=judge.name(), claude=False)
+
+    def build(free: TieredCritic | None, at_rest: bool) -> Critic:
+        rest = (perceiver, controller) if at_rest else None
+        return JevDoneCritic(judge, perceiver, free=free, rest=rest)
+
+    return build
 
 
 def budget_from(
