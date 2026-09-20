@@ -1,102 +1,24 @@
 """Build the one-file dashboard: what the agent has learned, as a page you can open.
 
-:func:`build_dashboard` reads a skillweaver data directory and writes a SINGLE HTML
-file that opens from the filesystem with no server and no network. Everything is
-inlined - the stylesheet, the few lines of script, and every screenshot as a
-``data:`` URI - because the thing a judge or a teammate actually does with this is
-open it, mail it, or drop it on a USB stick.
+``build_dashboard`` reads a skillweaver data directory and writes ONE HTML file that
+opens from the filesystem with no server and no network - stylesheet, script and every
+screenshot as a ``data:`` URI, all inlined. Nothing in the output may reference the
+network, which is why inline SVG carries no ``xmlns`` (its value is an ``http://`` URL,
+and the HTML parser namespaces the element anyway) and why every URL read out of the
+data is shown with its scheme stripped.
 
-What it reads, and what it shows::
+Six panels over ``<data>/{skills,graphs,trajectories,eval}``: cold-versus-warm, the
+library, the site graph drawn, a run as a filmstrip, what each skill DOES step by step
+(``read_skill_steps`` reads the stored source with ``ast`` and correlates it with its
+recording through ``Skill.provenance.trajectory_id``), and what the library has SAVED.
+Every panel is independent and DEFENSIVE: missing, empty or malformed input makes that
+panel say what is missing, never raise and never render an empty frame.
 
-    <data>/skills/         FileSkillStore      panel 2: the library growing
-    <data>/graphs/         JSONGraphStore      panel 3: the site graph, drawn
-    <data>/trajectories/   TrajectoryFileStore panel 4: a run, as a filmstrip
-    <data>/eval/*.json     see below           panel 1: cold versus warm
-
-    skills + trajectories                      panel 5: what each skill DOES,
-                                               step by step, with the screens it
-                                               was learned on beside the steps
-                                               they match
-    <data>/eval/*.json                         panel 6: what the library has
-                                               SAVED, in tokens and in dollars
-
-Panels 5 and 6 read nothing panels 1 to 4 do not; they answer the two questions the
-first four leave open. Panel 5 reads a skill's stored SOURCE with :mod:`ast` and
-describes it (:func:`read_skill_steps`), correlating it with its recording through
-``Skill.provenance.trajectory_id``, which is the trajectory store's ``run_id``. Panel
-6 is arithmetic over the same evaluation report panel 1 charts, and every rule it
-applies is printed on the page beside the number - see :func:`build_savings_panel`.
-
-Every panel is independent and every panel is defensive. A missing, empty or
-malformed input makes that panel say plainly what is missing; it never raises and
-never renders an empty frame. This module is written before the evaluation harness
-exists, so it has to behave well against data that is not there yet.
-
-The evaluation metrics format
------------------------------
-
-The eval harness is a separate piece of work and does not exist yet, so this module
-does not import it and writes nothing under ``skillweaver.eval``. Instead it defines
-the shape it needs here, as :class:`EvalReport` / :class:`EvalTask` / :class:`EvalRun`,
-and reads it out of ``<data>/eval/*.json`` defensively. **The harness author should
-write this shape**; deviating is not fatal (unknown keys are ignored and missing
-optional keys default), but a file that cannot be understood at all shows the panel's
-empty state rather than failing the build.
-
-One JSON object per file, one object per evaluated task, one object per run::
-
-    {
-      "schema_version": 1,
-      "suite": "sandbox-site",                  optional, free text
-      "generated_at": "2026-09-19T12:00:00Z",   optional, ISO-8601
-      "tasks": [
-        {
-          "task_id": "find_invoice",            required, stable across runs
-          "task_text": "Find Acme's invoice",   optional, shown as the row title
-          "domain": "sandbox.test",             optional
-          "runs": [
-            {
-              "attempt": 1,                     optional; defaults to list position + 1
-              "ok": true,                       optional, defaults to false
-              "wall_ms": 48120.0,               required for the time chart
-              "llm_calls": 23,                  required for the model-call chart
-              "steps": 14,                      optional
-              "skill_used": null,               optional; null means solved by exploring
-              "usd": 0.42,                      optional
-              "input_tokens": 19200,            optional; null means UNMEASURED
-              "output_tokens": 2480,            optional; null means UNMEASURED
-              "run_id": "a1b2c3d4",             optional; the Trajectory.run_id
-              "started_at": "2026-09-19T11:58:00Z"   optional, ISO-8601
-            },
-            {"attempt": 2, "ok": true, "wall_ms": 6210.0, "llm_calls": 2,
-             "skill_used": "search_invoice"}
-          ]
-        }
-      ]
-    }
-
-``input_tokens`` and ``output_tokens`` are ``null`` when the harness had no usage
-meter attached, which is NOT the same as zero and is never rendered as a saving of
-nothing; see :meth:`EvalRun.tokens`.
-
-The run with the lowest ``attempt`` is the COLD run - the first encounter, solved by
-trial and error. Every later run is WARM, and the panel charts the cold run against
-the mean of the warm ones, in wall-clock milliseconds and in model calls. A task with
-only a cold run is listed as awaiting its warm run rather than charted. A top-level
-JSON *list* is also accepted and treated as the ``tasks`` array, since that is the
-other obvious way to write this file.
-
-A note on self-containment
---------------------------
-
-Nothing in the output may reference the network, so: no external stylesheet, no
-external script, no web font, no linked image. Inline SVG here deliberately carries
-no ``xmlns`` attribute - the HTML parser puts it in the SVG namespace on its own, and
-the attribute's value is an ``http://`` URL that has no business in a file that
-claims to need no network. URLs read out of the data (a state's ``url_pattern``, an
-observation's ``url``) are displayed with their scheme stripped, as
-``sandbox.test/invoices``: shorter to read, and it keeps the page free of anything
-that looks like a live link.
+The eval harness is a separate piece of work, so this module imports nothing from it and
+defines the shape it reads instead - ``EvalReport`` / ``EvalTask`` / ``EvalRun``, whose
+field names are the JSON keys, out of ``<data>/eval/*.json``. Unknown keys are ignored
+and optional ones default. The run with the LOWEST ``attempt`` is the cold run and every
+later one is warm; a top-level JSON list is accepted as the ``tasks`` array.
 """
 
 from __future__ import annotations
@@ -149,34 +71,22 @@ TEMPLATE_DIR = HERE / "templates"
 STATIC_DIR = HERE / "static"
 
 MAX_FILMSTRIP_STEPS = 40
-"""How many steps of a run the filmstrip renders before it says it truncated. A page
-is a page; forty screenshots is already more than anybody scrolls."""
+"""Forty screenshots is already more than anybody scrolls; beyond it the strip says it
+truncated."""
 
 THUMBNAIL_WIDTH = 520
-"""Screenshots are downscaled to at most this many pixels wide before they are
-base64-encoded. A filmstrip of full-resolution frames is tens of megabytes."""
-
-
-# --------------------------------------------------------------------------------------
-# The evaluation metrics format (defined here; see the module docstring)
-# --------------------------------------------------------------------------------------
+"""Screenshots downscale to this before base64: a strip of full-resolution frames is tens
+of megabytes."""
 
 
 @dataclass(frozen=True, slots=True)
 class EvalRun:
-    """One measured attempt at one task.
+    """One measured attempt at one task. ``attempt`` counts from ``1`` and the lowest is
+    the cold run; ``skill_used`` is ``None`` when exploring solved it.
 
-    ``wall_ms`` is wall-clock milliseconds end to end and ``llm_calls`` the number of
-    model calls the run made - the two axes the cold-versus-warm panel charts.
-    ``attempt`` counts from ``1``; the lowest attempt of a task is its cold run.
-    ``skill_used`` names the stored skill that carried the run, or ``None`` when the
-    run solved the task by exploring.
-
-    ``usd``, ``input_tokens`` and ``output_tokens`` are what the run SPENT, and every
-    one of them is ``None`` when nobody was measuring rather than ``0``. The harness
-    writes ``None`` for the token fields when no usage meter was attached to the model
-    client (see ``RunRecord`` in :mod:`skillweaver.eval.harness`), and the
-    tokens-saved panel must never render an absent measurement as a saving of nothing.
+    ``usd``, ``input_tokens`` and ``output_tokens`` are ``None`` when nobody was measuring
+    rather than ``0``, and the savings panel must never render an absent measurement as a
+    saving of nothing.
     """
 
     attempt: int
@@ -193,13 +103,8 @@ class EvalRun:
 
     @property
     def tokens(self) -> int | None:
-        """Input plus output tokens, or ``None`` when neither was measured.
-
-        ``None`` propagates on purpose: a run with no meter has an unknown token cost,
-        and a subtraction against an unknown is not zero. A half-measured run - one
-        side present, the other absent - counts the side that is there, because that
-        is still a real number the harness recorded.
-        """
+        """Input plus output, or ``None`` when NEITHER was measured - a subtraction against
+        an unknown is not zero. A half-measured run counts the side that is there."""
         if self.input_tokens is None and self.output_tokens is None:
             return None
         return (self.input_tokens or 0) + (self.output_tokens or 0)
@@ -216,12 +121,12 @@ class EvalTask:
 
     @property
     def cold(self) -> EvalRun | None:
-        """The first encounter: the run with the lowest ``attempt``, or ``None``."""
+        """The first encounter: the run with the lowest ``attempt``."""
         return min(self.runs, key=lambda r: r.attempt, default=None)
 
     @property
     def warm(self) -> tuple[EvalRun, ...]:
-        """Every run after the cold one, in attempt order. Empty when there is none."""
+        """Every run after the cold one, in attempt order."""
         cold = self.cold
         if cold is None:
             return ()
@@ -238,33 +143,23 @@ class EvalReport:
     source: str = ""
 
 
-# --------------------------------------------------------------------------------------
-# Small conversions, all of them total: they answer for any input rather than raising
-# --------------------------------------------------------------------------------------
-
+# Conversions, all of them total: they answer for any input rather than raising.
 _SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _ANY_SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://")
 _UNSAFE_KEY = re.compile(r"[^A-Za-z0-9_-]+")
 
 
 def strip_scheme(url: str | None) -> str:
-    """``https://sandbox.test/x`` as ``sandbox.test/x``; ``None`` as ``""``.
-
-    Display only. See the module docstring: a dashboard that needs no network should
-    not be sprinkled with things that look like live links.
-    """
+    """``https://sandbox.test/x`` as ``sandbox.test/x``. Display only: a page needing no
+    network should not be sprinkled with things that look like live links."""
     if not url:
         return ""
     return _SCHEME.sub("", url).rstrip("/") or url
 
 
 def dom_key(value: str, prefix: str = "k") -> str:
-    """A short, stable, HTML-id-safe key for an arbitrary string.
-
-    Fingerprint values are hashes and edge keys are tuples of actions; neither is
-    safe to drop into an ``id`` or a CSS selector, and both need to survive the trip
-    into the page's embedded JSON unchanged.
-    """
+    """A short, stable, HTML-id-safe key: a fingerprint hash or an action tuple is safe in
+    neither an ``id`` nor a CSS selector, and both must survive the embedded JSON."""
     safe = _UNSAFE_KEY.sub("", value)[-24:]
     return f"{prefix}{safe or 'x'}"
 
@@ -288,12 +183,8 @@ def _integer(raw: Any, default: int = 0) -> int:
 
 
 def _optional_int(raw: Any) -> int | None:
-    """``raw`` as an int, or ``None`` for anything that is not a number.
-
-    The distinction this function exists to keep: a missing, null or unparseable
-    measurement is ``None``, which the savings panel prints as "not measured"; only a
-    real ``0`` in the file means zero.
-    """
+    """``raw`` as an int, or ``None``. The distinction this exists to keep: a missing or
+    unparseable measurement is "not measured", and only a real ``0`` means zero."""
     if isinstance(raw, bool) or not isinstance(raw, int | float):
         return None
     return None if not math.isfinite(raw) else int(raw)
@@ -350,28 +241,22 @@ def human_ago(moment: datetime | None, now: datetime) -> str:
 
 
 def percent(part: float, whole: float) -> float:
-    """``part`` as a percentage of ``whole``, clamped to ``0..100``; ``0`` when
-    ``whole`` is zero. Bar widths go through here so no bar can ever overflow its
-    track, whatever the data says."""
+    """Clamped to ``0..100``, so no bar overflows its track whatever the data says."""
     if whole <= 0:
         return 0.0
     return max(0.0, min(100.0, part / whole * 100.0))
 
 
 def success_rate(successes: int, attempts: int) -> float | None:
-    """``successes / attempts`` in ``0.0..1.0``, or ``None`` when never attempted -
-    which is a different thing from zero and is shown differently."""
+    """``0.0..1.0``, or ``None`` when never attempted - a different thing from zero."""
     if attempts <= 0:
         return None
     return max(0.0, min(1.0, successes / attempts))
 
 
 def data_uri(png: bytes, *, max_width: int = THUMBNAIL_WIDTH) -> str:
-    """PNG bytes as an inline ``data:`` URI, downscaled to ``max_width`` if wider.
-
-    Falls back to the original bytes if Pillow cannot read them, so a screenshot the
-    decoder dislikes costs file size rather than the whole panel.
-    """
+    """PNG bytes as an inline ``data:`` URI, downscaled if wider. Falls back to the original
+    bytes when Pillow cannot read them: file size beats losing the panel."""
     if not png:
         return ""
     shrunk = png
@@ -431,11 +316,6 @@ def actions_summary(actions: Sequence[Action]) -> str:
     return " -> ".join(parts)
 
 
-# --------------------------------------------------------------------------------------
-# Reading the data directory. Each reader returns (value, problem): never raises.
-# --------------------------------------------------------------------------------------
-
-
 def _eval_run_from(raw: Any, position: int) -> EvalRun | None:
     if not isinstance(raw, Mapping):
         return None
@@ -479,14 +359,9 @@ def _eval_task_from(raw: Any) -> EvalTask | None:
 
 
 def read_eval_reports(eval_dir: Path) -> tuple[list[EvalReport], list[str]]:
-    """Every readable ``<eval_dir>/*.json``, plus a note per file that was not.
-
-    Nothing in here raises. A missing directory yields ``([], [])``; a file that is
-    not JSON, is not an object or a list, or holds no recognizable task yields a
-    problem string naming the file, and the panel shows its empty state with that
-    note attached. This is the whole point: the harness that writes these files has
-    not been built yet.
-    """
+    """Every readable ``<eval_dir>/*.json``, plus a note per file that was not. Never raises:
+    a missing directory is ``([], [])``, and an unreadable file becomes a problem string
+    the panel's empty state carries."""
     reports: list[EvalReport] = []
     problems: list[str] = []
     if not eval_dir.is_dir():
@@ -520,11 +395,8 @@ def read_eval_reports(eval_dir: Path) -> tuple[list[EvalReport], list[str]]:
 
 
 def read_skills(skills_dir: Path) -> tuple[list[Skill], str | None]:
-    """Every stored skill, latest version first-class, newest-learned first.
-
-    Demoted skills are included - a library that quietly hides its retired skills is
-    telling half the story - and marked as such by the caller.
-    """
+    """Every stored skill, latest version, newest-learned first. Demoted ones are INCLUDED
+    and marked by the caller: a library that hides its retired skills tells half the story."""
     if not skills_dir.is_dir():
         return [], None
     try:
@@ -542,10 +414,8 @@ GraphTriple = tuple[str, list[UIState], list[Transition]]
 
 
 def read_graphs(graphs_dir: Path) -> tuple[list[GraphTriple], str | None]:
-    """One ``(domain, states, transitions)`` per stored domain, alphabetically.
-
-    A domain whose file is unreadable is skipped rather than failing the panel.
-    """
+    """One ``(domain, states, transitions)`` per stored domain, alphabetically; an unreadable
+    one is skipped rather than failing the panel."""
     if not graphs_dir.is_dir():
         return [], None
     try:
@@ -568,18 +438,10 @@ def read_graphs(graphs_dir: Path) -> tuple[list[GraphTriple], str | None]:
     return found, problem
 
 
-# --------------------------------------------------------------------------------------
-# Panel 1: cold versus warm
-# --------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class SpeedupRow:
-    """One task's first encounter measured against every later one.
-
-    Widths are percentages of the widest bar in the whole panel, so the eye compares
-    tasks against each other as well as cold against warm.
-    """
+    """One task's first encounter against every later one. Widths are percentages of the
+    widest bar in the WHOLE panel, so tasks compare against each other too."""
 
     task_id: str
     task_text: str
@@ -634,13 +496,9 @@ def _mean(values: Iterable[float]) -> float:
 
 
 def build_speedup_panel(reports: Sequence[EvalReport], problems: Sequence[str]) -> SpeedupPanel:
-    """Fold every report's tasks into one chartable panel.
-
-    Warm numbers are the mean over the task's SUCCESSFUL warm runs; a warm run that
-    failed took whatever time it took on the way to being wrong and would flatter or
-    smear the comparison either way. When no warm run succeeded, every warm run is
-    used and the row says so through ``warm_ok``.
-    """
+    """Fold every report's tasks into one chartable panel. Warm numbers are the mean over
+    SUCCESSFUL warm runs - a failed one would flatter or smear the comparison either way -
+    and when none succeeded every run is used and ``warm_ok`` says so."""
     notes = tuple(problems)
     tasks = [task for report in reports for task in report.tasks]
     if not tasks:
@@ -718,11 +576,6 @@ def dataclass_replace_widths(row: SpeedupRow, widest_ms: float, widest_calls: fl
         cold_calls_width=percent(row.cold_calls, widest_calls),
         warm_calls_width=percent(row.warm_calls, widest_calls),
     )
-
-
-# --------------------------------------------------------------------------------------
-# Panel 2: the skill library
-# --------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -803,11 +656,8 @@ def _skill_params(raw: Mapping[str, Any]) -> tuple[SkillParam, ...]:
 def _timeline(
     cards: Sequence[SkillCard], width: float, height: float
 ) -> tuple[tuple[TimelinePoint, ...], str, str, str]:
-    """The cumulative count-over-time curve, as points plus an area and a line path.
-
-    Returns empty paths unless the provenance timestamps actually support a curve:
-    at least two skills, spanning at least two distinct moments.
-    """
+    """The cumulative count-over-time curve. Empty paths unless the timestamps support one:
+    at least two skills over at least two distinct moments."""
     moments = sorted(c.learned_at for c in cards if c.learned_at is not None)
     if len(moments) < 2 or moments[0] == moments[-1]:
         return (), "", "", ""
@@ -890,10 +740,6 @@ def build_skill_panel(skills: Sequence[Skill], note: str | None, now: datetime) 
         note=note or "",
     )
 
-
-# --------------------------------------------------------------------------------------
-# Panel 3: the site graph, drawn
-# --------------------------------------------------------------------------------------
 
 NODE_W = 176.0
 NODE_H = 58.0
@@ -994,13 +840,9 @@ SUB_CHAR = 6.3
 
 
 def fit(text: str, available: float, char_width: float) -> str:
-    """``text`` shortened with an ellipsis until it fits ``available`` pixels.
-
-    SVG text does not wrap and does not clip to its parent, so a label that is too
-    long simply spills out of the node box and over whatever is next to it. Measuring
-    properly needs a font engine; a per-font average character width is accurate
-    enough to keep text inside a box whose width we chose ourselves.
-    """
+    """Ellipsized until it fits: SVG text neither wraps nor clips to its parent, so a long
+    label spills over whatever is beside it. A per-font average character width is enough
+    for a box whose width we chose ourselves."""
     limit = max(4, int(available // char_width))
     if len(text) <= limit:
         return text
@@ -1008,13 +850,9 @@ def fit(text: str, available: float, char_width: float) -> str:
 
 
 def _separate_labels(edges: list[GraphEdge]) -> list[GraphEdge]:
-    """Nudge edge labels apart so two of them never print on top of each other.
-
-    Bezier midpoints collide whenever two edges leave the same node at similar
-    angles, and two percentages stacked in the same 18 pixels are unreadable - which
-    is exactly the number this panel exists to show. Each label keeps its x and moves
-    only in y, alternately down then up, to the nearest free slot.
-    """
+    """Nudge edge labels apart: bezier midpoints collide whenever two edges leave a node at
+    similar angles, and stacked percentages are exactly the number this panel exists to
+    show. Each keeps its x and moves in y alone, alternately down then up."""
     from dataclasses import replace
 
     placed: list[tuple[float, float, float]] = []  # x centre, half width, y centre
@@ -1041,11 +879,8 @@ def _cubic(
     c2: tuple[float, float],
     p3: tuple[float, float],
 ) -> tuple[str, float, float]:
-    """A cubic bezier as ``(path, mid_x, mid_y)``.
-
-    The midpoint is the curve at ``t=0.5``, which is where an edge label belongs:
-    the average of the four endpoints would sit off the curve on anything bowed.
-    """
+    """A cubic bezier as ``(path, mid_x, mid_y)``, the midpoint taken at ``t=0.5``: the
+    average of the four endpoints sits OFF the curve on anything bowed."""
     path = (
         f"M {p0[0]:.1f},{p0[1]:.1f} C {c1[0]:.1f},{c1[1]:.1f} "
         f"{c2[0]:.1f},{c2[1]:.1f} {p3[0]:.1f},{p3[1]:.1f}"
@@ -1058,15 +893,12 @@ def _cubic(
 def _layer_nodes(
     ids: Sequence[str], edges: Sequence[tuple[str, str]], order: Mapping[str, int]
 ) -> dict[str, int]:
-    """Assign each node a column by breadth-first distance from the entry states.
+    """A column per node, by breadth-first distance from the entry states.
 
-    Breadth-first rather than longest-path on purpose: a site graph has cycles in it
-    (every "back to the list" edge is one), and longest-path layering does not
-    terminate on a cycle without extra machinery. BFS depth is defined for every
-    graph, is stable under insertion order because the frontier is seeded in
-    ``order``, and puts each screen as close to the entry as it really is - which is
-    the thing a viewer is reading off the picture.
-    """
+    BFS and not longest-path: a site graph has cycles (every "back to the list" edge), and
+    longest-path layering does not terminate on one. BFS depth is defined for every graph,
+    stable under insertion order because the frontier is seeded in ``order``, and puts each
+    screen as close to the entry as it really is."""
     outgoing: dict[str, list[str]] = {node: [] for node in ids}
     indegree = dict.fromkeys(ids, 0)
     for src, dst in edges:
@@ -1234,9 +1066,8 @@ def _build_graph_panel(
         )
     )
 
-    # A bezier stays inside the hull of its control points, so sizing the canvas to
-    # every point we drew guarantees nothing - a bowed back-edge least of all - is
-    # clipped, whatever shape the graph turns out to be.
+    # A bezier stays inside the hull of its control points, so sizing to every point
+    # drawn guarantees nothing is clipped - a bowed back-edge least of all.
     margin = 12.0
     min_x = min((x for x, _ in extents), default=0.0) - margin
     min_y = min((y for _, y in extents), default=0.0) - margin
@@ -1268,13 +1099,9 @@ def _build_routes(
     key_of: Mapping[str, str],
     edge_keys: Mapping[tuple[str, str, tuple[Action, ...]], str],
 ) -> tuple[GraphRoute, ...]:
-    """The cheapest route from the entry state to every other reachable state.
-
-    Routing is the graph module's own cost model rather than a reimplementation
-    here, so what the dashboard highlights is exactly the path the agent would take.
-    Anything that goes wrong yields no routes and a graph that simply is not
-    clickable - never a failed build.
-    """
+    """The cheapest route from the entry state to every reachable one, through the graph
+    module's OWN cost model, so the dashboard highlights the path the agent would take.
+    Anything going wrong leaves the graph unclickable rather than failing the build."""
     if not entry:
         return ()
     try:
@@ -1337,11 +1164,6 @@ def build_graph_section(graphs: Sequence[GraphTriple], note: str | None) -> Grap
     )
 
 
-# --------------------------------------------------------------------------------------
-# Panel 4: the run filmstrip
-# --------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class FilmFrame:
     """One step of a run: the screen it produced, what was done, how it was judged."""
@@ -1380,17 +1202,11 @@ class FilmPanel:
 
 
 def build_film_panel(trajectories_dir: Path) -> FilmPanel:
-    """The most interesting stored run, as a strip of screenshots.
+    """The most interesting stored run, as a strip of screenshots: the newest that finished
+    and SUCCEEDED, else the newest that finished, else the newest there is.
 
-    "Most interesting" is the newest run that finished and succeeded; failing that,
-    the newest that finished; failing that, the newest there is. A viewer opening
-    this page wants to watch the agent do the thing, so a successful run wins.
-
-    Pixels and structure are read separately, which is what the trajectory store's
-    layout is for: ``load(screenshots=False)`` gives the actions and verdicts without
-    touching a PNG, and ``frames`` gives the image paths without decoding them, so
-    only the frames this panel actually shows are ever read.
-    """
+    Pixels and structure are read separately - ``load(screenshots=False)`` for actions and
+    verdicts, ``frames`` for paths - so only the frames shown are ever decoded."""
     if not trajectories_dir.is_dir():
         reason = (
             "No runs recorded yet. Once the agent runs a task, its screenshots, "
@@ -1470,10 +1286,6 @@ def build_film_panel(trajectories_dir: Path) -> FilmPanel:
     )
 
 
-# --------------------------------------------------------------------------------------
-# Panel 5: what each stored skill actually does, step by step
-# --------------------------------------------------------------------------------------
-
 MAX_SKILL_STEPS = 48
 """How many steps of one skill the panel lists before it says it truncated. A stored
 skill is a page of code; a skill that needs more than this to describe is telling you
@@ -1516,18 +1328,12 @@ never given a screen."""
 
 @dataclass(frozen=True, slots=True)
 class SkillStep:
-    """One line of a stored skill, in the words someone deciding whether to trust it
-    would use.
+    """One line of a stored skill, in the words someone deciding whether to trust it uses.
 
-    ``kind`` groups the step for the eye: ``act`` performed something, ``look`` asked
-    the screen a question, ``check`` is where the skill refuses to continue, ``call``
-    runs another skill, ``flow`` is a branch or a loop, ``result`` is what comes back
-    and ``note`` is everything else. ``anchor`` is what the step aims at - the text or
-    kind it searches for rather than a coordinate - and ``brittle`` marks the opposite:
-    a step aimed at a fixed pixel, which is the one thing in a stored skill that does
-    not survive a redesign. ``shot`` is the recorded screen this step was matched to,
-    empty when there is none.
-    """
+    ``kind`` groups the step for the eye: ``act``, ``look``, ``check`` (where the skill
+    refuses to continue), ``call``, ``flow``, ``result``, ``note``. ``anchor`` is the text
+    or kind the step aims at rather than a coordinate; ``brittle`` marks the opposite, a
+    fixed pixel, which is the one thing in a skill that does not survive a redesign."""
 
     order: int
     depth: int
@@ -1587,12 +1393,7 @@ def _short(text: str, limit: int = 72) -> str:
 
 
 def _quoted(text: str, limit: int = 44) -> str:
-    """A string literal out of skill code, as the page should print it.
-
-    URL-looking literals lose their scheme, for the reason in the module docstring: a
-    page that needs no network should not be sprinkled with things that look like
-    live links.
-    """
+    """A string literal as the page should print it; URL-looking ones lose their scheme."""
     shown = strip_scheme(text) if _SCHEME.match(text) else text
     return '"' + _short(shown, limit) + '"'
 
@@ -1616,14 +1417,10 @@ def _literal(node: ast.expr) -> str | None:
 
 
 def _phrase(node: ast.expr, params: Iterable[str] = ()) -> str:
-    """One argument as the words a reader wants, whatever kind of expression it is.
-
-    A literal is quoted, an f-string keeps the parts that are fixed, a parameter is
-    named as one and anything else falls back to its own source. Stored skill code
-    searches for text it was HANDED at least as often as for text it hard-codes, and
-    reading ``text "row"`` off ``ctx.see.find_text(company, "row")`` would be a lie
-    about what the skill anchors on.
-    """
+    """One argument as the words a reader wants: a literal quoted, an f-string keeping its
+    fixed parts, a parameter named as one, anything else its own source. Skill code searches
+    for text it was HANDED as often as text it hard-codes, and reading ``text "row"`` off
+    ``find_text(company, "row")`` would lie about what it anchors on."""
     if (text := _literal(node)) is not None:
         return _quoted(text)
     if isinstance(node, ast.JoinedStr):
@@ -1649,9 +1446,8 @@ def _strings(nodes: Iterable[ast.expr]) -> list[str]:
 
 
 def _unparse(node: ast.AST) -> str:
-    """``ast.unparse`` on one line, never raising: the fallback rendering for code
-    this reader has no phrasing for. A skill is still described when it does
-    something unexpected; it just gets described in its own words."""
+    """``ast.unparse`` on one line, never raising: code this reader has no phrasing for is
+    still described, in its own words."""
     try:
         return _short(ast.unparse(node))
     except Exception:  # noqa: BLE001 - unparse can reject a hand-built or exotic node
@@ -1667,12 +1463,9 @@ def is_lookup(call: ast.Call) -> bool:
 
 
 def describe_lookup(call: ast.Call, params: Iterable[str] = ()) -> str:
-    """What a ``ctx.see`` query anchors on: ``text "Reply" (button)``, ``any row``.
-
-    This is the sentence the trajectories panel exists to print. A skill that
-    searches for the word on the button survives a redesign; one that does not says
-    so here.
-    """
+    """What a ``ctx.see`` query anchors on: ``text "Reply" (button)``, ``any row`` - the
+    sentence this panel exists to print, since a skill that searches for the word on the
+    button survives a redesign and one that does not says so here."""
     path = _dotted(call.func)
     method = path[-1] if path else ""
     first = _phrase(call.args[0], params) if call.args else ""
@@ -1699,12 +1492,9 @@ def describe_lookup(call: ast.Call, params: Iterable[str] = ()) -> str:
 def describe_target(
     node: ast.expr, binds: Mapping[str, str], params: Iterable[str] = ()
 ) -> tuple[str, bool]:
-    """What an action aims at, and whether that is a fixed pixel.
-
-    ``(anchor, brittle)``. ``binds`` carries the anchors of earlier lookups, so
-    ``ctx.ctl.click(reply_button[0])`` is described by what ``reply_button`` was
-    searched for rather than by its name.
-    """
+    """``(anchor, brittle)``: what an action aims at, and whether that is a fixed pixel.
+    ``binds`` carries earlier lookups' anchors, so ``click(reply_button[0])`` is described
+    by what ``reply_button`` SEARCHED for rather than by its name."""
     current = node
     while True:
         if isinstance(current, ast.Subscript):
@@ -1731,21 +1521,15 @@ def describe_target(
 
 
 class _StepReader:
-    """Walks one skill function and collects a :class:`SkillStep` per statement.
-
-    Deliberately total: every statement produces a step, and a statement this reader
-    has no phrasing for is rendered in its own source. A skill whose code does
-    something unusual must still be readable on the page - that is exactly when
-    somebody is looking at it.
-    """
+    """One ``SkillStep`` per statement of a skill function. Deliberately TOTAL: a statement
+    with no phrasing is rendered in its own source, because unusual code is exactly when
+    somebody is reading the page."""
 
     def __init__(self, params: Iterable[str] = ()) -> None:
         self.steps: list[SkillStep] = []
         self.binds: dict[str, str] = {}
         self.params = frozenset(params)
         self.truncated = False
-
-    # -- collecting ---------------------------------------------------------------------
 
     def add(
         self,
@@ -1778,8 +1562,6 @@ class _StepReader:
     def body(self, statements: Sequence[ast.stmt], depth: int) -> None:
         for statement in statements:
             self.statement(statement, depth)
-
-    # -- statements ---------------------------------------------------------------------
 
     def statement(self, node: ast.stmt, depth: int) -> None:
         match node:
@@ -1836,13 +1618,8 @@ class _StepReader:
                 self.add(node, depth, "note", "code", _unparse(node))
 
     def returned(self, node: ast.stmt, value: ast.expr | None, depth: int) -> None:
-        """``return <expr>`` - and, for a verifier, the check it really is.
-
-        A verifier written as ``return bool(ctx.see.find_text("Payment confirmed"))``
-        is not handing a value back to anybody: it is the place the skill decides
-        whether the work landed. Reading it as a result would bury the one line of a
-        skill a reader most wants to see.
-        """
+        """``return <expr>`` - and, for a VERIFIER, the check it really is: that line is where
+        the skill decides whether the work landed, not a value handed back."""
         if value is None:
             self.add(node, depth, "result", "hand back", "nothing")
             return
@@ -1866,8 +1643,6 @@ class _StepReader:
             self.add(call, depth, "look", "look for", f"and remember it as {name}", anchor=anchor)
             return
         self.call(call, depth, keeps=name)
-
-    # -- calls --------------------------------------------------------------------------
 
     def call(self, call: ast.Call, depth: int, keeps: str = "") -> None:
         path = _dotted(call.func)
@@ -1913,9 +1688,8 @@ class _StepReader:
         if isinstance(inner, ast.Call) and _dotted(inner.func)[-1:] == ("bool",) and inner.args:
             inner = inner.args[0]
         anchor, _ = describe_target(inner, self.binds, self.params)
-        # A bare truthiness test says nothing the anchor does not already say, so the
-        # step reads "check - text "Search" (text_field)" rather than repeating
-        # ``bool(search_field)`` at a reader who came here to avoid reading code.
+        # A bare truthiness test says nothing the anchor does not, and repeating
+        # ``bool(search_field)`` at a reader who came here to AVOID reading code.
         simple = isinstance(inner, ast.Name | ast.Subscript) or (
             isinstance(inner, ast.Attribute) and bool(_dotted(inner))
         )
@@ -1973,13 +1747,9 @@ class _StepReader:
 def read_skill_steps(
     code: str, *, function: str = "run", params: Iterable[str] = ()
 ) -> tuple[tuple[SkillStep, ...], bool, str]:
-    """``(steps, truncated, problem)`` for one stored function. Never raises.
-
-    ``problem`` is a sentence for the page when the code could not be read at all -
-    it does not parse, or it defines no function of that name. A skill whose code is
-    unreadable still appears on the panel, saying so: the library's job is to be
-    auditable, and a skill nobody can read is the most important thing to see.
-    """
+    """``(steps, truncated, problem)`` for one stored function; never raises. ``problem`` is
+    a sentence for the page when the code does not parse or defines no such function - an
+    unreadable skill still appears, saying so, because that is the one to see."""
     if not code.strip():
         return (), False, f"this skill stores no {function}() to describe"
     try:
@@ -2005,11 +1775,8 @@ def read_skill_steps(
 
 
 def _recorded_steps(store: Any, run_id: str) -> tuple[list[tuple[str, str, str, Path | None]], str]:
-    """``(verb, detail, url, screenshot path)`` per step of one recorded run.
-
-    Structure and pixels are read separately, as the filmstrip does: only the frames
-    a step is actually matched to are ever decoded.
-    """
+    """``(verb, detail, url, screenshot path)`` per step of one recorded run; structure and
+    pixels read separately, so only matched frames are decoded."""
     try:
         trajectory = store.load(run_id, screenshots=False)
         paths = {frame.index: frame.after for frame in store.frames(run_id)}
@@ -2025,15 +1792,12 @@ def _recorded_steps(store: Any, run_id: str) -> tuple[list[tuple[str, str, str, 
 def _match_shots(
     steps: Sequence[SkillStep], recorded: Sequence[tuple[str, str, str, Path | None]]
 ) -> tuple[tuple[SkillStep, ...], int]:
-    """Give each performed step the recorded screen it corresponds to, in order.
+    """Give each performed step its recorded screen, matched by verb and scanning forward.
 
-    Matched by verb, scanning forward and consuming: the recording holds steps a
-    skill does not (the navigation prologue the hardening pass lifts out, and
-    whatever exploring cost) so positions do not line up, but the ORDER of the
-    actions that survived into the code does. A step whose verb never comes up again
-    simply has no screen - guessing would put the wrong picture next to the wrong
-    step, which is worse than none.
-    """
+    Positions do NOT line up - the recording holds steps the skill does not (the navigation
+    prologue the hardening pass lifts out, and whatever exploring cost) - but the ORDER of
+    the actions that survived into the code does. A verb that never comes up again gets no
+    screen, since a wrong picture is worse than none."""
     from dataclasses import replace
 
     cursor, matched = 0, 0
@@ -2074,12 +1838,8 @@ def build_trajectory_panel(
     skills: Sequence[Skill], trajectories_dir: Path, note: str | None = None
 ) -> TrajectoryPanel:
     """Every stored skill as the procedure it runs, with the real screens where they exist.
-
-    A skill whose recording is no longer on disk still gets its steps, read out of its
-    own code, and a line saying the run is gone. That is the defensive rule the module
-    docstring states, applied per skill rather than per panel: one missing recording
-    must not cost the reader the other five skills' steps.
-    """
+    The defensive rule applied PER SKILL: one whose recording is gone still gets its steps
+    from its own code plus a line saying so, rather than costing the reader the rest."""
     if not skills:
         reason = (
             "Nothing to lay out yet. As soon as the agent writes its first skill, every "
@@ -2162,17 +1922,9 @@ def build_trajectory_panel(
     )
 
 
-# --------------------------------------------------------------------------------------
-# Panel 6: what the library has saved, in tokens and in dollars
-# --------------------------------------------------------------------------------------
-
-
 def human_usd(usd: float | None) -> str:
-    """Dollars as a figure someone can check: ``$0.0042``, ``$0.78``, ``$12.40``.
-
-    ``None`` is ``"not priced"`` and never ``"$0.00"``: a run nobody metered has an
-    unknown cost, which is a different claim from a free one.
-    """
+    """``$0.0042``, ``$0.78``, ``$12.40``; ``None`` is ``"not priced"`` and never ``"$0.00"``
+    - an unmetered run is a different claim from a free one."""
     if usd is None:
         return "not priced"
     magnitude = abs(usd)
@@ -2185,12 +1937,8 @@ def human_usd(usd: float | None) -> str:
 
 
 def human_count(value: float | None) -> str:
-    """A count as a figure that fits a tile: ``840``, ``12.3k``, ``1.4M``.
-
-    ``None`` is ``"not measured"``. See :meth:`EvalRun.tokens`: the harness writes
-    ``None`` when no usage meter was attached, and rendering that as a zero would
-    turn a missing measurement into a claimed saving of nothing.
-    """
+    """``840``, ``12.3k``, ``1.4M``; ``None`` is ``"not measured"``, since rendering an
+    unmetered run as zero would claim a saving of nothing."""
     if value is None:
         return "not measured"
     sign = "-" if value < 0 else ""
@@ -2206,13 +1954,10 @@ def human_count(value: float | None) -> str:
 class SavingRow:
     """One task's repeat runs, priced against the one attempt that had no library.
 
-    ``baseline_*`` is the COLD run - what one attempt cost when nothing was known.
-    ``saved_*`` totals every warm attempt: a warm run that did the task is credited
-    with the difference, and one that FAILED is charged its own cost with no credit,
-    because the work still had to be done afterwards. ``*_runs`` counts how many warm
-    attempts that measure was actually available for, so a partial measurement cannot
-    masquerade as a complete one.
-    """
+    ``baseline_*`` is the COLD run. ``saved_*`` totals every warm attempt: one that did the
+    task is credited the difference, one that FAILED is charged its own cost with no credit,
+    since the work still had to be done afterwards. ``*_runs`` counts how many attempts that
+    measure existed for, so a partial measurement cannot pass as a complete one."""
 
     task_id: str
     task_text: str
@@ -2237,12 +1982,8 @@ class SavingRow:
 
 @dataclass(frozen=True, slots=True)
 class ExcludedTask:
-    """A task deliberately left out of the arithmetic, and why.
-
-    The panel prints every one of these. A saving computed over a silently chosen
-    subset is not a measurement, and the first thing anyone checking this number will
-    ask is what was dropped.
-    """
+    """A task deliberately left out of the arithmetic, and why. The panel prints EVERY one:
+    a saving computed over a silently chosen subset is not a measurement."""
 
     task_id: str
     task_text: str
@@ -2315,35 +2056,25 @@ class SavingsPanel:
 
 
 def _credit(baseline: float, run: EvalRun, measure: float) -> float:
-    """What one warm attempt saved against ``baseline`` on one measure.
-
-    A warm run that did the task saves the difference. A warm run that FAILED saves
-    nothing and its own cost is still spent, so it subtracts - the conservative
-    reading, and the honest one: the task was not done, so the expensive path was
-    still ahead of it.
-    """
+    """One warm attempt against ``baseline``: a run that did the task saves the difference,
+    one that FAILED subtracts its own cost, since the expensive path was still ahead."""
     return baseline - measure if run.ok else -measure
 
 
 def _cumulative_curve(
     values: Sequence[float], labels: Sequence[str], width: float, height: float
 ) -> tuple[tuple[SavingPoint, ...], str, str]:
-    """The running total as points plus an area and a line path, in the report's order.
-
-    Deliberately indexed by task rather than by clock: the harness writes tasks in the
-    order it ran them, which IS the order the library grew, and most runs carry no
-    ``started_at`` at all. A curve drawn against invented timestamps would be a
-    prettier lie.
-    """
+    """The running total, indexed by TASK and not by clock: the harness writes tasks in the
+    order it ran them, most runs carry no ``started_at``, and a curve against invented
+    timestamps would be a prettier lie."""
     if len(values) < 2:
         return (), "", ""
     top, bottom, left, right = 14.0, height - 20.0, 6.0, width - 6.0
     peak = max(values) or 1.0
     floor = min(0.0, min(values))
-    # A twelfth of headroom above the peak. Without it a curve that rises once and then
-    # stays flat - which is exactly what a suite where only some runs were priced looks
-    # like - draws as a solid block against the top edge, reading as "off the chart"
-    # rather than "this is the total".
+    # A twelfth of headroom: without it a curve that rises once and stays flat - a suite
+    # where only some runs were priced - draws as a block against the top edge, reading
+    # as "off the chart" rather than "this is the total".
     span = ((peak - floor) * 1.12) or 1.0
     points: list[SavingPoint] = []
     for index, (value, label) in enumerate(zip(values, labels, strict=True)):
@@ -2364,18 +2095,13 @@ def _cumulative_curve(
 
 
 def build_savings_panel(reports: Sequence[EvalReport], problems: Sequence[str]) -> SavingsPanel:
-    """Price every repeat run against the first attempt at the same task.
+    """Price every repeat run against the first attempt at the same task. The rules, all of
+    them also printed ON the page because this is the number a stranger will poke at:
 
-    The rules, all of them visible on the page because this number is the one a
-    stranger will try to poke a hole in:
-
-    * The baseline is the COLD run and only if it SUCCEEDED. A task nobody ever
-      solved the slow way has no honest baseline, so it is excluded and named.
-    * A task with no repeat run yet is excluded and named: there is nothing to price.
-    * Dollars and tokens are counted only for the warm attempts where both sides of
-      the subtraction were measured. ``None`` never becomes a zero.
-    * A failed warm attempt subtracts its own cost instead of earning a credit.
-    """
+    * The baseline is the COLD run and only if it SUCCEEDED; otherwise excluded and named.
+    * A task with no repeat run yet is excluded and named.
+    * Dollars and tokens count only warm attempts where BOTH sides were measured.
+    * A failed warm attempt subtracts its own cost instead of earning a credit."""
     notes = tuple(problems)
     tasks = [task for report in reports for task in report.tasks]
     if not tasks:
@@ -2453,9 +2179,8 @@ def build_savings_panel(reports: Sequence[EvalReport], problems: Sequence[str]) 
 
     usd_runs = sum(r.usd_runs for r in rows)
     token_runs = sum(r.token_runs for r in rows)
-    # ONE unit for every bar in the panel, and it is the unit the headline quotes.
-    # Bars drawn from whichever measure each row happened to have would put a $0.78
-    # saving and a nine-model-call saving on the same axis, which is not a comparison.
+    # ONE unit for every bar, the one the headline quotes: bars from whichever measure a
+    # row happened to have would put $0.78 and nine model calls on one axis.
     metric, values = (
         ("dollars", [r.cumulative_usd for r in rows])
         if usd_runs
@@ -2514,14 +2239,9 @@ def _measure_of(row: SavingRow, metric: str) -> float | None:
 
 
 def _size_saving(row: SavingRow, measure: float | None, widest: float) -> SavingRow:
-    """``row`` with its bar width filled in against the panel-wide maximum.
-
-    One bar per row, pointing the way the number does: ``saved_width`` when the
-    repeats came out ahead, ``spent_width`` when they cost more than the first attempt
-    did. A saving that is actually a loss must LOOK like one, and a row with no
-    measurement in the panel's unit gets no bar at all rather than an empty track that
-    reads as a saving of nothing.
-    """
+    """``row`` with its bar width against the panel-wide maximum. One bar, pointing the way
+    the number does, because a saving that is actually a loss must LOOK like one; a row with
+    no measurement gets NO bar rather than an empty track reading as a saving of nothing."""
     from dataclasses import replace
 
     if measure is None:
@@ -2532,11 +2252,6 @@ def _size_saving(row: SavingRow, measure: float | None, widest: float) -> Saving
         saved_width=width if measure >= 0 else 0.0,
         spent_width=0.0 if measure >= 0 else width,
     )
-
-
-# --------------------------------------------------------------------------------------
-# The whole page
-# --------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -2711,11 +2426,8 @@ def _environment() -> Any:
 
 
 def _read_asset(name: str) -> str:
-    """One file from ``static/``, verbatim, for inlining into the page.
-
-    Returns ``""`` when it is missing: a dashboard with no stylesheet is ugly and
-    still readable, which beats not building at all.
-    """
+    """One file from ``static/``, verbatim, or ``""`` when missing: an ugly dashboard beats
+    not building at all."""
     path = STATIC_DIR / name
     try:
         return path.read_text(encoding="utf-8")
@@ -2731,28 +2443,12 @@ def render(dashboard: Dashboard) -> str:
 
 
 def build_dashboard(data_dir: Path | str, out_path: Path | str) -> Path:
-    """Read ``data_dir`` and write one self-contained HTML file to ``out_path``.
+    """Read ``data_dir`` and write one self-contained HTML file to ``out_path``, returning
+    that path. Raises only if the output itself cannot be written.
 
-    The output opens straight off the filesystem: no server, no network, no sibling
-    files. The stylesheet and script are inlined and every screenshot is a ``data:``
-    URI.
-
-    Missing data is never an error. A data directory that does not exist at all still
-    produces a valid page in which all four panels explain what is missing, because
-    this dashboard is built alongside the pipelines that fill it and has to be
-    openable before any of them has run.
-
-    Args:
-        data_dir: A skillweaver data directory - the one holding ``skills/``,
-            ``graphs/``, ``trajectories/`` and ``eval/``.
-        out_path: Where to write the HTML file. Parent directories are created.
-
-    Returns:
-        The path written, for convenience.
-
-    Raises:
-        SkillWeaverError: only if the output itself cannot be written.
-    """
+    Missing data is never an error: a data directory that does not exist still produces a
+    valid page whose panels explain what is missing, because this is built alongside the
+    pipelines that fill it and has to be openable before any of them has run."""
     source = Path(data_dir)
     destination = Path(out_path)
     page = render(collect(source))

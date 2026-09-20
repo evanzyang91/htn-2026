@@ -1,34 +1,7 @@
-"""Runtime settings, read from the process environment and an optional ``.env`` file.
+"""Runtime settings from the process environment and an optional ``.env``.
 
-The process environment wins over ``.env``; both win over the defaults below. No
-secret has a default, and ``.env`` is git-ignored. Use :func:`settings` everywhere;
-use :func:`load_settings` in tests that need a specific environment.
-
-Recognized variables::
-
-    SKILLWEAVER_DATA_DIR        data directory                  (default: data)
-    SKILLWEAVER_TARGET          "browser" or "desktop"          (default: browser)
-    SKILLWEAVER_HEADLESS        run the browser without a window (default: false)
-    SKILLWEAVER_CHROME_PROFILE  persistent real-Chrome profile dir (default: unset)
-    SKILLWEAVER_PERCEPTION      "pixels" or "dom"               (default: pixels)
-    SKILLWEAVER_POLICY          "claude" or "jev"               (default: claude)
-    SKILLWEAVER_LOG_LEVEL       DEBUG/INFO/WARNING/ERROR        (default: INFO)
-    SKILLWEAVER_CLAUDE_MODEL    Claude model id                 (default: claude-opus-5)
-    SKILLWEAVER_GEMINI_MODEL    Gemini computer-use model id
-    SKILLWEAVER_MAX_STEPS       default Budget.max_steps        (default: 40)
-    SKILLWEAVER_MAX_SECONDS     default Budget.max_seconds      (default: 300)
-    SKILLWEAVER_MAX_USD         default Budget.max_usd          (default: 2.0)
-    SKILLWEAVER_MAX_LLM_CALLS   default Budget.max_llm_calls    (default: 60)
-    SKILLWEAVER_SKILL_MAX_SECONDS
-                                default SkillLimits.max_seconds (default: 45)
-    SKILLWEAVER_EMBEDDER        rank skills with the local embedding model when its
-                                weights are present                (default: true)
-    SKILLWEAVER_EMBEDDER_DIR    where those weights live
-                                (default: <data_dir>/models/text_embedder)
-    ANTHROPIC_API_KEY           Claude credentials (optional: the SDK also resolves
-                                its own credentials when this is unset)
-    GEMINI_API_KEY              Gemini credentials (GOOGLE_API_KEY also accepted)
-    TYPESAFE_API_KEY            Jev policy credentials (skillweaver.llm.jev_)
+Environment wins over ``.env``, both win over the defaults below; ``load_settings``
+names every ``SKILLWEAVER_*`` variable it reads. No secret has a default.
 """
 
 from __future__ import annotations
@@ -48,101 +21,40 @@ DEFAULT_CLAUDE_MODEL = "claude-opus-5"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-computer-use-preview-10-2025"
 
 EMBEDDER_DIRNAME = "text_embedder"
-"""The directory under ``models_dir`` that holds the retrieval embedding model."""
 
 DEFAULT_SKILL_MAX_SECONDS = 45.0
-"""Wall-clock seconds one stored skill may spend running its OWN code.
-
-Not a guess. A skill is a short procedure and the code between two observations is
-milliseconds of it, so this number is a runaway-loop tripwire rather than a work
-allowance - see :class:`~skillweaver.skills.api.SkillLimits`, which does not charge a
-skill for the time it sits blocked on a screenshot or on OCR. Forty-five seconds is
-long enough that no honest procedure on a real, slow page reaches it and short enough
-that ``while True`` is a pause rather than a hang."""
+"""Seconds a skill may spend in its OWN code - a runaway-loop tripwire, not a work
+allowance: ``SkillLimits`` does not charge it for time blocked on a screenshot or OCR."""
 
 DEFAULT_EMBEDDER_ENABLED = False
-"""Whether retrieval ranks with the local embedding model when its weights are there.
-
-OFF, and that is a MEASURED decision rather than caution. Ranking by meaning does what
-it was built to do - it finds a stored skill asked for in other words, lifting top-1
-recall from 18/24 to 21/24 over the two libraries in this repository - and not one of
-those extra hits turns into a warm run, because what stops them is downstream of the
-ranking and is counted in words:
-:func:`~skillweaver.agent.planner.bind_args` first, then
-:data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR`. Runnable candidates: 3/24 both
-ways when a person types the request, 9/24 both ways when a suite supplies its values.
-Meanwhile retrieval's precision gets WORSE - a cosine is almost never zero, so five of
-six irrelevant requests come back with a candidate instead of one - and no cut-off
-separates the two populations, so there is nothing to tune either.
-
-Turn it on with ``SKILLWEAVER_EMBEDDER=true`` to re-measure (``make embedder``, then
-``scripts/bench_retrieval.py``), and flip this line when the number that matters moves.
-"""
+"""Off because it was MEASURED and did not pay: top-1 recall 18/24 -> 21/24, but runnable
+candidates 3/24 and 9/24 BOTH ways (the word-counting gates downstream stop them) and
+precision worse, 1/6 -> 5/6 irrelevant requests answered. Re-measure with
+``scripts/bench_retrieval.py`` before flipping this."""
 
 DEFAULT_HEADLESS = False
-"""Whether the browser this project opens runs without a visible window.
-
-Headed by DEFAULT, and that is a product decision rather than an oversight. A visible
-window is what makes the agent legible - a person watching it work is the whole reason
-a computer-use agent is convincing - so the mode a plain command opens is the one a
-person can see.
-
-Headless is what MEASUREMENT wants, and it is one flag away: a suite of tasks run four
-times each has no audience, and a browser window stealing focus on a laptop, in CI or
-over SSH is a cost with no benefit. See ``--headless`` in :mod:`skillweaver.cli`.
-
-The two modes are not interchangeable, which is why this is recorded rather than merely
-chosen: two fresh browsers of opposite modes on ONE page fingerprint 0.126 and 0.421
-apart, both at or below :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`,
-so a skill learned in one mode can never match a screen rendered in the other. See
-:mod:`skillweaver.render_mode`, which names that mismatch instead of letting it show up
-as a mysteriously low similarity."""
+"""Headed by default because the demo is watched. The two modes are not interchangeable
+- 0.126 and 0.421 cross-mode similarity on two real pages, under the same-state cut - so
+the mode is recorded beside a skill and a crossing is named by ``render_mode``."""
 
 DEFAULT_CHROME_PROFILE: Path | None = None
-"""The persistent Chrome profile a browser run drives, or ``None`` for none.
-
-``None`` by default, so a plain run opens the bundled Chromium with a throwaway profile
-exactly as it always has. Set it - ``SKILLWEAVER_CHROME_PROFILE``, or ``--chrome-profile``
-on one invocation - to drive the real Google Chrome on this machine out of a directory
-that survives the run, which is what a site refusing an automated browser requires. See
-``REAL_CHROME_CHANNEL`` in :mod:`skillweaver.controllers.browser` for what that is
-measured to fix and what it deliberately does not do.
-
-One directory per run. A profile is EXCLUSIVE - a Chrome window already open on it makes
-the launch fail rather than share it - and two runs pointed at one directory fight over
-the lock and spoil the state that made the setting worth having."""
+"""``None`` opens bundled Chromium on a throwaway profile; set it to drive the real Chrome
+(``REAL_CHROME_CHANNEL`` in ``controllers.browser``). One directory per run - a profile is
+exclusive, and two runs sharing one fight over the lock."""
 
 DEFAULT_CHROME_ATTACH = False
-"""Whether a browser run starts that real Chrome ITSELF and attaches to it, rather than
-letting Playwright launch it. ``False`` by default, so nothing changes for a run that
-says nothing.
-
-Set it - ``SKILLWEAVER_CHROME_ATTACH``, or ``--chrome-attach`` on one invocation, both
-of which need ``chrome_profile`` as well - for a site that refuses even the real Chrome
-when the automation framework is what started it. That is measured, three configurations
-against live doordash.com, at ``PLAINLY_LAUNCHED`` in
-:mod:`skillweaver.controllers.chrome_launch`, which also carries what this mode must
-never be extended into: it does not defeat, mask or retry past a human-verification page,
-and a challenge fails the run for a person to clear by hand."""
+"""Start real Chrome ourselves and attach, for a site that refuses even real Chrome when
+the framework launched it (measured at ``PLAINLY_LAUNCHED`` in ``controllers.chrome_launch``,
+which also states what this must never become). Needs ``chrome_profile``."""
 DEFAULT_PERCEPTION = PIXELS
-"""Which eyes a run opens with. PIXELS, and that is the point of the default.
-
-The pixel path is what every stored skill was learned against, what both landed
-speedups were measured on, and what the project's claim to be a computer-use agent
-rests on. The DOM path (``--perception dom``) is opt-in for browser use only; see
-:mod:`skillweaver.perception_mode` and ``AGENTS.md`` for the invariant it relaxes.
-"""
+"""Pixels: what every stored skill was learned against. ``--perception dom`` is opt-in
+and browser-only; see ``perception_mode`` and ``AGENTS.md``."""
 
 DEFAULT_POLICY = "claude"
-"""Who chooses each move. Claude through the acting prompt, unchanged.
-
-``jev`` swaps in :class:`~skillweaver.llm.jev_.JevPolicy` and requires
-``--perception dom``, because a policy that acts on an indexed control table needs a
-perceiver that produces one.
-"""
+"""``jev`` swaps in ``JevPolicy`` and requires ``--perception dom``: it acts on an
+indexed control table and needs a perceiver that produces one."""
 
 POLICIES = ("claude", "jev")
-"""Every acting policy, for validating a flag or a setting."""
 
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 _TARGETS = ("browser", "desktop")
@@ -152,8 +64,7 @@ _FALSE = ("0", "false", "no", "off")
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Resolved configuration. API keys are excluded from ``repr`` so they cannot
-    leak into logs."""
+    """Resolved configuration; API keys are out of ``repr`` so they cannot leak into logs."""
 
     data_dir: Path = Path("data")
     default_target: Literal["browser", "desktop"] = "browser"
@@ -175,44 +86,35 @@ class Settings:
 
     @property
     def skills_dir(self) -> Path:
-        """Where the skill library is stored: ``<data_dir>/skills``."""
         return self.data_dir / "skills"
 
     @property
     def graphs_dir(self) -> Path:
-        """Where per-domain site graphs are stored: ``<data_dir>/graphs``."""
         return self.data_dir / "graphs"
 
     @property
     def trajectories_dir(self) -> Path:
-        """Where recorded runs are stored: ``<data_dir>/trajectories``."""
         return self.data_dir / "trajectories"
 
     @property
     def models_dir(self) -> Path:
-        """Where detector weights and datasets live: ``<data_dir>/models``."""
         return self.data_dir / "models"
 
     @property
     def embedder_dir(self) -> Path:
-        """Where the retrieval embedding model's weights live.
-
-        ``<models_dir>/text_embedder`` unless ``SKILLWEAVER_EMBEDDER_DIR`` names
-        somewhere else, so several worktrees can share one 90 MB download.
-        """
+        """``SKILLWEAVER_EMBEDDER_DIR`` overrides, so worktrees can share one 90 MB download."""
         if self.embedder_dir_override is not None:
             return self.embedder_dir_override
         return self.models_dir / EMBEDDER_DIRNAME
 
     @property
     def eval_dir(self) -> Path:
-        """Where evaluation results are written: ``<data_dir>/eval``."""
         return self.data_dir / "eval"
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
-    """Parse a ``.env`` file: ``KEY=value`` lines, ``#`` comments, optional
-    ``export`` prefix and optional matching quotes. A missing file gives ``{}``."""
+    """``KEY=value`` lines, ``#`` comments, optional ``export`` prefix and matching
+    quotes; a missing file gives ``{}``."""
     if not path.is_file():
         return {}
     values: dict[str, str] = {}
@@ -242,16 +144,8 @@ def _number[T: (int, float)](env: Mapping[str, str], key: str, default: T, cast:
 
 
 def _flag(env: Mapping[str, str], key: str, default: bool) -> bool:
-    """A boolean setting, spelled any of the ways a shell or a CI file spells one.
-
-    ``1/true/yes/on`` and ``0/false/no/off``, in any case. An unset or empty value
-    means ``default``, so a variable that is merely present-but-blank does not flip
-    a mode nobody asked to flip.
-
-    Raises:
-        ConfigError: on anything else - a mode silently misread is worse than a
-            command that refuses to start.
-    """
+    """``1/true/yes/on`` or ``0/false/no/off``, any case; unset or blank means ``default``.
+    Anything else raises rather than silently misreading a mode."""
     raw = env.get(key)
     if raw is None or raw.strip() == "":
         return default
@@ -264,9 +158,8 @@ def _flag(env: Mapping[str, str], key: str, default: bool) -> bool:
 
 
 def _path(env: Mapping[str, str], key: str, default: Path | None) -> Path | None:
-    """An optional filesystem path. Blank and unset both mean the default, so
-    ``SKILLWEAVER_CHROME_PROFILE=`` turns a configured profile off rather than
-    resolving to the current directory."""
+    """Blank and unset both mean ``default``, so ``SKILLWEAVER_CHROME_PROFILE=`` turns a
+    profile off rather than resolving to the current directory."""
     raw = env.get(key)
     if raw is None or raw.strip() == "":
         return default
@@ -276,16 +169,8 @@ def _path(env: Mapping[str, str], key: str, default: Path | None) -> Path | None
 def load_settings(
     env: Mapping[str, str] | None = None, env_file: Path | str | None = Path(".env")
 ) -> Settings:
-    """Build :class:`Settings` without caching.
-
-    Args:
-        env: The environment to read; ``None`` means ``os.environ``.
-        env_file: A ``.env`` path whose values fill in anything ``env`` lacks;
-            ``None`` disables it. A missing file is ignored.
-
-    Raises:
-        ConfigError: on a malformed number, an unknown target or log level.
-    """
+    """Build ``Settings`` without caching; ``env_file`` fills in anything ``env`` lacks,
+    and ``None`` for either means ``os.environ`` / no file."""
     merged: dict[str, str] = {}
     if env_file is not None:
         merged.update(parse_env_file(Path(env_file)))
@@ -341,17 +226,9 @@ def load_settings(
 
 
 def check_settings(settings: Settings) -> Settings:
-    """The settings back, or a refusal naming what does not go together.
-
-    Applied to the environment AND to the flags laid over it, because the two halves of
-    a combination can arrive from different places: ``SKILLWEAVER_CHROME_ATTACH=1`` in a
-    shell profile and the directory it needs on the command line, or the other way
-    about. The alternative is discovering it when the browser fails to open, several
-    seconds and one confusing message later.
-
-    Raises:
-        ConfigError: if two settings contradict each other.
-    """
+    """The settings back, or ``ConfigError`` naming what does not go together. Applied to
+    the environment AND to the flags over it, since the halves of a combination can arrive
+    from different places."""
     if settings.chrome_attach and settings.chrome_profile is None:
         raise ConfigError(
             "chrome_attach starts a real Chrome of its own and needs a profile "
@@ -363,10 +240,6 @@ def check_settings(settings: Settings) -> Settings:
 
 @lru_cache(maxsize=1)
 def settings() -> Settings:
-    """The process-wide settings, loaded once from ``os.environ`` and ``./.env``.
-    Tests that change the environment call ``settings.cache_clear()`` afterwards.
-
-    Raises:
-        ConfigError: if the environment holds an invalid value.
-    """
+    """The process-wide settings, loaded once from ``os.environ`` and ``./.env``. Anything
+    changing the environment must call ``settings.cache_clear()`` afterwards."""
     return load_settings()

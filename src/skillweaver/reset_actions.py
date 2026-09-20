@@ -1,96 +1,16 @@
-"""An undo that is PERFORMED in the world, rather than fetched from it.
+"""An undo PERFORMED on the screen, for a site with no reset endpoint.
 
-A :data:`~skillweaver.orchestrator.WorldReset` is "how do I put this back?", and the
-admission gate cannot learn a mutating task without one. The only undo the command
-line could express was a single HTTP GET - ``--reset-url`` - which exists on a demo
-app and on essentially nothing else. DoorDash has no endpoint that empties a cart, so
-every cart task was unlearnable: not because the agent could not do it, but because
-its undo could not be written down.
+A reset is an ordered list of ``ResetStep`` - an ordinary ``Action``, optionally aimed
+by anchor text and optionally looped until a condition holds - that
+``world_reset_from_actions`` turns into the zero-argument ``WorldReset`` the gate takes.
 
-This module widens the expression, not the contract. A reset is an ordered list of
-:class:`ResetStep` - each one an ordinary :data:`~skillweaver.contracts.Action` the
-controller already performs - and :func:`world_reset_from_actions` turns the list into
-the same zero-argument callable the gate has always taken.
-
-Why a step is not just an action
---------------------------------
-
-The gate re-runs a candidate up to three times and resets BETWEEN attempts, so an undo
-that works four times in five does not produce a flaky demo - it produces a REJECTED
-skill, because the fourth attempt starts on a dirty screen and disagrees with the first
-three. You would have moved the failure, not fixed it. Four properties buy the
-reliability, and each is a field:
-
-* :attr:`ResetStep.until_gone` and :attr:`ResetStep.until_seen` make the step a LOOP
-  with a verified exit condition. "Remove every line until the cart is empty" is not a
-  number of clicks; it is a condition, re-read after every click, and it is what makes
-  the reset idempotent - a clean world already satisfies it, so the step performs
-  nothing and succeeds.
-* :attr:`ResetStep.max_rounds` bounds that loop. A loop that cannot converge reports
-  :class:`ResetDidNotConverge`, which the caller reads as a ``failed`` reset - the
-  honest answer, and the one that keeps an unreliable undo from being laundered into a
-  stored skill.
-* :attr:`ResetStep.find` names the target by CONTENT rather than by pixel. A notice
-  arriving at the top of a page - an appeal, a cookie bar, an A/B strip - pushes
-  everything below it down, and a reset pinned to a grid position clicks whatever slid
-  into that spot. The same lesson the fingerprinter learned (see
-  :class:`~skillweaver.perception.fingerprint.StateFingerprinter`) applies to hands as
-  well as to eyes: anchor on what a thing SAYS, and let :attr:`ResetStep.dx` /
-  :attr:`ResetStep.dy` carry the within-row geometry that no text can express - the
-  unlabelled trash icon at the end of the line the anchor sits on.
-* :attr:`ResetStep.via` chooses which reading of the screen answers all three. See
-  below; it is the difference between a reset that works on a real site and one that
-  does not.
-
-An anchor is LOOKED UP, not ranked
-----------------------------------
-
-``find`` resolves through ``ElementIndex.find_text(..., fuzzy=False)`` - case-
-insensitive containment - and not through ``ElementIndex.best``, which is the same
-distinction the planner draws between a ranking and a decision. ``best`` is a ranking,
-and a ranking has a winner even when nothing fits: asked for ``"cart"`` on a screen
-with no cart it returned a mail message beginning "First pass at the hero section",
-and the reset clicked it, found no cart lines to remove and reported the world
-restored. A lookup can answer "not here", which is the answer that makes a step fail
-loudly instead of succeeding on the wrong screen. Aim at text the page literally says.
-
-Say what the clean world LOOKS like, not only what it lacks
-------------------------------------------------------------
-
-``until_gone`` is a negative test, and a negative test passes on every screen that
-does not say the thing - including the wrong screen. That is not hypothetical: a
-sandbox reset whose first step missed the cart button ran its loop on the mail
-inbox, found no cart lines there, and reported the world restored. ``until_seen``
-is the positive test that cannot do this - "Your cart is empty" is a sentence only
-the emptied cart says - and a step may carry both, in which case both must hold
-before it is done. Prefer the positive one. It is also the check that survives a
-site where removing a line and lowering a quantity look the same: emptiness is a
-screen, not the absence of a row.
-
-Two readings of one screen, and why the DOM is allowed here
-------------------------------------------------------------
-
-:attr:`ResetStep.via` picks ``"screen"`` - pixels, detection and OCR, the same eyes
-the agent has - or ``"dom"``, the :class:`~skillweaver.contracts.GroundTruthSource`
-the caller supplies. ``"screen"`` is the default and needs nothing; it is all a
-desktop controller can offer.
-
-``"dom"`` exists because a real site does not label its controls in pixels. DoorDash's
-quick-add and its header cart are icon-only ``<button>`` elements whose only name is an
-``aria-label`` - ``"Add item to cart"``, ``"1 items, open Order Cart"`` - and a search
-for visible text finds NOTHING on that page. No amount of OCR recovers a name that was
-never painted.
-
-That source is documented as an offline teacher the agent must never touch, and this
-does not breach it. A reset is not the agent: it is scaffolding, the peer of the
-``curl`` behind ``--reset-url``, which does not look at the screen at all. The agent
-never sees it, no skill is synthesized from it, and nothing it reads reaches a
-trajectory. It is passed to :func:`world_reset_from_actions` as an explicit argument
-for exactly the reason that Protocol asks for - so the dependency is visible at the
-call site rather than reachable from anywhere.
-
-Nothing here weakens the gate. An undo that cannot prove it worked raises, the gate
-reports the reset as failed, and no skill is stored.
+The gate resets BETWEEN its three re-runs, so an undo working four times in five
+REJECTS the skill. Hence: a step aims by CONTENT (a notice at the top of a page moves
+everything below it) through ``find_text(fuzzy=False)`` and never ``ElementIndex.best``,
+which is a ranking with a winner even when nothing fits; a loop prefers ``until_seen``,
+because ``until_gone`` is a negative test that also passes on the WRONG screen; and
+``via="dom"`` exists because a real site's controls are icon-only with their name in an
+``aria-label`` - see ``AGENTS.md`` for why scaffolding may read that and the agent may not.
 """
 
 from __future__ import annotations
@@ -139,87 +59,38 @@ log = get_logger(__name__)
 
 
 RESET_ACTIONS_PARAM = "reset_actions"
-"""The task parameter holding an action reset.
-
-It rides in ``TaskSpec.params`` beside ``reset_url`` and ``read_only`` for the reason
-those do: a caller that already builds a workbench keeps working unchanged and gains
-the hook by naming it. Its value is whatever :func:`reset_steps_from` accepts.
-"""
+"""The ``TaskSpec.params`` key holding an action reset; its value is whatever
+``reset_steps_from`` accepts."""
 
 
 Oracle = Literal["screen", "dom"]
-"""Which reading of the screen a step's text is looked up in.
-
-``"screen"`` is detection and OCR - what the agent itself sees, and all a desktop
-controller can offer. ``"dom"`` is the caller-supplied
-:class:`~skillweaver.contracts.GroundTruthSource`, which is the only way to reach a
-control whose name lives in an ``aria-label`` and was never painted. See the module
-docstring for why a reset may read it and the agent may not.
-"""
+"""``"screen"`` is detection and OCR, all a desktop controller can offer; ``"dom"`` is the
+caller-supplied ``GroundTruthSource``, the only way to reach a never-painted name."""
 
 
 SETTLE_BUDGET_MS = 4000.0
-"""How long a converging step waits for the page to answer, before reading it again.
-
-**Not a sleep.** The loop polls, returns the instant the screen differs from the one
-that prompted the action, and on a page that responds immediately costs one extra read
-of a few milliseconds. That is the distinction
-:func:`~skillweaver.skills.refactor.strip_reflex_waits` draws, and this is the side of
-it that survives: a wait for something no load event covers.
-
-It exists because an undo on a real site is frequently NOT a navigation.
-``BrowserController`` settles an action by waiting for the page's load event, which is
-the right thing and covers nothing here: splitkb.com removes a cart line with an
-in-place fetch, so the load event never fires, the loop re-read the unchanged cart and
-- measured on 2026-09-19, a two-line cart - reported ``ResetDidNotConverge`` after
-twelve clicks with both lines still in it. Worse than the failure is what it looked
-like: the clicks were real, the anchor was right, and the step was correct. With a
-settle the same two lines come off in two rounds.
-
-Four seconds because the loop is already bounded by :data:`DEFAULT_MAX_ROUNDS` and the
-exit condition, so this only has to outlast one slow request; a step that will never
-converge still says so within ``max_rounds`` reads rather than ``max_rounds`` times
-this.
-"""
+"""A poll, not a sleep: it returns the instant the screen answers. An undo is often not a
+navigation, so ``_settle``'s load event covers nothing - splitkb.com removes a cart line
+by in-place fetch, and without this the loop re-read the unchanged cart and reported
+``ResetDidNotConverge`` after twelve clicks. Four seconds only has to outlast one slow
+request, since ``DEFAULT_MAX_ROUNDS`` already bounds the loop."""
 
 SETTLE_POLL_MS = 120.0
-"""How often the settle above looks. Short enough that a fast page pays almost nothing
-for it, long enough that a ``via="screen"`` poll - which costs a real observation - is
-not run flat out."""
+"""A ``via="screen"`` poll costs a real observation, so this is not run flat out."""
 
 DEFAULT_MAX_ROUNDS = 12
-"""How many times a converging step may act before it gives up.
-
-A bound, not a target: the whole point of :attr:`ResetStep.until_gone` is that the
-step stops when the condition clears, which on a clean world is immediately. The
-number only has to exceed the largest mess a task can make - a cart with more lines
-than anyone orders - while staying small enough that a step which will NEVER converge
-(a control that does not remove anything, a condition naming text that is always on
-the page) says so in seconds instead of spinning. Raise it per step when a task really
-can dirty the world more than this.
-"""
+"""A bound, not a target: enough to exceed the largest mess a task can make, small enough
+that a step which will NEVER converge says so in seconds. Raise it per step if needed."""
 
 
 class ResetStepFailed(SkillWeaverError):
-    """One step of an action reset could not be performed.
-
-    A :class:`~skillweaver.errors.SkillWeaverError` rather than an ``OSError``
-    because it is this project's own failure, and both are read by
-    :func:`~skillweaver.orchestrator.reset_world` as ``failed`` - "a real way back was
-    tried and did not work this time" - which is exactly what it is. It is NOT a
-    :class:`~skillweaver.orchestrator.ResetRefused`: that means "there is no reset
-    here and never will be", and a step list is a reset whether or not it worked.
-    """
+    """One step could not be performed; ``reset_world`` reads it as ``failed``. NOT a
+    ``ResetRefused``, which means there is no reset here at all."""
 
 
 class ResetDidNotConverge(ResetStepFailed):
-    """A converging step ran out of rounds with its exit condition still true.
-
-    The one failure this module exists to report honestly. The alternative - shrugging
-    and returning - hands the admission gate a dirty screen and lets it blame the
-    candidate skill for the mess, which is how an unreliable undo gets laundered into
-    a stored skill that only works on a clean world.
-    """
+    """A converging step ran out of rounds with its exit condition still true. Shrugging
+    instead would hand the gate a dirty screen and let it blame the candidate skill."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,40 +98,16 @@ class ResetStep:
     """One step of an action reset: an action, optionally aimed and optionally looped.
 
     Attributes:
-        action: What to do, in the controller's own vocabulary. When :attr:`find` is
-            set, the action must be one that carries a point (:class:`Click`,
-            :class:`Move`, :class:`Scroll`) and that point is replaced at run time.
-        find: Text the ANCHOR says, looked up by ``find_text(..., fuzzy=False)``:
-            case-insensitive, an exact match ranked above a containing one, and
-            NOTHING when the screen does not say it. Empty means the action's own
-            point is used as written, which is what a task that really does mean a
-            fixed pixel wants.
-        anchor_kind: Restricts the anchor to one element kind, for the screen where
-            the word appears both as a label and on the control beside it. Spelled
-            out rather than ``kind`` because a step dict's ``kind`` is the ACTION's -
-            one key cannot mean two things, and the collision silently rewrote the
-            action the first time this was tried.
-        dx / dy: Logical pixels from the anchor's centre to the thing actually
-            clicked. This is how an unlabelled control is reached - the trash icon at
-            the end of the line whose price text is the anchor - WITHOUT naming a
-            position on the page: the pair travels with the anchor when the page
-            moves. Requires :attr:`find`.
-        until_gone: Text whose presence means the world is still dirty. Non-empty
-            turns the step into a loop: read the screen, and if nothing says this,
-            stop; otherwise act and look again.
-        until_seen: Text whose presence means the world is clean - "Your cart is
-            empty". Also turns the step into a loop, and is the STRONGER of the two:
-            a negative test passes on any screen that lacks the marker, including a
-            screen an earlier step failed to leave. With both, both must hold.
-        via: Which reading of the screen answers :attr:`find`, :attr:`until_gone` and
-            :attr:`until_seen`. See :data:`Oracle`.
-        max_rounds: The cap on actions this loop may perform. See
-            :data:`DEFAULT_MAX_ROUNDS`.
-        optional: Whether a :attr:`find` that matches nothing is a no-op that
-            succeeds rather than a failure. For a step that opens a screen which may
-            already be open. Meaningless - and rejected - on a looping step, where
-            "the target is not there" either ends the loop through the exit condition
-            or is the reason it cannot converge.
+        find: Anchor text, via ``find_text(fuzzy=False)``; empty uses the action's own point.
+        anchor_kind: Narrows the anchor to one kind. Named apart from the action dict's
+            own ``kind``, which silently rewrote the action when the two collided.
+        dx / dy: Pixels from the anchor's centre, so an unlabelled control (the trash icon
+            on the anchored row) travels with the anchor. Requires ``find``.
+        until_gone: Text meaning the world is still dirty; non-empty makes the step a loop.
+        until_seen: Text meaning it is clean, and the STRONGER of the two - a negative test
+            also passes on a screen an earlier step failed to leave. With both, both hold.
+        optional: A ``find`` matching nothing succeeds. Rejected on a looping step, where
+            a missing target is either the exit condition or the reason it cannot converge.
 
     Raises:
         ValueError: if the fields do not fit together.
@@ -279,12 +126,10 @@ class ResetStep:
 
     @property
     def loops(self) -> bool:
-        """Whether this step repeats until a condition holds."""
         return bool(self.until_gone or self.until_seen)
 
     @property
     def reads_screen(self) -> bool:
-        """Whether performing this step needs the screen read at all."""
         return bool(self.find) or self.loops
 
     def __post_init__(self) -> None:
@@ -335,25 +180,13 @@ _STEP_FIELDS = frozenset(
         "optional",
     }
 )
-"""Keys of a step dict that belong to the step rather than to the action it carries.
-
-Split out before ``action_from_dict`` sees the dict, because that function turns every
-mapping value into a ``Point`` and every list into a tuple - it is reading an action,
-and a step is an action plus the things this module adds to it.
-"""
+"""Split out before ``action_from_dict`` sees the dict: that function turns every mapping
+value into a ``Point`` and every list into a tuple."""
 
 
 def reset_step_from_dict(data: Mapping[str, Any]) -> ResetStep:
-    """Build one :class:`ResetStep` from a JSON-shaped mapping.
-
-    The mapping is an action dict - ``{"kind": "click", "point": {...}}``, exactly
-    what :func:`~skillweaver.contracts.action_to_dict` writes - with any of
-    :data:`_STEP_FIELDS` alongside it. A click that is aimed by ``find`` needs no
-    ``point``; one is supplied so the action can be built and then replaced.
-
-    Raises:
-        ValueError: if the action or the step fields do not parse.
-    """
+    """One ``ResetStep`` from an ``action_to_dict`` mapping plus any of ``_STEP_FIELDS``.
+    A click aimed by ``find`` needs no ``point``; a placeholder is supplied and replaced."""
     if not isinstance(data, Mapping):
         raise ValueError(f"a reset step must be an object, got {type(data).__name__}")
     extras = {k: v for k, v in data.items() if k in _STEP_FIELDS}
@@ -373,23 +206,14 @@ def reset_step_from_dict(data: Mapping[str, Any]) -> ResetStep:
 
 
 _AIMABLE = frozenset({Click.kind, Move.kind, Scroll.kind})
-"""Action kinds that carry a point, and so can be aimed by :attr:`ResetStep.find`."""
 
 
 def reset_step_to_dict(step: ResetStep) -> dict[str, Any]:
-    """The JSON-shaped mapping :func:`reset_step_from_dict` reads back.
-
-    Only the fields that differ from their defaults are written, so a step round-trips
-    to roughly what a human typed rather than to every knob this module has. It is
-    what a parsed reset is stored back onto ``TaskSpec.params`` as: params are handed
-    to the composer and the explorer as text, and a page of dataclass reprs there is
-    tokens paid for nothing.
-    """
+    """The mapping ``reset_step_from_dict`` reads back. Only non-default fields are
+    written: this goes back onto ``TaskSpec.params``, which the composer is shown as text."""
     data = action_to_dict(step.action)
     if step.find:
-        # The written point is a placeholder once an anchor names the target; keeping
-        # it would suggest a fixed pixel that is never clicked.
-        data.pop("point", None)
+        data.pop("point", None)  # a placeholder once an anchor names the target
         data["find"] = step.find
         if step.anchor_kind is not None:
             data["anchor_kind"] = step.anchor_kind.value
@@ -405,17 +229,8 @@ def reset_step_to_dict(step: ResetStep) -> dict[str, Any]:
 
 
 def reset_steps_from(value: Any) -> tuple[ResetStep, ...]:
-    """Parse an action reset from what a command line or a task parameter holds.
-
-    Accepts a JSON array as a string (``-p reset_actions='[{"kind": ...}]'``), an
-    already-decoded sequence of mappings, or a sequence of :class:`ResetStep`. An
-    empty list is a real answer - "this task configures no action reset" - and comes
-    back as an empty tuple.
-
-    Raises:
-        ValueError: if the value is not one of those, or a step does not parse. The
-            message names the step's position, because a list is typed by hand.
-    """
+    """Parse an action reset: a JSON array as a string, a sequence of mappings, or a
+    sequence of ``ResetStep``. Empty is a real answer and comes back as an empty tuple."""
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -448,31 +263,14 @@ def world_reset_from_actions(
     perceiver: Perceiver,
     truth: GroundTruthSource | None = None,
 ) -> Any:
-    """A :data:`~skillweaver.orchestrator.WorldReset` that PERFORMS ``steps``.
+    """A ``WorldReset`` that PERFORMS ``steps`` in order, raising ``ResetStepFailed``
+    unless every step finished and every converging step saw its condition hold.
 
-    The returned callable runs the steps in order against ``controller``, reading the
-    screen whenever a step has to aim or has to decide whether it is done. It returns
-    normally only when every step finished and every converging step saw its condition
-    hold; otherwise it raises :class:`ResetStepFailed`, which the caller reads as a
-    ``failed`` reset rather than as a crash.
-
-    Idempotent by construction, as long as every step that undoes something is a
-    converging one: on an already-clean world each such step reads the screen once,
-    finds its condition already satisfied, and performs nothing.
-
-    Args:
-        steps: The undo, in order. Empty is allowed and does nothing.
-        controller: The hands. It is the SAME controller the gate re-runs the
-            candidate with, so the reset leaves the screen where the next step of the
-            gate expects to find it - the gate navigates afterwards regardless.
-        perceiver: The eyes, for a step reading ``via="screen"``. Consulted only when
-            a step aims or loops, because an observation is the most expensive thing
-            this module can do (OCR dominates it; see :mod:`skillweaver.perception.ocr`).
-        truth: The DOM, for a step reading ``via="dom"``. ``None`` means no step may
-            ask for one, and a step that does fails saying so rather than quietly
-            falling back to pixels - a reset that silently changed which reading it
-            trusted would be the flaky undo this module exists to rule out. See the
-            module docstring for why scaffolding may read this and the agent may not.
+    Idempotent while every undoing step converges: on a clean world it reads once and acts
+    never. ``perceiver`` is consulted only when a step aims or loops, since an observation
+    is the most expensive thing here. ``truth=None`` makes a ``via="dom"`` step FAIL rather
+    than fall back to pixels - silently changing which reading is trusted is the flaky undo
+    this module rules out.
     """
     plan = tuple(steps)
     read = _Reader(controller, perceiver, truth)
@@ -486,13 +284,9 @@ def world_reset_from_actions(
 
 
 def chain_resets(*resets: Any) -> Any:
-    """Run several resets in order as one, skipping the ``None`` ones.
-
-    Both undo kinds coexist rather than compete: a site with a seed-restoring endpoint
-    AND a screen that needs tidying gets both, URL first. Returns ``None`` when every
-    argument was ``None``, which is the caller's "nothing can put this back" and must
-    stay distinguishable from a reset that does nothing.
-    """
+    """Several resets in order as one, skipping ``None``. Returns ``None`` when all were
+    ``None`` - "nothing can put this back", which must stay distinct from a reset that
+    does nothing."""
     live = [r for r in resets if r is not None]
     if not live:
         return None
@@ -506,19 +300,9 @@ def chain_resets(*resets: Any) -> Any:
     return reset
 
 
-# --------------------------------------------------------------------------------------
-# Performing one step
-# --------------------------------------------------------------------------------------
-
-
 class _Reader:
-    """Reads the screen the way a step asks to, and says so plainly when it cannot.
-
-    One object rather than two arguments threaded everywhere, because the choice is
-    per step and the failure - "this step wants the DOM and no DOM was supplied" -
-    has to name the step. It holds no state: nothing here is cached, because the whole
-    point of a converging loop is that each round looks at a screen that just changed.
-    """
+    """Reads the screen the way a step asks to. Stateless: a converging loop's every round
+    looks at a screen that just changed, so nothing may be cached."""
 
     __slots__ = ("_controller", "_perceiver", "_truth")
 
@@ -561,12 +345,9 @@ def _run_step(step: ResetStep, position: int, controller: Controller, read: _Rea
         if _settled(seen, step):
             log.info("agent.world_reset.converged", step=position, rounds=performed)
             if performed == 0 and not step.until_seen:
-                # Did nothing and declared victory, on the word of a NEGATIVE test.
-                # True of a world that was already clean, and equally true of a world
-                # an earlier step never reached: the sandbox cart reset that missed
-                # the cart button ran this loop on the mail inbox and reported the
-                # world restored with three lines still in it. Say so, every time,
-                # because the reader is the only thing that can tell the two apart.
+                # Did nothing, on the word of a NEGATIVE test: equally true of a clean
+                # world and of a screen an earlier step never left. Only the reader can
+                # tell those apart, so say so every time.
                 log.warning(
                     "agent.world_reset.unverified",
                     step=position,
@@ -587,17 +368,9 @@ def _run_step(step: ResetStep, position: int, controller: Controller, read: _Rea
 
 
 def _await_answer(step: ResetStep, position: int, read: _Reader, before: ElementIndex) -> None:
-    """Wait for the page to answer the action just performed. See :data:`SETTLE_BUDGET_MS`.
-
-    Returns as soon as the screen differs from ``before`` or the step's exit condition
-    holds, and at the budget otherwise. Timing out is NOT a failure here: the next round
-    reads the screen and judges it on the same terms as every other round, so a page that
-    genuinely did not change still converges or still runs out of rounds. All this
-    decides is whether the loop is looking at the answer or at the question.
-
-    A read that fails is swallowed for the same reason: this is a poll, and the read at
-    the top of the next round is the one whose failure means something.
-    """
+    """Poll until the screen differs from ``before`` or the exit condition holds, else
+    return at ``SETTLE_BUDGET_MS``. Timing out is not a failure - this only decides whether
+    the loop looks at the answer or at the question - so a failed read is swallowed too."""
     deadline = time.monotonic() + SETTLE_BUDGET_MS / 1000.0
     start = _signature(before)
     previous = start
@@ -611,12 +384,9 @@ def _await_answer(step: ResetStep, position: int, read: _Reader, before: Element
         if _settled(now, step):
             return
         signature = _signature(now)
-        # Changed AND stopped changing. Waiting for the first change alone is not
-        # enough, because a page answers in two phases: splitkb.com's last cart line
-        # disappears one frame and "Your cart is empty" is painted the next, and a loop
-        # that returned in between saw a screen with nothing to click and nothing
-        # saying it was done - which _perform correctly reports as being on the wrong
-        # screen. One quiet poll is the difference.
+        # Changed AND stopped changing: a page answers in two frames (splitkb.com paints
+        # "Your cart is empty" after the last line goes), and returning in between shows a
+        # screen with nothing to click and nothing saying it is done.
         if changed and signature == previous:
             return
         changed = changed or signature != start
@@ -625,37 +395,22 @@ def _await_answer(step: ResetStep, position: int, read: _Reader, before: Element
 
 
 def _signature(seen: ElementIndex) -> tuple[tuple[str, int, int], ...]:
-    """A cheap identity for one reading of the screen, for :func:`_await_answer`.
-
-    Text and position, not a fingerprint: this is asking "did anything at all move or
-    change wording", which is deliberately a much lower bar than
-    :meth:`~skillweaver.contracts.Fingerprint.similarity`. A removed cart line changes
-    it; so does a spinner, and that is fine - the exit condition, not this, decides
-    whether the world is back.
-    """
+    """Text and position, not a fingerprint: "did anything move or change wording", a
+    deliberately lower bar. A spinner trips it, and that is fine - the exit condition
+    decides whether the world is back."""
     return tuple((element.text, element.box.x, element.box.y) for element in seen.all())
 
 
 def _settled(seen: ElementIndex, step: ResetStep) -> bool:
-    """Whether ``step``'s exit condition holds on this reading of the screen.
-
-    Both clauses must, when both are given. ``until_gone`` alone is a negative test
-    and passes on any screen lacking the marker, which is why ``until_seen`` exists;
-    see the module docstring for the run that proved it.
-    """
+    """Whether ``step``'s exit condition holds; both clauses must, when both are given."""
     if step.until_gone and _says(seen, step.until_gone):
         return False
     return not (step.until_seen and not _says(seen, step.until_seen))
 
 
 def _says(seen: ElementIndex, text: str) -> bool:
-    """Whether anything on this screen reads as ``text``.
-
-    ``fuzzy=False``: equality or containment, case-insensitive. A converging loop's
-    exit condition decides whether a skill is admitted, and a fuzzy match would let an
-    unrelated word keep the loop running - or, worse, stop it early on a screen that
-    only nearly says the marker is gone.
-    """
+    """``fuzzy=False`` on purpose: a fuzzy match on an exit condition could stop the loop
+    early on a screen that only nearly says the marker is gone."""
     return bool(seen.find_text(text, fuzzy=False))
 
 
@@ -692,7 +447,7 @@ def _perform(
 
 
 def _aimed(action: Action, point: Point) -> Action:
-    """``action`` with its point replaced. ``ResetStep`` has already checked the kind."""
+    """``action`` with its point replaced; ``ResetStep`` has already checked the kind."""
     if isinstance(action, Click | Move | Scroll):
         return replace(action, point=point)
     raise ResetStepFailed(  # pragma: no cover - ResetStep.__post_init__ rejects this
