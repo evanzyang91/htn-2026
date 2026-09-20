@@ -479,8 +479,39 @@ A run's model client is built with `computer_use=True`, which appends the comput
 EVERY request it makes, helpers included. A helper that wants text back can get a
 `screenshot` tool call and no text instead: 1 reply in 12 for the Jev text writer, which
 ended three cold runs at step 0 and read exactly like a truncated reply until the stop
-reason was printed. `_TEXT_ASKS` in `llm/jev_.py` carries the fix and the measurement. The
-critic's "(empty reply)" degradations are the same shape and are NOT fixed.
+reason was printed. The text writer was fixed by LEAVING that client: it is
+`OpenAITextWriter` in `llm/openai_.py`, a client of its own that was never handed the tool
+(`OPENAI_API_KEY`; a missing key fails at construction, there is no fall-back writer, and
+`JevPolicy.total_usage` now ADDS its spend because nothing else meters it). The critic's
+"(empty reply)" degradations are the same shape and are NOT fixed, and they are not rare:
+on one fixture the Jev policy made the right two moves 4 runs of 4, and 2 of those 4 were
+reported NOT SOLVED because the critic answered the `DONE` claim with an empty reply five
+times running. Read `critic.degrade` lines before believing a Jev run failed.
+
+The Jev path's logic is upstream's (`jev-ultrafast` `e8f6894`) INSIDE this project's flow:
+everything lives behind `ActingPolicy`, and the explorer, critic, graph, trajectory and
+gate are untouched - a skill learned through it still stores and replays warm (live
+Wikipedia: 4 actions, 0 model calls, ~1.4s). Upstream's own `Agent` and `Browser` were NOT
+adopted and must not be: its loop writes no `Trajectory`, no graph edge and has no critic,
+so taking it deletes synthesis, routing and replay. Five things there were each paid for in
+a run. An OFFERED scroll is not a CHOSEN one: under a dialog the document is locked, so
+`DomSnapshot.scroller` decides the offer, and the policy still answered `BLOCKED` 0.96
+until `state.page.scroll` told it the list continues (`_scroll_state`, `llm/jev_.py`, with
+the table). A control is reported only if it is what is AT its own click point - the
+hit-test in `_SNAPSHOT_JS` - because `checkVisibility` knows nothing of a scroll container
+clipping its children: 8 of 18 checkboxes offered in one dialog were phantoms and a click
+on the wanted one landed on the backdrop, silently. `page_changed` is LITERAL
+(`DomSnapshot.digest`), never the critic's verdict, and `refused` is relayed only when the
+page did not change: told a correct *Add to cart* "did not work", the policy added the
+other nine products. Upstream's rules are `_RULES`, but its rewrite DROPPED the WAIT
+discipline and that paragraph is ours again (finished page: `DONE` 0.49 -> 0.65). And the
+quiesce is `BrowserController.quiesce`, armed per move by `DomPerceiver.rest_after` and
+NEVER in `_settle`; it waits for a busy page to finish, not for an idle one to start.
+Goal refinement (`SKILLWEAVER_REFINE_GOAL`, off) is for the POLICY'S EYES ONLY -
+`JevDriver._goal_shown` - because a rewrite that reached the recorder would become the
+stored `Precedent` and the warm gates count words; measured, it did not pay on a
+single-item task. `AttemptRecord.wall_ms`/`policy_ms`/`site_ms` split a run's clock: cold
+is ~2/3 critic and recording, warm is ~96% site.
 
 `skillweaver inspect` is a LIVE control surface, not `dashboard build`'s static report:
 a loopback page that drives the real agent one move at a time (`src/skillweaver/inspector/`).
