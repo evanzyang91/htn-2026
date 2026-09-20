@@ -62,17 +62,17 @@ import argparse
 import logging
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from skillweaver.agent.planner import MIN_ACCOUNTED_FOR, bind_args  # noqa: E402
+from skillweaver.agent.planner import MIN_ACCOUNTED_FOR, account_of, bind_args  # noqa: E402
 from skillweaver.config import load_settings  # noqa: E402
 from skillweaver.contracts import Skill, SkillStore, TaskSpec  # noqa: E402
 from skillweaver.skills.embed import embedder_for  # noqa: E402
-from skillweaver.skills.retrieve import SkillRetriever, accounted_for  # noqa: E402
+from skillweaver.skills.retrieve import SkillRetriever  # noqa: E402
 from skillweaver.skills.store import FileSkillStore  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,7 +199,11 @@ class Score:
 
 
 def would_run(
-    text: str, domain: str, skill: Skill, params: Mapping[str, object]
+    text: str,
+    domain: str,
+    skill: Skill,
+    params: Mapping[str, object],
+    library: Callable[[], Sequence[Skill]],
 ) -> tuple[bool, str]:
     """``(would the planner run this, what stopped it)``, asked exactly this way.
 
@@ -209,10 +213,15 @@ def would_run(
     now ranked first and still does not run was stopped by ONE of these, and which one
     it is decides whether better ranking could ever have helped.
     """
-    args = bind_args(skill, TaskSpec(text=text, domain=domain, params=dict(params)))
+    task = TaskSpec(text=text, domain=domain, params=dict(params))
+    args = bind_args(skill, task)
     if args is None:
         return False, "bind"
-    covered = accounted_for(text, skill, args)
+    # The planner's own account, family included: a candidate whose own words fall
+    # short may be vouched for by relatives that EARNED a signature. Neither library
+    # measured here was admitted after signatures existed, so unless one has been
+    # backfilled (scripts/measure_families.py --backfill) this is the skill alone.
+    covered, _ = account_of(task, skill, args, library)
     return (True, "") if covered >= MIN_ACCOUNTED_FOR else (False, f"gate {covered:.2f}")
 
 
@@ -232,7 +241,9 @@ def run(
         top = hits[0] if hits else None
         params = query.params if with_params else {}
         runs, stopped_by = (
-            would_run(query.text, domain, top.skill, params) if top else (False, "no hit")
+            would_run(query.text, domain, top.skill, params, store.list)
+            if top
+            else (False, "no hit")
         )
         if stopped_by.startswith("bind"):
             score.stopped_by_binding += 1

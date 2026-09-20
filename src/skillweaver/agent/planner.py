@@ -158,6 +158,7 @@ __all__ = [
     "Planner",
     "Rejection",
     "account_of",
+    "asks_for",
     "bind_args",
     "fit_through_family",
 ]
@@ -504,6 +505,12 @@ class Planner:
                 stage, reason = _why_unbound(skill, task)
                 reasons.append(reason)
                 looked_at.append(Rejection(skill.name, candidate.score, stage, reason))
+                continue
+            if not asks_for(task, skill, args):
+                stage, reason = "other_intent", _other_intent(skill, task)
+                reasons.append(reason)
+                looked_at.append(Rejection(skill.name, candidate.score, stage, reason))
+                log.info("planner.other_intent", task=task.text, skill=skill.name, why=reason)
                 continue
             share, vouchers = account_of(task, skill, args, self._library)
             if share < MIN_ACCOUNTED_FOR:
@@ -905,9 +912,12 @@ class Planner:
 
 def _how_bound(skill: Skill, task: TaskSpec) -> str:
     """Which reader :func:`bind_args` used for a candidate it DID bind."""
-    if _bind_args(skill, task) is not None:
-        return "params"
     name = _text_bound(skill, task)
+    if name is None:
+        open_slots = [
+            n for n, schema in skill.params.items() if n not in task.params and _has_default(schema)
+        ]
+        name = open_slots[0] if len(open_slots) == 1 else None
     found = _span_for(skill, name, task.text) if name is not None else None
     return found[1] if found is not None else "params"
 
@@ -935,6 +945,40 @@ def _vouchers(
         other
         for other in relatives(skill, library)
         if same_intent(task.text, other, outside=outside)
+    )
+
+
+def asks_for(task: TaskSpec, skill: Skill, args: Mapping[str, Any]) -> bool:
+    """Whether ``task`` asks for the errand ``skill`` performs, HOWEVER it was bound.
+
+    The gate every single-skill candidate passes, and it is here rather than inside
+    one binder because of what a real synthesized skill looks like. Measured on
+    2026-09-20 against ``search_and_add_product_to_cart`` as the admission gate
+    stored it on live splitkb.com: the synthesizer had given ``product`` a DEFAULT, so
+    :func:`_bind_args` bound ``{}`` without reading the sentence at all, and *Remove
+    the "MBK Choc Glow Legended Keycaps" from the cart* then accounted for 0.86 of
+    itself on the add skill's own words and was cleared to RUN. A check that lived in
+    the text binder never saw it. A hand-built skill with a required parameter had
+    been refused correctly an hour earlier, which is the whole argument for proving
+    things against what the gate actually stores.
+
+    The arguments' own text is cut out first, so a product called *Clear Glass Set*
+    is a value and not the verb *clear*.
+    """
+    outside = task.text
+    for value in args.values():
+        outside = _without(outside, str(value))
+    return same_intent(task.text, skill, outside=outside)
+
+
+def _other_intent(skill: Skill, task: TaskSpec) -> str:
+    asked, known = head_verb(task.text), head_verb(skill.provenance.task_text)
+    return (
+        f"{skill.name}: the request leads with {asked!r} "
+        f"({intent_of(asked or '') or 'no known intent'}) and the skill was learned under "
+        f"{known!r} ({intent_of(known or '') or 'no known intent'}), or it names an opposing "
+        "verb elsewhere; the same controls in the other direction are a different errand, "
+        "so it is not run"
     )
 
 
@@ -1041,7 +1085,51 @@ def bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     two callers cannot drift apart.
     """
     args = _bind_args(skill, task)
-    return args if args is not None else _bind_from_text(skill, task)
+    if args is None:
+        return _bind_from_text(skill, task)
+    return _with_defaults(skill, task, args)
+
+
+def _with_defaults(skill: Skill, task: TaskSpec, args: dict[str, Any]) -> dict[str, Any]:
+    """``args`` with every defaulted parameter the caller left out given a VALUE.
+
+    Two defects of "a declared default may simply be omitted", both measured on the
+    skill named in :func:`asks_for`:
+
+    * the default lives in the SCHEMA, and ``run(ctx, product)`` has none, so omitting
+      it was ``TypeError: run() missing 1 required positional argument`` - and because
+      a skill that raises on the warm path is demoted, one bare repeat retired a
+      skill that had just passed admission;
+    * when the sentence NAMES a value, the default is the wrong one. *Buy the "Kailh
+      Choc Transparent Keycaps"* bound ``{}`` and would have been run for the MBK set
+      it was learned on, with a verifier that checks the cart against its own return
+      value and so says yes.
+
+    So the text is asked first, through the same guarded readers as a required
+    parameter (one candidate parameter only - several is a guess), and the declared
+    default is what is used when the text names nothing. Either way the call now
+    matches the schema.
+    """
+    open_slots = [
+        name for name, schema in skill.params.items() if name not in args and _has_default(schema)
+    ]
+    if len(open_slots) == 1 and len(skill.params) - len(args) == 1:
+        name = open_slots[0]
+        found = _span_for(skill, name, task.text)
+        value = _as_declared(found[0], skill.params[name]) if found is not None else _REFUSED
+        if value is not _REFUSED:
+            log.info(
+                "planner.bound_from_text",
+                skill=skill.name,
+                domain=skill.domain,
+                param=name,
+                value=value,
+                how=found[1],  # type: ignore[index]
+                over_default=skill.params[name]["default"],
+                task=task.text,
+            )
+            return {**args, name: value}
+    return {**{name: skill.params[name]["default"] for name in open_slots}, **args}
 
 
 def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:

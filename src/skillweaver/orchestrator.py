@@ -71,6 +71,7 @@ from skillweaver.agent.planner import (
     PlanFailure,
     Planner,
     account_of,
+    asks_for,
     bind_args,
     fit_through_family,
 )
@@ -1480,6 +1481,9 @@ def resolve_domain(
         # they do not - because what binds them there is the composer, which costs a
         # model call and cannot run before the browser is even open.
         args = bind_args(skill, probe) or probe.params
+        if not asks_for(probe, skill, args):
+            passed_over.append(f"{skill.name}@{skill.domain} (a different errand: other intent)")
+            continue
         share, _ = account_of(probe, skill, args, _whole_library(retriever))
         if share < MIN_ACCOUNTED_FOR:
             passed_over.append(f"{skill.name}@{skill.domain} (accounts for {share:.0%})")
