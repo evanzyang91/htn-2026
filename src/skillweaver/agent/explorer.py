@@ -594,6 +594,8 @@ class _Run:
     at: int = 0
     strays: int = 0
     history: list[str] = field(default_factory=list)
+    # What was literally DONE, with no verdict attached: what a final judge is shown.
+    actions: list[str] = field(default_factory=list)
     rejection: str | None = None
     steps: int = 0
     moves: int = 0
@@ -686,6 +688,11 @@ class Explorer:
         self._recorder.start(task.text, task.domain)
         self._go_to_start(task, controller)
         observation = self._perceiver.observe(controller)
+        # A critic that judges from the page's own text is told where the run began;
+        # see agent/critic_final.py. The default critic has no such method.
+        open_run = getattr(self._critic, "open_run", None)
+        if callable(open_run):
+            open_run(observation)
         run = _Run(
             task=task,
             spend=spend,
@@ -768,6 +775,12 @@ class Explorer:
                 f"{run.moves}. {move.summary} -> "
                 f"{'ok' if verdict.ok else 'FAILED'}: {_short(verdict.reason)}"
             )
+            literal = (
+                move.summary
+                if move.action is not None
+                else "; ".join(describe_action(step.action) for step in performed)
+            )
+            run.actions.append(f"{run.moves}. {literal}")
             if not verdict.ok:
                 run.memory.remember(
                     before.fingerprint, move.signature, move.summary, verdict.reason
@@ -788,10 +801,19 @@ class Explorer:
 
     def _settle(self, task: TaskSpec, move: Move, run: _Run) -> None:
         """Test the model's claim that the task is finished, and believe only the critic."""
+        brief = getattr(self._critic, "brief_final", None)
+        if callable(brief):
+            brief(tuple(run.actions))
         verdict = self._judge(task.text, run.first, run.current, move, run)
         if verdict.ok:
             run.ok, run.verdict, run.stopped_by = True, verdict, "solved"
-            log.info("explore.solved", task=task.text, steps=run.steps, moves=run.moves)
+            log.info(
+                "explore.solved",
+                task=task.text,
+                steps=run.steps,
+                moves=run.moves,
+                judged_by=getattr(verdict, "policy", "") or verdict.source,
+            )
             return
         run.memory.remember(
             run.current.fingerprint,
