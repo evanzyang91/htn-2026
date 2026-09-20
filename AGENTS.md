@@ -33,9 +33,10 @@ history, a `Back` in `contracts.py` that only a controller with a session histor
 supports. It is OFFERED from `DomSnapshot.can_go_back`, which is the Navigation API's
 `canGoBack` and not `history.length` - length counts entries in both directions and would
 offer a back with nothing behind it - and WITHHELD again by `BACK_SIGNATURE` in
-`agent/jev_driver.py` once a back is on this screen's dead-end list, because a targetless
-move is the one `_without` cannot prune and the policy will otherwise re-pick it until the
-run gives up. A skill CANNOT replay a back and that is deliberate: `ActionSurface` has no
+`agent/jev_driver.py` once a back is on this screen's dead-end list. That is a second
+line rather than a row in `DEAD_END_OPERATIONS` because `BACK` names no element, so
+`_exclusions` cannot reach it twice over, and the policy will otherwise re-pick it until
+the run gives up at `BLOCKED`. A skill CANNOT replay a back and that is deliberate: `ActionSurface` has no
 `back()` any more than it has `navigate()`, and the sandbox namespace holds no action
 class, so a stored skill can never pop a history stack it did not build. Two measured
 facts to save a re-derivation: the operation head picks `BACK` only when the goal names
