@@ -56,6 +56,12 @@ def validate_choice(answer, ids):
     return answer
 
 
+def action_name(action):
+    """What distinguishes this control. Several may share a label, so the context decides."""
+    context = action.get("context")
+    return f"{action['label']} — {context}" if context else action["label"]
+
+
 def progress(history, window=20, limit=60):
     """Every action that changed the page, plus the recent tail.
 
@@ -80,7 +86,7 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            keep = ("role", "value", "checked", "selected", "expanded", "section", "opens")
+            keep = ("role", "value", "checked", "selected", "expanded", "section", "opens", "context")
             element = {k: action[k] for k in keep if k in action}
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
@@ -131,7 +137,7 @@ def choose(state, goal, history, covered=(), inert=(), limit=None):
     if dead or inert:
         for operation in list(targets):
             candidates = targets[operation]
-            for index in [t for t, a in candidates.items() if a["id"] in dead or a["label"] in inert]:
+            for index in [t for t, a in candidates.items() if a["id"] in dead or action_name(a) in inert]:
                 del candidates[index]
                 element = elements[int(index.split(":")[0]) - 1]
                 if operation in element["operations"] and not any(
@@ -162,7 +168,11 @@ def choose(state, goal, history, covered=(), inert=(), limit=None):
                 index: {
                     "element": f"[{index}] {a['label']}",
                     "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded", "section", "opens") if k in a},
+                    **{
+                        k: a[k]
+                        for k in ("role", "checked", "selected", "expanded", "section", "opens", "context")
+                        if k in a
+                    },
                 }
                 for index, a in candidates.items()
             },

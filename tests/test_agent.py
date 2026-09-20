@@ -329,3 +329,17 @@ def test_progress_is_not_mistaken_for_a_cycle():
     # A varied multi-item flow must never be pruned.
     assert loop.Agent.cycling(steps(["Search", "Go", "Item A", "Add to cart", "Search", "Go", "Item B"])) == set()
     assert loop.Agent.cycling(steps(["Open Search", "Go"])) == set()  # too short to conclude
+
+
+def test_scroll_that_reveals_nothing_counts_against_itself(runner):
+    # A scroll always moves the offset, so page_changed can never flag a pointless one.
+    scroll = {"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560}
+    settled = page()
+    settled["actions"].append(scroll)
+    runner.state["page"]["actions"].append(scroll)
+    runner.state["browser"].observe.return_value = settled
+    for _ in range(3):
+        runner.state["decision"] = decision("scroll_down")
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.inert["Scroll down"] == 3
+    assert all(h["revealed"] == 0 for h in runner.state["history"])

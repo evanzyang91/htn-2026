@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .browser import Browser, CoveredTarget, StalePage
-from .model import NoFieldValue, action_space, choose, field_context, field_text
+from .model import NoFieldValue, action_name, action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
 
@@ -290,7 +290,10 @@ class Agent:
             state["history"].append(
                 {
                     "step": len(state["history"]) + 1,
-                    "action": action["label"],
+                    # The distinguishing name, so a history of seven "Add item to cart" entries
+                    # says which item each one was — and so the loop guards below can tell them
+                    # apart instead of banning every control that shares a label.
+                    "action": action_name(action),
                     "kind": action["kind"],
                     "choice": selected,
                     "probability": decision["probabilities"][selected],
@@ -371,7 +374,17 @@ class Agent:
             state["frame_ms"] += frame_ms
             if action["kind"] in {"click", "select", "fill"}:
                 changed = state["history"][-1]["page_changed"]
-                self.inert[action["label"]] = 0 if changed else self.inert.get(action["label"], 0) + 1
+                name = action_name(action)
+                self.inert[name] = 0 if changed else self.inert.get(name, 0) + 1
+            elif action["kind"] == "scroll":
+                # A scroll always moves the offset, so it always "changes the page" and no guard
+                # built on page_changed can ever see a pointless one. Judge it by what it revealed:
+                # controls that were not on screen before. Scrolling a settled panel reveals none.
+                seen = {action_name(a) for a in page["actions"]}
+                revealed = sum(1 for a in after["actions"] if action_name(a) not in seen)
+                state["history"][-1]["revealed"] = revealed
+                name = action["label"]
+                self.inert[name] = 0 if revealed else self.inert.get(name, 0) + 1
             self.taken.setdefault(page["fingerprint"], set()).add(selected)
             if state["record"] and state["page"].get("screenshot"):
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(

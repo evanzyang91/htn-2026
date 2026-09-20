@@ -69,6 +69,21 @@
     const r=l.getAttribute('role');
     return r ? (ROLE_NAMES[r]||r) : l.tagName.toLowerCase();
   };
+  // What surrounds a control, for when its own name does not identify it. A store listing can show
+  // seven buttons all named "Add item to cart"; the product name lives in the card around each one.
+  // Reads innerText, which forces layout, so it runs only for the ambiguous ones and is capped.
+  const describe=(e,label)=>{
+    for (let p=e.parentElement, i=0; p && i<4; p=p.parentElement, i++) {
+      // Stop at the row or card holding this control. A container full of other controls is a
+      // header or a list, and its text describes all of them equally — which is no help at all.
+      if (p.querySelectorAll('a,button,input,select,textarea,[role="button"]').length>3) break;
+      const whole=(p.innerText||'').replace(/\s+/g,' ').trim();
+      if (whole.length<=label.length+3 || whole.length>300) continue;
+      const rest=whole.split(label).join(' ').replace(/\s+/g,' ').trim();
+      if (rest.length>2) return rest.slice(0,80);
+    }
+    return null;
+  };
   const actions=[];
   for (const e of document.querySelectorAll(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
@@ -108,6 +123,17 @@
     if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
       words.push(value); length+=value.length;
     }
+  }
+  // Only labels shared by several controls need disambiguating, and only the first few: past that
+  // the page is a list of near-identical rows and the index carries the same information.
+  const shared={};
+  for (const a of actions) if (a.kind==='click'||a.kind==='fill') shared[a.label]=(shared[a.label]||0)+1;
+  let described=0;
+  for (const a of actions) {
+    if (described>=30) break;
+    if ((shared[a.label]||0)<2) continue;
+    const context=describe(cache.nodes.get(a.node),a.label);
+    if (context) { a.context=context; described++; }
   }
   const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
   const page_key=cache.pageKey(), guards={};
