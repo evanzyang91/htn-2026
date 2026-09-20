@@ -107,17 +107,54 @@
 
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
+  // Phrasings for each live state. Every line in a group means the same thing and
+  // describes the same moment; the page rotates through them so a long stage reads as
+  // alive rather than stuck. A state not listed here (a chosen site, a refined task, an
+  // error) is shown verbatim.
+  const PHRASES = {
+    'starting': ['starting', 'getting ready', 'setting up the run'],
+    'choosing a website': ['choosing a website', 'deciding where to go', 'picking the right site', 'working out which website fits'],
+    'refining the request': ['refining the request', 'turning the request into steps', 'writing out concrete steps', 'making the task precise'],
+    'launching the agent': ['launching the agent', 'starting the agent', 'handing the task to the agent'],
+    'connecting to your Chrome': ['connecting to your Chrome', 'reaching your browser', 'opening a tab in your Chrome'],
+    'waiting for you to click Allow in Chrome': ['waiting for you to click Allow in Chrome', 'Chrome is asking to allow remote debugging', 'needs your Allow in Chrome'],
+    'checking the skill library': ['checking the skill library', 'looking for a skill it already knows', 'seeing if it has done this before'],
+    'exploring the site': ['exploring the site', 'looking at the page', 'reading the screen', 'working out the next move'],
+    'acting on the page': ['acting on the page', 'clicking and typing', 'carrying out the steps', 'moving through the site'],
+    'task done - checking what it learned': ['task done - checking what it learned', 'finished - reviewing the run', 'done - deciding what to keep'],
+    'stored a new skill': ['stored a new skill', 'saved what it learned', 'wrapping up'],
+  };
+  let tick = 0;
+  let known = [];
+
+  function liveText(state) {
+    const group = PHRASES[state];
+    const phrase = group ? group[Math.floor(tick / 8) % group.length] : state;
+    return phrase + '.'.repeat(1 + (tick % 3));
+  }
+
   function render(runs) {
+    known = runs;
     list.innerHTML = runs.map(r => {
       const cls = r.done ? (r.state === 'done' ? 'done' : 'failed') : 'busy';
       const stop = r.done ? '' : `<a class="stop" data-stop="${r.id}">stop</a>`;
-      return `<div class="run ${cls}">
+      return `<div class="run ${cls}" data-id="${r.id}">
         <div class="title"><span class="n">run ${r.id}</span><span class="t">${esc(r.text)}</span>
           <a href="/run/${r.id}" target="_blank">debug</a>${stop}</div>
-        <div class="state">${esc(r.state)}</div>
+        <div class="state">${esc(r.done ? r.state : liveText(r.state))}</div>
       </div>`;
     }).join('');
   }
+
+  // The dots and the phrasing move between polls, without rebuilding the list.
+  setInterval(() => {
+    tick += 1;
+    for (const r of known) {
+      if (r.done) continue;
+      const el = list.querySelector(`.run[data-id="${r.id}"] .state`);
+      if (el) el.textContent = liveText(r.state);
+    }
+  }, 500);
 
   list.addEventListener('click', (e) => {
     const id = e.target.dataset && e.target.dataset.stop;
