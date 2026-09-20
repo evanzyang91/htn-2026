@@ -106,6 +106,8 @@
   .run.busy .state { border-left-color: var(--accent); }
   .run a { color: #8ab4ff; text-decoration: none; font-size: 12px; cursor: pointer; }
   .run .stop { color: #e08a8a; margin-left: 8px; }
+  .run .trash { color: var(--muted); margin-left: 8px; opacity: .6; }
+  .run .trash:hover { opacity: 1; color: #e08a8a; }
 </style>
 </head>
 <body>
@@ -157,8 +159,9 @@
 
   function rowHtml(r) {
     const stop = r.done ? '' : `<a class="stop" data-stop="${r.id}">stop</a>`;
+    const trash = `<a class="trash" data-trash="${r.id}" title="remove from this list">&#128465;</a>`;
     return `<div class="title"><span class="n">run ${r.id}</span><span class="t">${esc(r.text)}</span>
-        <a href="/run/${r.id}" target="_blank">debug</a>${stop}</div>
+        <a href="/run/${r.id}" target="_blank">debug</a>${stop}${trash}</div>
       <div class="state"></div>`;
   }
 
@@ -196,8 +199,15 @@
   }, 500);
 
   list.addEventListener('click', (e) => {
-    const id = e.target.dataset && e.target.dataset.stop;
-    if (id) { e.preventDefault(); fetch(`/api/runs/${id}/stop`, {method: 'POST'}); }
+    const d = e.target.dataset || {};
+    if (d.stop) { e.preventDefault(); fetch(`/api/runs/${d.stop}/stop`, {method: 'POST'}); }
+    if (d.trash) {
+      e.preventDefault();
+      const row = e.target.closest('.run');
+      if (row) row.remove();
+      known = known.filter(x => String(x.id) !== d.trash);
+      fetch(`/api/runs/${d.trash}/delete`, {method: 'POST'}).then(poll);
+    }
   });
 
   async function poll() {

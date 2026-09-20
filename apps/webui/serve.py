@@ -599,6 +599,13 @@ class Handler(BaseHTTPRequestHandler):
         if m and int(m.group(1)) in RUNS:
             RUNS[int(m.group(1))].stop()
             return self._json(HTTPStatus.OK, {"ok": True})
+        m = re.fullmatch(r"/api/runs/(\d+)/delete", path)
+        if m and int(m.group(1)) in RUNS:
+            # Off the screen and out of memory. A live run is stopped first; what it
+            # recorded on disk (its trajectory, any skill) is untouched.
+            run = RUNS.pop(int(m.group(1)))
+            run.stop()
+            return self._json(HTTPStatus.OK, {"ok": True})
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def _events(self, run_id: int) -> None:
