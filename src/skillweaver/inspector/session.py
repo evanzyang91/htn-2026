@@ -534,6 +534,14 @@ class _Pending:
     split: _Split
 
 
+def _move_critic_for(settings: Settings, perceiver: Perceiver) -> Any:
+    """The orchestrator's own choice of per-move judge, so a stepped run and ``learn``
+    cannot disagree about it."""
+    from skillweaver.orchestrator import _open_move_critic
+
+    return _open_move_critic(settings, perceiver)
+
+
 class LiveSession:
     """One inspected run: a browser, a task, and a loop a person advances by hand.
 
@@ -765,6 +773,9 @@ class LiveSession:
                 recorder=Recorder(self._settings.trajectories_dir),
                 retriever=build_retriever(self._store),
                 policy=policy,
+                # The same per-move judge `learn` gets, or the page would time a run the
+                # command line never makes: a model call after every move that changed it.
+                move_critic=_move_critic_for(self._run_settings, perceiver),
             )
         except Exception:
             self.close()
