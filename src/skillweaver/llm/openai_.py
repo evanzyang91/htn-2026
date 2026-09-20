@@ -22,6 +22,7 @@ per provider, newer OpenAI models take ``max_completion_tokens`` and reject
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -96,7 +97,10 @@ explicitly asked": the policy's own rules end every errand at the cart
 that must not is two instructions fighting at every decision."""
 
 _MAX_TEXT_TOKENS = 1024
-_PAGE_TEXT_SHOWN = 6000
+_PAGE_TEXT_SHOWN = 2000
+"""Page text the writer is shown. Upstream's number as of ``1489129`` and its measurement:
+2,000 characters answered ~200ms faster per call than 6,000 with identical answers - the
+value comes from the goal and the field, not from the bulk of the page."""
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 529})
 _MAX_ATTEMPTS = 3
 _TIMEOUT_SECONDS = 25.0
@@ -127,6 +131,7 @@ class OpenAITextWriter:
         "_base",
         "_effort",
         "_key",
+        "_lock",
         "_meter",
         "_model",
         "_refine_model",
@@ -157,6 +162,7 @@ class OpenAITextWriter:
         self._effort = effort
         self._meter = UsageMeter()
         self._session: httpx.Client | None = None
+        self._lock = threading.Lock()
         self._token_key = "max_tokens"
 
     def __repr__(self) -> str:
@@ -283,13 +289,21 @@ class OpenAITextWriter:
         return {"reasoning": {"effort": self._effort or "low"}}
 
     def _post(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
-        """One POST with backoff, every failure mapped onto ``ProviderError``."""
-        if self._session is None:
-            self._session = httpx.Client(timeout=_TIMEOUT_SECONDS)
+        """One POST with backoff, every failure mapped onto ``ProviderError``.
+
+        Callable from two threads at once: the policy writes a field's value beside its
+        own round trip (``JevPolicy._speculate``), and a discarded one can still be in
+        flight when the next is asked for directly. An ``httpx.Client`` is safe to share
+        and the meter locks itself; what needed a lock is making the session ONCE.
+        """
+        with self._lock:
+            if self._session is None:
+                self._session = httpx.Client(timeout=_TIMEOUT_SECONDS)
+            session = self._session
         last: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                response = self._session.post(
+                response = session.post(
                     f"{self._base}/chat/completions",
                     json=body,
                     headers={"Authorization": f"Bearer {self._key}"},
