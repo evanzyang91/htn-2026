@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SkillWeaver</title>
+<style>
+  :root {
+    --bg: #0d0d0d;
+    --fg: #ececec;
+    --muted: #8e8e8e;
+    --pill: #1b1b1b;
+    --pill-border: #2a2a2a;
+    --accent: #2f6fe4;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    -webkit-font-smoothing: antialiased;
+  }
+  .stage {
+    flex: 1;
+    width: 100%;
+    max-width: 980px;
+    padding: 0 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  h1 { font-weight: 400; font-size: 30px; text-align: center; margin: 0 0 28px; }
+  form {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--pill);
+    border: 1px solid var(--pill-border);
+    border-radius: 999px;
+    padding: 10px 10px 10px 22px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.45);
+  }
+  form:focus-within { border-color: #3a3a3a; }
+  input {
+    flex: 1; min-width: 0;
+    background: transparent; border: 0; outline: 0;
+    color: var(--fg); font-size: 18px; font-family: inherit;
+  }
+  input::placeholder { color: var(--muted); }
+  button {
+    width: 44px; height: 44px; border-radius: 50%; border: 0; flex: none;
+    background: var(--accent); color: #fff;
+    display: grid; place-items: center; cursor: pointer;
+  }
+  button:disabled { opacity: .35; cursor: default; }
+  .hint { text-align: center; color: var(--muted); font-size: 13px; margin-top: 16px; min-height: 1.2em; }
+  .hint a { color: #8ab4ff; text-decoration: none; }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <h1>What should the agent do?</h1>
+    <form id="f">
+      <input id="task" autofocus autocomplete="off" spellcheck="false" placeholder="Ask anything">
+      <button id="go" type="submit" title="Run">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+      </button>
+    </form>
+    <div class="hint" id="hint">Put a URL in the sentence to say where to start. Each run opens in a new tab.</div>
+  </div>
+<script>
+  const form = document.getElementById('f');
+  const input = document.getElementById('task');
+  const go = document.getElementById('go');
+  const hint = document.getElementById('hint');
+  const runs = [];
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    // Open the tab synchronously, inside the click, so a popup blocker lets it through.
+    const tab = window.open('', '_blank');
+    go.disabled = true;
+    try {
+      const r = await fetch('/api/run', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+      });
+      const info = await r.json();
+      if (!r.ok) { if (tab) tab.close(); hint.textContent = info.error || 'could not start'; return; }
+      const href = `/run/${info.id}`;
+      if (tab) tab.location = href; else window.open(href, '_blank');
+      runs.unshift({id: info.id, task: info.task});
+      input.value = '';
+      hint.innerHTML = runs.map(x =>
+        `<a href="/run/${x.id}" target="_blank">run ${x.id}</a> · ${x.task.replace(/</g, '&lt;')}`
+      ).join('<br>');
+    } finally {
+      go.disabled = false;
+      input.focus();
+    }
+  });
+</script>
+</body>
+</html>
