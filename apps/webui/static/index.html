@@ -68,10 +68,8 @@
   .run.done .state { border-left-color: #3ccf7a; }
   .run.failed .state { border-left-color: #e05a5a; }
   .run.busy .state { border-left-color: var(--accent); }
-  .run a, .tools a, .tools label { color: #8ab4ff; text-decoration: none; font-size: 12px; cursor: pointer; }
+  .run a { color: #8ab4ff; text-decoration: none; font-size: 12px; cursor: pointer; }
   .run .stop { color: #e08a8a; margin-left: 8px; }
-  .tools { display: flex; justify-content: center; gap: 18px; margin-top: 14px; color: var(--muted); font-size: 12px; }
-  .tools input { accent-color: var(--accent); vertical-align: -1px; }
 </style>
 </head>
 <body>
@@ -84,7 +82,6 @@
       </button>
     </form>
     <div class="hint" id="hint">Just say what to do; the agent picks the website and works in a tab of your Chrome.</div>
-    <div class="tools"><label><input type="checkbox" id="debug"> open the debug view for each run</label></div>
     <div class="runs" id="runs"></div>
   </div>
 <script>
@@ -92,10 +89,7 @@
   const input = document.getElementById('task');
   const go = document.getElementById('go');
   const hint = document.getElementById('hint');
-  const debug = document.getElementById('debug');
   const list = document.getElementById('runs');
-  try { debug.checked = localStorage.getItem('debug') === '1'; } catch (e) {}
-  debug.addEventListener('change', () => { try { localStorage.setItem('debug', debug.checked ? '1' : '0'); } catch (e) {} });
 
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
@@ -131,9 +125,7 @@
     e.preventDefault();
     const text = input.value.trim();
     if (!text) return;
-    // Only the agent's own tab appears, in your Chrome. The debug view is opt-in; when
-    // it is on, the tab is opened here, inside the click, so a popup blocker allows it.
-    const tab = debug.checked ? window.open('', '_blank') : null;
+    // Only the agent's own tab appears, in your Chrome; each run keeps a debug link.
     go.disabled = true;
     try {
       const r = await fetch('/api/run', {
@@ -141,8 +133,7 @@
         body: JSON.stringify({text})
       });
       const info = await r.json();
-      if (!r.ok) { if (tab) tab.close(); hint.textContent = info.error || 'could not start'; return; }
-      if (tab) tab.location = `/run/${info.id}`;
+      if (!r.ok) { hint.textContent = info.error || 'could not start'; return; }
       input.value = '';
       poll();
     } finally {
