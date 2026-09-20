@@ -754,15 +754,12 @@ def serve(settings: Settings, *, port: int | None = None, open_browser: bool = F
         settings: The resolved configuration, honoured as-is.
         port: The loopback port: ``None`` for the default falling forward to the next
             free one, a number for exactly that port, ``0`` for one of the OS's choosing.
-            :data:`DEFAULT_PORT` itself is read as ``None``, because that is what the
-            ``inspect`` command passes when ``--port`` was not given and the two cannot be
-            told apart from here; the cost is that ``--port 8767`` falls forward too.
         open_browser: Open the page in the default browser once the server is up.
 
     Raises:
         OSError: if the port cannot be had.
     """
-    inspector = Inspector(settings, port=None if port == DEFAULT_PORT else port)
+    inspector = Inspector(settings, port=port)
     if inspector.port != inspector.asked_port and inspector.asked_port:
         print(
             f"port {inspector.asked_port} is in use; serving on {inspector.port} instead.",

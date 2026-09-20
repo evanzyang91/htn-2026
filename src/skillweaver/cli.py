@@ -1312,12 +1312,12 @@ def inspect_command(
     at startup, because the browser it drives may be carrying your own logged-in profile.
     """
     bench = _bench(ctx)
-    from skillweaver.inspector import DEFAULT_PORT, serve
+    from skillweaver.inspector import serve
 
     try:
         serve(
             bench.settings,
-            port=DEFAULT_PORT if port is None else port,
+            port=port,
             open_browser=open_it,
         )
     except OSError as exc:
