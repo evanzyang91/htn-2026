@@ -669,6 +669,10 @@ def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[s
                 "steps": a.steps,
                 "llm_calls": a.llm_calls,
                 "usd": round(a.usd, 6),
+                "seconds": round(a.seconds, 3),
+                "wall_ms": round(a.wall_ms),
+                "policy_ms": round(a.policy_ms),
+                "site_ms": round(a.site_ms),
                 "cross_mode": a.cross_mode,
                 "demoted": a.demoted,
             }

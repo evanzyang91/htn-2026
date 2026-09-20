@@ -319,7 +319,16 @@ class DomPerceiver:
     Not thread-safe: :attr:`last` is one slot, so one perceiver drives one browser.
     """
 
-    __slots__ = ("_armed", "_counters", "_fingerprinter", "_last", "_rested_ms", "_rests")
+    __slots__ = (
+        "_acted_ms",
+        "_armed",
+        "_counters",
+        "_fingerprinter",
+        "_last",
+        "_observed_ms",
+        "_rested_ms",
+        "_rests",
+    )
 
     def __init__(
         self,
@@ -333,6 +342,8 @@ class DomPerceiver:
         self._armed: tuple[int, DomSnapshot, bool] | None = None
         self._rests = 0
         self._rested_ms = 0.0
+        self._observed_ms = 0.0
+        self._acted_ms = 0.0
 
     def __repr__(self) -> str:
         return f"DomPerceiver(counts={self._counters.snapshot()})"
@@ -350,6 +361,24 @@ class DomPerceiver:
         ``Observation`` must not assume this still describes it.
         """
         return self._last
+
+    @property
+    def site_ms(self) -> float:
+        """Milliseconds this run has spent on the SITE rather than on a model.
+
+        Time inside :meth:`observe` - the capture, the page script, and any
+        :meth:`rest_after` wait - plus the controller's own ``acted_ms``, read off it at
+        each observation: input delivery and ``_settle``. Together that is everything a
+        run waits on the page for, which is upstream's ``load_ms``.
+
+        A DURATION, where ``PerceptionCounters`` is deliberately counts - seconds move
+        with machine load, and OCR taught this project that twice. This one is kept
+        because its question cannot be asked in counts: of a run's wall clock, how much
+        was the models and how much was the website? It is dominated by the network and
+        the page, not by this machine, and it is reported beside the counts, never
+        instead of them.
+        """
+        return self._observed_ms + self._acted_ms
 
     @property
     def rests(self) -> tuple[int, float]:
@@ -383,6 +412,7 @@ class DomPerceiver:
             PerceptionError: if the page answers with something unusable, or if
                 fingerprinting fails.
         """
+        began = time.monotonic()
         shot: Screenshot = controller.capture()
         self._counters.captures += 1
         snapshot = self._read(controller, shot)
@@ -406,6 +436,10 @@ class DomPerceiver:
             taken_at=utcnow(),
         )
         self._counters.observations += 1
+        self._observed_ms += (time.monotonic() - began) * 1000.0
+        acted = getattr(controller, "acted_ms", None)
+        if isinstance(acted, (int, float)):
+            self._acted_ms = float(acted)
         return observation
 
     def _rested(self, controller: Controller, snapshot: DomSnapshot) -> bool:

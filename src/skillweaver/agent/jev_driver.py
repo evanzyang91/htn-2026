@@ -125,13 +125,14 @@ class JevDriver:
             observation asked about, which means the two were not driving the same run.
     """
 
-    __slots__ = ("_perceiver", "_policy", "_steps", "_taken")
+    __slots__ = ("_decided_ms", "_perceiver", "_policy", "_steps", "_taken")
 
     def __init__(self, policy: BrowserPolicy, perceiver: DomPerceiver) -> None:
         self._policy = policy
         self._perceiver = perceiver
         self._steps: list[dict[str, Any]] = []
         self._taken: dict[str, set[str]] = {}
+        self._decided_ms = 0.0
 
     def __repr__(self) -> str:
         return f"JevDriver({self._policy.name()})"
@@ -139,6 +140,15 @@ class JevDriver:
     def name(self) -> str:
         """The policy model identifier."""
         return self._policy.name()
+
+    @property
+    def policy_ms(self) -> float:
+        """Milliseconds this driver's own models have taken so far: every Jev round trip
+        and every call to the text writer. The MODEL half of upstream's split, whose
+        other half is ``DomPerceiver.site_ms``. It is not all of a run's model time - the
+        critic's calls are the explorer's - and the report says so rather than folding
+        them in."""
+        return self._decided_ms
 
     def total_usage(self) -> Usage:
         """What the policy has spent, so the explorer can charge it. See
@@ -258,6 +268,15 @@ class JevDriver:
         last = self._steps[-1]
         last["page_changed"] = state != last["state"]
         last["url"] = snapshot.url
+        # Upstream's per-step split: what the models took to choose this move, against
+        # what the site took to answer it - performing, settling, observing, resting.
+        log.info(
+            "jev.step",
+            kind=last["kind"],
+            changed=last["page_changed"],
+            model_ms=round(last["model_ms"]),
+            site_ms=round(self._perceiver.site_ms - last["site_mark"]),
+        )
         if rejection and not last["page_changed"]:
             last["refused"] = rejection
         elif last["kind"] == "CLICK" and last["element_id"]:
@@ -276,8 +295,11 @@ class JevDriver:
                 "text": decision.text,
                 "state": state,
                 "element_id": decision.element_id,
+                "model_ms": decision.latency_ms,
+                "site_mark": self._perceiver.site_ms,
             }
         )
+        self._decided_ms += decision.latency_ms
 
     def _spent(self, state: str) -> dict[str, set[str]]:
         """``{operation: element ids}`` this exact page state has already used up.

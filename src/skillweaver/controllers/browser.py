@@ -255,6 +255,7 @@ class BrowserController:
         self._drag_steps = max(int(drag_steps), 1)
         self._navigation_timeout_ms = float(navigation_timeout_ms)
         self._settle_timeout_ms = max(float(settle_timeout_ms), 0.0)
+        self._acted_ms = 0.0
         self._blocked: tuple[str | re.Pattern[str], ...] = (
             SOMETIMES_ONLY_OVERLAYS if block is None else tuple(block)
         )
@@ -422,9 +423,16 @@ class BrowserController:
             if page.is_closed():
                 raise ControllerError(f"page closed during {action.kind}") from exc
             error = f"{action.kind} failed: {_brief(exc)}"
-        return ActionResult(
-            ok=error is None, error=error, elapsed_ms=(time.perf_counter() - started) * 1000.0
-        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._acted_ms += elapsed_ms
+        return ActionResult(ok=error is None, error=error, elapsed_ms=elapsed_ms)
+
+    @property
+    def acted_ms(self) -> float:
+        """Milliseconds spent inside :meth:`perform` so far: delivering input and then
+        waiting for the page in :meth:`_settle`. Half of what a run's site time is; the
+        DOM perceiver adds the other half - see ``DomPerceiver.site_ms``."""
+        return self._acted_ms
 
     def viewport(self) -> Box:
         """The page area in logical pixels, anchored at ``(0, 0)``."""
