@@ -18,6 +18,7 @@
   body {
     margin: 0;
     background: var(--bg);
+    position: relative;
     color: var(--fg);
     font-family: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
     display: flex;
@@ -25,7 +26,20 @@
     align-items: center;
     -webkit-font-smoothing: antialiased;
   }
+  /* A low-key glow behind the box: two soft radial layers, fixed to the viewport. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(ellipse 34% 26% at 50% 50%, rgba(46, 84, 200, 0.28), transparent 70%),
+      radial-gradient(ellipse 60% 48% at 50% 54%, rgba(28, 52, 140, 0.16), transparent 72%);
+  }
   .stage {
+    position: relative;
+    z-index: 1;
     flex: 1;
     width: 100%;
     max-width: 980px;
