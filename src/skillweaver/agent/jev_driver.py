@@ -17,11 +17,41 @@ move is one action OR one code block, so it becomes the block. ``ENTER`` is one
 Three loop rules are upstream's (``jev-ultrafast`` ``1489129``), each a PURE function here
 so it can be checked without a browser: :func:`cycling`, :func:`spent_controls`, and the
 one fresh look a ``DONE`` claim has to survive (:func:`fresh_look`).
+
+Two more are upstream's ``cbf517a``. A control is known by its NAME (:func:`control_name`:
+its label, plus the text of the row or card around it when the label is shared), and every
+guard and history entry here keys on that - seven *Add item to cart* buttons are seven
+names, so pruning one no longer prunes all seven. And upstream's ``inert`` memory, never
+ported before: one ``{name: consecutive misses}`` dict, updated as each step is closed
+(:func:`tally`), where a scroll's miss is that it REVEALED nothing.
+
+WHICH GUARD ANSWERS WHICH FAILURE - four memories, two by identity and two run-wide:
+
+* :meth:`JevDriver._spent` (upstream's ``streak`` and ``taken``) - an ELEMENT, on one
+  exact page state. Catches the click that did nothing a moment ago, and open/close
+  oscillation. Blind the moment the page's digest differs.
+* :func:`spent_controls` (upstream's ``repeated``) - a target-less OPERATION, twice, on
+  one exact page state. Catches a ``WAIT``, ``BACK`` or ``ENTER`` that does nothing, and
+  a scroll at the end of its box, which literally moves nothing.
+* ``inert`` (:func:`tally`, :func:`withheld_inert`) - a NAME, or a scroll operation,
+  :data:`INERT_MISSES` times in a row ACROSS page states. Catches what the two above
+  cannot: a control re-offered after a reopen because the digest reset (*Make 2 required
+  selections*), and a scroll that moves the offset - so is "a change" to every rule
+  keyed on ``page_changed`` - and shows nothing new.
+* :func:`cycling` - two or three NAMES filling the window while every step changes the
+  page. Catches churn no miss-counter can see, because nothing missed.
+
+The two identity rules and the two run-wide ones are upstream's one rule in two halves -
+``repeated`` and ``inert`` sit side by side in its ``choose`` - and a scroll is the case
+that shows why both are needed: the first can only ever see one that did not move. All
+four ride the put-back in :func:`_exclusions`, except the operations: a run with nothing
+left but ``BLOCKED`` is blocked.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import sys
 import time
@@ -51,14 +81,21 @@ __all__ = [
     "CYCLE_WINDOW",
     "DEAD_END_OPERATIONS",
     "DONE_LOOK_MS",
+    "INERT_MISSES",
     "NO_CHANGE_LIMIT",
+    "SCROLL_OPERATIONS",
     "SCROLL_PIXELS",
     "SELECT_ALL_CHORD",
     "WAIT_MS",
     "JevDriver",
+    "control_name",
+    "count_revealed",
     "cycling",
     "fresh_look",
+    "names_on",
     "spent_controls",
+    "tally",
+    "withheld_inert",
 ]
 
 DEAD_END_OPERATIONS: Mapping[str, str] = {"click": "CLICK"}
@@ -131,7 +168,30 @@ target-less operation is withheld. Upstream's number and its reason: results rea
 arrive during a second ``WAIT`` and a second scroll can reveal what the first did not, so
 one miss is patience and two are a loop. These operations are re-offered every step and
 nothing else can withhold them - a fingerprint-keyed dead end is keyed on a screen that
-repaints, and ``NO_CHANGE_LIMIT`` does not count a ``WAIT`` at all."""
+repaints, and ``NO_CHANGE_LIMIT`` does not count a ``WAIT`` at all.
+
+For a SCROLL this rule fires only at the end of the box, where the wheel moves nothing:
+``DomSnapshot.digest`` holds ``scroll_y``, so any scroll that moves is a new page state and
+ends the streak this counts. The pointless scroll that DOES move is :data:`INERT_MISSES`'."""
+
+SCROLL_OPERATIONS: frozenset[str] = frozenset({"SCROLL_DOWN", "SCROLL_UP"})
+"""The two operations judged by what they REVEAL rather than by ``page_changed``. The
+document's scroll and a scrollable container's are the same two operations here
+(``DomSnapshot.scroller`` decides which box the wheel moves), so both count the same way."""
+
+INERT_MISSES = 3
+"""Consecutive misses, run-wide, after which a NAME - or a scroll operation - is withheld.
+Upstream's number (``misses >= 3``), taken as it is: nothing here has measured another.
+
+A miss is a click or a typing that literally changed nothing, or a scroll that revealed no
+control that was not already on screen. ONE hit puts the count back to zero. Unlike every
+identity rule in this module it is NOT keyed on the page state, and that is its point: a
+label like *Make 2 required selections* can never advance the goal and is re-offered after
+any reopen, because the reopen resets the digest and with it everything
+:meth:`JevDriver._spent` knew. The label changes once the control becomes usable, so it is
+a different name then and comes back by itself. And a scroll always moves the offset, so
+it always "changes the page" and no rule built on ``page_changed`` can ever see a pointless
+one - upstream measured 9 scrolls inside an empty cart panel."""
 
 CYCLE_WINDOW = 8
 """How many of the latest steps :func:`cycling` judges. Upstream's ``window``."""
@@ -158,8 +218,13 @@ refuses a repeat by signature, and a look that changed nothing must not make a l
 
 _RESERVED: frozenset[str] = frozenset({"CONTROLS", "LABELS"})
 """The two keys of the ``exclude`` mapping that do not map an operation to element ids:
-``CONTROLS`` holds target-less operation names and ``LABELS`` control labels. Anything that
-counts or names withheld TARGETS steps over them."""
+``CONTROLS`` holds target-less operation names and ``LABELS`` control NAMES
+(:func:`control_name` - the key kept its spelling, and a name IS the label wherever the
+label is unique). Anything that counts or names withheld TARGETS steps over them."""
+
+_PUT_BACK_NAMES: frozenset[str] = frozenset({"LABELS", "INERT"})
+"""What :func:`_exclusions` reports as put back when it was NAMES and not an operation's
+element ids: ``LABELS`` for the churn set, ``INERT`` for the inert one."""
 
 _ERRAND_MARKER = "The errand: "
 """How ``Explorer._aimed`` introduces the task inside a borrowed step's goal. Read, never
@@ -203,7 +268,9 @@ class JevDriver:
     __slots__ = (
         "_decided_ms",
         "_done_seen",
+        "_inert",
         "_looking",
+        "_names_operation",
         "_perceiver",
         "_policy",
         "_refine",
@@ -225,6 +292,9 @@ class JevDriver:
         self._refined: dict[str, str] = {}
         self._steps: list[dict[str, Any]] = []
         self._taken: dict[str, set[str]] = {}
+        # Upstream's ``self.inert``: {name or scroll operation: consecutive misses}. See tally.
+        self._inert: dict[str, int] = {}
+        self._names_operation = _accepts(perceiver.rest_after, "operation")
         self._decided_ms = 0.0
         # Whether a DONE claim has had its fresh look since the last real action, and
         # whether the move now in flight IS that look. See fresh_look.
@@ -273,7 +343,7 @@ class JevDriver:
         snapshot = self._snapshot_for(observation)
         if not history and self._steps:
             # No moves yet and steps on file: the explorer has begun another run.
-            self._steps, self._taken, self._refined = [], {}, {}
+            self._steps, self._taken, self._refined, self._inert = [], {}, {}, {}
             self._done_seen = self._looking = False
         state = snapshot.digest
         self._settle(snapshot, state, rejection)
@@ -283,8 +353,14 @@ class JevDriver:
         if any(a.signature == BACK_SIGNATURE for a in dead_ends):
             controls.add("BACK")
         churned, labels = cycling(self._steps)
+        unrevealing, inert = withheld_inert(self._inert)
         exclude, restored = _exclusions(
-            snapshot, dead_ends, self._spent(state), controls=controls | churned, labels=labels
+            snapshot,
+            dead_ends,
+            self._spent(state),
+            controls=controls | churned | unrevealing,
+            labels=labels,
+            inert=inert,
         )
         asked = _without(snapshot, exclude.get("CONTROLS", ()))
         goal = self._goal_shown(task.text, observation.url or snapshot.url)
@@ -294,14 +370,15 @@ class JevDriver:
             # Not a step: upstream's history holds what was PERFORMED, and a claim the
             # policy is about to be asked again is not that. It is still this policy's time.
             self._decided_ms += decision.latency_ms
-            self._perceiver.rest_after(1, snapshot, waited=False)
+            self._rest(1, snapshot, waited=False, operation=decision.operation)
         else:
-            self._remember(decision, state, _label_of(decision, snapshot))
+            self._remember(decision, state, snapshot)
             if decision.operation not in ("DONE", "BLOCKED"):
-                self._perceiver.rest_after(
+                self._rest(
                     _ACTIONS_IN.get(decision.operation, 1),
                     snapshot,
                     waited=decision.operation == "WAIT",
+                    operation=decision.operation,
                 )
         self._looking = looking
         log.info(
@@ -316,6 +393,7 @@ class JevDriver:
             withheld=_withheld(exclude),
             controls=sorted(exclude.get("CONTROLS", ())) or None,
             labels=sorted(exclude.get("LABELS", ())) or None,
+            inert=sorted(unrevealing | inert) or None,
             restored=sorted(restored) or None,
             looking=looking or None,
         )
@@ -323,7 +401,7 @@ class JevDriver:
             raise PolicyBlocked(
                 f"the policy found no supported operation on {observation.url or 'this screen'}"
             )
-        note = _note(exclude, restored)
+        note = _note(exclude, restored, inert)
         if looking:
             return json.dumps(_look_again(decision, note))
         return json.dumps(_answer(decision, catalog, snapshot, note))
@@ -363,6 +441,20 @@ class JevDriver:
             # The rewrite is this policy's models at work, so it is this policy's time.
             self._decided_ms += (time.perf_counter() - began) * 1000.0
         return f"{head}{marker}{self._refined[errand]}"
+
+    def _rest(self, actions: int, basis: DomSnapshot, *, waited: bool, operation: str) -> None:
+        """Arm the perceiver's rest for the coming move, NAMING the operation when it asks.
+
+        Upstream ``0da4053`` watches for a click's or a fill's effect instead of waiting
+        for quiet, and excludes scroll and wait; which of those a move is, only this
+        driver knows. That lives in ``DomPerceiver.rest_after`` and is another worker's,
+        so the keyword is passed only to a perceiver whose signature takes it
+        (:func:`_accepts`, asked once) - this works against the perceiver without it too.
+        """
+        if self._names_operation:
+            self._perceiver.rest_after(actions, basis, waited=waited, operation=operation)
+        else:
+            self._perceiver.rest_after(actions, basis, waited=waited)
 
     # -- odds and ends -----------------------------------------------------------------
 
@@ -427,19 +519,26 @@ class JevDriver:
             return
         last = self._steps[-1]
         if self._looking:
-            if state != last["state"]:
+            if state != last["state"] and not last.get("page_changed"):
                 last["page_changed"] = True
                 last.pop("refused", None)
+                # What that step was tallied as was not a miss, and a hit is a reset.
+                tally(self._inert, last)
             last["url"] = snapshot.url
             return
         last["page_changed"] = state != last["state"]
         last["url"] = snapshot.url
+        if last["kind"] in SCROLL_OPERATIONS:
+            last["revealed"] = count_revealed(last.pop("seen", frozenset()), snapshot)
+        tally(self._inert, last)
         # Upstream's per-step split: what the models took to choose this move, against
         # what the site took to answer it - performing, settling, observing, resting.
         log.info(
             "jev.step",
             kind=last["kind"],
             changed=last["page_changed"],
+            revealed=last.get("revealed"),
+            misses=self._inert.get(str(last.get("label"))) or None,
             model_ms=round(last["model_ms"]),
             site_ms=round(self._perceiver.site_ms - last["site_mark"]),
         )
@@ -448,27 +547,30 @@ class JevDriver:
         elif last["kind"] == "CLICK" and last["element_id"]:
             self._taken.setdefault(last["state"], set()).add(last["element_id"])
 
-    def _remember(self, decision: PolicyDecision, state: str, label: str) -> None:
+    def _remember(self, decision: PolicyDecision, state: str, snapshot: DomSnapshot) -> None:
         """Open a step with what the policy asked for. :meth:`_settle` closes it.
 
-        ``state``, ``label``, ``element_id`` and later ``url`` are this driver's own
-        bookkeeping; the request builder names the keys it sends, so they never reach the
-        wire. ``label`` is there because ``action`` cannot be compared: it is the policy's
-        ``why``, which carries an index and a probability that differ on every lap of a
-        loop that is otherwise the same two controls.
+        ``state``, ``label``, ``element_id``, ``seen`` and later ``url`` and ``revealed``
+        are this driver's own bookkeeping; the request builder names the keys it sends, so
+        they never reach the wire. ``label`` holds the control's NAME (:func:`_name_of`),
+        and is there because ``action`` cannot be compared: it is the policy's ``why``,
+        which carries an index and a probability that differ on every lap of a loop that
+        is otherwise the same two controls. ``seen`` is on a scroll only: the names on the
+        screen it was chosen from, which closing it is judged against and then drops.
         """
-        self._steps.append(
-            {
-                "action": decision.why or decision.operation,
-                "kind": decision.operation,
-                "text": decision.text,
-                "label": label,
-                "state": state,
-                "element_id": decision.element_id,
-                "model_ms": decision.latency_ms,
-                "site_mark": self._perceiver.site_ms,
-            }
-        )
+        step: dict[str, Any] = {
+            "action": decision.why or decision.operation,
+            "kind": decision.operation,
+            "text": decision.text,
+            "label": _name_of(decision, snapshot),
+            "state": state,
+            "element_id": decision.element_id,
+            "model_ms": decision.latency_ms,
+            "site_mark": self._perceiver.site_ms,
+        }
+        if decision.operation in SCROLL_OPERATIONS:
+            step["seen"] = names_on(snapshot)
+        self._steps.append(step)
         self._decided_ms += decision.latency_ms
 
     def _spent(self, state: str) -> dict[str, set[str]]:
@@ -544,6 +646,78 @@ class JevDriver:
 # --------------------------------------------------------------------------------------
 
 
+def control_name(control: Any) -> str:
+    """What distinguishes this control: upstream's ``action_name``.
+
+    ``"<label> — <context>"`` when the page reader gave it a context - the text of the row
+    or card around a control whose label is shared - and the label alone otherwise. Read
+    with ``getattr`` because ``DomControl.context`` is another worker's field, and a
+    snapshot built without it names every control by its label, which is what this
+    module did before.
+    """
+    context = getattr(control, "context", None)
+    return f"{control.label} — {context}" if context else str(control.label)
+
+
+def names_on(snapshot: DomSnapshot) -> frozenset[str]:
+    """The name of every control ``snapshot`` offers."""
+    return frozenset(control_name(control) for control in snapshot.controls)
+
+
+def count_revealed(seen: Collection[str], snapshot: DomSnapshot) -> int:
+    """How many controls on ``snapshot`` have a name that is not in ``seen``.
+
+    Upstream's measure of a scroll, and the only one that works: the offset always moves,
+    so ``page_changed`` is true of a scroll through an empty panel. Controls, not text -
+    what a policy can ACT on is what a scroll is for, and a list of identically named
+    rows scrolling past reveals nothing it could choose differently.
+    """
+    return sum(1 for control in snapshot.controls if control_name(control) not in seen)
+
+
+def tally(inert: dict[str, int], step: Mapping[str, Any]) -> None:
+    """Count one CLOSED step into ``inert``, upstream's ``{name: consecutive misses}``.
+
+    A click or a typing misses when the page literally did not change; a scroll misses
+    when it revealed nothing, whatever ``page_changed`` says of it. A hit sets the count to
+    ZERO rather than lowering it: the rule is about misses IN A ROW. Every other
+    operation is left to :func:`spent_controls`. A scroll is filed under its operation
+    and a target under its name; a control that calls itself ``SCROLL_DOWN`` would share
+    a row with the wheel, which costs it one offer and is not worth a second dict.
+    """
+    kind = step["kind"]
+    if kind in SCROLL_OPERATIONS:
+        key, missed = str(kind), not step.get("revealed")
+    elif kind in ("CLICK", "TYPE_TEXT") and step.get("label"):
+        key, missed = str(step["label"]), step.get("page_changed") is False
+    else:
+        return
+    inert[key] = inert.get(key, 0) + 1 if missed else 0
+
+
+def withheld_inert(
+    inert: Mapping[str, int], misses: int = INERT_MISSES
+) -> tuple[set[str], set[str]]:
+    """``(scroll operations, names)`` that have missed ``misses`` times in a row.
+
+    Apart, as :func:`cycling` returns them, because they go out under different reserved
+    keys: the operations under ``CONTROLS`` and the names under ``LABELS``.
+    """
+    spent = {key for key, count in inert.items() if count >= misses}
+    return spent & SCROLL_OPERATIONS, spent - SCROLL_OPERATIONS
+
+
+def _accepts(function: Callable[..., Any], keyword: str) -> bool:
+    """Whether ``function`` can be called with ``keyword=``. Unknown means no."""
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+
+
 def _streak(steps: Sequence[Mapping[str, Any]], state: str) -> list[Mapping[str, Any]]:
     """The latest steps, newest first, that each LITERALLY changed nothing on ``state``.
 
@@ -590,7 +764,9 @@ def cycling(
     go). And two or more, never one: a single move repeating - *Increase quantity by 1*,
     *Load more*, a scroll - is usually progress, and a dead one is caught elsewhere.
 
-    A step is named by its control's label, or by its operation when it has no target,
+    A step is named by its control's NAME (:func:`control_name`, which is what the step's
+    ``label`` key holds - so *Add item to cart* in two different cards is two moves, and a
+    run adding seven items is not churn), or by its operation when it has no target,
     and the two come back APART because they are withheld through different reserved
     keys - so a button that happens to be labelled ``WAIT`` is still a label. ``DONE``
     and ``BLOCKED`` are not moves and are not counted, as upstream's history never holds
@@ -647,11 +823,11 @@ def _without(snapshot: DomSnapshot, controls: Collection[str]) -> DomSnapshot:
     return dataclasses.replace(snapshot, **off) if off else snapshot
 
 
-def _label_of(decision: PolicyDecision, snapshot: DomSnapshot) -> str:
-    """What :func:`cycling` calls this move: the control's own label, as the reserved
+def _name_of(decision: PolicyDecision, snapshot: DomSnapshot) -> str:
+    """What every guard here calls this move: the control's NAME, as the reserved
     ``LABELS`` key will be matched against it, or the operation when there is no target."""
     control = snapshot.by_element_id.get(decision.element_id or "")
-    return control.label if control is not None else decision.operation
+    return control_name(control) if control is not None else decision.operation
 
 
 # --------------------------------------------------------------------------------------
@@ -724,7 +900,9 @@ def _answer(
             "the explorer is holding; the snapshot and the observation have diverged"
         )
     control = snapshot.by_element_id.get(element_id)
-    label = control.label if control is not None else element_id
+    # The NAME, so the critic and anyone reading the run are told WHICH of seven
+    # identically labelled buttons this was.
+    label = control_name(control) if control is not None else element_id
 
     if operation == "CLICK":
         return {
@@ -795,6 +973,7 @@ def _exclusions(
     *,
     controls: Collection[str] = (),
     labels: Collection[str] = (),
+    inert: Collection[str] = (),
 ) -> tuple[dict[str, set[str]], set[str]]:
     """``({operation: element ids to withhold, + the reserved keys}, {what was put back})``.
 
@@ -814,12 +993,17 @@ def _exclusions(
     ``spent`` is :meth:`JevDriver._spent` - what this exact page state has used up by
     upstream's two identity rules - and rides the same put-back as everything else.
 
-    ``controls`` and ``labels`` go out under the reserved ``CONTROLS`` and ``LABELS`` keys,
-    present only when non-empty. ``labels`` rides the put-back too, worked out HERE from
-    the labels themselves rather than by asking :func:`targets_of`, so it holds whether or
-    not the policy on the other side reads the key yet: churn labels that would empty a
-    target head are dropped whole and ``"LABELS"`` is reported as put back. ``controls``
-    does not: with every target spent and every control twice inert, ``BLOCKED`` is true.
+    ``controls`` goes out under the reserved ``CONTROLS`` key, and ``inert`` and ``labels``
+    - both sets of NAMES (:func:`control_name`): what has missed :data:`INERT_MISSES`
+    times running, and what :func:`cycling` says the run is churning between - go out
+    TOGETHER under ``LABELS``; each key is present only when non-empty. Names ride the
+    put-back too, worked out HERE from the names themselves rather than by asking
+    :func:`targets_of`, so it holds whatever the policy on the other side matches the key
+    against. One set at a time, the inert one first because it is the stronger evidence
+    (three literal misses, against a pattern): a set that would empty a target head is
+    dropped whole and reported as put back, ``"INERT"`` or ``"LABELS"``, and the other
+    still stands. ``controls`` does not ride it: with every target spent and every control
+    inert, ``BLOCKED`` is true.
     """
     wanted: dict[str, set[str]] = {op: set(ids) for op, ids in (spent or {}).items() if ids}
     for attempt in dead_ends:
@@ -833,28 +1017,40 @@ def _exclusions(
     kept = targets_of(snapshot, wanted) if wanted else full
     restored = {op for op in wanted if op in full and op not in kept}
     exclude = {op: ids for op, ids in wanted.items() if op not in restored}
-    if labels:
-        heads = targets_of(snapshot, exclude) if exclude else full
-        if any(all(c.label in labels for c in head.values()) for head in heads.values()):
-            restored.add("LABELS")
+    heads = targets_of(snapshot, exclude) if exclude and (inert or labels) else full
+    names: set[str] = set()
+    for group, put_back in ((inert, "INERT"), (labels, "LABELS")):
+        if not group:
+            continue
+        trial = names | set(group)
+        if any(all(control_name(c) in trial for c in head.values()) for head in heads.values()):
+            restored.add(put_back)
         else:
-            exclude["LABELS"] = set(labels)
+            names = trial
+    if names:
+        exclude["LABELS"] = names
     if controls:
         exclude["CONTROLS"] = set(controls) & CONTROL_OPERATIONS
     return {key: held for key, held in exclude.items() if held}, restored
 
 
-def _note(exclude: Mapping[str, Collection[str]], restored: Collection[str]) -> str:
+def _note(
+    exclude: Mapping[str, Collection[str]],
+    restored: Collection[str],
+    inert: Collection[str] = (),
+) -> str:
     """What the trajectory is told about targets withheld here, or ``""``.
 
     It goes on the move's ``thought``, the line ``Explorer._write_down`` records against
     the step, so a run where the policy chose from less than the whole screen says so
     where anyone reading the run will see it. The reserved keys get sentences of their
-    own: what they hold are operation names and labels, and counting those as targets
-    would tell the reader a number of elements that were never withheld.
+    own: what they hold are operation names and control names, and counting those as
+    targets would tell the reader a number of elements that were never withheld. ``inert``
+    is which of the withheld names are there for having changed nothing, so the reader is
+    not told a control that never worked was "churning".
     """
     said: list[str] = []
-    operations = sorted(op for op in restored if op not in _RESERVED)
+    operations = sorted(op for op in restored if op not in _PUT_BACK_NAMES)
     if operations:
         said.append(
             f"every {'/'.join(operations).lower()} target on this screen has already "
@@ -867,8 +1063,20 @@ def _note(exclude: Mapping[str, Collection[str]], restored: Collection[str]) -> 
         )
     if controls := sorted(exclude.get("CONTROLS", ())):
         said.append(f"{', '.join(controls)} withheld as inert or churning on this screen")
-    if labels := sorted(exclude.get("LABELS", ())):
-        quoted = ", ".join(repr(label) for label in labels)
+    held = set(exclude.get("LABELS", ()))
+    if dead := sorted(held & set(inert)):
+        quoted = ", ".join(repr(name) for name in dead)
+        said.append(
+            f"{quoted} changed nothing {INERT_MISSES} times running, so "
+            f"{'it is' if len(dead) == 1 else 'they are'} withheld"
+        )
+    elif "INERT" in restored:
+        said.append(
+            "every control left has changed nothing several times running, and they are "
+            "still offered because withholding them would leave nothing to choose"
+        )
+    if churning := sorted(held - set(inert)):
+        quoted = ", ".join(repr(name) for name in churning)
         said.append(f"the run is churning between {quoted}, so those are withheld")
     elif "LABELS" in restored:
         said.append(
