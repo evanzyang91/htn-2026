@@ -1250,6 +1250,55 @@ def dashboard_build(
         webbrowser.open(written.resolve().as_uri())
 
 
+@app.command("inspect")
+def inspect_command(
+    ctx: typer.Context,
+    port: Annotated[
+        int | None,
+        typer.Option(
+            "--port",
+            help="Loopback port to serve on. 0 asks the OS for a free one. "
+            "Default: the inspector's own.",
+            show_default=False,
+        ),
+    ] = None,
+    open_it: Annotated[
+        bool, typer.Option("--open", help="Open the page in the default browser.")
+    ] = False,
+) -> None:
+    """Drive a live browser session by hand, one move at a time.
+
+    Not `dashboard build`, which writes a report of what already happened. This serves
+    a page on 127.0.0.1 with a prompt bar, the browser's screen with the controls the
+    agent found drawn over it, buttons to CHOOSE a move without making it, EXECUTE the
+    one shown, or do both, a running log of every decision and verdict, resets for the
+    run, the browser and the site, and a live view of the skill library that updates
+    while a `learn` in another terminal adds to it.
+
+    It drives the same agent `learn` does, so the global flags mean what they always
+    mean and are written before the subcommand:
+
+        skillweaver --perception dom --policy jev inspect --open
+        skillweaver --chrome-profile ~/.sw-chrome --chrome-attach inspect
+
+    The server listens on the loopback only and every request must carry a token minted
+    at startup, because the browser it drives may be carrying your own logged-in profile.
+    """
+    bench = _bench(ctx)
+    from skillweaver.inspector import DEFAULT_PORT, serve
+
+    try:
+        serve(
+            bench.settings,
+            port=DEFAULT_PORT if port is None else port,
+            open_browser=open_it,
+        )
+    except OSError as exc:
+        _die(f"the inspector could not listen on that port: {exc}")
+    except SkillWeaverError as exc:
+        _die(f"the inspector could not start: {exc}")
+
+
 @eval_app.command("run")
 def eval_run(
     ctx: typer.Context,
