@@ -67,6 +67,42 @@ where the bottleneck IS: the next person to work on warm-path reuse should spend
 binding and on the content gate, and re-run the bench with ``SKILLWEAVER_EMBEDDER=true``
 once either has moved.
 
+Re-measured after both moved, and it still does not pay
+-------------------------------------------------------
+
+Both moved on 2026-09-20: binding reads a value through the slot a proven request left
+(:func:`~skillweaver.agent.planner._through_slot`), and the content gate lets relatives
+that perform the same workflow vouch in their own words
+(:func:`~skillweaver.agent.planner.account_of`, :mod:`skillweaver.skills.family`). The
+same bench, the same 48 requests, scored through the planner's own new gate:
+
+    ranking    top-1 recall    runnable    irrelevant requests answered
+    keywords      18/24         3 or 8/24            1/6
+    embedder      21/24         3 or 8/24            5/6
+
+The embedder still converts none of its recall into a warm run and still answers five
+of six irrelevant requests, so the switch stays off. One number DID move, for both
+rankings alike and in the wrong direction: 9/24 became 8/24 when a suite supplies the
+values. That is the new intent gate (:func:`~skillweaver.agent.planner.asks_for`)
+declining *Bring up the list of records* for a skill learned as *Open the records
+list ...* - ``bring`` is on no verb list, and a verb the gate does not know matches
+only itself. It is a correct run lost, stated here because it is the price of refusing
+*remove ... from my cart* on an add-to-cart skill, and the list was NOT extended to
+win the bench back. WHY nothing else moved is the useful
+part, because the new readers demonstrably do convert rewordings into warm runs on a
+live site (*Buy the "..."* against a skill learned as *Add the "..." to the cart*: 0
+model calls). This bench's paraphrases were written to avoid each skill's own nouns AND
+its sentence shape - *look up Grace Hopper on Wikipedia and bring up her page* for
+*search Wikipedia for "..." and open her article* - and the slot reader deliberately
+refuses those: every content word outside the value must agree, because the alternative
+is running a skill on a guess. And neither library here was admitted after signatures
+existed, so neither holds a family to vouch. What the new gates reach is the request
+that keeps the errand's shape and changes its verb, its value or its tail; what this
+bench asks for is a request that shares nothing but meaning, and no model-free reader
+in this project binds an argument out of one of those. An embedder would have to be
+paired with a binder that can - which is the composer, and it already costs a model
+call. The precision loss (1/6 -> 5/6) is unchanged too, and by itself still decides it.
+
 What is deliberately NOT here
 -----------------------------
 

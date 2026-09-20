@@ -68,7 +68,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from skillweaver.agent.planner import MIN_ACCOUNTED_FOR, account_of, bind_args  # noqa: E402
+from skillweaver.agent.planner import (  # noqa: E402
+    MIN_ACCOUNTED_FOR,
+    account_of,
+    asks_for,
+    bind_args,
+)
 from skillweaver.config import load_settings  # noqa: E402
 from skillweaver.contracts import Skill, SkillStore, TaskSpec  # noqa: E402
 from skillweaver.skills.embed import embedder_for  # noqa: E402
@@ -221,6 +226,8 @@ def would_run(
     # short may be vouched for by relatives that EARNED a signature. Neither library
     # measured here was admitted after signatures existed, so unless one has been
     # backfilled (scripts/measure_families.py --backfill) this is the skill alone.
+    if not asks_for(task, skill, args):
+        return False, "intent"
     covered, _ = account_of(task, skill, args, library)
     return (True, "") if covered >= MIN_ACCOUNTED_FOR else (False, f"gate {covered:.2f}")
 
