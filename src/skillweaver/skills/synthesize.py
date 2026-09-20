@@ -75,6 +75,7 @@ stored, and the gate's guarantee is untouched by any of it.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -819,6 +820,68 @@ def _echo(reply: str) -> tuple[LLMMessage, ...]:
     return (LLMMessage(role="assistant", text=reply),) if reply.strip() else ()
 
 
+REST_WINDOW_MS = 500.0
+"""How long a screen must hold the SAME fingerprint before the gate believes it has
+stopped painting. See :func:`_observe_at_rest`, which carries the measurements."""
+
+REST_BUDGET_MS = 4000.0
+"""The most the gate will wait for a screen to come to rest before judging whatever is
+there. The slowest settle measured on walmart.com was 2s; this is
+:data:`skillweaver.reset_actions.SETTLE_BUDGET_MS`, which answers the same question."""
+
+REST_POLL_MS = 120.0
+"""Between reads while waiting. A DOM read is ~50ms and a cached pixel read is cheap."""
+
+_sleep = time.sleep
+
+
+def _observe_at_rest(env: ReplayEnvironment) -> Observation:
+    """Observe the environment once it has STOPPED CHANGING, and not before.
+
+    The gate reads the screen twice - where the candidate starts and where it ended -
+    and both reads used to happen the instant the controller returned. ``_settle`` waits
+    for the load event, and a page that paints after it has already fired is then
+    photographed mid-paint. On live walmart.com the gate's precondition read 0.40, 1.00,
+    0.238, 0.238, 1.00, 0.40 over six attempts against one recorded screen and a 0.26
+    cut: not six different pages, one page caught at six moments. The filled cart moved
+    through five fingerprints in its first 340ms (0.474 to its own final screen at 0s)
+    and then held ONE, exactly equal, for every one of the next 125 reads.
+
+    That equality is the signal. This waits for a THING - the fingerprint holding still
+    for :data:`REST_WINDOW_MS` - and never for the score: it is not told what the screen
+    is about to be compared with, so it cannot keep looking until a screen happens to
+    pass. It returns ONE observation, the last one, which is then judged exactly as
+    strictly as before. A screen that never rests inside :data:`REST_BUDGET_MS` - a
+    carousel, a clock - is judged as it stands, which is what happened before this
+    existed; the wait costs such a page time and buys it nothing.
+
+    A window and not a single quiet poll, because a zero-window check reads quiet before
+    the page has started (25-45ms, measured; AGENTS.md). This is the gate, which runs a
+    handful of times per LEARNED skill - not ``_settle``, which would tax every action.
+    """
+    started = time.monotonic()
+    seen = env.perceiver.observe(env.controller)
+    still_since = time.monotonic()
+    reads = 1
+    while True:
+        now = time.monotonic()
+        rested = (now - still_since) * 1000.0 >= REST_WINDOW_MS
+        if rested or (now - started) * 1000.0 >= REST_BUDGET_MS:
+            log.info(
+                "skill.admit.observed",
+                rested=rested,
+                reads=reads,
+                waited_ms=round((now - started) * 1000.0),
+            )
+            return seen
+        _sleep(REST_POLL_MS / 1000.0)
+        latest = env.perceiver.observe(env.controller)
+        reads += 1
+        if latest.fingerprint.value != seen.fingerprint.value:
+            still_since = time.monotonic()
+        seen = latest
+
+
 def _not_at_the_start(
     candidate: Skill, similarity: float, threshold: float, *, restored: bool
 ) -> str:
@@ -1156,7 +1219,7 @@ class Synthesizer:
             )
 
         env = environment()
-        before = env.perceiver.observe(env.controller)
+        before = _observe_at_rest(env)
         if candidate.precondition is not None:
             similarity = before.fingerprint.similarity(candidate.precondition)
             # Logged whether it passes or fails. A gate that only speaks when it
@@ -1215,7 +1278,7 @@ class Synthesizer:
                 hardening=hardening,
             )
 
-        after = env.perceiver.observe(env.controller)
+        after = _observe_at_rest(env)
         verdict = self._critic.judge(trajectory.task, before, after, candidate.docstring)
         if not verdict.ok:
             return Attempt(
