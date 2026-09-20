@@ -81,6 +81,27 @@
             />
           </div>
         </details>
+        <details class="undo-field" id="model-field">
+          <summary>Text writer and goal refinement <span class="muted" id="model-summary"></span></summary>
+          <div class="model-row">
+            <label class="overlay-control" title="Rewrite the task once into short ordered sentences, for the policy's eyes only. One more model call before the first move."
+              ><input id="refine" type="checkbox" /> Refine the goal</label
+            >
+            <label class="inline-field"
+              >refine with <select id="refine-model" aria-label="Model that rewrites the goal"></select
+            ></label>
+            <label class="inline-field"
+              >types with <select id="text-model" aria-label="Model that writes what the agent types"></select
+            ></label>
+            <label class="inline-field"
+              >effort <select id="text-effort" aria-label="Reasoning effort of the text writer"></select
+            ></label>
+          </div>
+          <p class="muted model-note" id="model-note">
+            Applied when a run is started: the text writer is built once per run, so a change
+            here takes effect at the next Start run, not in the middle of this one.
+          </p>
+        </details>
       </form>
 
       <div class="toolbar">
@@ -100,8 +121,9 @@
             Execute choice
           </button>
           <button type="button" id="step" disabled title="Choose, then execute.">Step</button>
-          <button type="button" id="auto" disabled>Run automatically</button>
-          <button type="button" id="stop" hidden>Pause</button>
+          <label class="overlay-control" title="While on, the agent keeps choosing and executing by itself - through this run and into the next one you start. Switch it off at any time; the move in flight finishes and no other begins."
+            ><input id="auto" type="checkbox" /> Auto-run</label
+          >
         </div>
       </div>
       <div class="toolbar resets">
@@ -122,6 +144,10 @@
         </div>
       </div>
       <div id="error" role="alert" hidden></div>
+      <div id="restarted" role="alert" hidden>
+        <span id="restarted-text"></span>
+        <button type="button" id="reload">Reload</button>
+      </div>
 
       <section class="workspace">
         <div class="browser-panel">

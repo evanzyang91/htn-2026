@@ -7,7 +7,7 @@ const headers = { "Content-Type": "application/json", "X-Inspector-Token": token
 
 let state = null;
 let busy = false;
-let automatic = false;
+let stale = false;
 let stateAt = performance.now();
 let shownFrame = -1;
 let frameUrl = null;
@@ -23,12 +23,71 @@ const percent = (value) => `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
 const seconds = (ms) => `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`;
 const TERMINAL = ["done", "blocked", "stopped"];
 
+// sessionStorage can throw (blocked storage, some private modes). Nothing here needs it
+// to work: without it the page shows the reload banner instead of reloading itself.
+const stored = {
+  get(key) {
+    try {
+      return sessionStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  set(key, value) {
+    try {
+      sessionStorage.setItem(key, value);
+    } catch {
+      /* see above */
+    }
+  },
+  drop(key) {
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      /* see above */
+    }
+  },
+};
+
+// A 403 is nearly always this tab outliving the server it was loaded from: the token in
+// its meta tag belongs to a process that has exited. The server says which check failed;
+// a stale token is cured by loading the page again, so do that ONCE, keeping what was
+// typed, and if that was tried seconds ago and it is still refused, stop and say so
+// rather than reloading in a loop.
+async function refused(response) {
+  if (response.status !== 403) return false;
+  let data = {};
+  try {
+    data = await response.clone().json();
+  } catch {
+    /* a bare 403 is still a refusal */
+  }
+  if (stale) return true;
+  stale = true;
+  const again = Date.now() - Number(stored.get("inspector-reloaded") || 0) < 15000;
+  if (data.code === "stale-token" && !again) {
+    stored.set("inspector-reloaded", String(Date.now()));
+    stored.set("inspector-draft", JSON.stringify({ url: $("url").value, goal: $("goal").value }));
+    location.reload();
+    return true;
+  }
+  $("restarted-text").textContent =
+    data.error || "This inspector was restarted. Reload the page to reconnect to it.";
+  $("restarted").hidden = false;
+  $("server-dot").classList.add("down");
+  $("status").textContent = "Disconnected · reload to reconnect";
+  for (const el of document.querySelectorAll("main button, main input, main select, main textarea"))
+    if (el.id !== "reload") el.disabled = true;
+  return true;
+}
+
 async function call(name, body = {}) {
   const response = await fetch(`/api/${name}`, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
   });
+  if (await refused(response)) throw Error("This inspector was restarted - reload the page.");
   const data = await response.json();
   if (!response.ok) throw Error(data.error || "Request failed");
   accept(data);
@@ -36,8 +95,10 @@ async function call(name, body = {}) {
 }
 
 async function poll() {
+  if (stale) return;
   try {
     const response = await fetch("/api/state", { headers });
+    if (await refused(response)) return;
     if (!response.ok) throw Error("state");
     accept(await response.json());
     $("server-dot").classList.remove("down");
@@ -77,7 +138,13 @@ async function refreshFrame() {
   const wanted = state.frame;
   try {
     const response = await fetch("/api/frame", { headers });
-    if (!response.ok) return;
+    if (await refused(response)) return;
+    if (!response.ok) {
+      // A closed session keeps its frame COUNTER and has no picture: without this the
+      // page asked again on every poll - 230 logged 404s on one idle tab.
+      if (response.status === 404) shownFrame = wanted;
+      return;
+    }
     const url = URL.createObjectURL(await response.blob());
     if (frameUrl) URL.revokeObjectURL(frameUrl);
     frameUrl = url;
@@ -104,18 +171,26 @@ function renderElapsed() {
 }
 setInterval(renderElapsed, 100);
 
+const isLive = () => state && !["idle", ...TERMINAL].includes(state.status);
+// An automatic run is the SERVER's loop (see server.py); the page only flips the switch
+// and draws what it is told. `running` is that loop with something left to do.
+const running = () => Boolean(state?.auto && isLive());
+
 function controls() {
-  const working = busy || state?.busy;
+  if (stale) return;
+  const working = busy || state?.busy || running();
   const can = state?.can || {};
-  const live = state && !["idle", ...TERMINAL].includes(state.status);
+  const live = isLive();
   for (const id of ["start", "url", "goal", "reset-url", "reset-steps", "read-only", "max-steps", "max-usd"])
     $(id).disabled = working;
+  const adjustable = Boolean(state?.options?.adjustable);
+  $("refine").disabled = $("text-model").disabled = $("text-effort").disabled = working || !adjustable;
+  $("refine-model").disabled = working || !adjustable || !$("refine").checked;
   $("choose").disabled = working || !can.predict;
   $("execute").disabled = working || !can.act;
   $("step").disabled = working || !live;
-  $("auto").disabled = working || !live;
-  $("auto").hidden = automatic;
-  $("stop").hidden = !automatic;
+  // Never disabled: switching it OFF in the middle of a move is the whole point of it.
+  $("auto").checked = Boolean(state?.auto);
   $("reset-run").disabled = working || !can.reset_run;
   $("reset-browser").disabled = working || !can.reset_browser;
   $("reset-site").disabled = working || !can.reset_run || !$("recipe").value;
@@ -131,7 +206,6 @@ async function perform(fn, label) {
   try {
     await fn();
   } catch (error) {
-    automatic = false;
     await poll();
     $("error").textContent = error.message;
     $("error").hidden = false;
@@ -155,6 +229,7 @@ const DOING = {
   predict: "Choosing the next move…",
   act: "Executing, then judging the result…",
   tick: "Choosing, executing and judging…",
+  auto: "Running automatically · choosing, executing and judging…",
   reset_run: "Resetting the run…",
   reset_browser: "Opening a fresh browser…",
   reset_site: "Putting the site back…",
@@ -186,8 +261,15 @@ function renderDecision() {
   $("ranking-note").textContent = d
     ? `Aimed by ${d.decided_by}`
     : "Choose next to aim";
+  const held = [
+    d?.withheld_controls?.length ? `Not offered this step, having changed nothing twice: ${d.withheld_controls.join(", ")}.` : "",
+    d?.withheld_labels?.length ? `Withheld from every operation, because the run was going round between them: ${d.withheld_labels.map((l) => `“${l}”`).join(", ")}.` : "",
+    d?.fresh_look ? "The policy said DONE. That claim has to survive one fresh look at the page - a cart badge or a navigation may not have landed yet - so this move is a short wait and the policy is asked again." : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
   $("aside-note").textContent = d?.ranked
-    ? "The chosen target is highlighted and dead ends are marked withheld. Per-target odds are not shown: the policy reports only the chosen target's probability."
+    ? `${held ? `${held} ` : ""}The chosen target is highlighted and dead ends are marked withheld. Per-target odds are not shown: the policy reports only the chosen target's probability.`
     : state.mode?.policy === "jev"
       ? "Jev is the acting policy. Choose next to see its operation, target and confidence."
       : "The prompted model is the acting policy here, so there is no confidence to show - it states a reason and an expectation instead.";
@@ -255,7 +337,7 @@ function renderHistory() {
           return `<div class="trace-row ${open ? "open" : ""}" data-row="${i}">
   <span class="number">${String(h.number).padStart(2, "0")}</span>
   <div class="trace-main">${escape(h.headline)}${h.claimed_done ? ' <em class="claim">claims done</em>' : ""}<small>${escape(h.thought)}</small></div>
-  <span class="time">${h.decide_ms} ms decide · ${h.act_ms} ms act${odds}</span>
+  <span class="time">${h.model_ms ?? h.decide_ms} ms model · ${h.site_ms ?? "—"} ms site · ${h.frame_ms ?? "—"} ms frame${odds}</span>
   <span class="effect ${tone}">${escape(label)}</span>
   <div class="trace-detail">
     <dl>
@@ -263,6 +345,7 @@ function renderHistory() {
       <dt>Expected</dt><dd>${escape(h.expect || "—")}</dd>
       <dt>Executed</dt><dd>${h.actions.length ? h.actions.map((a) => `<code>${escape(a)}</code>`).join("<br>") : "nothing reached the browser"}</dd>
       <dt>Came back</dt><dd>${h.screen_changed ? "a different screen" : h.similarity < 1 ? "the same screen, repainted" : "no change observed"} <small>(similarity ${h.similarity.toFixed(2)} to the screen before)</small>${h.url_after !== h.url_before ? ` · now at <code>${escape(h.url_after)}</code>` : ""}${h.error ? ` · <span class="bad">${escape(h.error)}</span>` : ""}</dd>
+      <dt>Took</dt><dd>${seconds(h.wall_ms ?? h.decide_ms + h.act_ms)} <small>(${h.decide_ms} ms choosing, ${h.act_ms} ms executing and judging)</small> · model ${h.model_ms ?? "—"} ms · site ${h.site_ms ?? "—"} ms · frame ${h.frame_ms ?? "—"} ms · judging and recording ${h.other_ms ?? "—"} ms</dd>
       <dt>Verdict</dt><dd>${escape(h.verdict_reason || label)}${h.verdict_source ? ` <small>(${escape(h.verdict_source)}, confidence ${percent(h.verdict_confidence)})</small>` : ""}</dd>
     </dl>
   </div>
@@ -271,9 +354,18 @@ function renderHistory() {
         .join("")
     : '<p class="muted">Each move leaves what was decided, what was executed, what came back, and the verdict.</p>';
   const s = state.spend || {};
+  const t = state.timing || {};
+  // `stepping` is the agent's own time; the clock beside the status also counts the time
+  // a person spent reading between presses, which is nobody's latency.
   $("step-count").textContent =
-    `${state.moves || 0} moves · ${state.steps || 0} actions · ${seconds(state.elapsed_ms || 0)}` +
+    `${state.moves || 0} moves · ${state.steps || 0} actions · ${seconds(t.wall_ms || 0)} stepping · ` +
+    `${seconds(t.model_ms || 0)} model · ${seconds(t.site_ms || 0)} site · ${seconds(t.frame_ms || 0)} frames` +
+    (t.other_ms ? ` · ${seconds(t.other_ms)} judging` : "") +
+    (t.first_load_ms ? ` · ${seconds(t.first_load_ms)} first load` : "") +
     (s.calls != null ? ` · ${s.calls} model calls · $${(s.usd || 0).toFixed(3)}` : "");
+  $("step-count").title = t.site_clock
+    ? "model: the policy's own calls · site: performing, settling, observing, resting · frames: the screenshots, taken out of the site's share · judging: the critic and the recording"
+    : "This perceiver keeps no site clock, so site is what the actions reported and perception is counted under judging.";
 }
 
 function ago(iso) {
@@ -348,19 +440,60 @@ function renderRecipes() {
   );
 }
 
+function fill(select, values, label, current) {
+  if (select.dataset.filled === values.join()) return;
+  select.dataset.filled = values.join();
+  select.replaceChildren(
+    ...values.map((v) => {
+      const option = document.createElement("option");
+      option.value = v;
+      option.textContent = label(v);
+      return option;
+    }),
+  );
+  select.value = current;
+}
+
+// Filled ONCE from what the server is configured with and then left alone: these are the
+// next run's settings and belong to whoever is about to press Start, so a poll must not
+// put them back.
+function renderModels() {
+  const o = state.options;
+  if (!o) return;
+  const c = o.configured || {};
+  fill($("text-model"), o.text_models || [], (v) => v, c.text_model);
+  fill($("refine-model"), o.text_models || [], (v) => v, c.refine_model || c.text_model);
+  fill($("text-effort"), o.efforts || [""], (v) => v || "default", c.text_effort || "");
+  if (!$("refine").dataset.filled) {
+    $("refine").dataset.filled = "1";
+    $("refine").checked = Boolean(c.refine_goal);
+  }
+  const m = state.mode || {};
+  $("model-summary").textContent = !o.adjustable
+    ? "· only the Jev policy has them"
+    : state.status === "idle"
+      ? ""
+      : `· this run types with ${m.text_model}${m.text_effort ? ` (${m.text_effort})` : ""}, refinement ${m.refine_goal ? `on, by ${m.refine_model || m.text_model}` : "off"}`;
+  $("model-note").textContent =
+    "Applied when a run is started: the text writer is built once per run, so a change here takes effect at the next Start run, not in the middle of this one." +
+    (m.goal_shown ? ` The policy is being shown: “${m.goal_shown}”` : "");
+}
+
 function render() {
-  if (!state) return;
+  if (!state || stale) return;
   renderElapsed();
   renderRecipes();
-  const working = busy || state.busy;
+  renderModels();
+  const working = busy || state.busy || running();
   $("status").textContent = working
-    ? DOING[state.doing] || $("status").textContent
+    ? DOING[state.doing] || (running() ? DOING.auto : $("status").textContent)
     : STATUS[state.status] || state.status;
   $("status-dot").className = `dot ${working ? "working" : state.status}`;
   // A finished run's note is already in the decision panel; the last reset is reported
   // in every state, because "did the undo work?" is asked most often AFTER a run ends.
   const reset = state.resets?.at(-1);
   $("note").textContent =
+    state.auto_note ||
     (!TERMINAL.includes(state.status) && state.note) ||
     (reset ? `Last reset · ${reset.what} · ${reset.ok ? "restored" : "FAILED"} · ${reset.detail}` : "");
   const m = state.mode || {};
@@ -392,7 +525,6 @@ function render() {
 
 $("task-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  automatic = false;
   opened.clear();
   perform(
     () =>
@@ -404,6 +536,14 @@ $("task-form").addEventListener("submit", (event) => {
         read_only: $("read-only").checked,
         max_steps: $("max-steps").value,
         max_usd: $("max-usd").value,
+        ...(state?.options?.adjustable
+          ? {
+              refine_goal: $("refine").checked,
+              refine_model: $("refine").checked ? $("refine-model").value : "",
+              text_model: $("text-model").value,
+              text_effort: $("text-effort").value,
+            }
+          : {}),
       }),
     DOING.start,
   );
@@ -411,35 +551,30 @@ $("task-form").addEventListener("submit", (event) => {
 $("choose").addEventListener("click", () => perform(() => call("predict"), DOING.predict));
 $("execute").addEventListener("click", () => perform(() => call("act"), DOING.act));
 $("step").addEventListener("click", () => perform(() => call("tick"), DOING.tick));
-$("auto").addEventListener("click", () =>
-  perform(async () => {
-    automatic = true;
-    controls();
-    while (automatic && !TERMINAL.includes(state.status) && state.status !== "idle") {
-      $("status").textContent = "Running…";
-      await call("tick");
-    }
-    automatic = false;
-  }, "Running the browser…"),
-);
-$("stop").addEventListener("click", () => {
-  if (!automatic) return;
-  automatic = false;
-  $("status").textContent = "Pausing after the current step…";
-  controls();
+// Not through perform(): that refuses while a step is running, and "off" has to get
+// through exactly then. The server takes this one without queueing it, for the same reason.
+$("auto").addEventListener("change", async () => {
+  const on = $("auto").checked;
+  $("error").hidden = true;
+  try {
+    await call("auto", { on });
+    if (!on && state?.busy) $("status").textContent = "Pausing after the current move…";
+  } catch (error) {
+    $("error").textContent = error.message;
+    $("error").hidden = false;
+  }
 });
+$("refine").addEventListener("change", controls);
+$("reload").addEventListener("click", () => location.reload());
 $("reset-run").addEventListener("click", () => {
-  automatic = false;
   opened.clear();
   perform(() => call("reset_run"), DOING.reset_run);
 });
 $("reset-browser").addEventListener("click", () => {
-  automatic = false;
   opened.clear();
   perform(() => call("reset_browser"), DOING.reset_browser);
 });
 $("reset-site").addEventListener("click", () => {
-  automatic = false;
   perform(() => call("reset_site", { recipe: $("recipe").value }), DOING.reset_site);
 });
 $("recipe").addEventListener("change", controls);
@@ -486,7 +621,22 @@ $("download").addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 
-poll();
-setInterval(() => {
-  if (!busy) poll();
-}, 1000);
+// What was typed before a self-reload (see refused()), put back once.
+try {
+  const draft = JSON.parse(stored.get("inspector-draft") || "null");
+  if (draft) {
+    $("url").value = draft.url ?? $("url").value;
+    $("goal").value = draft.goal ?? $("goal").value;
+  }
+} catch {
+  /* a draft that does not parse is not worth a message */
+}
+stored.drop("inspector-draft");
+
+// Faster while the server is running by itself: nothing on this page is awaiting those
+// moves, so the poll is the only thing that shows them.
+async function loop() {
+  if (!busy) await poll();
+  if (!stale) setTimeout(loop, running() ? 400 : 1000);
+}
+loop();
