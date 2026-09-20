@@ -506,7 +506,17 @@ page did not change: told a correct *Add to cart* "did not work", the policy add
 other nine products. Upstream's rules are `_RULES`, but its rewrite DROPPED the WAIT
 discipline and that paragraph is ours again (finished page: `DONE` 0.49 -> 0.65). And the
 quiesce is `BrowserController.quiesce`, armed per move by `DomPerceiver.rest_after` and
-NEVER in `_settle`; it waits for a busy page to finish, not for an idle one to start.
+NEVER in `_settle`; it waits for a busy page to finish, not for an idle one to start. It
+rests a frame after an IN-PLACE change too, which upstream does not: on live splitkb.com a
+modal opened, the page had "answered", and the policy was offered its close button alone
+because the video player inside had not hydrated (`CHANGED_REST_MS`). Two live facts from
+2026-09-20, both headless and framework-launched. splitkb.com lets us in and locks its
+document behind NO overlay, so the missing-scroll defect does not reproduce there; what its
+*More info* modal shows is the phantom one - `main` offers 40 controls, 38 of them behind
+the modal. And walmart.com served `/cart` once (redirected to the home page, already at
+rest) and answered the SECOND load, minutes later, with `/blocked?...` - "Robot or human?
+Activate and hold" - so a Walmart run needs `--chrome-attach` and a profile a person has
+cleared, exactly as `PLAINLY_LAUNCHED` says of DoorDash, and is not to be retried headless.
 Goal refinement (`SKILLWEAVER_REFINE_GOAL`, off) is for the POLICY'S EYES ONLY -
 `JevDriver._goal_shown` - because a rewrite that reached the recorder would become the
 stored `Precedent` and the warm gates count words; measured, it did not pay on a

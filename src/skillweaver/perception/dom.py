@@ -59,6 +59,7 @@ log = get_logger(__name__)
 
 __all__ = [
     "ARRIVAL_REST_MS",
+    "CHANGED_REST_MS",
     "MAX_CONTROLS",
     "MAX_PAGE_TEXT",
     "MAX_TEXT_NODES",
@@ -82,6 +83,17 @@ NO_CHANGE_REST_MS: tuple[float, float] = (120.0, 1000.0)
 """``(quiet, cap)`` for a move after which the page reads EXACTLY as before: the effect may
 land asynchronously - a cart badge, a toast - so look once more before "no change" is
 what the policy is told. Upstream's numbers."""
+
+CHANGED_REST_MS: tuple[float, float] = (150.0, 1500.0)
+"""``(quiet, cap)`` for a move after which the page CHANGED IN PLACE. This one is not
+upstream's - its two conditions leave this case unrested, and so did this project's for a
+day - and it was paid for on a live site. splitkb.com, a product page's *More info*: the
+click opened a modal, the page had visibly answered, so the next frame was taken at once -
+and the policy was offered ONE control, the modal's close button, because the video player
+inside it had not hydrated yet. It closed the popup it had been asked to play a video in.
+The same page observed after a quiesce offers two. A page answers in PHASES
+(``AGENTS.md``, where Walmart's *Add* button arrives 0.61s after its title), and a frame
+taken between two of them is a skeleton whatever the address bar says."""
 
 MAX_CONTROLS = 250
 """Controls reported from one frame, matching Jev's own cap: it bounds the policy's
@@ -391,10 +403,13 @@ class DomPerceiver:
         An acting policy calls this as it answers: ``basis`` is the screen it decided
         on, and ``actions`` how many controller actions its move performs - the explorer
         observes after each, and the one worth waiting for is the LAST, which is the
-        frame the next decision is made on. That frame then gets upstream's two
-        conditions: the address changed (:data:`ARRIVAL_REST_MS`), or the page reads
-        exactly as ``basis`` did (:data:`NO_CHANGE_REST_MS`, skipped when the move WAS a
-        wait). Anything else is a page that visibly answered, and is not made to wait.
+        frame the next decision is made on. That frame is taken on a page at rest,
+        whichever of three things the move did to it: changed the address
+        (:data:`ARRIVAL_REST_MS`), left it reading exactly as ``basis`` did
+        (:data:`NO_CHANGE_REST_MS`, skipped when the move WAS a wait), or changed it in
+        place (:data:`CHANGED_REST_MS`). The first two are upstream's; the third is the
+        one a live run added, and its constant says what that cost. On a page that has
+        finished answering, the wait is one quiet window and no more.
 
         Armed per move rather than switched on, because every other reader of this
         perceiver must stay untaxed: a warm replay, the admission gate's rest loop and a
@@ -453,7 +468,9 @@ class DomPerceiver:
         self._armed = None
         if snapshot.url != basis.url:
             why, (quiet, cap) = "arrived", ARRIVAL_REST_MS
-        elif not waited and snapshot.digest == basis.digest:
+        elif snapshot.digest != basis.digest:
+            why, (quiet, cap) = "changed", CHANGED_REST_MS
+        elif not waited:
             why, (quiet, cap) = "unchanged", NO_CHANGE_REST_MS
         else:
             return False
