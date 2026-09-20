@@ -328,6 +328,17 @@ class Agent:
                 # go quiet, then look once more before recording "no change observed".
                 state["browser"].settle(quiet_ms=120, cap_ms=1000)
                 after = state["browser"].observe(screenshot=False)
+                if after["fingerprint"] == page["fingerprint"] and action["kind"] in {"click", "select"}:
+                    # Quiet is not the same as finished. A page waiting on a cart request makes no
+                    # mutations, so settle returns in ~150 ms while the badge updates a second or
+                    # more later — and a wrongly recorded "no change" makes the run add the item
+                    # again. Only mutations pay this, and only when they look like they failed.
+                    deadline = time.perf_counter() + 2.0
+                    while time.perf_counter() < deadline:
+                        time.sleep(0.2)
+                        after = state["browser"].observe(screenshot=False)
+                        if after["fingerprint"] != page["fingerprint"]:
+                            break
             elif after["url"] != page["url"]:
                 # A navigation may still be materializing content (skeleton results pages).
                 # Decide on a quiet page, not on whatever happened to be rendered first.

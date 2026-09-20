@@ -24,8 +24,16 @@ def post_json(url, key, body):
     for attempt in range(3):
         try:
             response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
-        except httpx.HTTPError:
-            raise RuntimeError("Model connection failed; no action executed.") from None
+        except httpx.HTTPError as error:
+            # Typically a pooled connection the server closed while idle, which surfaces only on
+            # reuse. The request never reached the model, so nothing could have executed and asking
+            # again is safe. Without this one transient socket error ends an entire run.
+            if attempt == 2:
+                raise RuntimeError(
+                    f"Model connection failed after 3 attempts ({type(error).__name__}); no action executed."
+                ) from None
+            time.sleep(0.25 * 2**attempt)
+            continue
         if response.status_code in {429, 529, 503} and attempt < 2:
             time.sleep(0.5 * 2**attempt)
             continue
