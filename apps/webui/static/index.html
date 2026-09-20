@@ -144,17 +144,34 @@
     return phrase + '.'.repeat(1 + (tick % 3));
   }
 
+  function rowHtml(r) {
+    const stop = r.done ? '' : `<a class="stop" data-stop="${r.id}">stop</a>`;
+    return `<div class="title"><span class="n">run ${r.id}</span><span class="t">${esc(r.text)}</span>
+        <a href="/run/${r.id}" target="_blank">debug</a>${stop}</div>
+      <div class="state"></div>`;
+  }
+
+  // Rows are updated in place: rebuilding them on every poll restarted the shine
+  // animation from the left each time, which read as the bar teleporting.
   function render(runs) {
     known = runs;
-    list.innerHTML = runs.map(r => {
-      const cls = r.done ? (r.state === 'done' ? 'done' : 'failed') : 'busy';
-      const stop = r.done ? '' : `<a class="stop" data-stop="${r.id}">stop</a>`;
-      return `<div class="run ${cls}" data-id="${r.id}">
-        <div class="title"><span class="n">run ${r.id}</span><span class="t">${esc(r.text)}</span>
-          <a href="/run/${r.id}" target="_blank">debug</a>${stop}</div>
-        <div class="state">${esc(r.done ? r.state : liveText(r.state))}</div>
-      </div>`;
-    }).join('');
+    const seen = new Set();
+    let prev = null;
+    for (const r of runs) {
+      seen.add(String(r.id));
+      let el = list.querySelector(`.run[data-id="${r.id}"]`);
+      if (!el) {
+        el = document.createElement('div');
+        el.dataset.id = r.id;
+        el.innerHTML = rowHtml(r);
+        list.insertBefore(el, prev ? prev.nextSibling : list.firstChild);
+      }
+      const cls = 'run ' + (r.done ? (r.state === 'done' ? 'done' : 'failed') : 'busy');
+      if (el.className !== cls) { el.className = cls; el.innerHTML = rowHtml(r); }
+      el.querySelector('.state').textContent = r.done ? r.state : liveText(r.state);
+      prev = el;
+    }
+    for (const el of [...list.children]) if (!seen.has(el.dataset.id)) el.remove();
   }
 
   // The dots and the phrasing move between polls, without rebuilding the list.
