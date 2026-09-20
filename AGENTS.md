@@ -101,7 +101,15 @@ and `DEFAULT_MATCH_THRESHOLD` both defer to, and which carries the two corpora i
 calibrated on. Re-derive it, do not nudge it, and re-derive it again if the fingerprinter
 changes what it puts in `parts` - a cut is only meaningful against the shape of the signal
 it judges. An exact match is a property of the demo site alone, which is why a gate tuned
-against the sandbox looks green until it meets a website.
+against the sandbox looks green until it meets a website. The place that rule was still
+being broken is the one where it is hardest to see: a FAILED move usually repaints the
+page without changing it, so a dead end filed under an exact fingerprint is filed under a
+screen the very next step is not standing on - measured at six of seven lost on one
+33-action run. Do not re-check that with a synthetic no-op: an inert click re-observes
+IDENTICALLY on the sandbox, live Wikipedia, splitkb and bbc.com, which is how this was
+first measured and reported the wrong way round. `FailureMemory.near` in `agent/explorer.py` carries that measurement and is
+the reader an acting policy uses; `at` and `seen` beside it stay exact because the default
+explorer's prompt and its repeat guard are calibrated against them.
 
 What moves a real page is a notice arriving at the top - a fundraising appeal, a cookie
 bar, an A/B strip - which pushes everything below it DOWN. A fingerprint part must
