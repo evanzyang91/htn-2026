@@ -91,7 +91,7 @@
   function reset() {
     clearInterval(countdown); countdown = null;
     clearInterval(watching); watching = null;
-    finalText = '';
+    finalText = ''; spoken = ''; current = '';
     heard.textContent = '';
     edit.style.display = 'none';
     send.hidden = editBtn.hidden = again.hidden = true;
@@ -106,34 +106,40 @@
     send.hidden = false; again.hidden = false; editBtn.hidden = true;
   }
 
+  // One phrase per recognition session, and the LATEST result is the phrase: on
+  // Android Chrome every report carries the whole phrase so far and is marked final,
+  // so summing the list ("add", "add to", "add to cart"...) prints each prefix again.
+  // Finished phrases are kept in `spoken`; the session restarts while you are still
+  // listening, so a pause does not end the request.
+  let spoken = '', current = '';
   function start() {
     rec = new Recognition();
     rec.lang = navigator.language || 'en-US';
     rec.interimResults = true;
-    rec.continuous = true;
-    finalText = '';
+    rec.continuous = false;
+    current = '';
     rec.onresult = (ev) => {
-      // Rebuilt from the whole list every time, never appended: Android Chrome
-      // re-sends results it already marked final, and appending stacked each one
-      // ("add to cartadd to cartadd to cart the").
-      let interim = '';
-      finalText = '';
-      for (let i = 0; i < ev.results.length; i++) {
-        const r = ev.results[i];
-        if (r.isFinal) finalText += r[0].transcript + ' '; else interim += r[0].transcript + ' ';
-      }
-      finalText = finalText.replace(/\s+/g, ' ').trim();
-      interim = interim.trim();
+      const last = ev.results[ev.results.length - 1];
+      current = last[0].transcript.trim();
+      finalText = (spoken + ' ' + current).trim();
       heard.innerHTML = '';
-      heard.append(finalText);
-      if (interim) { const s = document.createElement('span'); s.className = 'interim'; s.textContent = ' ' + interim; heard.append(s); }
+      heard.append(spoken ? spoken + ' ' : '');
+      const s = document.createElement('span');
+      s.className = last.isFinal ? '' : 'interim';
+      s.textContent = current;
+      heard.append(s);
     };
     rec.onerror = (ev) => {
+      if (ev.error === 'no-speech' || ev.error === 'aborted') return;  // onend restarts or stops
       stop();
       state.textContent = ev.error === 'not-allowed' ? 'Microphone blocked. Allow it for this page and try again.' : `Speech error: ${ev.error}`;
       state.className = 'state bad';
     };
-    rec.onend = () => { if (listening) stop(); };
+    rec.onend = () => {
+      if (current) { spoken = (spoken + ' ' + current).trim(); current = ''; }
+      finalText = spoken;
+      if (listening) { try { rec.start(); } catch (e) { stop(); } }
+    };
     rec.start();
     listening = true;
     mic.classList.add('listening');
@@ -144,7 +150,8 @@
     listening = false;
     mic.classList.remove('listening');
     try { rec && rec.stop(); } catch (e) {}
-    const text = finalText.trim();
+    const text = (spoken + ' ' + current).trim();
+    finalText = text;
     if (!text) { sub.textContent = 'Nothing heard. Tap the mic and try again.'; return; }
     heard.textContent = text;
     sub.textContent = 'Heard this:';
