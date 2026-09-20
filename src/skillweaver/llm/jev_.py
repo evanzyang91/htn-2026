@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 import time
 from collections.abc import Collection, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -66,6 +67,7 @@ __all__ = [
     "NoFieldValue",
     "PolicyDecision",
     "TextWriter",
+    "name_of",
     "progress",
     "targets_of",
 ]
@@ -113,7 +115,8 @@ RESERVED_EXCLUDE_KEYS = frozenset({"CONTROLS", "LABELS"})
 """Keys of ``exclude`` that are NOT operation names.
 
 ``CONTROLS`` names target-less operations to withhold from this step's offer, and
-``LABELS`` names control labels to withhold from EVERY targeted operation. Both are
+``LABELS`` names controls BY NAME (:func:`name_of`: the label, plus the row or card around
+it when the label is shared) to withhold from EVERY targeted operation. Both are
 upstream's pruning as of ``1489129``, and both exist because the id-keyed exclusions
 cannot see what they catch: a scroll, wait or back names no element, and a run churning
 between two labels on a page that varies each lap never meets the same element id twice.
@@ -320,6 +323,12 @@ on the page the task asked for. Each ask is a provider call and is charged as on
 
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 529})
 _MAX_ATTEMPTS = 3
+_TRANSPORT_BACKOFF_SECONDS = 0.25
+"""First pause after a TRANSPORT failure, doubling: 0.25s then 0.5s. Upstream's number
+(``aa13d36``) and shorter than the 0.5s a retryable STATUS waits, for its reason: the
+usual cause is a pooled connection the server closed while idle, which surfaces only on
+reuse and is cured by the fresh connection the very next attempt opens - there is no
+overloaded server to give room to."""
 _TIMEOUT_SECONDS = 25.0
 _HISTORY_WINDOW = 20
 """The recent tail :func:`progress` always keeps, as upstream has it."""
@@ -463,13 +472,17 @@ class _Speculation:
     """A field value being written BESIDE the policy round trip.
 
     ``element_id`` is the whole reuse check. Upstream compares the writer's entire input,
-    because its speculation outlives the step that started it; this one is started and
-    settled inside one :meth:`JevPolicy.decide`, from the same goal, snapshot and history
+    because its speculation is started a step early; this one is only ever REUSED inside
+    the :meth:`JevPolicy.decide` that started it, from the same goal, snapshot and history
     the direct call would be given, so the field is the only input that can differ.
+
+    ``reused`` is set by the one reader that takes the value. A call that RAN and was
+    never reused is a discarded guess (:meth:`JevPolicy._retire`).
     """
 
     element_id: str
     future: Future[str]
+    reused: bool = False
 
 
 @runtime_checkable
@@ -523,12 +536,15 @@ class JevPolicy:
 
     __slots__ = (
         "_cassette",
+        "_discarded",
         "_key",
+        "_lock",
         "_meter",
         "_mode",
         "_model",
         "_recorded",
         "_session",
+        "_speculation",
         "_text",
         "_workers",
     )
@@ -551,6 +567,9 @@ class JevPolicy:
         self._meter = UsageMeter()
         self._session: httpx.Client | None = None
         self._workers: ThreadPoolExecutor | None = None
+        self._speculation: _Speculation | None = None
+        self._discarded = 0
+        self._lock = threading.Lock()
         if self._key:
             register_secret(self._key)
         elif not (self._cassette is not None and self._mode == "replay"):
@@ -588,15 +607,45 @@ class JevPolicy:
         writer's second of a decision: measured once, a run stopped by its budget printed
         its report before its last discarded call returned. Whoever reads the final total
         should :meth:`close` first.
+
+        A discarded guess is charged as MONEY AND TOKENS and not as a CALL. The explorer
+        bounds a run by the ``calls`` it reads here (``max_llm_calls``), and on a page
+        whose one field is on every screen a guess is spent on every step that does not
+        type - 8 of 12 writer calls in one measured run - so the speculation that exists
+        to make a run faster was ending it sooner. The run did not ask for those calls;
+        it still paid for them, so their tokens and dollars stay in this total and
+        :meth:`discarded_calls` says how many there were. Never more than the writer
+        itself reports: a writer metered elsewhere reports nothing here, and a guess of
+        its must not cancel one of the policy's own calls.
         """
-        return self._meter.total() + self._text.total_usage()
+        written = self._text.total_usage()
+        with self._lock:
+            discarded = self._discarded
+        uncounted = replace(written, calls=written.calls - min(discarded, written.calls))
+        return self._meter.total() + uncounted
+
+    def discarded_calls(self) -> int:
+        """How many speculated writer calls RAN, were answered, and were never read.
+
+        Real spend that :meth:`total_usage` charges in tokens and dollars but keeps out
+        of ``calls``; this is where that number stays visible.
+        """
+        with self._lock:
+            return self._discarded
 
     def close(self) -> None:
         """Wait out any text call still in flight, so its spend is on the meter, then
-        release the worker and the HTTP session. Idempotent."""
+        release the workers and the HTTP session. Idempotent.
+
+        The outstanding guess is given up first, so one still queued is never run just
+        to be thrown away; one already running is waited for, which is what puts its
+        spend on the meter before the run's last read of it.
+        """
+        self._drop_speculation()
         if self._workers is not None:
             self._workers.shutdown(wait=True)
             self._workers = None
+            log.info("jev.speculation.closed", discarded=self.discarded_calls())
         if self._session is not None:
             self._session.close()
             self._session = None
@@ -740,16 +789,18 @@ class JevPolicy:
         ``latency_ms`` covers a pass that was thrown away as well as the one that stood.
 
         The text writer is started BESIDE the ask when the screen allows it
-        (:meth:`_speculate`), and whatever ends this pass without using that call gives
-        it up: one not yet started is never paid for, and one already running cannot be
-        stopped, so its spend lands on the writer's meter when it returns.
+        (:meth:`_speculate`), and the guess is held on the policy, as upstream holds it
+        on its agent, and given up (:meth:`_drop_speculation`) at upstream's two moments:
+        as soon as a move is chosen that does not use it - which is here, and covers a
+        pass that raised - and at the start of the next :meth:`_speculate`. One not yet
+        started is never paid for; one already running cannot be stopped, so its spend
+        lands on the writer's meter when it returns.
         """
         speculation = self._speculate(goal, snapshot, history, targets_of(snapshot, exclude))
         try:
             return self._settle_on(goal, snapshot, history, exclude, began, speculation)
         finally:
-            if speculation is not None:
-                speculation.future.cancel()  # a no-op on a call that ran or is running
+            self._drop_speculation()
 
     def _settle_on(
         self,
@@ -833,7 +884,7 @@ class JevPolicy:
             text=text,
             confidence=float(operation["confidence"]),
             probability=probability,
-            why=f"{chosen} [{index}] {control.label!r} ({probability:.2f})",
+            why=f"{chosen} [{index}] {name_of(control)!r} ({probability:.2f})",
             policy_ms=policy_ms,
             latency_ms=(time.perf_counter() - began) * 1000,
         )
@@ -871,18 +922,75 @@ class JevPolicy:
         COSTS, on GitHub's search page, whose one field is on every screen: 12 writer
         calls for 4 typed values, so 8 were discarded - each a real call, charged, and
         counted against ``max_llm_calls``. A page with one field pays a writer call per
-        step that does not type; that is upstream's trade and it is not free.
+        step that does not type; that is upstream's trade and it is not free. It is
+        still paid in money; it is no longer paid in the run's call budget
+        (:meth:`total_usage`).
+
+        TWO workers, and the outstanding guess dropped FIRST: upstream's ``0da4053``.
+        Each step starts a guess and most are never read, and a guess that has started
+        cannot be cancelled, so on one worker the next value waited for the backlog -
+        upstream measured a typing step at 10.8s whose own writer call took 1.1s. Here
+        that wait never reached the typed value, because :meth:`_value` cancels a guess
+        still QUEUED and writes directly; what the single worker cost was the OVERLAP,
+        the thing speculation is for: with step N's discarded guess still running, step
+        N+1's guess sat in the queue, was cancelled, and the value was written after the
+        policy answered instead of beside it. A second worker lets that guess start at
+        once. Two is enough because a guess is dropped before the next is made, so at
+        most one abandoned call is running when a new one is submitted.
         """
+        self._drop_speculation()  # its page is gone; never let it stand in the next one's way
         fields = list(targets.get("TYPE_TEXT", {}).values())
         if len(fields) != 1:
             return None
         if history and history[-1].get("kind") == "TYPE_TEXT":
             return None
         if self._workers is None:
-            self._workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jev-text")
+            self._workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jev-text")
         steps = [dict(step) for step in history]
         future = self._workers.submit(self._text.write, goal, fields[0], snapshot, steps)
-        return _Speculation(fields[0].element_id, future)
+        self._speculation = _Speculation(fields[0].element_id, future)
+        return self._speculation
+
+    def _drop_speculation(self) -> None:
+        """Give up the outstanding guess, if there is one. Idempotent.
+
+        ``cancel`` takes a guess that has not started out of the queue, so it is never
+        paid for, and is a no-op on one that ran or is running. That one is RETIRED when
+        it returns (:meth:`_retire`), which may be now or in a worker thread a second
+        from now; a guess whose value was read is not a discarded one.
+        """
+        speculation, self._speculation = self._speculation, None
+        if speculation is None or speculation.reused:
+            return
+        if not speculation.future.cancel():
+            speculation.future.add_done_callback(self._retire)
+
+    def _retire(self, future: Future[str]) -> None:
+        """Count one discarded guess, once its call has actually been answered.
+
+        Counted when the call RETURNS and never before: the writer meters a call when
+        its reply arrives, and taking the call out of ``calls`` ahead of that would make
+        the total dip and then rise, which the explorer's running difference would charge
+        as the very call this exists to leave out. A guess that raised a plain
+        ``ProviderError`` is NOT counted, because that error cannot say whether the
+        writer metered a reply it could not use or never got one - and the wrong guess
+        there must be the one that over-counts the budget, never the one that flatters
+        it. A decline (:class:`NoFieldValue`) is a reply, and was metered.
+        """
+        if future.cancelled():
+            return
+        error = future.exception()
+        answered = error is None or isinstance(error, NoFieldValue)
+        if answered:
+            with self._lock:
+                self._discarded += 1
+        # Logged because it is spend the call count no longer shows, and because a guess
+        # that DECLINED or failed logs nothing of its own.
+        log.info(
+            "jev.speculation.discarded",
+            outcome="value" if error is None else type(error).__name__,
+            uncounted=answered,
+        )
 
     def _value(
         self,
@@ -898,9 +1006,9 @@ class JevPolicy:
         A reused future re-raises what the writer raised IN the thread, the same object,
         so a decline (:class:`NoFieldValue`) or a ``ProviderError`` reaches
         :meth:`decide` exactly as it does from the direct call. A speculation still
-        QUEUED - the single worker busy with an earlier, discarded one - is cancelled and
-        written directly: waiting out a stale call first would make speculating slower
-        than not.
+        QUEUED - both workers busy, which two of them make rare - is cancelled and
+        written directly, on THIS thread: a needed value never waits behind a guess,
+        running or queued.
         """
         started = time.perf_counter()
         if speculation is not None and speculation.element_id != control.element_id:
@@ -908,6 +1016,7 @@ class JevPolicy:
         if speculation is not None and speculation.future.cancel():
             speculation = None
         if speculation is not None:
+            speculation.reused = True  # read, so not a discarded guess whatever it raises
             text = speculation.future.result()
         else:
             text = self._text.write(goal, control, snapshot, history)
@@ -979,9 +1088,20 @@ class JevPolicy:
         return answers
 
     def _post(self, body: Mapping[str, Any]) -> Mapping[str, Any]:
-        """One POST with backoff, every failure mapped onto :class:`ProviderError`."""
+        """One POST with backoff, every failure mapped onto :class:`ProviderError`.
+
+        A TRANSPORT failure - connect, read, write, pool, a remote protocol error - is
+        retried twice (:data:`_TRANSPORT_BACKOFF_SECONDS`) before it is raised. Upstream's
+        ``aa13d36``, where one such error ended a whole Walmart run: the usual cause is a
+        pooled connection the server closed while idle, which surfaces only on reuse.
+        TIMEOUTS are retried too, deliberately. A read timeout on a POST is the one case
+        where the request may well have ARRIVED, and on most APIs that makes a retry
+        unsafe; here the call is a question to a classifier and executes nothing - the
+        action is performed by this process, after a reply - so a question asked twice
+        costs one answer nobody read and cannot act twice. What it can cost is time,
+        three times :data:`_TIMEOUT_SECONDS` at worst, against a run that ends.
+        """
         session = self._client()
-        last: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             try:
                 response = session.post(
@@ -990,10 +1110,13 @@ class JevPolicy:
                     headers={"Authorization": f"Bearer {self._key}"},
                 )
             except httpx.HTTPError as exc:
-                last = exc
                 if attempt + 1 == _MAX_ATTEMPTS:
-                    break
-                time.sleep(0.5 * 2**attempt)
+                    raise ProviderError(
+                        f"the Jev connection to {self._model} failed {_MAX_ATTEMPTS} times "
+                        f"({type(exc).__name__}); no action was performed"
+                    ) from exc
+                log.warning("jev.transport.retry", attempt=attempt + 1, error=type(exc).__name__)
+                time.sleep(_TRANSPORT_BACKOFF_SECONDS * 2**attempt)
                 continue
             if response.status_code in _RETRY_STATUS and attempt + 1 < _MAX_ATTEMPTS:
                 time.sleep(0.5 * 2**attempt)
@@ -1013,7 +1136,7 @@ class JevPolicy:
             if not isinstance(payload, Mapping):
                 raise ProviderError(f"the Jev reply was {type(payload).__name__}, not an object")
             return payload
-        raise ProviderError(f"the Jev call to {self._model} exhausted retries") from last
+        raise ProviderError(f"the Jev call to {self._model} exhausted retries")
 
     def _client(self) -> httpx.Client:
         """The HTTP session, made once and kept alive: the claim of this backend is one
@@ -1049,6 +1172,20 @@ class JevPolicy:
         )
 
 
+def name_of(control: DomControl) -> str:
+    """What DISTINGUISHES this control: ``label — context``, or the label alone.
+
+    Upstream's ``action_name``. Several controls may share a label - measured there at 17%
+    of DoorDash's and 35% of Hacker News's - and the perceiver then gives each the text of
+    the row or card around it as ``context``. This is the key ``exclude["LABELS"]`` is
+    matched on and the name a decision's ``why`` (and so the history's ``action``) quotes,
+    so seven "Add item to cart" entries say which item each one was. Read tolerantly: the
+    perceiver's half is another module's, and a control without it is named as before.
+    """
+    context = getattr(control, "context", None)
+    return f"{control.label} — {context}" if context else control.label
+
+
 def targets_of(
     snapshot: DomSnapshot, exclude: Mapping[str, Collection[str]] | None = None
 ) -> dict[str, dict[str, DomControl]]:
@@ -1062,9 +1199,11 @@ def targets_of(
         exclude: ``{operation: element ids}`` to leave OUT of that operation's target
             head. Per OPERATION, because a click that achieved nothing is not evidence
             against typing into the same field. Its two :data:`RESERVED_EXCLUDE_KEYS` are
-            not operations and are never read as one: ``LABELS`` holds control LABELS and
-            is applied to every operation here, because a run churning between two labels
-            is churning whatever it does to them; ``CONTROLS`` is :func:`_offered`'s.
+            not operations and are never read as one: ``LABELS`` holds control NAMES
+            (:func:`name_of`) and is applied to every operation here, because a run
+            churning between two controls is churning whatever it does to them. By name
+            and not by bare label, or pruning one of seven "Add item to cart" buttons
+            prunes all seven - upstream's ``cbf517a``. ``CONTROLS`` is :func:`_offered`'s.
 
     An excluded control stays in the request's ``elements`` list: the policy is choosing
     from a page, and a page with a control silently missing is one it is being lied to
@@ -1078,7 +1217,7 @@ def targets_of(
     no_type = frozenset((exclude or {}).get("TYPE_TEXT", ()))
     no_label = frozenset((exclude or {}).get("LABELS", ()))
     for control in snapshot.controls:
-        if control.label in no_label:
+        if name_of(control) in no_label:
             continue
         if control.element_id not in no_click:
             click[str(control.index)] = control
@@ -1261,9 +1400,11 @@ def _traits(control: DomControl) -> list[tuple[str, Any]]:
 
     ``section`` and ``opens`` are upstream's as of ``1489129``: the landmark a control
     sits in and its ``aria-haspopup``, so the policy can tell a control in the open dialog
-    from the same label in the footer. Sent in the element table AND in each target
-    criterion, as upstream does. Read tolerantly because they are the perceiver's to
-    supply, and a control without them is described exactly as it was before.
+    from the same label in the footer. ``context`` is upstream's ``cbf517a``: the row or
+    card around a control whose label is shared (:func:`name_of`). Sent in the element
+    table AND in each target criterion, as upstream does. Read tolerantly because they are
+    the perceiver's to supply, and a control without them is described exactly as it was
+    before.
     """
     return [
         (key, value)
@@ -1273,6 +1414,7 @@ def _traits(control: DomControl) -> list[tuple[str, Any]]:
             ("expanded", control.expanded),
             ("section", getattr(control, "section", None)),
             ("opens", getattr(control, "opens", None)),
+            ("context", getattr(control, "context", None)),
         )
         if value is not None
     ]

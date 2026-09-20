@@ -103,6 +103,9 @@ _PAGE_TEXT_SHOWN = 2000
 value comes from the goal and the field, not from the bulk of the page."""
 _RETRY_STATUS = frozenset({429, 500, 502, 503, 529})
 _MAX_ATTEMPTS = 3
+_TRANSPORT_BACKOFF_SECONDS = 0.25
+"""First pause after a transport failure, doubling. The policy's number and reason:
+``_TRANSPORT_BACKOFF_SECONDS`` in :mod:`skillweaver.llm.jev_`."""
 _TIMEOUT_SECONDS = 25.0
 
 
@@ -199,7 +202,14 @@ class OpenAITextWriter:
         """
         context = {
             "goal": goal,
-            "field": {"label": field.label, "role": field.role, "value": field.value},
+            "field": {
+                "label": field.label,
+                "role": field.role,
+                "value": field.value,
+                # The row or card around a field whose label is shared, when the page
+                # reader supplied one: two "Quantity" boxes are told apart by their item.
+                **({"context": around} if (around := getattr(field, "context", None)) else {}),
+            },
             "page": {
                 "title": snapshot.title,
                 "text": snapshot.text[:_PAGE_TEXT_SHOWN],
@@ -295,12 +305,16 @@ class OpenAITextWriter:
         own round trip (``JevPolicy._speculate``), and a discarded one can still be in
         flight when the next is asked for directly. An ``httpx.Client`` is safe to share
         and the meter locks itself; what needed a lock is making the session ONCE.
+
+        A transport failure - typically a pooled connection the server closed while idle,
+        which surfaces only on reuse - is retried twice before it is raised, timeouts
+        included: a completion TYPES nothing, this process does that after a reply, so
+        asking again can cost a reply nobody reads and can never type twice.
         """
         with self._lock:
             if self._session is None:
                 self._session = httpx.Client(timeout=_TIMEOUT_SECONDS)
             session = self._session
-        last: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             try:
                 response = session.post(
@@ -309,10 +323,15 @@ class OpenAITextWriter:
                     headers={"Authorization": f"Bearer {self._key}"},
                 )
             except httpx.HTTPError as exc:
-                last = exc
                 if attempt + 1 == _MAX_ATTEMPTS:
-                    break
-                time.sleep(0.5 * 2**attempt)
+                    raise ProviderError(
+                        f"the connection to the text model {self._model} failed "
+                        f"{_MAX_ATTEMPTS} times ({type(exc).__name__}); nothing was typed"
+                    ) from exc
+                log.warning(
+                    "jev.text.transport.retry", attempt=attempt + 1, error=type(exc).__name__
+                )
+                time.sleep(_TRANSPORT_BACKOFF_SECONDS * 2**attempt)
                 continue
             if response.status_code in _RETRY_STATUS and attempt + 1 < _MAX_ATTEMPTS:
                 time.sleep(0.5 * 2**attempt)
@@ -332,7 +351,7 @@ class OpenAITextWriter:
             if not isinstance(payload, Mapping):
                 raise ProviderError("the text model's reply was not an object; nothing typed")
             return payload
-        raise ProviderError(f"the text call to {self._model} exhausted retries") from last
+        raise ProviderError(f"the text call to {self._model} exhausted retries")
 
 
 class _WrongTokenKey(ProviderError):
