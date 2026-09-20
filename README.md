@@ -1,4 +1,4 @@
-# skillweaver
+# Jevis
 
 A self-growing skill library for computer-use agents (Hack the North 2026).
 
