@@ -21,10 +21,21 @@ ran clean, passed its own verifier and was still rejected at similarity 0.120.
 An unparseable model reply, or one claiming success without naming visible evidence,
 degrades to an honest ``ok=False, confidence=0.0``. A failing model CALL raises
 ProviderError instead: an outage is infrastructure, not a judgment about the screen.
+
+**The judge is never handed a tool, and a reply that is not a verdict is asked for once
+more before it degrades.** A run's client is built with ``computer_use=True``, which
+appends the computer tool to every request, and a judge shown two screenshots beside a
+screenshot tool sometimes CALLS it and says nothing: the ``(empty reply)`` degradations
+that reported finished errands NOT SOLVED, and on the Jev path sent a correct ``DONE``
+back through the policy to be claimed again (~5s a time, measured). :func:`text_only` is
+the door every ask goes through, and :data:`REASK_MAX_TOKENS` is why the second ask is
+given more room than the first. The re-ask is the SAME evidence and the SAME gates - it
+can turn "I do not know" into a verdict, never a no into a yes.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Sequence
@@ -49,9 +60,11 @@ __all__ = [
     "MIN_EVIDENCE_CHARS",
     "MODEL_CONFIDENCE_CAP",
     "PROMPT_PATH",
+    "REASK_MAX_TOKENS",
     "CriticVerdict",
     "TieredCritic",
     "load_prompt",
+    "text_only",
 ]
 
 log = get_logger(__name__)
@@ -71,6 +84,14 @@ MIN_EVIDENCE_CHARS = 12
 ``"done"`` and ``"it worked"`` are all shorter, and all of them are the model agreeing
 rather than looking; a claim with less evidence degrades to "I do not know"."""
 
+REASK_MAX_TOKENS = 2048
+"""``max_tokens`` for the ONE re-ask a reply that is not a verdict earns.
+
+``claude-opus-5`` thinks by default and thinking is billed against ``max_tokens``, so a
+first ask at 512 can end on ``max_tokens`` with no text at all - the same empty reply a
+tool call produces, for a different reason. The re-ask is given room for both; the first
+ask keeps its small ceiling because that is what bounds the common case."""
+
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
@@ -82,6 +103,26 @@ def load_prompt() -> str:
         OSError: if the prompt file is missing from the installed package.
     """
     return PROMPT_PATH.read_text(encoding="utf-8")
+
+
+def text_only(llm: LLMClient) -> LLMClient:
+    """``llm`` as a client whose requests carry no tool the caller did not pass.
+
+    A client exposing ``text_only()`` is asked for its own. Otherwise a client that
+    appends the computer tool to every request (``AnthropicClient(computer_use=True)``,
+    recognised by that flag) is shallow-copied with the flag off: the copy SHARES the
+    SDK client and the usage meter, so every call the judge makes is still charged to the
+    run through ``total_usage`` - the standing rule that cost is read from the meter.
+    Anything else is returned as it came.
+    """
+    own = getattr(llm, "text_only", None)
+    if callable(own):
+        return own()
+    if getattr(llm, "_computer_use", False) is True:
+        judge = copy.copy(llm)
+        judge._computer_use = False  # type: ignore[attr-defined]  # noqa: SLF001
+        return judge
+    return llm
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +186,7 @@ class TieredCritic:
         vetoes: Sequence[Check] = (),
         max_tokens: int = 512,
     ) -> None:
-        self._llm = llm
+        self._llm = text_only(llm) if llm is not None else None
         self._max_tokens = max_tokens
         self._require_change = require_change
         self._check_errors = check_errors
@@ -286,19 +327,37 @@ class TieredCritic:
         results: tuple[CheckVerdict, ...],
         corroboration: tuple[CheckVerdict, ...] = (),
     ) -> CriticVerdict:
-        """Exactly one model call, then a verdict that never over-claims."""
+        """One model call - two when the first reply is not a verdict - and a verdict that
+        never over-claims.
+
+        The re-ask is against the SAME message: same goal, same frames, same check trail.
+        Without it a degraded ``done`` verdict goes back to the policy as a refusal, the
+        policy claims ``DONE`` again on the unchanged screen, and the run pays a policy
+        call and a fresh escalation to ask the identical question.
+        """
         log.debug("critic.escalate", model=self._llm.name(), goal=goal)  # type: ignore[union-attr]
+        message = self._message(goal, before, after, expectation, results, corroboration)
+        verdict = self._ask_once(message, results, self._max_tokens)
+        if verdict.policy == "model":
+            return verdict
+        log.warning("critic.reask", policy=verdict.policy, reason=verdict.reason)
+        return self._ask_once(message, results, max(self._max_tokens, REASK_MAX_TOKENS))
+
+    def _ask_once(
+        self, message: LLMMessage, results: tuple[CheckVerdict, ...], max_tokens: int
+    ) -> CriticVerdict:
+        """Ask, parse, and apply the evidence gate. Degrades; never raises on a bad reply."""
         response = self._llm.complete(  # type: ignore[union-attr]
-            [self._message(goal, before, after, expectation, results, corroboration)],
-            system=load_prompt(),
-            max_tokens=self._max_tokens,
+            [message], system=load_prompt(), max_tokens=max_tokens
         )
         parsed = _parse_reply(response.text)
         if parsed is None:
             return self._degraded(
                 "model-unparseable",
                 "the model's reply could not be parsed as a verdict, so it is being read "
-                f"as 'I do not know' rather than as a success: {_snippet(response.text)}",
+                f"as 'I do not know' rather than as a success: {_snippet(response.text)} "
+                f"[stop_reason={response.stop_reason}, "
+                f"tool_calls={[call.name for call in response.tool_calls]}]",
                 results,
             )
 
