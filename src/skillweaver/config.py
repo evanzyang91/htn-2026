@@ -106,6 +106,29 @@ the refined wording in 0 stored files, and the trajectory, the provenance and th
 line and says why. ``SKILLWEAVER_REFINE_MODEL`` names a slower, more careful model
 for it, and defaults to the text model."""
 
+DEFAULT_FAST_MOVES = True
+"""``SKILLWEAVER_FAST_MOVES``: on a ``--policy jev`` run, judge each MOVE by literal page
+change alone (``agent/move_critic.py``) instead of escalating to the vision model. It
+reaches NO other path - ``orchestrator._open_move_critic`` - and never the ``done`` claim,
+which keeps the full critic; set it to ``0`` to get the per-move model verdict back.
+
+On by default because it was measured and learning survived it. Live splitkb.com, cold
+from the home page, *Add the "LPF Glow ... Keycaps" to the cart*, private headless Chrome
+through the harness, interleaved A B A B, 2026-09-20, n=2 per arm:
+
+  per-move verdict | wall to solved | model calls | cost          | solved | admitted
+  model (off)      | 33.5s, 32.1s   | 17, 14      | $0.243, $0.198 | 2/2    | 2/2
+  literal (on)     | 14.3s, 13.6s   | 11, 11      | $0.048, $0.049 | 2/2    | 2/2 (one repair)
+
+The same six moves both ways. A move the model judged took 5.8-8.4s against 0.5-2.4s for
+the same move judged literally, and the model arm was WRONG twice per run in the
+direction ``AGENTS.md`` warns of: it failed the typed search field and the AJAX *Add to
+cart*, both of which had worked. The skill the literal arm stored replayed warm in 4.4s,
+0 model calls. Read-only control on live Wikipedia search, n=1 per arm: 15.3s / 9 calls
+against 10.8s / 8 (log timestamps, start to solved), both admitted. ``wall to solved`` is
+``AttemptRecord.wall_ms``.
+"""
+
 DEFAULT_TEXT_BASE_URL = "https://api.openai.com/v1"
 """Any OpenAI-compatible endpoint works; ``SKILLWEAVER_TEXT_BASE_URL`` names another."""
 
@@ -146,6 +169,7 @@ class Settings:
     text_effort: str | None = None
     refine_goal: bool = DEFAULT_REFINE_GOAL
     refine_model: str | None = None
+    fast_moves: bool = DEFAULT_FAST_MOVES
     default_budget: Budget = field(default_factory=Budget)
 
     @property
@@ -301,6 +325,7 @@ def load_settings(
         text_effort=text_effort,
         refine_goal=_flag(merged, "SKILLWEAVER_REFINE_GOAL", DEFAULT_REFINE_GOAL),
         refine_model=merged.get("SKILLWEAVER_REFINE_MODEL") or None,
+        fast_moves=_flag(merged, "SKILLWEAVER_FAST_MOVES", DEFAULT_FAST_MOVES),
         default_budget=budget,
     )
     return check_settings(settings)

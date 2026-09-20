@@ -627,6 +627,12 @@ class Explorer:
             :class:`ActingPolicy` for what it does NOT replace.
         library: Read ONCE per run to find a workflow worth aiming at
             (:meth:`_adopt_skeleton`).
+        move_critic: Who judges each MOVE. ``None`` - the DEFAULT - is ``critic``, so the
+            path every stored skill was learned on is unchanged. The ``done`` claim is
+            ALWAYS judged by ``critic``, whatever this is: a cheap per-move judge must
+            never be what decides a run was solved. If it has an ``open_move`` method it
+            is told the screen each move starts from, BEFORE the move is performed - see
+            :class:`~skillweaver.agent.move_critic.LiteralMoveCritic` for why it needs to be.
     """
 
     def __init__(
@@ -641,10 +647,12 @@ class Explorer:
         runner: SkillRunner | None = None,
         policy: ActingPolicy | None = None,
         library: Callable[[], Sequence[Skill]] | None = None,
+        move_critic: Critic | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_block_actions: int = MAX_BLOCK_ACTIONS,
     ) -> None:
         self._library = library
+        self._move_critic = move_critic
         self._llm = llm
         self._perceiver = perceiver
         self._critic: Critic = critic if critic is not None else TieredCritic(llm)
@@ -740,10 +748,15 @@ class Explorer:
         """Perform one move, judge it, write it down - and check a ``done`` claim."""
         run.moves += 1
         before = run.current
+        open_move = getattr(self._move_critic, "open_move", None)
+        if callable(open_move):
+            open_move(before)
         performed = self._perform(move, catalog, controller, run)
         if performed:
             after = performed[-1].after
-            verdict = self._judge(move.expect or move.summary, before, after, move, run)
+            verdict = self._judge(
+                move.expect or move.summary, before, after, move, run, per_move=True
+            )
             self._write_down(task, move, performed, verdict, run)
             run.current = after
             run.steps += len(performed)
@@ -1181,10 +1194,22 @@ class Explorer:
     # -- judging and writing down ------------------------------------------------------
 
     def _judge(
-        self, goal: str, before: Observation, after: Observation, move: Move, run: _Run
+        self,
+        goal: str,
+        before: Observation,
+        after: Observation,
+        move: Move,
+        run: _Run,
+        *,
+        per_move: bool = False,
     ) -> Verdict:
-        """One critic call, with whatever it cost charged to this run's budget."""
-        verdict = self._critic.judge(goal, before, after, move.expect or None)
+        """One critic call, with whatever it cost charged to this run's budget.
+
+        ``per_move`` is the ONLY door to ``move_critic``: a ``done`` claim never passes
+        it, so the run's final verdict is the full critic's under every configuration.
+        """
+        critic = self._move_critic if per_move and self._move_critic is not None else self._critic
+        verdict = critic.judge(goal, before, after, move.expect or None)
         self._charge(run, at_least=1 if getattr(verdict, "escalated", False) else 0)
         return verdict
 
