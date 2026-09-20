@@ -423,7 +423,15 @@ stored skill waited for the title and then looked for the button ONCE, and its
 cart button, so it passed one gate attempt and then 0 of 3 replays with Walmart's cart
 empty. `_acted_on_read` in `skills/refactor.py` now awaits a read whose result is PRESSED;
 the same stored skill with that one call rewritten filled the cart. The assumption that
-died is "one action is answered once" - a page answers in phases. Measure a screen by the
+died is "one action is answered once" - a page answers in phases. (4) THE WARM CRITIC,
+not fixed, and why a Walmart replay that WORKS is reported as a failure: the planner reads
+the end screen the instant a code-speed skill returns, so six consecutive
+`--library-only --no-learn` replays that each put exactly the right item in Walmart's cart
+(3.2-4.4s of skill time, confirmed on the site) were all reported `ok=False,
+stage=rejected`, each after ONE escalated model call (~$0.055) whose AFTER screenshot was
+"empty with a loading spinner". `_observe_at_rest` is the fix's shape; it lives in the gate
+only. So on this site the critic's verdict and the site DISAGREE in the safe direction, and
+`SkillStats` (6/6) happens to be right - do not learn from that to trust it. Measure a screen by the
 ROUTE and the MOMENT it is read at - `/cart` reloaded from `/cart` after 4s says 1.000 and
 tells you nothing - and start a Walmart task at `/cart`, the only anchor that reaches
 1.000. This machine also
