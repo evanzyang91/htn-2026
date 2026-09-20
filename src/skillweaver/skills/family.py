@@ -26,9 +26,10 @@ The operations come from the skill's own CODE (:func:`signature_from_code`), bec
 the code is what will run: a trajectory is a recording of a model finding its way, and
 one Walmart errand whose skill is four actions took seventeen to record. The ROLES
 come from the code where it names them (``find_text('Search', 'text_field')``) and
-from the recording where it does not (:func:`signature_from_trajectory`, aligned in
-:func:`derive_signature`); a role neither can show stays ``?``, which matches anything
-and costs nothing, because an unknown is not a difference.
+from the recording only where the two line up action for action
+(:func:`derive_signature`, which carries the measurement of why nothing looser is
+safe); a role neither can show stays ``?``, which matches anything and costs nothing,
+because an unknown is not a difference.
 
 Three normalisations keep the token stream about the WORKFLOW rather than about how
 one site happens to be built:
@@ -393,46 +394,32 @@ def tokens_of(performed: Iterable[tuple[Action, Observation]]) -> tuple[str, ...
 
 def derive_signature(code: str, trajectory: Trajectory | None = None) -> tuple[str, ...]:
     """The signature to store: the code's operations, with the recording's roles
-    filled in where the code named none.
+    filled in where the code named none - and ONLY where that is not a guess.
 
-    The two are aligned on OPERATION alone, in order, and a role is borrowed only
-    across an aligned pair - so a seventeen-action recording lends a four-action skill
-    at most four roles and none of its detours. With no recording, or no alignment,
-    the unknowns stay unknown.
+    A role is borrowed when the recording's accepted moves have exactly the code's
+    sequence of operations, so each action in the code pairs with one action in the
+    recording and there is nothing to choose between. Anything looser was measured to
+    be wrong in the way that matters. On live splitkb.com, 2026-09-20, a skill whose
+    last action is ``click(add[0])`` (looked up by text alone, so its role is unknown)
+    was aligned against a recording whose accepted clicks were *Search*, the product
+    link and *More info*: both clicks on *Add to cart* had WORKED and been judged
+    failed by the critic, which cannot see an AJAX add change the page, so they were
+    left out, and the skill's last action was given the role of a button it never
+    presses. An unknown role costs nothing in :func:`distance`; a wrong one costs half
+    an edit against every honest relative. So when the shapes differ the unknowns stay
+    unknown, which is the true state of knowledge.
     """
     coded = list(signature_from_code(code))
     if trajectory is None or not any(_parts(t)[1] == UNKNOWN_ROLE for t in coded):
         return tuple(coded)
     recorded = signature_from_trajectory(trajectory)
-    for mine, theirs in _aligned([_parts(t)[0] for t in coded], [_parts(t)[0] for t in recorded]):
-        operation, role = _parts(coded[mine])
+    if [_parts(t)[0] for t in coded] != [_parts(t)[0] for t in recorded]:
+        return tuple(coded)
+    for index, theirs in enumerate(recorded):
+        operation, role = _parts(coded[index])
         if role == UNKNOWN_ROLE:
-            coded[mine] = _token(operation, _parts(recorded[theirs])[1])
+            coded[index] = _token(operation, _parts(theirs)[1])
     return tuple(coded)
-
-
-def _aligned(left: Sequence[str], right: Sequence[str]) -> list[tuple[int, int]]:
-    """Index pairs of a longest common subsequence of two operation lists."""
-    rows, cols = len(left), len(right)
-    table = [[0] * (cols + 1) for _ in range(rows + 1)]
-    for i in range(rows - 1, -1, -1):
-        for j in range(cols - 1, -1, -1):
-            table[i][j] = (
-                table[i + 1][j + 1] + 1
-                if left[i] == right[j]
-                else max(table[i + 1][j], table[i][j + 1])
-            )
-    pairs: list[tuple[int, int]] = []
-    i = j = 0
-    while i < rows and j < cols:
-        if left[i] == right[j]:
-            pairs.append((i, j))
-            i, j = i + 1, j + 1
-        elif table[i + 1][j] >= table[i][j + 1]:
-            i += 1
-        else:
-            j += 1
-    return pairs
 
 
 # --------------------------------------------------------------------------------------

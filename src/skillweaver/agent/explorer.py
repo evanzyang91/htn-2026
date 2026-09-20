@@ -1002,12 +1002,25 @@ class Explorer:
     def _follow(self, run: _Run, performed: Sequence[_Performed], ok: bool) -> None:
         """Move along the skeleton, or away from it, after one judged move.
 
-        A move that WORKED and is the current step (or the one after it - sites skip
-        steps) advances past it. Anything else that acted is a stray, and
-        :data:`MAX_STRAYS` strays in a row drop the skeleton: the screen has shown
-        this is not that workflow, and a wrong goal is worse than a vague one. A move
-        with no token - a scroll, a wait, a back - is how a page is reached, not a
-        step of the errand, and counts as neither.
+        A move that REACHED THE SCREEN and is the current step (or the one after it -
+        sites skip steps) advances past it, whatever the critic then said about it. A
+        move that worked and fits nothing is a stray, and :data:`MAX_STRAYS` strays in
+        a row drop the skeleton: the screen has shown this is not that workflow, and a
+        wrong goal is worse than a vague one. A move with no token - a scroll, a wait,
+        a back - is how a page is reached, not a step of the errand, and counts as
+        neither; nor does a move that fits nothing and FAILED, which says something
+        about the move and nothing about the workflow.
+
+        The verdict is deliberately not what advances it, and that was measured rather
+        than chosen. On live splitkb.com, 2026-09-20, the first version required
+        ``ok``: the policy typed the product into the search field, the critic's
+        ``state_changed`` check called it a failure (a filled field is 0.898 similar
+        to an empty one), the step did not advance, the policy - still told to type -
+        clicked the field again, and the skeleton was dropped at step 0 of 4 after two
+        moves. The same check calls an AJAX *Add to cart* a failure on this site every
+        time. A stalled skeleton is not neutral: it tells the policy to REDO the step
+        it just did. Advancing past a step that truly failed costs less - the errand
+        is still in the goal, and the policy can see the page.
         """
         if self._subgoal(run) is None:
             return
@@ -1017,12 +1030,14 @@ class Explorer:
         fitted = False
         for token in tokens:
             for ahead in range(run.at, min(run.at + 1 + LOOKAHEAD, len(run.skeleton))):
-                if ok and run.skeleton[ahead].matches(token):
+                if run.skeleton[ahead].matches(token):
                     run.at, fitted = ahead + 1, True
                     break
         if fitted:
             run.strays = 0
-            log.info("explore.skeleton.advanced", at=run.at, of=len(run.skeleton))
+            log.info("explore.skeleton.advanced", at=run.at, of=len(run.skeleton), judged_ok=ok)
+            return
+        if not ok:
             return
         run.strays += 1
         if run.strays >= MAX_STRAYS:
@@ -1031,7 +1046,7 @@ class Explorer:
                 source=run.skeleton_from,
                 at=run.at,
                 of=len(run.skeleton),
-                why=f"{run.strays} move(s) in a row did not fit it",
+                why=f"{run.strays} working move(s) in a row did not fit it",
             )
             run.skeleton, run.at = (), 0
 
