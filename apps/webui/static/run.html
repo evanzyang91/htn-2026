@@ -82,6 +82,7 @@
     taskEl.innerHTML = '';
     taskEl.append(info.task);
     if (info.url) { const s = document.createElement('small'); s.textContent = info.url; taskEl.append(s); }
+    else if (!info.done) setTimeout(() => location.reload(), 4000);  // the site is still being chosen
   });
 
   function append(text, cls) {

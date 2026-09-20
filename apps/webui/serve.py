@@ -14,7 +14,10 @@ nothing about the run is different from one typed into a terminal.
     uv run python apps/webui/serve.py -- --perception dom   # flags handed to every run
 
 A URL typed into the box (``add 2 apples to the cart on http://localhost:5173``) is
-lifted out and passed as ``--url``; everything else is the task, verbatim.
+lifted out and passed as ``--url``; everything else is the task, verbatim. With no URL
+a SIDE AGENT (:func:`pick_site`, one small model call) chooses the website from the
+task and its choice is printed at the top of the run; when it cannot choose, the run
+goes ahead without ``--url`` and the library resolves the domain itself.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -244,6 +248,70 @@ class Mirror:
 
 
 # --------------------------------------------------------------------------------------
+# The side agent: which website, when the sentence does not say
+# --------------------------------------------------------------------------------------
+
+SITE_PICKER_MODEL = "claude-sonnet-5"
+
+_SITE_PICKER_PROMPT = """You choose the website a browser agent should start on for a task.
+The agent drives an ordinary browser; it is not logged in anywhere and never pays.
+
+Task: {task}
+
+Answer with ONE JSON object and nothing else, of this shape:
+{{"url": "https://...", "site": "short site name", "why": "one short sentence"}}
+
+Rules:
+- If the task names or clearly implies a website, use that site.
+- Otherwise pick the single best-known public website where an ordinary person would do
+  this, and its home page or the most useful landing page for the task.
+- The URL must be public and need no login. Prefer https.
+- If no website can reasonably be chosen, answer {{"url": null, "site": null, "why": "..."}}.
+"""
+
+
+def _api_key() -> str | None:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key
+    try:  # the same .env the agent itself reads
+        for line in (REPO / ".env").read_text(encoding="utf-8").splitlines():
+            name, sep, value = line.strip().partition("=")
+            if sep and name == "ANTHROPIC_API_KEY":
+                return value.strip().strip("\"'")
+    except OSError:
+        pass
+    return None
+
+
+def pick_site(task: str) -> dict[str, Any]:
+    """Ask a small model for the site. Never prefilled - asked tolerantly and parsed."""
+    import anthropic
+
+    key = _api_key()
+    if not key:
+        return {"url": None, "site": None, "why": "no ANTHROPIC_API_KEY"}
+    client = anthropic.Anthropic(api_key=key)
+    reply = client.messages.create(
+        model=SITE_PICKER_MODEL,
+        max_tokens=300,
+        messages=[{"role": "user", "content": _SITE_PICKER_PROMPT.format(task=task)}],
+    )
+    text = "".join(getattr(block, "text", "") for block in reply.content)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return {"url": None, "site": None, "why": f"unparseable reply: {text[:120]!r}"}
+    try:
+        chosen = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {"url": None, "site": None, "why": f"unparseable reply: {text[:120]!r}"}
+    url = chosen.get("url")
+    if not isinstance(url, str) or not _URL.fullmatch(url.strip()):
+        chosen["url"] = None
+    return chosen
+
+
+# --------------------------------------------------------------------------------------
 # One run
 # --------------------------------------------------------------------------------------
 
@@ -256,31 +324,17 @@ class Run:
     def __init__(self, text: str, extra: list[str]) -> None:
         self.id = next(self._ids)
         self.text = text
+        self.extra = extra
         self.task, self.url = split_task(text)
+        self.site: dict[str, Any] | None = None
         self.lines: list[str] = []
         self.done = False
         self.exit_code: int | None = None
         self.listeners: list[queue.Queue[str | None]] = []
         self.lock = threading.Lock()
-        env = dict(os.environ)
-        env.update(
-            PYTHONUNBUFFERED="1",
-            PYTHONIOENCODING="utf-8",
-            NO_COLOR="1",
-            TERM="dumb",
-            COLUMNS="110",
-        )
-        self.proc = subprocess.Popen(
-            command_for(self.task, self.url, extra),
-            cwd=REPO,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        self.mirror = Mirror(self.proc.pid)
+        self.proc: subprocess.Popen[str] | None = None
+        self.mirror: Mirror | None = None
+        self.stopped = False
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _emit(self, line: str) -> None:
@@ -290,15 +344,54 @@ class Run:
                 q.put(line)
 
     def _pump(self) -> None:
-        assert self.proc.stdout is not None
+        if self.url is None:
+            self._emit("choosing a website for this task...")
+            try:
+                self.site = pick_site(self.task)
+            except Exception as exc:  # the run still goes ahead, on the library alone
+                self.site = {"url": None, "site": None, "why": f"{type(exc).__name__}: {exc}"}
+            if self.site.get("url"):
+                self.url = self.site["url"]
+                self._emit(f"site: {self.site.get('site')} - {self.site.get('why')}")
+            else:
+                self._emit(
+                    f"no site chosen ({self.site.get('why')}); "
+                    "the run will look for a stored skill that knows where to go"
+                )
+        if self.stopped:
+            self._finish(-1)
+            return
+        env = dict(os.environ)
+        env.update(
+            PYTHONUNBUFFERED="1",
+            PYTHONIOENCODING="utf-8",
+            NO_COLOR="1",
+            TERM="dumb",
+            COLUMNS="110",
+        )
         shown = ["skillweaver", "run", json.dumps(self.task)]
         if self.url:
             shown += ["--url", self.url]
         self._emit("$ " + " ".join(shown))
+        self.proc = subprocess.Popen(
+            command_for(self.task, self.url, self.extra),
+            cwd=REPO,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.mirror = Mirror(self.proc.pid)
+        assert self.proc.stdout is not None
         for raw in self.proc.stdout:
             self._emit(raw.rstrip("\r\n"))
-        self.exit_code = self.proc.wait()
+        self._finish(self.proc.wait())
+
+    def _finish(self, exit_code: int) -> None:
         with self.lock:
+            self.exit_code = exit_code
             self.done = True
             for q in self.listeners:
                 q.put(None)
@@ -312,8 +405,12 @@ class Run:
             return list(self.lines), q
 
     def stop(self) -> None:
-        if self.proc.poll() is None:
+        self.stopped = True
+        if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
+
+    def frame(self) -> bytes | None:
+        return self.mirror.latest() if self.mirror is not None else None
 
 
 RUNS: dict[int, Run] = {}
@@ -364,6 +461,7 @@ class Handler(BaseHTTPRequestHandler):
                     "text": run.text,
                     "task": run.task,
                     "url": run.url,
+                    "site": run.site,
                     "done": run.done,
                 },
             )
@@ -372,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._events(int(m.group(1)))
         m = re.fullmatch(r"/api/runs/(\d+)/frame\.jpg", path)
         if m and int(m.group(1)) in RUNS:
-            frame = RUNS[int(m.group(1))].mirror.latest()
+            frame = RUNS[int(m.group(1))].frame()
             if frame is None:
                 self.send_response(HTTPStatus.NO_CONTENT)
                 self.send_header("Cache-Control", "no-store")
