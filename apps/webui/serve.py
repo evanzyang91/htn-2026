@@ -541,6 +541,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/":
             return self._page("index.html")
+        if path == "/phone":
+            return self._page("phone.html")
+        if path == "/api/phone":
+            return self._json(HTTPStatus.OK, {"url": PHONE_URL})
         if path == "/api/runs":
             return self._json(
                 HTTPStatus.OK,
@@ -645,11 +649,75 @@ class Handler(BaseHTTPRequestHandler):
                         run.listeners.remove(q)
 
 
+# --------------------------------------------------------------------------------------
+# The phone: a second listener, HTTPS on the LAN, because a microphone needs a secure page
+# --------------------------------------------------------------------------------------
+
+PHONE_URL: str | None = None
+CERT_DIR = HERE / ".certs"
+
+
+def lan_address() -> str:
+    """The address another device on this network reaches this machine at."""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))  # no packet is sent; it picks the route
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def self_signed(ip: str) -> tuple[Path, Path]:
+    """A certificate for the LAN address, made once with openssl and kept beside the
+    server. The phone warns about it the first time; that warning is the honest cost of
+    HTTPS without a domain, and accepting it once on the phone is the whole setup."""
+    CERT_DIR.mkdir(exist_ok=True)
+    cert, key = CERT_DIR / f"{ip}.crt", CERT_DIR / f"{ip}.key"
+    if cert.exists() and key.exists():
+        return cert, key
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "825",
+            "-keyout", str(key), "-out", str(cert),
+            "-subj", "/CN=skillweaver-webui",
+            "-addext", f"subjectAltName=IP:{ip},DNS:localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )  # fmt: skip
+    return cert, key
+
+
+def serve_phone(port: int) -> str:
+    """Start the HTTPS listener on every interface and return the URL the phone opens."""
+    import ssl
+
+    ip = lan_address()
+    cert, key = self_signed(ip)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(cert), str(key))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server.daemon_threads = True
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"https://{ip}:{port}/phone"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="The one-box web UI that starts the agent.")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true", help="do not open a browser tab")
+    ap.add_argument(
+        "--phone",
+        action="store_true",
+        help="also listen over HTTPS on the LAN (port+1) so a phone can open /phone, "
+        "speak a request and start a run; the launcher shows the QR code",
+    )
     ap.add_argument(
         "cli_flags",
         nargs="*",
@@ -670,6 +738,10 @@ def main() -> None:
     server.daemon_threads = True
     address = f"http://{args.host}:{args.port}"
     print(f"skillweaver web ui: {address}  (repo {REPO})", flush=True)
+    if args.phone:
+        global PHONE_URL
+        PHONE_URL = serve_phone(args.port + 1)
+        print(f"phone: {PHONE_URL}  (accept the certificate warning once)", flush=True)
     if not args.no_open:
         threading.Timer(0.5, webbrowser.open, (address,)).start()
     try:

@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Say it</title>
+<style>
+  :root { --bg: #0d0d0d; --fg: #ececec; --muted: #8e8e8e; --accent: #2f6fe4; --ok: #3ccf7a; --bad: #e05a5a; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px 20px calc(24px + env(safe-area-inset-bottom));
+    -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent;
+  }
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background: radial-gradient(ellipse 60% 40% at 50% 55%, rgba(46, 84, 200, 0.26), transparent 70%);
+  }
+  main { position: relative; z-index: 1; width: 100%; max-width: 480px; text-align: center; }
+  h1 { font-weight: 400; font-size: 24px; margin: 0 0 8px; }
+  .sub { color: var(--muted); font-size: 14px; margin: 0 0 36px; min-height: 1.3em; }
+  .mic {
+    width: 132px; height: 132px; border-radius: 50%; border: 0; margin: 0 auto;
+    background: var(--accent); color: #fff; display: grid; place-items: center; cursor: pointer;
+    box-shadow: 0 0 0 0 rgba(47, 111, 228, 0.5); transition: transform .15s;
+  }
+  .mic:active { transform: scale(.96); }
+  .mic.listening { animation: pulse 1.4s infinite; background: #e05a5a; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(224, 90, 90, 0.5); } 100% { box-shadow: 0 0 0 26px rgba(224, 90, 90, 0); } }
+  .heard {
+    margin: 34px 0 0; min-height: 3.4em; font-size: 20px; line-height: 1.4;
+    color: var(--fg); padding: 0 8px;
+  }
+  .heard .interim { color: var(--muted); }
+  textarea {
+    display: none; width: 100%; margin-top: 30px; padding: 14px 16px; border-radius: 16px;
+    background: #1b1b1b; border: 1px solid #2a2a2a; color: var(--fg); font: inherit; font-size: 18px;
+    resize: none; outline: 0;
+  }
+  .actions { display: flex; gap: 12px; justify-content: center; margin-top: 22px; }
+  .actions button {
+    border: 1px solid #2a2a2a; background: #1b1b1b; color: var(--fg); border-radius: 999px;
+    padding: 12px 22px; font: inherit; font-size: 16px; cursor: pointer;
+  }
+  .actions button.primary { background: var(--accent); border-color: var(--accent); }
+  .actions button[hidden] { display: none; }
+  .state { margin-top: 30px; color: var(--muted); font-size: 15px; min-height: 1.4em; }
+  .state.ok { color: var(--ok); } .state.bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Say what the agent should do</h1>
+  <p class="sub" id="sub">Tap the mic, speak, tap again when you are done.</p>
+  <button class="mic" id="mic" aria-label="Talk">
+    <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5"/><path d="M8 22h8"/></svg>
+  </button>
+  <div class="heard" id="heard"></div>
+  <textarea id="edit" rows="3"></textarea>
+  <div class="actions">
+    <button id="send" class="primary" hidden>Send</button>
+    <button id="editBtn" hidden>Edit</button>
+    <button id="again" hidden>Again</button>
+  </div>
+  <div class="state" id="state"></div>
+</main>
+<script>
+  const mic = document.getElementById('mic');
+  const sub = document.getElementById('sub');
+  const heard = document.getElementById('heard');
+  const edit = document.getElementById('edit');
+  const send = document.getElementById('send');
+  const editBtn = document.getElementById('editBtn');
+  const again = document.getElementById('again');
+  const state = document.getElementById('state');
+
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let rec = null, listening = false, finalText = '', countdown = null, watching = null;
+
+  if (!Recognition) {
+    sub.textContent = 'This browser has no speech recognition. Type the request instead.';
+    showEditor('');
+  } else if (!window.isSecureContext) {
+    sub.textContent = 'Open this page over https, or the microphone stays locked.';
+  }
+
+  function reset() {
+    clearInterval(countdown); countdown = null;
+    clearInterval(watching); watching = null;
+    finalText = '';
+    heard.textContent = '';
+    edit.style.display = 'none';
+    send.hidden = editBtn.hidden = again.hidden = true;
+    state.textContent = ''; state.className = 'state';
+    sub.textContent = 'Tap the mic, speak, tap again when you are done.';
+    mic.style.display = '';
+  }
+
+  function showEditor(text) {
+    edit.value = text; edit.style.display = 'block'; edit.focus();
+    heard.textContent = '';
+    send.hidden = false; again.hidden = false; editBtn.hidden = true;
+  }
+
+  function start() {
+    rec = new Recognition();
+    rec.lang = navigator.language || 'en-US';
+    rec.interimResults = true;
+    rec.continuous = true;
+    finalText = '';
+    rec.onresult = (ev) => {
+      let interim = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const r = ev.results[i];
+        if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript;
+      }
+      heard.innerHTML = '';
+      heard.append(finalText);
+      if (interim) { const s = document.createElement('span'); s.className = 'interim'; s.textContent = ' ' + interim; heard.append(s); }
+    };
+    rec.onerror = (ev) => {
+      stop();
+      state.textContent = ev.error === 'not-allowed' ? 'Microphone blocked. Allow it for this page and try again.' : `Speech error: ${ev.error}`;
+      state.className = 'state bad';
+    };
+    rec.onend = () => { if (listening) stop(); };
+    rec.start();
+    listening = true;
+    mic.classList.add('listening');
+    sub.textContent = 'Listening… tap again when you are done.';
+  }
+
+  function stop() {
+    listening = false;
+    mic.classList.remove('listening');
+    try { rec && rec.stop(); } catch (e) {}
+    const text = finalText.trim();
+    if (!text) { sub.textContent = 'Nothing heard. Tap the mic and try again.'; return; }
+    heard.textContent = text;
+    sub.textContent = 'Heard this:';
+    send.hidden = editBtn.hidden = again.hidden = false;
+    let n = 3;
+    send.textContent = `Send (${n})`;
+    countdown = setInterval(() => {
+      n -= 1;
+      if (n <= 0) { clearInterval(countdown); countdown = null; submit(text); }
+      else send.textContent = `Send (${n})`;
+    }, 1000);
+  }
+
+  async function submit(text) {
+    clearInterval(countdown); countdown = null;
+    send.hidden = editBtn.hidden = true; again.hidden = true;
+    edit.style.display = 'none';
+    heard.textContent = text;
+    sub.textContent = 'Sent to the agent.';
+    state.textContent = 'starting…';
+    try {
+      const r = await fetch('/api/run', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}) });
+      const info = await r.json();
+      if (!r.ok) throw new Error(info.error || 'could not start');
+      again.hidden = false; again.textContent = 'New request';
+      watching = setInterval(async () => {
+        const rr = await fetch(`/api/runs/${info.id}`);
+        if (rr.status === 404) { clearInterval(watching); return; }
+        const run = await rr.json();
+        state.textContent = run.state;
+        state.className = 'state ' + (run.done ? (run.state === 'done' ? 'ok' : 'bad') : '');
+        if (run.done) clearInterval(watching);
+      }, 1500);
+    } catch (e) {
+      state.textContent = e.message; state.className = 'state bad'; again.hidden = false;
+    }
+  }
+
+  mic.addEventListener('click', () => {
+    if (!Recognition) return;
+    if (countdown) { clearInterval(countdown); countdown = null; send.textContent = 'Send'; }
+    if (listening) stop(); else { reset(); start(); }
+  });
+  send.addEventListener('click', () => submit((edit.style.display === 'block' ? edit.value : finalText).trim()));
+  editBtn.addEventListener('click', () => { clearInterval(countdown); countdown = null; send.textContent = 'Send'; showEditor(finalText.trim()); });
+  again.addEventListener('click', () => { reset(); again.textContent = 'Again'; });
+</script>
+</body>
+</html>
