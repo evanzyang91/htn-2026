@@ -342,6 +342,7 @@ body.idle .composer-wrap { padding-top: 22px; }
   stroke-linecap: round; stroke-linejoin: round;
 }
 .mic:hover { border-color: var(--iris); }
+.mic.off { background: none; border-color: var(--line-firm); color: var(--muted); }
 .mic:active { transform: scale(.94); }
 .mic.listening {
   background: var(--red-soft); border-color: var(--red); color: var(--red);
@@ -880,18 +881,9 @@ footer {
   .live {
     padding: 18px 16px;
   }
-  /* The prompt stacks: the mic drops below the text, still flush right. */
-  .prompt {
-    padding: 12px 14px;
-  }
   #goal {
     min-height: 92px;
     padding-bottom: 8px;
-  }
-  .mic {
-    position: static;
-    display: flex;
-    margin: 6px 0 0 auto;
   }
   .options {
     flex-direction: column;

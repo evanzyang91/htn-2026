@@ -533,7 +533,14 @@ $("focus-browser").addEventListener("click", () =>
 
 const Recogniser = window.SpeechRecognition || window.webkitSpeechRecognition;
 if (!Recogniser) {
-  $("mic").hidden = true;
+  // Kept on screen and explained. A button that deletes itself reads as a missing feature.
+  $("mic").classList.add("off");
+  $("mic").title = "This browser has no speech recognition";
+  $("mic").addEventListener("click", () => {
+    $("voice-status").textContent =
+      "This browser cannot listen. Chrome, Edge and Safari can; Firefox needs the feature turned on.";
+    $("voice-status").hidden = false;
+  });
 } else {
   const recogniser = new Recogniser();
   recogniser.lang = navigator.language || "en-US";
