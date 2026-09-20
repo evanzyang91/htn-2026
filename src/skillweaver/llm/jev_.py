@@ -122,8 +122,9 @@ OPERATIONS: Mapping[str, str] = {
     "SCROLL_DOWN": "Scroll the page down to bring what is below the fold into view.",
     "SCROLL_UP": "Scroll the page up to bring what is above the fold back into view.",
     "BACK": (
-        "Return to the previous page using the browser's own history, when this page "
-        "cannot advance the goal and the page before it could."
+        "Press the browser's Back button, returning to the page visited just before "
+        "this one. Undoes a wrong turn, and reaches a page already visited without "
+        "searching for it again."
     ),
     "WAIT": "Wait for the page to update.",
     "DONE": "Every requirement is visibly satisfied.",
@@ -147,8 +148,10 @@ prove a requested filter was set.
 Do not toggle a checkbox, switch, or radio already in the requested state.
 Submit populated search fields before opening a result; a populated field alone is not
 an applied search.
-BACK returns to the previous page and is for a wrong turn: this page cannot advance the
-goal and the page before it could. Do not BACK to reach something this page already shows.
+BACK is the browser's Back button. Choose it when the page that can advance the goal is
+the one just visited - a wrong turn to undo, or a list of results to return to - and
+prefer it over retyping a search that would rebuild that same page. Do not BACK to reach
+something this page already shows.
 WAIT only when the needed control is absent/disabled, or submitted results are still loading.
 If Search/Submit is visible and the required fields are ready, CLICK it immediately.
 Recent WAIT actions are not evidence of loading. Prefer a useful visible control over WAIT.
@@ -491,6 +494,19 @@ class JevPolicy:
 
         operation = _validate_choice(answers.get("operation"), offered)
         chosen = str(operation["choice"])
+        # What was on the table, not only what was taken. An operation offered under a
+        # condition - BACK under a history, SCROLL_DOWN under a fold - is answered
+        # differently by "the policy did not pick it" and "the policy was never shown
+        # it", and a run cannot be read afterwards without knowing which.
+        log.info(
+            "jev.offered",
+            operations=sorted(offered),
+            chosen=chosen,
+            probabilities={
+                name: round(float(value), 3)
+                for name, value in sorted(operation["probabilities"].items())
+            },
+        )
         if chosen not in targets:
             return PolicyDecision(
                 operation=chosen,

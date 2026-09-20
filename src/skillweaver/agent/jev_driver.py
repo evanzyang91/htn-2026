@@ -34,9 +34,10 @@ BACK is one action and has no target
 ``BACK`` grounds to :class:`~skillweaver.contracts.Back`, which takes no argument, so it
 skips the catalogue entirely - there is no element id to check against the screen. It is
 still a step like any other: the explorer performs it, re-observes, records the graph
-edge and asks the critic, exactly as it does for a click. That is the point of grounding
+edge and asks the critic exactly as it does for a click. That is the point of grounding
 it as an ACTION rather than as a code block; a move the graph cannot see would make a
-second run no cheaper than the first.
+second run no cheaper than the first. Having no target is also what puts it outside
+:func:`_exclusions`, which is why :data:`BACK_SIGNATURE` exists.
 
 
 TYPE_TEXT is three actions, so it is a code block
@@ -53,6 +54,7 @@ Select-all is :data:`SELECT_ALL_CHORD` and the reason it is a constant is writte
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from collections.abc import Collection, Mapping, Sequence
@@ -73,6 +75,7 @@ from skillweaver.perception.dom import DomPerceiver, DomSnapshot
 log = get_logger(__name__)
 
 __all__ = [
+    "BACK_SIGNATURE",
     "DEAD_END_OPERATIONS",
     "SCROLL_PIXELS",
     "SELECT_ALL_CHORD",
@@ -84,16 +87,36 @@ DEAD_END_OPERATIONS: Mapping[str, str] = {"click": "CLICK"}
 """Which Jev operation a failed move's signature kind is evidence against.
 
 Read this before adding to it. A :attr:`~skillweaver.agent.explorer.Move.signature` is
-``<kind>:<element_id>:...`` and this driver only ever produces two shapes: a ``CLICK``
-grounds to ``click:<id>:...``, and a ``TYPE_TEXT`` grounds to a CODE BLOCK, whose
-signature names no element at all (:func:`~skillweaver.agent.explorer.signature_move`
-returns ``None`` for it). ``SCROLL_UP``/``SCROLL_DOWN`` and ``WAIT`` name none either.
+``<kind>:<element_id>:...`` and a ``CLICK`` is the only shape this driver produces that
+NAMES an element: a ``TYPE_TEXT`` grounds to a CODE BLOCK, whose signature names none
+(:func:`~skillweaver.agent.explorer.signature_move` returns ``None`` for it), and
+``SCROLL_UP``/``SCROLL_DOWN``, ``WAIT`` and ``BACK`` name none either.
 
 So a click is the only dead end this path can record, and ``CLICK`` is the only thing it
 is evidence against. Mapping ``scroll`` or ``drag`` in here would let a move the policy
 never made withhold a target it never tried, and mapping a control's failed click onto
 ``TYPE_TEXT`` would take away the search box on the one screen whose task is to type in
 it.
+
+A TARGETLESS operation cannot be withheld this way at all - there is no id to leave out
+of a head it does not have - so the one operation that needs withholding carries its own
+constant; see :data:`BACK_SIGNATURE`.
+"""
+
+BACK_SIGNATURE = "back"
+"""The whole move signature :func:`~skillweaver.agent.explorer._resolve` gives a ``back``.
+
+``BACK`` is the only operation this driver produces with no target, which puts it out of
+:func:`_exclusions`' reach twice over: ``signature_move`` answers ``None`` for a
+signature that names no element, and there would be no target head to leave an id out of
+anyway. Withholding it therefore means withholding the OPERATION, which is
+:attr:`~skillweaver.perception.dom.DomSnapshot.can_go_back` turned off for that one ask.
+
+Measured on live en.wikipedia.org, the cost of not doing it: one back the critic degraded
+to "I do not know", then EIGHT more chosen by the policy at falling confidence and refused
+by the explorer one after another until the run gave up at ``BLOCKED`` - 9 provider calls
+spent on a move that could not be performed. Same rule as the exclusions above, applied
+where they cannot reach.
 """
 
 SCROLL_PIXELS = 560
@@ -182,8 +205,11 @@ class JevDriver:
         """
         snapshot = self._snapshot_for(observation)
         exclude, restored = _exclusions(snapshot, dead_ends)
+        asked = snapshot
+        if snapshot.can_go_back and any(a.signature == BACK_SIGNATURE for a in dead_ends):
+            asked = dataclasses.replace(snapshot, can_go_back=False)
         self._settle(history, rejection)
-        decision = self._policy.decide(task.text, snapshot, self._steps, exclude)
+        decision = self._policy.decide(task.text, asked, self._steps, exclude)
         self._remember(decision)
         log.info(
             "jev.decide",
@@ -301,7 +327,7 @@ def _answer(
         }
     if operation == "BACK":
         return {
-            "thought": f"the policy is going back to the previous page {_odds(decision)}",
+            "thought": f"the policy is going back to the previous page {odds}",
             "expect": "the page before this one is showing again",
             "done": False,
             "action": {"kind": "back"},
