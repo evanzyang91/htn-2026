@@ -121,9 +121,7 @@ class SkillLibrary:
         return _Stamp(
             manifest_mtime=_mtime(self._root / MANIFEST_FILE),
             root_mtime=_mtime(self._root),
-            domains=tuple(
-                sorted(_mtime(path) for path in self._root.glob("*") if path.is_dir())
-            ),
+            domains=tuple(sorted(_mtime(path) for path in self._root.glob("*") if path.is_dir())),
         )
 
     def _read(self) -> list[dict[str, Any]]:

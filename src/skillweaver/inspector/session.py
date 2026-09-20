@@ -427,9 +427,7 @@ class LiveSession:
 
         self._graph = InMemorySiteGraph(store=JSONGraphStore(settings.graphs_dir))
         self._trajectories = TrajectoryFileStore(settings.trajectories_dir)
-        self._store = FileSkillStore(
-            settings.skills_dir, render_mode=mode_name(settings.headless)
-        )
+        self._store = FileSkillStore(settings.skills_dir, render_mode=mode_name(settings.headless))
 
     # -- what the page reads -----------------------------------------------------------
 
@@ -687,12 +685,16 @@ class LiveSession:
                 f"{recipe!r} names no undo. This task declared none, so there is "
                 "nothing to put back with."
             )
-        restore = world_reset_from_actions(
-            steps,
-            controller=self._controller,
-            perceiver=self._perceiver,
-            truth=_dom_reader(self._controller),
-        ) if steps else None
+        restore = (
+            world_reset_from_actions(
+                steps,
+                controller=self._controller,
+                perceiver=self._perceiver,
+                truth=_dom_reader(self._controller),
+            )
+            if steps
+            else None
+        )
         if url:
             restore = chain_resets(world_reset_from_url(url), restore)
         report = reset_world(restore)
@@ -1229,4 +1231,3 @@ def _spend_json(spend: Spend | None) -> dict[str, Any]:
         "calls": spend.llm_calls,
         "max_llm_calls": budget.max_llm_calls,
     }
-
