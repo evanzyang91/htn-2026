@@ -147,6 +147,9 @@ class JevDriver:
         self._perceiver = perceiver
         self._refine = refine
         self._refined: dict[str, str] = {}
+        # The run's FIRST frame is taken before this driver is ever asked anything, so it
+        # is armed here, as the policy is built: see ``DomPerceiver.rest_after``.
+        perceiver.rest_after(1, None)
         self._steps: list[dict[str, Any]] = []
         self._taken: dict[str, set[str]] = {}
         self._decided_ms = 0.0

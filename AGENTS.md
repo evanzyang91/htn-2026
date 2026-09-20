@@ -533,6 +533,12 @@ the modal. And walmart.com served `/cart` once (redirected to the home page, alr
 rest) and answered the SECOND load, minutes later, with `/blocked?...` - "Robot or human?
 Activate and hold" - so a Walmart run needs `--chrome-attach` and a profile a person has
 cleared, exactly as `PLAINLY_LAUNCHED` says of DoorDash, and is not to be retried headless.
+A HEADED attempt five hours later, the mode every stored Walmart skill was recorded in, was
+refused on its FIRST request. Whether the headless loads are what flagged this machine is not
+established, and that is the point: do not find out whether Walmart is letting you in by asking
+it. The run's FIRST frame is rested too (`rest_after(1, None)`, armed as `JevDriver` is built):
+opened directly on a page that streams in after `load`, step 0 was offered 5 of 10 controls and
+answered `BLOCKED` 0.92; rested, all 10. It costs ~165ms once per run, the warm path included.
 Goal refinement (`SKILLWEAVER_REFINE_GOAL`, off) is for the POLICY'S EYES ONLY -
 `JevDriver._goal_shown` - because a rewrite that reached the recorder would become the
 stored `Precedent` and the warm gates count words; measured, it did not pay on a

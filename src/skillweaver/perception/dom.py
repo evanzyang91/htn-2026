@@ -334,6 +334,7 @@ class DomPerceiver:
     __slots__ = (
         "_acted_ms",
         "_armed",
+        "_resting",
         "_counters",
         "_fingerprinter",
         "_last",
@@ -351,7 +352,8 @@ class DomPerceiver:
         self._fingerprinter = fingerprinter if fingerprinter is not None else StateFingerprinter()
         self._counters = counters if counters is not None else PerceptionCounters()
         self._last: DomSnapshot | None = None
-        self._armed: tuple[int, DomSnapshot, bool] | None = None
+        self._armed: tuple[int, DomSnapshot | None, bool] | None = None
+        self._resting: tuple[str, float, DomSnapshot] | None = None
         self._rests = 0
         self._rested_ms = 0.0
         self._observed_ms = 0.0
@@ -397,7 +399,7 @@ class DomPerceiver:
         """``(how many times, total milliseconds)`` :meth:`rest_after` made a frame wait."""
         return self._rests, self._rested_ms
 
-    def rest_after(self, actions: int, basis: DomSnapshot, *, waited: bool = False) -> None:
+    def rest_after(self, actions: int, basis: DomSnapshot | None, *, waited: bool = False) -> None:
         """Arm ONE coming observation to be taken on a page that has come to rest.
 
         An acting policy calls this as it answers: ``basis`` is the screen it decided
@@ -410,6 +412,22 @@ class DomPerceiver:
         place (:data:`CHANGED_REST_MS`). The first two are upstream's; the third is the
         one a live run added, and its constant says what that cost. On a page that has
         finished answering, the wait is one quiet window and no more.
+
+        ``basis=None`` is the FIRST frame of a run, which has nothing to be compared
+        with and is rested as an arrival: the explorer takes it the moment ``Navigate``
+        returns, which is the moment ``_settle`` saw the load event, and a real page is
+        not the page yet (``AGENTS.md``, Walmart). An acting policy arms it as it is
+        built, before anything has observed. It costs ONE quiet window per run - not per
+        action, which is what ``AGENTS.md`` forbids - and the warm path pays it too when a
+        policy is configured, where it is the start screen the planner matches a
+        precondition against that gets to finish painting.
+
+        Measured, 2026-09-20. A results page opened DIRECTLY that streams its rows in
+        after ``load``: without this the step-0 decision was offered 5 of 10 controls and
+        answered ``BLOCKED`` 0.92 in zero actions; with it, ``waited_ms=664
+        controls_before=4 controls_after=10`` and the first move was the right one at
+        1.00. The price on a page already at rest, live Wikipedia warm replay, 3 of 3:
+        165-168ms, ``54 -> 54``, ``frame_changed=False``, still 0 model calls.
 
         Armed per move rather than switched on, because every other reader of this
         perceiver must stay untaxed: a warm replay, the admission gate's rest loop and a
@@ -439,6 +457,7 @@ class DomPerceiver:
             self._counters.captures += 1
             snapshot = self._read(controller, shot)
             self._counters.detections += 1
+            self._report_rest(snapshot)
         self._last = snapshot
         elements = _elements_of(snapshot)
         url = controller.url()
@@ -466,7 +485,9 @@ class DomPerceiver:
             self._armed = (remaining - 1, basis, waited)
             return False
         self._armed = None
-        if snapshot.url != basis.url:
+        if basis is None:
+            why, (quiet, cap) = "first", ARRIVAL_REST_MS
+        elif snapshot.url != basis.url:
             why, (quiet, cap) = "arrived", ARRIVAL_REST_MS
         elif snapshot.digest != basis.digest:
             why, (quiet, cap) = "changed", CHANGED_REST_MS
@@ -482,8 +503,25 @@ class DomPerceiver:
         spent = (time.monotonic() - started) * 1000.0
         self._rests += 1
         self._rested_ms += spent
-        log.info("dom.rest", why=why, waited_ms=round(spent), controls=len(snapshot.controls))
+        self._resting = (why, spent, snapshot)
         return True
+
+    def _report_rest(self, rested: DomSnapshot) -> None:
+        """Say what the wait bought: the frame that WOULD have been decided on, against
+        the one that will be. Logged after the re-read so one line carries both, which is
+        what lets a single live run be its own before-and-after."""
+        if self._resting is None:
+            return
+        why, spent, before = self._resting
+        self._resting = None
+        log.info(
+            "dom.rest",
+            why=why,
+            waited_ms=round(spent),
+            controls_before=len(before.controls),
+            controls_after=len(rested.controls),
+            frame_changed=before.digest != rested.digest,
+        )
 
     def _read(self, controller: Controller, shot: Screenshot) -> DomSnapshot:
         """Run :data:`_SNAPSHOT_JS` on the controller's page and parse the result.
