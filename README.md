@@ -19,12 +19,12 @@ make install     # uv sync + playwright install chromium
 ```
 
 Settings come from the environment or `.env`; `src/skillweaver/config.py` lists every
-variable. No API key is needed to run the tests.
+variable. An Anthropic API key is needed: every run drives a real model against a real
+site.
 
-## Test
+## Lint
 
 ```sh
-make test        # uv run pytest
 make lint        # ruff check + format check
 make fmt         # auto-fix
 ```
@@ -33,5 +33,4 @@ make fmt         # auto-fix
 
 - `src/skillweaver/contracts.py` - every shared type and Protocol. Start here.
 - `src/skillweaver/<package>/` - implementations, one package per concern.
-- `tests/fakes/` - test doubles for every Protocol, plus a small fake app
-  (`scenario.py`), so anything can be tested without a browser, a model or a network.
+- `eval/wikipedia.yaml` - the live-site evaluation suite.

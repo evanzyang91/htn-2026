@@ -1,38 +1,36 @@
-# A second suite: six search-and-navigation tasks against the LIVE en.wikipedia.org.
+# The suite: six search-and-navigation tasks against the LIVE en.wikipedia.org.
 #
 # ██  THIS SUITE HITS THE PUBLIC INTERNET.  ██
 #
-# It is therefore NOT part of `make test`, and no test in tests/ runs it. The only
-# thing tested offline is that this file parses and validates
-# (tests/eval/test_wikipedia_suite.py); running it is a deliberate, paid, by-hand act
-# against a website neither this project nor its authors control. Wikipedia can
-# redesign a skin, rename a section or rate-limit a client at any time, so a red run
-# here is a fact about today rather than a regression in this repository.
+# Running it is a deliberate, paid, by-hand act against a website neither this project
+# nor its authors control. Wikipedia can redesign a skin, rename a section or
+# rate-limit a client at any time, so a red run here is a fact about today rather than
+# a regression in this repository.
 #
-# Why it exists: eval/tasks.yaml measures the agent against a sandbox built for it,
-# where every element is clean, every screen is small and OCR is fast. That proves
-# the loop works; it cannot prove the loop works on a real page. This suite is the
-# claim "it works on Wikipedia" written down as something that can be falsified.
+# Why it exists: it is the claim "it works on Wikipedia" written down as something that
+# can be falsified. There used to be a second suite against a local demo application
+# built for the agent, where every element was clean, every screen was small and OCR
+# was fast. It proved the loop works; it could not prove the loop works on a real page,
+# which is the only claim worth making, so this is now the only suite.
 #
 # ----------------------------------------------------------------------------------
-# What is different from eval/tasks.yaml
+# What a live suite has to do differently
 # ----------------------------------------------------------------------------------
 #
-# *Nothing is mutated.* Every task reads and navigates. That is not a softer choice
-# than the sandbox suite, it is the only honest one: this project's rule is that a
-# task which changes state cannot be learned without something that can change it
-# back (see WorldReset in orchestrator.py), and we have no way to put Wikipedia back
-# and no business trying. Read-only tasks need no undo, so they are learnable here
-# exactly as they are in the sandbox.
+# *Nothing is mutated.* Every task reads and navigates. That is not a soft choice, it
+# is the only honest one: this project's rule is that a task which changes state
+# cannot be learned without something that can change it back (see WorldReset in
+# orchestrator.py), and we have no way to put Wikipedia back and no business trying.
+# Read-only tasks need no undo, so they are learnable here as they stand.
 #
 # *The reset is a no-op, deliberately.* `reset_path` below points at the main page,
 # so the harness's per-run reset is one ordinary page load that restores nothing
-# because nothing was disturbed. Writing it this way rather than leaving the default
-# /__reset - which would 404 on every run and be logged as a failed reset - keeps
-# `reset_ok` in the report meaning what it says.
+# because nothing was disturbed. Naming a real page rather than an endpoint that
+# would 404 on every run and be logged as a failed reset keeps `reset_ok` in the
+# report meaning what it says.
 #
-# *Ground truth comes from the DOM, not from a control endpoint.* The sandbox has
-# GET /__state; Wikipedia obviously does not. The `expect` checks below are written
+# *Ground truth comes from the DOM, not from a control endpoint.* A public website
+# has no endpoint that reports its own state. The `expect` checks below are written
 # against a state mapping read by an OFFLINE TEACHER over the live page - the shape
 # `BrowserGroundTruth` in controllers/browser.py already produces:
 #
@@ -45,13 +43,11 @@
 # in `headings` as exactly its title, so `headings contains Ada Lovelace` is a real
 # equality against one element rather than a search of the whole page.
 #
-# `referee: dom` below is how this file asks for that referee, and it is the whole
-# difference between this suite and the sandbox one. A suite naming an application
-# that reports its own state leaves the key off and gets HttpReferee; this one names
-# a website, which has no /__state and never will, so it gets BrowserReferee and is
-# scored on the page the run ended on. `skillweaver eval run --suite eval/wikipedia.yaml`
-# is therefore an ordinary command - it used to build an HttpReferee whatever the
-# suite said, ask en.wikipedia.org for /__state, and fail before the first task.
+# `referee: dom` below is how this file asks for that referee: BrowserReferee, which
+# scores the run on the page it ended on. It is the only kind the harness has, and the
+# key is written down anyway so the file says out loud where its ground truth comes
+# from. `skillweaver eval run --suite eval/wikipedia.yaml` is therefore an ordinary
+# command.
 #
 # ----------------------------------------------------------------------------------
 # The checks, and why they are loose
@@ -63,8 +59,8 @@
 # tracking parameter would be measuring Wikipedia's analytics, not this agent. The
 # substring is still specific: no other article's URL contains it.
 #
-# The operators are exactly the five eval/tasks.yaml documents; nothing new was
-# added to the harness for this file.
+# The operators are the five in OPERATORS in skillweaver/eval/harness.py, which is
+# where each one is documented; nothing was added to the harness for this file.
 #
 # ----------------------------------------------------------------------------------
 # Running it
@@ -84,8 +80,8 @@
 #
 # Six tasks at three shapes each is a real amount of live traffic and real money.
 # Keep `warm_runs` low here - the point of a warm run on a live site is to show the
-# stored skill replays at all, and the variance that three runs buy on the sandbox is
-# not worth six more page loads of somebody else's bandwidth.
+# stored skill replays at all, and the variance that a third run would buy is not
+# worth six more page loads of somebody else's bandwidth.
 
 suite: wikipedia
 domain: en.wikipedia.org
@@ -140,7 +136,7 @@ tasks:
   - id: search_photosynthesis
     # Deliberately the SAME SHAPE as search_ada_lovelace with a different term. This
     # is the task whose warm replay died at "skill ran for 20.89s of 20.00s allowed":
-    # the skill was right, the page was slow, and the sandbox charged it for OCR.
+    # the skill was right, the page was slow, and the run was charged for the OCR.
     # Its warm run is the direct evidence that the time limit was the problem.
     text: Search Wikipedia for "Photosynthesis" and open the article.
     tags: [multi-step]

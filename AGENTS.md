@@ -9,9 +9,10 @@ Two rules the code cannot tell you, because this repository is built by many wor
   Create and edit only the files your task names.
   If you need a change in a file you do not own, report it instead of editing it.
 
-**Work here is proven by a real end-to-end run, not by tests.** Do not write test files and
-do not run the suite; run the thing you built against the real target and report what it did -
-the task, the steps, the wall time, the outcome. Change a default path that already worked and
+**Work here is proven by a real end-to-end run, not by tests.** There is no test tree:
+`tests/` and the whole static-test setup were removed on 2026-09-20, along with pytest and
+`make test`. Do not reinstate them. Run the thing you built against the real target and
+report what it did - the task, the steps, the wall time, the outcome. Change a default path that already worked and
 you owe it one real run too. Report failures plainly: "it worked" with no run behind it is
 worse than "I could not get it to run, here is where it stopped". The linter still runs.
 
@@ -51,7 +52,10 @@ that file is shared surface. `src/skillweaver/orchestrator.py` holds the cold-ve
 decision and `build_agent`, the one place the real agent is wired; build on that rather than
 assembling a planner and an explorer by hand.
 
-To iterate without a browser, a model or a network, drive the doubles in `tests/fakes/` (fixtures in `tests/conftest.py`; `tests/fakes/scenario.py` is a small fake app). They are a development aid - the evidence of done is still a real run.
+There are no test doubles to iterate against either - `tests/fakes/` went with the test
+tree - so a change is exercised by running the real command against the real site. Budget
+for that: it needs `.env`, a browser and money, and it is the only evidence this project
+accepts.
 
 Two live-API facts that no test can teach you, both already paid for in lost runs.
 `claude-opus-5` **refuses an assistant prefill** - a conversation ending on an assistant
@@ -81,8 +85,10 @@ DoorDash's quick-add and header cart are icon-only buttons whose only name is an
 `aria-label`, and a search of that page's visible text finds nothing - so the
 scaffolding that puts the world back is handed `BrowserGroundTruth` explicitly, at the
 one call site in `_dom_of`. Nothing else may. That site is also Cloudflare-gated
-against automated browsers and this project does not evade it; `apps/sandbox-site/README.md`
-explains why the local Pantry Lane cart is the world to build an ordering task against.
+against automated browsers and this project does not evade it. The local demo site that
+used to stand in for it (Northwind Console / Pantry Lane, `apps/sandbox-site`) was removed
+on 2026-09-20; an ordering task is now built against a real shop that does let us in, which
+is what splitkb and Walmart are doing in the entries below.
 
 "Where the last run of this task ended" is NOT where this run should end: a task that
 takes an argument ends somewhere the argument decides, so a recalled end screen can
@@ -100,8 +106,9 @@ Wikipedia graph. Worse than the number is what it freezes, because new evidence 
 then outweighed by a history that doubles: an edge measured at 5 successes and then
 failing 200 runs straight was still priced and still preferred. `InMemorySiteGraph.unsaved`
 and `subtract_transitions` in `graph/model.py` carry the rule and its inverse-of-merge
-arithmetic. A test that observes into a graph it never LOADED cannot see any of this,
-which is how it survived a full suite; `explain_edge` in `graph/route.py` is how a
+arithmetic. Observing into a graph that was never LOADED cannot show any of this -
+which is how the bug survived for months, and why the only way to see it is a real run
+that loads a domain and then saves it; `explain_edge` in `graph/route.py` is how a
 preferred edge is asked which counts chose it.
 
 An attempt's cost is read from the model client's own `total_usage` across it
@@ -191,7 +198,7 @@ the run and a person clears it by hand, once, in that profile; and access is not
 property you can retest your way into, because hammering a site to find out whether it is
 still letting you in is what stops it. Say what this mode is, too: it makes us stop
 announcing ourselves, which is smaller than making a site accept us. Prove it against
-something that does not gate you - `apps/sandbox-site`, or `example.com`.
+something that does not gate you - `example.com`, or any small page of your own.
 
 Chrome 153 does NOT write `DevToolsActivePort`, in either render mode, so a launcher that
 waits for that file waits out its whole timeout beside a perfectly healthy browser. The
@@ -235,10 +242,9 @@ its task, and demoting it for that is a defect this project has shipped once alr
 
 `ultralytics` is a noisy import; three of its side effects have already cost time here.
 
-- It installs its own top-level `tests` package into the venv, which shadows this repository's
-  `tests/` in any plain `python` process. Pytest is unaffected; a script that needs the fakes
-  must bind them first:
-  `sys.modules["tests"] = types.ModuleType("tests"); sys.modules["tests"].__path__ = ["tests"]`.
+- It installs its own top-level `tests` package into the venv. That no longer shadows
+  anything here, but it means `import tests` in any script silently resolves to
+  ultralytics' package rather than failing.
 - A relative `project=` given to `model.train()` resolves against ultralytics' GLOBAL
   `runs_dir` setting, which is per-user and can point at a different worktree entirely, so a
   training run silently writes into someone else's checkout. Pass an absolute path and read
@@ -246,13 +252,16 @@ its task, and demoting it for that is a defect this project has shipped once alr
 - Importing it patches `PIL.Image.open`; `skillweaver.perception.detect_yolo._import_yolo`
   explains why that has to be undone and does it.
 
-What the element detector knows is a measured claim, not an assumption. Its training
-set is the sandbox app AND live public pages, so a full `scripts/build_ui_dataset.py`
-run needs the network (`--no-web` opts out) and takes minutes, not seconds. That same
-script's `--bench` scores any set of weights on pages held out of training entirely,
-and `tests/perception/fixtures/README.md` is where the detector's numbers and its
-remaining blind spots are written down. Quote that file rather than guessing, and
-remeasure with `--bench` rather than assuming a retrain helped.
+**The trained detector ships and works; there is no in-repo way to rebuild it.**
+`data/models/ui_detector.pt` is committed and every run uses it as before. What was
+removed on 2026-09-20 is its producer: `scripts/build_ui_dataset.py` drove the local demo
+site to harvest the training frames, and its `--bench`, which scored any set of weights on
+held-out pages, went with it - as did `tests/perception/fixtures/README.md`, where the
+detector's numbers and its remaining blind spots were written down. So the detector's
+accuracy is now an undocumented property of a binary, retraining starts with writing a new
+harvester against real pages, and `scripts/train_detector.py` still trains but no longer
+has a dataset to be pointed at. Do not quote detector numbers from memory; there is
+nothing in the repository left to quote.
 
 A skill must never sleep for time the browser has already spent, which was the
 largest single line item in warm replay. Every action is SETTLED before the controller
@@ -314,8 +323,8 @@ a local MiniLM through onnxruntime, no new dependency and no network at run time
 (`skills/embed.py`, `make embedder`) - and it is OFF because it was measured and did
 not pay. Do not "finish" it by turning it on.
 
-What the measurement said, over both libraries this repository carries
-(`scripts/bench_retrieval.py`, 48 requests, re-runnable in a minute):
+What the measurement said, over the two libraries this repository carried at the time
+(`scripts/bench_retrieval.py`, 48 requests):
 
   * recall improved, which is what an embedder is for: top-1 18/24 -> 21/24.
   * RUNNABLE candidates did not move AT ALL: 3/24 both ways when a person types the
@@ -325,6 +334,15 @@ What the measurement said, over both libraries this repository carries
     requests answered went 1/6 -> 5/6, because a cosine is almost never zero. No
     cut-off separates the two populations either, so there is nothing to tune - which
     is the argument against ever switching this on without re-measuring.
+
+Half that corpus is gone. The `console` library was a fixture library under the removed
+test tree, so the bench now runs the Wikipedia half alone: 24 requests, and re-measured
+on 2026-09-20 it says the same thing - recall 8/9 both ways, runnable 2/9 (typed) and
+4/9 (suite-supplied) both ways, false hits 0/3 keywords against 2/3 embedder. The
+conclusion holds and the NEAR-NEIGHBOUR case does not survive: `open_records` /
+`open_record_detail` lived only in that fixture library, and that is the shape which
+breaks retrieval in a library that has grown. Re-establish it from a real run before
+quoting this bench about a grown library.
 
 WHY it does not pay: a candidate that ranks first still has to bind (`bind_args`) and
 then account for the request (`MIN_ACCOUNTED_FOR`), and BOTH of those count words. A
@@ -340,12 +358,11 @@ positions and four extra wrong answers. It is reachable ONLY through
 `SKILLWEAVER_EMBEDDER` (`DEFAULT_EMBEDDER_ENABLED` is False): fetched weights sitting
 on disk do not enable it and are not meant to.
 
-And the case that prompted all of this was never a retrieval miss. The ordering
-suite's `add_dish_with_option` log line says `no embedder`, but its stage is
+And the case that prompted all of this was never a retrieval miss. The 2026-09-19
+ordering run's `add_dish_with_option` log line says `no embedder`, but its stage is
 `unaccounted` - the gate never sees a retrieval score at all, and a cosine of 1.00
-would have changed the order of the candidates and nothing else.
-`test_the_ordering_miss_of_2026_09_19_was_the_gate_and_not_the_ranking` holds the
-arithmetic.
+would have changed the order of the candidates and nothing else. The arithmetic used to
+be pinned by a test; read `MIN_ACCOUNTED_FOR` in `agent/planner.py` for it now.
 
 Reuse is also keyed on what a skill DOES. The admission gate stores an action signature
 (`TYPE_TEXT(text_field) -> CLICK(button) -> ...`, labels and values abstracted) and the

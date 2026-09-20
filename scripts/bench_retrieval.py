@@ -37,23 +37,21 @@ cannot answer and the case the captain's brief is about. The learned sentence it
 included as a control: it must stay a hit, since a verbatim repeat is the cheapest warm
 run there is.
 
-The libraries are the two real ones this repository carries:
+The library is the real one this repository carries:
 
 ``wikipedia``  ``data/skills``, written by ``claude-opus-5`` during the live Wikipedia
                run of 2026-09-19. Three usable skills; the other two are demoted and
                retrieval never offers them, which is left exactly as it is.
-``console``    ``tests/dashboard_fixtures/full/skills``. Hand-written fixtures in the
-               shape the synthesizer produces, not the output of a run - said plainly
-               because it matters when reading the numbers. It is included because it
-               is the only library here with near-neighbours in it
-               (``open_records`` / ``open_record_detail``), which is the shape that
-               breaks retrieval in a library that has grown.
 
-NOT measured here: the ordering suite of ``eval/order.yaml``. Its library was never
-committed - ``data/skills`` holds only the Wikipedia run - and rebuilding it means
-twelve cold runs against a model, which needs an API key this worktree does not have.
-Inventing those skills' text and then scoring against it would be measuring the
-invention.
+This used to be two libraries. The second, ``console``, was a hand-written fixture
+library under the static test tree, and it went with that tree when the local demo
+site was removed. It carried the only NEAR-NEIGHBOURS this bench ever had
+(``open_records`` / ``open_record_detail``) - the shape that breaks retrieval in a
+library that has grown - so the half of the measurement that stressed near-neighbours
+is no longer reproducible here. Read the numbers below as the Wikipedia half alone,
+and re-establish the near-neighbour case from a real run before quoting this bench on
+a grown library. Inventing a library's text and then scoring against it would be
+measuring the invention.
 """
 
 from __future__ import annotations
@@ -94,8 +92,8 @@ class Query:
     library can do this and the right result is no candidate at all.
 
     ``params`` are the values a SUITE would supply with this request
-    (``eval/order.yaml`` carries ``{cuisine: Japanese}``); a person typing the same
-    sentence supplies none. Both shapes are measured, because they fail in different
+    (``eval/wikipedia.yaml`` carries ``{query: "Ada Lovelace"}``); a person typing the
+    same sentence supplies none. Both shapes are measured, because they fail in different
     places: with no values a skill with a required parameter cannot even be bound, and
     with them binding is free and the content gate decides.
     """
@@ -155,30 +153,6 @@ WIKIPEDIA_QUERIES = [
     q("Recalibrate the telescope mirror."),
     q("Book a table for two at eight o'clock."),
     q("Reset the router and reconnect the printer."),
-]
-
-CONSOLE_QUERIES = [
-    # -- controls ---------------------------------------------------------------------
-    q("Export the current records view as CSV.", "export_csv", scope="page"),
-    q("Open the records list from anywhere in the console.", "open_records"),
-    q("Search the records table for a company.", "search_records", company="Acme Corp"),
-    q("Open one record from a filtered list.", "open_record_detail", row=1),
-    q("Reply to the currently open message.", "send_reply", body="Thanks, will do."),
-    # -- the same errands, in other words ---------------------------------------------
-    q("Download the visible rows as a spreadsheet file.", "export_csv", scope="page"),
-    q("Save this table to a comma separated file.", "export_csv", scope="page"),
-    q("Bring up the list of records.", "open_records"),
-    q("Navigate to the records table.", "open_records"),
-    q("Filter the table down to Initech.", "search_records", company="Initech"),
-    q("Find the rows belonging to Acme Corp.", "search_records", company="Acme Corp"),
-    q("Drill into a single entry from the filtered results.", "open_record_detail", row=1),
-    q("Show the detail pane for one of the rows.", "open_record_detail", row=1),
-    q("Write a response to this message and send it.", "send_reply", body="Thanks, will do."),
-    q("Answer the open thread.", "send_reply", body="Thanks, will do."),
-    # -- nothing in this library can do these -----------------------------------------
-    q("Recalibrate the telescope mirror."),
-    q("Book a table for two at eight o'clock."),
-    q("Change the office wifi password."),
 ]
 
 
@@ -304,12 +278,6 @@ def main() -> int:
 
     suites = [
         ("wikipedia", library(ROOT / "data" / "skills"), "en.wikipedia.org", WIKIPEDIA_QUERIES),
-        (
-            "console",
-            library(ROOT / "tests" / "dashboard_fixtures" / "full" / "skills"),
-            "sandbox.test",
-            CONSOLE_QUERIES,
-        ),
     ]
     for shape, with_params in (("as a person types it", False), ("as a suite asks it", True)):
         print(f"\n#### {shape}")
@@ -329,7 +297,7 @@ def main() -> int:
                 total = totals[label]
                 for name_ in vars(score):
                     setattr(total, name_, getattr(total, name_) + getattr(score, name_))
-        print(f"\n== both libraries, {shape}")
+        print(f"\n== every library, {shape}")
         for label, total in totals.items():
             print(f"  {label:<9} {total.line()}")
     print(
