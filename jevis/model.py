@@ -320,6 +320,7 @@ def classify_task(goal, url):
         "category": answer["choice"],
         "confidence": answer["confidence"],
         "latency_ms": round((time.perf_counter() - started) * 1000),
+        "usage": result.get("usage", {}),
     }
 
 
@@ -332,10 +333,10 @@ def refine_goal(goal, url, model=None, effort=None):
         info = classify_task(goal, url)
     except (RuntimeError, ValueError, KeyError, TypeError):
         # Classification only selects wording guidance; refinement must still run without it.
-        info = {"category": None, "confidence": 0.0, "latency_ms": 0}
+        info = {"category": None, "confidence": 0.0, "latency_ms": 0, "usage": {}}
     rules = CATEGORY_RULES.get(info["category"], "") if info["confidence"] >= MIN_CATEGORY_CONFIDENCE else ""
     info["applied"] = bool(rules)
-    result, _, _ = text_completion(
+    result, wrote_with, _ = text_completion(
         "Goal refinement",
         REFINE_GOAL + ("\n" + rules if rules else ""),
         json.dumps({"goal": goal, "site": url}),
@@ -349,6 +350,7 @@ def refine_goal(goal, url, model=None, effort=None):
             raise ValueError()
     except (ValueError, KeyError, TypeError):
         raise ValueError("Goal refinement returned no usable goal; retry or start with Refine off.") from None
+    info["writer"] = {"model": wrote_with, "usage": result.get("usage", {})}
     return value.strip(), info
 
 

@@ -72,7 +72,7 @@ def close_browser():
 def command(name, body):
     global AGENT
     if name == "reset":
-        refinement = None
+        refinement, setup = None, []
         scenario = body.get("scenario", "flights")
         if scenario not in {"travel", "research", "flights", "custom"}:
             raise ValueError("Unknown demo scenario")
@@ -100,6 +100,11 @@ def command(name, body):
             if effort and effort not in EFFORTS:
                 raise ValueError("Unknown thinking level")
             goal, refinement = refine_goal(goal, url, chosen, effort)
+            writer = refinement.pop("writer", None)
+            if writer:
+                setup.append({"meter": "writer", **writer})
+            if refinement.get("usage"):
+                setup.append({"meter": "policy", "usage": refinement.pop("usage")})
         close_browser()
         AGENT = Agent(
             url,
@@ -111,6 +116,7 @@ def command(name, body):
         )
         AGENT.state["scenario"] = scenario
         AGENT.state["refinement"] = refinement
+        AGENT.state["setup_calls"] = setup
         AGENT.state["chosen_url"] = url
     elif name == "focus":
         # The agent owns a background tab, so it comes forward only when the user asks.

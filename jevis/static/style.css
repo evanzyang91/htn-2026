@@ -116,6 +116,7 @@ header {
   background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: blur(10px);
 }
+.brand-space { flex: 1; }
 .brand {
   font-size: 15px;
   font-weight: 600;
@@ -205,6 +206,12 @@ body.idle .composer-wrap { padding-top: 22px; }
 .verdict { margin: 14px 0 0; font-size: 14.5px; }
 .verdict.ok { color: var(--green); }
 .verdict.bad { color: var(--red); }
+.cost {
+  margin: 6px 0 0;
+  font: 12px ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
 
 /* ---- Composer ----------------------------------------------------------- */
 .composer-wrap { flex: none; padding: 6px 20px 22px; }

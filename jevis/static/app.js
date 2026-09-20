@@ -132,7 +132,7 @@ function render() {
       state.decision ||
       (state.status === "done" ? state.decisions?.at(-1) : null);
   const labels = {
-    idle: "Ready",
+    idle: "",
     ready: "Reading the page",
     predicted: "Ready to act",
     done: "Finished. Check the result.",
@@ -352,6 +352,20 @@ function stepText(h) {
   if (h.kind === "enter") return "Submitted the search";
   return `Clicked ${(h.action || "").split(" · ")[0]}`;
 }
+// Both meters in one line. Fractions of a cent are the normal case, so show enough digits to be
+// truthful rather than rounding an honest $0.0004 down to nothing.
+function money(usd) {
+  if (!usd) return "$0";
+  return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
+}
+function costLine(spend) {
+  if (!spend?.tokens) return "";
+  const tokens = spend.tokens.toLocaleString();
+  const unpriced = spend.unpriced?.length
+    ? ` (${spend.unpriced.join(", ")} has no published rate)`
+    : "";
+  return `${tokens} tokens, about ${money(spend.usd)}${unpriced}`;
+}
 let turn = null;
 function startTurn(request) {
   $("intro").hidden = true;
@@ -372,9 +386,12 @@ function startTurn(request) {
   const verdict = document.createElement("p");
   verdict.className = "verdict";
   verdict.hidden = true;
-  agent.append(site, acts, verdict);
+  const cost = document.createElement("p");
+  cost.className = "cost";
+  cost.hidden = true;
+  agent.append(site, acts, verdict, cost);
   thread.append(you, agent);
-  turn = { site, acts, verdict };
+  turn = { site, acts, verdict, cost };
   thread.scrollTop = thread.scrollHeight;
 }
 function renderTurn() {
@@ -408,6 +425,8 @@ function renderTurn() {
     turn.verdict.textContent = done
       ? "Done. The browser window shows the result."
       : "I could not finish this one. The browser window shows where I stopped.";
+    turn.cost.textContent = costLine(state.spend);
+    turn.cost.hidden = !state.spend?.tokens;
   }
   document.body.classList.toggle("running", running);
   $("thread").scrollTop = $("thread").scrollHeight;
