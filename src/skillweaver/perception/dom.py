@@ -65,6 +65,7 @@ __all__ = [
     "DomControl",
     "DomOption",
     "DomPerceiver",
+    "DomScroller",
     "DomSnapshot",
     "ROLE_KINDS",
 ]
@@ -171,6 +172,30 @@ class DomControl:
 
 
 @dataclass(frozen=True, slots=True)
+class DomScroller:
+    """The box a wheel at the middle of the viewport would scroll, when that is not the
+    document: a dialog's option list, a results pane, a drawer.
+
+    Found by walking up from ``elementFromPoint`` at the viewport centre to the nearest
+    ancestor that overflows and may scroll, as upstream Jev's ``snapshot.js`` does. The
+    start point is not arbitrary: it is where this path's targetless ``Scroll`` is
+    delivered (``Explorer._resolve`` wheels at ``controller.viewport().center``, the same
+    floor division), so the box found IS the box the wheel moves and the offer cannot
+    disagree with the action. Aiming at the box's own centre instead would not be safer -
+    a nested scroller can sit under that point and take the wheel.
+
+    Attributes:
+        can_down / can_up: Whether THIS box has content past its own fold.
+        label: What the box calls itself, for the log - ``aria-label``, else its role,
+            else its tag.
+    """
+
+    can_down: bool
+    can_up: bool
+    label: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class DomSnapshot:
     """Everything one ``page.evaluate`` returned, beside the observation it produced.
 
@@ -181,8 +206,18 @@ class DomSnapshot:
         texts: Visible text runs as ready-made ``text`` elements, not in the policy's
             target table.
         viewport: The visible area in logical pixels.
-        scroll_y / page_height: What decides whether scrolling is offered.
+        scroll_y / page_height: What decides whether scrolling is offered, when the
+            DOCUMENT is what a wheel would move.
+        scroller: The box a wheel would move instead, or ``None`` when that is the
+            document. When set it ALONE decides the offer; see :attr:`can_scroll_down`.
+        loading: The page saying it is still arriving - ``readyState`` short of
+            ``complete``, or an ``aria-busy`` / ``progressbar`` on it. ADVISORY, as
+            upstream has it: shown to the policy so a ``WAIT`` can be deliberate, and
+            part of nothing that identifies the screen.
         omitted_controls: How many controls :data:`MAX_CONTROLS` cut.
+        covered_controls: How many controls were left out because something else is at
+            the point a click on them would land - clipped by a scrolling list, or under
+            a banner. See :data:`_SNAPSHOT_JS`.
         can_go_back: Whether this tab has a previous session-history entry - the page's
             own answer from the Navigation API, not ``history.length``. It counts only
             entries contiguous and SAME-ORIGIN with this one, so the ``about:blank`` a run
@@ -200,17 +235,37 @@ class DomSnapshot:
     scroll_y: float = 0.0
     page_height: float = 0.0
     omitted_controls: int = 0
+    covered_controls: int = 0
     can_go_back: bool = False
+    scroller: DomScroller | None = None
+    loading: bool = False
     by_element_id: dict[str, DomControl] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def can_scroll_down(self) -> bool:
-        """Whether there is page below the fold."""
+        """Whether a wheel at the middle of the screen has anything below to reveal.
+
+        The document's own extent answered this alone until 2026-09-20, and that is
+        wrong under a dialog: the page behind is locked, so the document reports nothing
+        to scroll while the option list in front of it has a fold of its own. Measured on
+        a modal of 40 options over a locked 800px page: ``False`` here, NO scroll
+        operation offered, and 14 controls the policy could never reach - while one wheel
+        at the viewport centre moved that list 0 -> 560. With :attr:`scroller` the same
+        screen offers ``SCROLL_DOWN``, and ``SCROLL_UP`` once it has moved.
+
+        The box decides ALONE when there is one, as upstream does it: a locked document
+        often still reports a tall ``scrollHeight``, and offering a scroll on the
+        strength of that is offering a wheel that moves nothing.
+        """
+        if self.scroller is not None:
+            return self.scroller.can_down
         return self.scroll_y + self.viewport.h < self.page_height - 2
 
     @property
     def can_scroll_up(self) -> bool:
-        """Whether there is page above the fold."""
+        """Whether there is anything above to bring back. See :attr:`can_scroll_down`."""
+        if self.scroller is not None:
+            return self.scroller.can_up
         return self.scroll_y > 0
 
 
@@ -345,14 +400,28 @@ def _snapshot_from(raw: dict[str, Any], shot: Screenshot) -> DomSnapshot:
             viewport=viewport,
             scroll_y=float(raw.get("scrollY") or 0.0),
             can_go_back=bool(raw.get("canGoBack")),
+            scroller=_scroller_from(raw.get("scroller")),
+            loading=bool(raw.get("loading")),
             page_height=float(raw.get("pageHeight") or 0.0),
             omitted_controls=int(raw.get("omitted") or 0),
+            covered_controls=int(raw.get("covered") or 0),
             by_element_id={control.element_id: control for control in controls},
         )
     except PerceptionError:
         raise
     except (TypeError, ValueError, KeyError) as exc:
         raise PerceptionError(f"the page snapshot could not be read: {exc}") from exc
+
+
+def _scroller_from(entry: Any) -> DomScroller | None:
+    """The page's scroller, or ``None`` - which means the document is what scrolls."""
+    if not isinstance(entry, dict):
+        return None
+    return DomScroller(
+        can_down=bool(entry.get("canDown")),
+        can_up=bool(entry.get("canUp")),
+        label=_clean(entry.get("label"))[:80],
+    )
 
 
 def _control_from(
@@ -550,6 +619,7 @@ _SNAPSHOT_JS = (
   };
 
   const controls = [];
+  let covered = 0;
   for (const el of document.querySelectorAll(SELECTOR)) {
     if (!safe(el) || !visible(el) || el.matches(':disabled') ||
         el.closest('[aria-disabled="true"]')) continue;
@@ -562,6 +632,21 @@ _SNAPSHOT_JS = (
         cx < 0 || cy < 0 || cx >= innerWidth || cy >= innerHeight) continue;
     // A grid cell that contains its own button would shadow it with a bigger box.
     if (rname === 'gridcell' && el.querySelector('button,[role="button"]')) continue;
+
+    // Is the control what is actually AT the point a click on it would be delivered
+    // to? checkVisibility cannot say: it knows nothing of a scroll container clipping
+    // its children, or of anything drawn on top. The point is the centre of the box
+    // clipped to the viewport, which is where Python will aim (see _control_from). A
+    // hit on the control's own <label> counts, because that click activates it.
+    const px0 = Math.max(Math.round(r.x), 0), py0 = Math.max(Math.round(r.y), 0);
+    const px1 = Math.min(Math.round(r.x + r.width), innerWidth);
+    const py1 = Math.min(Math.round(r.y + r.height), innerHeight);
+    const hit = document.elementFromPoint(
+      px0 + Math.floor((px1 - px0) / 2), py0 + Math.floor((py1 - py0) / 2));
+    if (!hit || !(el.contains(hit) || [...(el.labels || [])].some((l) => l.contains(hit)))) {
+      covered += 1;
+      continue;
+    }
 
     const editable = !el.readOnly && el.getAttribute('aria-readonly') !== 'true' &&
       (['textbox', 'searchbox', 'spinbutton'].includes(rname) ||
@@ -623,6 +708,27 @@ _SNAPSHOT_JS = (
   const nav = window.navigation;
   const canGoBack = !!(nav && nav.canGoBack);
 
+  // What a wheel at the middle of the viewport would actually scroll. Under a dialog
+  // the document is locked and its option list scrolls on its own, so a document-only
+  // test offers no way to the controls below that list's fold. Walk up from the centre
+  // to the nearest ancestor that overflows and may scroll; null means the document.
+  // The start point is where this path delivers a targetless Scroll - see DomScroller.
+  let scroller = null;
+  for (let el = document.elementFromPoint(innerWidth >> 1, innerHeight >> 1);
+       el && el !== document.body && el !== document.documentElement;
+       el = el.parentElement) {
+    if (el.scrollHeight > el.clientHeight + 2 &&
+        /auto|scroll/.test(getComputedStyle(el).overflowY)) {
+      scroller = {
+        canDown: el.scrollTop + el.clientHeight < el.scrollHeight - 2,
+        canUp: el.scrollTop > 0,
+        label: el.getAttribute('aria-label') || el.getAttribute('role') ||
+          el.tagName.toLowerCase(),
+      };
+      break;
+    }
+  }
+
   return {
     url: location.href,
     title: document.title,
@@ -630,11 +736,15 @@ _SNAPSHOT_JS = (
     h: innerHeight,
     scrollY: scrollY,
     canGoBack: canGoBack,
+    scroller: scroller,
+    loading: document.readyState !== 'complete' ||
+      !!document.querySelector('[aria-busy="true"],[role="progressbar"]'),
     pageHeight: document.documentElement.scrollHeight,
     text: words.join('\\n').slice(0, MAX_PAGE_TEXT),
     controls: controls,
     texts: texts,
     omitted: omitted,
+    covered: covered,
   };
 }
 """.replace("%(max_controls)d", str(MAX_CONTROLS))
@@ -643,8 +753,15 @@ _SNAPSHOT_JS = (
 )
 """The one page script this perceiver runs, adapted from ``jev-ultrafast/snapshot.js``.
 
-Three differences from Jev's. No node-identity ``WeakMap`` or freshness guard: this path
-acts by POINT and the explorer re-observes after every action, so a stale target shows up
-as the next observation disagreeing. Text nodes come back WITH their rectangles, because
-this path needs ``Element``s. And select options are carried although no select action
-exists - see :mod:`skillweaver.llm.jev_`."""
+Differences from Jev's. No node-identity ``WeakMap`` or freshness guard: this path acts
+by POINT and the explorer re-observes after every action, so a stale target shows up as
+the next observation disagreeing. Its HIT-TEST is kept, though, and moved from the
+executor to here: upstream reports a covered control and refuses the click
+(``CoveredTarget``); this path never offers it, because a click by point lands on
+whatever is on top and says nothing. Measured on an option dialog scrolled to its end:
+8 of 18 checkboxes reported sat outside the list's visible box, and a click on the one
+the task wanted was delivered to the backdrop - 0 ticked, no error anywhere.
+
+Text nodes come back WITH their rectangles, because this path needs ``Element``s. And
+select options are carried although no select action exists - see
+:mod:`skillweaver.llm.jev_`."""

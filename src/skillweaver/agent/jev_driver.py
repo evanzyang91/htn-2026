@@ -17,6 +17,7 @@ move is one action OR one code block, so it becomes the block.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import sys
 from collections.abc import Collection, Mapping, Sequence
@@ -39,6 +40,7 @@ log = get_logger(__name__)
 __all__ = [
     "BACK_SIGNATURE",
     "DEAD_END_OPERATIONS",
+    "NO_CHANGE_LIMIT",
     "SCROLL_PIXELS",
     "SELECT_ALL_CHORD",
     "WAIT_MS",
@@ -70,6 +72,17 @@ Measured on live en.wikipedia.org, the cost of not doing it: one back the critic
 to "I do not know", then EIGHT more chosen at falling confidence and refused one after
 another until the run gave up at ``BLOCKED`` - 9 provider calls on a move that could not
 be performed.
+"""
+
+NO_CHANGE_LIMIT = 4
+"""How many moves in a row one address may absorb without changing before the run stops.
+
+Upstream's bound, and its reason for the address: a navigation that commits after the
+observation window records a false "no change", so differing URLs across the streak are
+proof of progress even when each step looked idle. ``WAIT`` is not counted - time passing
+IS the point of one. Nothing else here bounds a single screen: all four ``Budget`` limits
+are global, so without this a page that repaints slightly on every failed click can absorb
+the whole run and be reported as ``budget`` rather than as the dead end it was.
 """
 
 SCROLL_PIXELS = 560
@@ -108,12 +121,13 @@ class JevDriver:
             observation asked about, which means the two were not driving the same run.
     """
 
-    __slots__ = ("_perceiver", "_policy", "_steps")
+    __slots__ = ("_perceiver", "_policy", "_steps", "_taken")
 
     def __init__(self, policy: BrowserPolicy, perceiver: DomPerceiver) -> None:
         self._policy = policy
         self._perceiver = perceiver
         self._steps: list[dict[str, Any]] = []
+        self._taken: dict[str, set[str]] = {}
 
     def __repr__(self) -> str:
         return f"JevDriver({self._policy.name()})"
@@ -146,16 +160,22 @@ class JevDriver:
             ProviderError: from the policy, on a provider failure.
         """
         snapshot = self._snapshot_for(observation)
-        exclude, restored = _exclusions(snapshot, dead_ends)
+        if not history and self._steps:
+            # No moves yet and steps on file: the explorer has begun another run.
+            self._steps, self._taken = [], {}
+        state = _content_digest(snapshot)
+        self._settle(snapshot, state, rejection)
+        self._stop_if_inert(observation)
+        exclude, restored = _exclusions(snapshot, dead_ends, self._spent(state))
         asked = snapshot
         if snapshot.can_go_back and any(a.signature == BACK_SIGNATURE for a in dead_ends):
             asked = dataclasses.replace(snapshot, can_go_back=False)
-        self._settle(history, rejection)
         decision = self._policy.decide(task.text, asked, self._steps, exclude)
-        self._remember(decision)
+        self._remember(decision, state)
         log.info(
             "jev.decide",
             operation=decision.operation,
+            changed=self._steps[-2].get("page_changed") if len(self._steps) > 1 else None,
             confidence=round(decision.confidence, 3),
             probability=round(decision.probability, 3),
             policy_ms=round(decision.policy_ms),
@@ -195,34 +215,95 @@ class JevDriver:
             )
         return snapshot
 
-    def _settle(self, history: Sequence[str], rejection: str | None) -> None:
-        """Close the previous step with what actually became of it, before asking again.
+    def _settle(self, snapshot: DomSnapshot, state: str, rejection: str | None) -> None:
+        """Close the previous step with what LITERALLY became of the page, before asking.
 
-        The half upstream Jev fills in from its own post-action fingerprint. Here the
-        explorer owns the after-observation and the CRITIC owns the verdict, so the
-        honest thing to report is the critic's.
+        ``page_changed`` is upstream's field and upstream's meaning: did the page's
+        content differ afterwards (:func:`_content_digest`). It was the CRITIC's verdict
+        here until 2026-09-20, and the two are different questions. Measured live on an
+        option dialog: the policy scrolled the list twice, ticked the right add-on and
+        added it to the order - the task, done - while ``state_changed`` called both
+        scrolls and the tick failures (0.925, 0.767, and "the fingerprints are identical"
+        for a ticked checkbox). So the policy was told three times that nothing happened,
+        and under rules that make the history "the authoritative record of progress" it
+        answered a finished task with ``BLOCKED`` 0.57 against ``DONE`` 0.23.
+        ``AGENTS.md`` already says nothing may be keyed on that per-move verdict.
 
-        A policy not told its last click did nothing has no reason to choose differently,
-        and the screen that prompted the click has not changed - which is the loop the
-        failure memory exists to break.
+        The verdict is not lost: a move it failed is still a dead end in the explorer's
+        memory and still withheld by :func:`_exclusions`.
         """
         if not self._steps:
             return
         last = self._steps[-1]
-        outcome = history[-1] if history else ""
-        last["page_changed"] = None if not outcome else ("FAILED" not in outcome)
+        last["page_changed"] = state != last["state"]
+        last["url"] = snapshot.url
         if rejection:
             last["refused"] = rejection
+        elif last["kind"] == "CLICK" and last["element_id"]:
+            self._taken.setdefault(last["state"], set()).add(last["element_id"])
 
-    def _remember(self, decision: PolicyDecision) -> None:
-        """Open a step with what the policy asked for. :meth:`_settle` closes it."""
+    def _remember(self, decision: PolicyDecision, state: str) -> None:
+        """Open a step with what the policy asked for. :meth:`_settle` closes it.
+
+        ``state``, ``element_id`` and later ``url`` are this driver's own bookkeeping;
+        the request builder names the keys it sends, so they never reach the wire.
+        """
         self._steps.append(
             {
                 "action": decision.why or decision.operation,
                 "kind": decision.operation,
                 "text": decision.text,
+                "state": state,
+                "element_id": decision.element_id,
             }
         )
+
+    def _spent(self, state: str) -> dict[str, set[str]]:
+        """``{operation: element ids}`` this exact page state has already used up.
+
+        Two of upstream's rules, both proofs BY IDENTITY and so both keyed on the exact
+        :func:`_content_digest` rather than on fingerprint similarity. A click already
+        made from this state, when the run is standing on the state again, did not
+        advance the goal however much it changed the page - that is what turns
+        open/close into an oscillation. And whatever has changed nothing since the page
+        last changed will change nothing now; a ``WAIT`` ends that streak, because time
+        passing is a reason a dead control may work.
+
+        Exact on purpose, and it is the opposite call from
+        :meth:`~skillweaver.agent.explorer.FailureMemory.near`. At the 0.26 same-state
+        cut a dialog with one more box ticked IS the same screen, so similarity here
+        would withhold a legitimate second ``Add``. On a page too noisy to digest
+        identically twice this withholds nothing: it fails open, similarity fails closed.
+        """
+        spent: dict[str, set[str]] = {}
+        if state in self._taken:
+            spent["CLICK"] = set(self._taken[state])
+        for step in reversed(self._steps):
+            if step.get("page_changed") is not False or step["kind"] == "WAIT":
+                break
+            if step["state"] != state:
+                break
+            if step["kind"] in ("CLICK", "TYPE_TEXT") and step["element_id"]:
+                spent.setdefault(step["kind"], set()).add(step["element_id"])
+        return spent
+
+    def _stop_if_inert(self, observation: Observation) -> None:
+        """Give up on a page that has absorbed :data:`NO_CHANGE_LIMIT` moves unchanged.
+
+        Raises:
+            PolicyBlocked: which the explorer already turns into a diagnosed stop at this
+                screen, after its one retry without a borrowed workflow.
+        """
+        recent = self._steps[-NO_CHANGE_LIMIT:]
+        if len(recent) < NO_CHANGE_LIMIT:
+            return
+        inert = all(s.get("page_changed") is False and s["kind"] != "WAIT" for s in recent)
+        if inert and len({s.get("url") for s in recent}) == 1:
+            tried = "; ".join(str(s["action"]) for s in recent)
+            raise PolicyBlocked(
+                f"{observation.url or 'this screen'} did not change across the last "
+                f"{NO_CHANGE_LIMIT} moves ({tried}), so nothing more is spent on it"
+            )
 
 
 # --------------------------------------------------------------------------------------
@@ -324,8 +405,31 @@ def _type_into(element_id: str, text: str) -> str:
     )
 
 
+def _content_digest(snapshot: DomSnapshot) -> str:
+    """Whether the page is LITERALLY the page it was: upstream's ``fingerprint``, here.
+
+    Address, visible text, every control with its value and state, and where things are
+    scrolled to. A change DETECTOR and an exact one, which is a different job from
+    identifying a screen: that stays ``StateFingerprinter`` and its calibrated similarity,
+    and nothing stored is ever keyed on this. It sees what the pixel identity cannot - a
+    ticked box, a list scrolled inside a dialog, a cart badge going from 0 to 1 - because
+    those are the changes a policy's history has to be honest about.
+    """
+    scroller = snapshot.scroller
+    content = [
+        snapshot.url,
+        snapshot.text,
+        [(c.element_id, c.value, c.checked, c.selected, c.expanded) for c in snapshot.controls],
+        snapshot.scroll_y,
+        None if scroller is None else (scroller.can_down, scroller.can_up),
+    ]
+    return hashlib.sha256(json.dumps(content).encode("utf-8")).hexdigest()[:16]
+
+
 def _exclusions(
-    snapshot: DomSnapshot, dead_ends: Sequence[Attempt]
+    snapshot: DomSnapshot,
+    dead_ends: Sequence[Attempt],
+    spent: Mapping[str, Collection[str]] | None = None,
 ) -> tuple[dict[str, set[str]], set[str]]:
     """``({operation: element ids to withhold}, {operations put back})``.
 
@@ -341,8 +445,11 @@ def _exclusions(
     target head is PUT BACK and said out loud by :func:`_note`: a policy offered only
     ``WAIT``, ``DONE`` and ``BLOCKED`` answers one of them, and a false ``BLOCKED`` is a
     silent failure. Measured on the sandbox's Mail screen: 17 controls, 0 offered.
+
+    ``spent`` is :meth:`JevDriver._spent` - what this exact page state has used up by
+    upstream's two identity rules - and rides the same put-back as everything else.
     """
-    wanted: dict[str, set[str]] = {}
+    wanted: dict[str, set[str]] = {op: set(ids) for op, ids in (spent or {}).items() if ids}
     for attempt in dead_ends:
         move = signature_move(attempt.signature)
         if move is None:
@@ -374,7 +481,7 @@ def _note(exclude: Mapping[str, Collection[str]], restored: Collection[str]) -> 
         return ""
     plural = "" if withheld == 1 else "s"
     return (
-        f"; {withheld} target{plural} already tried and failed on this screen "
+        f"; {withheld} target{plural} already used up on this screen "
         f"{'was' if withheld == 1 else 'were'} withheld"
     )
 
