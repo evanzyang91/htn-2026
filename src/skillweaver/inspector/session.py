@@ -542,6 +542,13 @@ def _move_critic_for(settings: Settings, perceiver: Perceiver) -> Any:
     return _open_move_critic(settings, perceiver)
 
 
+def _done_critic_for(settings: Settings, perceiver: Perceiver, controller: Any, policy: Any) -> Any:
+    """The orchestrator's own choice of done judge, for the same reason as the move judge."""
+    from skillweaver.orchestrator import _open_done_critic
+
+    return _open_done_critic(settings, perceiver, controller, policy)
+
+
 class LiveSession:
     """One inspected run: a browser, a task, and a loop a person advances by hand.
 
@@ -764,7 +771,9 @@ class LiveSession:
             self._policy = _WatchedPolicy(policy._policy) if _has_inner_policy(policy) else None
             if self._policy is not None:
                 policy._policy = self._policy  # noqa: SLF001 - see _WatchedPolicy
-            self._critic = _WatchedCritic(TieredCritic(llm))
+            # The done judge `learn` gets: on the Jev path that is Jev, and Claude is not asked.
+            done = _done_critic_for(settings, perceiver, controller, policy)
+            self._critic = _WatchedCritic(done(None, False) if done else TieredCritic(llm))
             self._explorer = Explorer(
                 llm,
                 perceiver,

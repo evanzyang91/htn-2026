@@ -466,7 +466,14 @@ def _check_orchestrator_seam() -> None:
     """Fail at start-up, by name, if an opener this module borrows was renamed."""
     from skillweaver import orchestrator
 
-    wanted = ("_open_world", "_open_model", "_open_policy", "_open_move_critic", "_reset_for")
+    wanted = (
+        "_open_world",
+        "_open_model",
+        "_open_policy",
+        "_open_move_critic",
+        "_open_done_critic",
+        "_reset_for",
+    )
     missing = [name for name in wanted if not callable(getattr(orchestrator, name, None))]
     if missing:
         raise SkillWeaverError(
@@ -494,6 +501,9 @@ class ErrandSession:
             self._llm = o._open_model(self._config)
             self._policy = o._open_policy(self._config, self.perceiver, self._llm)
             self._move_critic = o._open_move_critic(self._config, self.perceiver)
+            self._done_critic = o._open_done_critic(
+                self._config, self.perceiver, self.controller, self._policy
+            )
         except BaseException:
             self.controller.close()
             raise
@@ -511,6 +521,7 @@ class ErrandSession:
             llm=self._llm,
             policy=self._policy,
             move_critic=self._move_critic,
+            done_critic=self._done_critic,
             store=bench.store,
             retriever=o.build_retriever(bench.store),
             graph=bench.graph,
