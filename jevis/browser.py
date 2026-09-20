@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -53,7 +54,19 @@ class Browser:
         ensure_daemon()
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        # The tab renders at the window's own size. A fixed override was worth it when the page was
+        # only ever seen as a replay, but it letterboxes the real window the user now watches, and
+        # it hides content the window is tall enough to show. JEVIS_VIEWPORT ("1120x780") restores a
+        # fixed size for recording, where every frame must match.
+        if "x" in os.environ.get("JEVIS_VIEWPORT", ""):
+            width, _, height = os.environ["JEVIS_VIEWPORT"].partition("x")
+            self.call(
+                "Emulation.setDeviceMetricsOverride",
+                width=int(width),
+                height=int(height),
+                deviceScaleFactor=1,
+                mobile=False,
+            )
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
         self.frame_misses, self.frame_skip = 0, 0
