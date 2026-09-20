@@ -77,18 +77,14 @@ that perform the same workflow vouch in their own words
 same bench, the same 48 requests, scored through the planner's own new gate:
 
     ranking    top-1 recall    runnable    irrelevant requests answered
-    keywords      18/24         3 or 8/24            1/6
-    embedder      21/24         3 or 8/24            5/6
+    keywords      18/24         3 or 9/24            1/6
+    embedder      21/24         3 or 9/24            5/6
 
-The embedder still converts none of its recall into a warm run and still answers five
-of six irrelevant requests, so the switch stays off. One number DID move, for both
-rankings alike and in the wrong direction: 9/24 became 8/24 when a suite supplies the
-values. That is the new intent gate (:func:`~skillweaver.agent.planner.asks_for`)
-declining *Bring up the list of records* for a skill learned as *Open the records
-list ...* - ``bring`` is on no verb list, and a verb the gate does not know matches
-only itself. It is a correct run lost, stated here because it is the price of refusing
-*remove ... from my cart* on an add-to-cart skill, and the list was NOT extended to
-win the bench back. WHY nothing else moved is the useful
+Every number is where it was, so the switch stays off. (One intermediate build did
+move a number, downwards: an intent gate that treated every UNKNOWN verb as a refusal
+cost *Bring up the list of records* its warm run, 9/24 -> 8/24. That gate now refuses
+only a known conflict when the caller supplied the values; see
+:func:`~skillweaver.skills.family.same_intent`.) WHY nothing moved is the useful
 part, because the new readers demonstrably do convert rewordings into warm runs on a
 live site (*Buy the "..."* against a skill learned as *Add the "..." to the cart*: 0
 model calls). This bench's paraphrases were written to avoid each skill's own nouns AND

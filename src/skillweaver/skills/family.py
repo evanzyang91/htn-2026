@@ -601,7 +601,9 @@ def leads_alike(request: str, learned: str) -> bool:
     return asked == known or (intent_of(asked) is not None and intent_of(asked) == intent_of(known))
 
 
-def same_intent(request: str, skill: Skill, *, outside: str | None = None) -> bool:
+def same_intent(
+    request: str, skill: Skill, *, outside: str | None = None, strict: bool = True
+) -> bool:
     """Whether ``request`` asks for the errand ``skill`` performs. Declines when unsure.
 
     Two conditions, both required:
@@ -614,17 +616,34 @@ def same_intent(request: str, skill: Skill, *, outside: str | None = None) -> bo
       old one* is refused while *add X to the cart, then open the cart* still matches
       the skill that was learned doing exactly that.
 
+    ``strict`` is for a binding this project's looser readers made - the slot and the
+    family - where the verb is most of the evidence that the errand is the same. With
+    ``strict=False`` only a KNOWN conflict refuses: two verbs on two different lists,
+    or an opposing verb elsewhere. That is the setting for a caller who supplied the
+    values themselves, and it exists because the strict one was measured to break a
+    warm path that had always worked: *Confirm payment of the Acme Corp invoice* with
+    ``company`` supplied, against a skill learned as *Pay the ... invoice* - neither
+    verb is on a list, and "I do not know these verbs" is not "these are opposites".
+
     Args:
         request: The task, in the words it was asked in.
         skill: The skill that would run.
+        strict: Whether an UNKNOWN verb is a refusal (see above).
         outside: The request with the bound argument's own text cut out of it, when
             the caller has one. A product called *Clear Glass Set* is a value, not a
             verb, and must not be read as one; without this the whole request is read.
     """
     learned = skill.provenance.task_text
-    if not leads_alike(request, learned):
-        return False
     mine = intent_of(head_verb(learned) or "")
+    if strict:
+        if not leads_alike(request, learned):
+            return False
+    else:
+        theirs = intent_of(head_verb(request) or "")
+        if mine is not None and theirs is not None and mine != theirs:
+            return False
+    if mine is None:
+        return True  # with no class of its own, nothing elsewhere can be its opposite
     spoken = set(_WORD.findall(learned.casefold()))
     for word in _WORD.findall((outside if outside is not None else request).casefold()):
         theirs = intent_of(word)

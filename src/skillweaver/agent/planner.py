@@ -95,6 +95,7 @@ controller are not evidence against a skill either.
 
 from __future__ import annotations
 
+import ast
 import re
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -948,7 +949,7 @@ def _vouchers(
     )
 
 
-def asks_for(task: TaskSpec, skill: Skill, args: Mapping[str, Any]) -> bool:
+def asks_for(task: TaskSpec, skill: Skill, args: Mapping[str, Any], how: str | None = None) -> bool:
     """Whether ``task`` asks for the errand ``skill`` performs, HOWEVER it was bound.
 
     The gate every single-skill candidate passes, and it is here rather than inside
@@ -964,11 +965,20 @@ def asks_for(task: TaskSpec, skill: Skill, args: Mapping[str, Any]) -> bool:
 
     The arguments' own text is cut out first, so a product called *Clear Glass Set*
     is a value and not the verb *clear*.
+
+    How hard it looks depends on ``how`` the candidate was bound (``None`` works it
+    out). A binding the looser readers made (:data:`_WIDENED`) must lead with the
+    learned verb or one of its class; anything else - the caller's own ``params``, a
+    declared default, the two strict sentence readers - is refused only on a KNOWN
+    conflict, which is what *remove* against *add* is. See
+    :func:`~skillweaver.skills.family.same_intent` for the warm path the single strict
+    setting broke.
     """
     outside = task.text
     for value in args.values():
         outside = _without(outside, str(value))
-    return same_intent(task.text, skill, outside=outside)
+    how = how if how is not None else _how_bound(skill, task)
+    return same_intent(task.text, skill, outside=outside, strict=how in _WIDENED)
 
 
 def _other_intent(skill: Skill, task: TaskSpec) -> str:
@@ -1107,8 +1117,9 @@ def _with_defaults(skill: Skill, task: TaskSpec, args: dict[str, Any]) -> dict[s
 
     So the text is asked first, through the same guarded readers as a required
     parameter (one candidate parameter only - several is a guess), and the declared
-    default is what is used when the text names nothing. Either way the call now
-    matches the schema.
+    default is what is used when the text names nothing - passed explicitly only
+    when ``run`` has no default of its own for it (:func:`_required_by_code`), so a
+    skill whose code already declares one is called exactly as before.
     """
     open_slots = [
         name for name, schema in skill.params.items() if name not in args and _has_default(schema)
@@ -1129,7 +1140,29 @@ def _with_defaults(skill: Skill, task: TaskSpec, args: dict[str, Any]) -> dict[s
                 task=task.text,
             )
             return {**args, name: value}
-    return {**{name: skill.params[name]["default"] for name in open_slots}, **args}
+    needed = _required_by_code(skill)
+    return {**{n: skill.params[n]["default"] for n in open_slots if n in needed}, **args}
+
+
+def _required_by_code(skill: Skill) -> frozenset[str]:
+    """The parameters ``run`` itself cannot be called without, whatever the schema
+    says. A default the CODE also declares is left to the code, as it always was; one
+    that exists only in the schema has to be passed, or the call is a ``TypeError``."""
+    try:
+        tree = ast.parse(skill.code)
+    except SyntaxError:
+        return frozenset()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "run":
+            positional = [a.arg for a in (*node.args.posonlyargs, *node.args.args)][1:]
+            bare = positional[: len(positional) - len(node.args.defaults)]
+            keyword = [
+                a.arg
+                for a, d in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True)
+                if d is None
+            ]
+            return frozenset((*bare, *keyword))
+    return frozenset()
 
 
 def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
