@@ -881,7 +881,7 @@ def _is_expect(call: ast.Call) -> bool:
 def _required_read(statement: ast.stmt, following: ast.stmt | None) -> ast.Call | None:
     """The ``ctx.see.find_text`` call ``statement`` makes and then INSISTS on, or ``None``.
 
-    Two shapes count, and nothing else::
+    Two shapes count here, and :func:`_acted_on_read` holds the third::
 
         found = ctx.see.find_text("Subtotal")        # bound, then
         ctx.expect(bool(found), "no cart")           # required by the very next line
@@ -928,8 +928,73 @@ def _required_read(statement: ast.stmt, following: ast.stmt | None) -> ast.Call 
             return None
 
 
-def _awaited_reads_in(body: Sequence[ast.stmt]) -> dict[int, tuple[AwaitedRead, ast.Call]]:
+def _acts(statement: ast.stmt) -> str | None:
+    """The last ``ctx.ctl`` action anywhere inside ``statement``, or ``None``.
+
+    :func:`_settling_action` asks whether a statement IS an action; this asks whether
+    one happens anywhere within it, a loop's body included, which is the question "has
+    this skill touched the page yet?" needs answered.
+    """
+    last: str | None = None
+    for node in ast.walk(statement):
+        if isinstance(node, ast.Call):
+            method = _ctl_method(node.func)
+            if method is not None and method not in _NOT_AN_ACTION:
+                last = method
+    return last
+
+
+def _acted_on_read(statement: ast.stmt, rest: Sequence[ast.stmt]) -> ast.Call | None:
+    """The ``ctx.see.find_text`` call whose result ``rest`` goes on to ACT on, or ``None``.
+
+    The third shape, beside the two :func:`_required_read` accepts::
+
+        adds = ctx.see.find_text("Add to cart - " + product, "button")   # bound, then
+        if not adds:                                                     # maybe replaced,
+            adds = ctx.see.best("Add to cart button for " + product)
+        ctx.ctl.click(adds[0])                                           # and PRESSED
+
+    Handing a read's result to ``ctx.ctl`` proves it is required as surely as a
+    ``ctx.expect`` does - nothing can be pressed that was not found - and it is the shape
+    that needs the second look most, because what follows an empty first look is a
+    FALLBACK. Measured on live walmart.com, traced lookup by lookup: a result's title was
+    on screen at +2.32s, this read for its button found nothing at +2.33s because the
+    button had not hydrated, ``ctx.see.best`` - a ranking with a winner when nothing fits -
+    answered with the header's "Cart contains 0 items" at +2.42s, and the skill clicked
+    that. It passed one gate attempt and then 0 of 3 replays, the cart empty every time.
+
+    The ``ctx.expect`` rule missed it twice over. Its expect was four fallbacks further
+    down, not on the next line; and the read followed a wait that had already been
+    converted, after which "every later read is a read of a screen that has arrived" -
+    which is false of a page that answers in PHASES, titles and then buttons.
+    """
+    match statement:
+        case ast.Assign(targets=[ast.Name(id=name)], value=ast.Call() as call):
+            if _ctx_method(call.func, "see") != "find_text":
+                return None
+            if any(keyword.arg == "fuzzy" for keyword in call.keywords):
+                return None
+        case _:
+            return None
+    for later in rest:
+        for node in ast.walk(later):
+            if not isinstance(node, ast.Call) or _ctl_method(node.func) in (None, *_NOT_AN_ACTION):
+                continue
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                if any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(argument)):
+                    return call
+    return None
+
+
+def _awaited_reads_in(
+    body: Sequence[ast.stmt], acted: str | None = None
+) -> dict[int, tuple[AwaitedRead, ast.Call]]:
     """Which reads of ONE block race the control before them, keyed by index.
+
+    ``acted`` is the last action the skill performed BEFORE this block, anywhere above
+    it. Only :func:`_acted_on_read` consults it: a read about to be pressed is looked
+    for again whenever the page has been touched at all, because a page that answers in
+    phases is still answering after the first thing it said.
 
     The block is walked in order carrying the last action the controller settled,
     exactly as :func:`_reflex_waits_in` does, and for the same reason: a read is only
@@ -951,11 +1016,21 @@ def _awaited_reads_in(body: Sequence[ast.stmt]) -> dict[int, tuple[AwaitedRead, 
             )
             settled = None
             continue
+        touched = settled or acted
+        pressed = _acted_on_read(statement, body[position + 1 :]) if touched else None
+        if pressed is not None:
+            query = _string(pressed.args[0]) if pressed.args else None
+            found[position] = (
+                AwaitedRead(query, touched, getattr(statement, "lineno", 0)),
+                pressed,
+            )
+            continue
         action = _settling_action(statement)
         if action is not None:
             settled = action
         elif not _page_neutral(statement):
             settled = None
+        acted = _acts(statement) or acted
     return found
 
 
@@ -983,13 +1058,14 @@ def awaited_reads(code: str) -> tuple[AwaitedRead, ...]:
         return ()
     found: list[AwaitedRead] = []
 
-    def descend(body: Sequence[ast.stmt]) -> None:
-        found.extend(read for read, _ in _awaited_reads_in(body).values())
+    def descend(body: Sequence[ast.stmt], acted: str | None) -> None:
+        found.extend(read for read, _ in _awaited_reads_in(body, acted).values())
         for statement in body:
             for _, _, block in _blocks(statement):
-                descend(block)
+                descend(block, acted)
+            acted = _acts(statement) or acted
 
-    descend(fn.body)
+    descend(fn.body, None)
     return tuple(sorted(found, key=lambda read: read.line))
 
 
@@ -1212,7 +1288,9 @@ class _Hardener:
 
     # -- the wait that settling cannot give ----------------------------------------------
 
-    def await_expected_reads(self, body: list[ast.stmt]) -> list[ast.stmt]:
+    def await_expected_reads(
+        self, body: list[ast.stmt], acted: str | None = None
+    ) -> list[ast.stmt]:
         """Let a read the skill REQUIRES look again while the control answers.
 
         Runs straight after the sleeps are stripped, and the pairing is the point: the
@@ -1220,15 +1298,17 @@ class _Hardener:
         and this goes in because that event is exactly what a control answering in the
         background does not fire. A duration out, a condition in.
 
-        Only the shapes :func:`_required_read` accepts, only after an action, and only
-        once per action - see :func:`_awaited_reads_in`. Statements are rewritten in
+        Only the shapes :func:`_required_read` and :func:`_acted_on_read` accept, and
+        only after an action - see :func:`_awaited_reads_in`. Statements are rewritten in
         place: nothing is added, nothing is removed, and the read's arguments are
         carried across untouched, so a parameterized query stays parameterized.
         """
+        before = acted
         for statement in body:
             for owner, name, block in _blocks(statement):
-                setattr(owner, name, self.await_expected_reads(block))
-        for read, call in _awaited_reads_in(body).values():
+                setattr(owner, name, self.await_expected_reads(block, before))
+            before = _acts(statement) or before
+        for read, call in _awaited_reads_in(body, acted).values():
             call.func = _attr("ctx", "wait_for_text")
             self.awaits.append(read)
             self.changes.append(

@@ -217,9 +217,33 @@ followed by `[0]` is an `IndexError` and tells whoever reads the trace nothing.
     to cart" is on the page you are leaving, so waiting for it returns at once and
     proves nothing; "Subtotal", "Your cart", the confirmation heading, are the cart's
     own words. The hardening pass writes this rewrite in for you where your code makes
-    a read and then `ctx.expect`s it, so write it yourself and it stays as you wrote
-    it - and a read you only branch on is left alone, which is right, because you are
-    asking what is on screen rather than waiting for something to arrive.
+    a read and then `ctx.expect`s it, or hands its result to `ctx.ctl`, so write it
+    yourself and it stays as you wrote it - and a read you only branch on is left
+    alone, which is right, because you are asking what is on screen rather than
+    waiting for something to arrive.
+
+    A page also answers in PHASES, and the same rule covers it: a search result's
+    title is on screen before its button is. Measured on a live shop, the title was
+    there at 2.32s and the "Add to cart" beside it 0.61s later. So waiting for the
+    title does not make the button safe to `find_text` - wait for THE THING YOU ARE
+    ABOUT TO PRESS. And when a named lookup for something you are about to press comes
+    back empty, do NOT fall back to `ctx.see.best`: it ranks what IS on screen and has
+    a winner even when nothing fits, so it answers with the wrong control - on that
+    shop, the header's cart button - and your skill presses it. An empty lookup for a
+    press target is `ctx.expect`'s job.
+
+    ```python
+    # NO - the button has not arrived, and the fallback presses something else
+    adds = ctx.see.find_text("Add to cart - " + product, "button")
+    if not adds:
+        adds = ctx.see.best("Add to cart button for " + product)
+    ctx.ctl.click(adds[0])
+
+    # YES
+    adds = ctx.wait_for_text("Add to cart - " + product, "button")
+    ctx.expect(bool(adds), "no Add to cart control for that product")
+    ctx.ctl.click(adds[0])
+    ```
 
 ## What you must return
 

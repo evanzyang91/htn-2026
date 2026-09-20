@@ -369,8 +369,8 @@ and the two passes sit next to each other in `skills/refactor.py` on purpose. It
 strictly, never fuzzily, because a fuzzy `find_text("Your cart")` on splitkb's PRODUCT page
 answers with "Add tocart" - a wait satisfied by the screen it was meant to outlast. The
 hardening pass writes the rewrite in wherever a read is followed by a `ctx.expect` on it
-(`awaited_reads`), which is the only shape that proves the text is REQUIRED rather than
-merely asked about; a read that is only branched on is left alone, or every run pays the
+or has its result handed to `ctx.ctl` (`awaited_reads`, `_acted_on_read`), which are the
+shapes that prove the text is REQUIRED rather than merely asked about; a read that is only branched on is left alone, or every run pays the
 budget for something it hoped was absent. `SETTLE_BUDGET_MS` in `reset_actions.py` is the
 same lesson for a converging undo, which must wait for the screen to change AND go quiet
 because such a page answers in two frames. Do NOT fix any of this by widening `_settle`: a
@@ -417,14 +417,16 @@ does at its tail can settle that screen, which cost one wrong fix here. (2) THE 
 not fixed: a run that goes on past its goal - Jev re-typed the product on the cart page at
 confidence 0.30 before DONE - records an end screen no correct skill reaches (0.064 to
 the cart it had just opened), and the admission critic demands that screen. (3) THE SKILL,
-not fixed, and why there is still NO warm Walmart number: a result's TITLE paints before
-its Add button hydrates, the stored skill waits for the title and then looks for the
-button ONCE, and its `ctx.see.best` fallback - a ranking with a winner when nothing fits -
-hands it the header cart button. It passed one gate attempt and then 0 of 3 replays, with
-Walmart's cart empty each time. `awaited_reads` does not rewrite that read because
-fallbacks, not a `ctx.expect`, follow it. Measure a screen by the ROUTE and the MOMENT it
-is read at - `/cart` reloaded from `/cart` after 4s says 1.000 and tells you nothing - and
-start a Walmart task at `/cart`, the only anchor that reaches 1.000. This machine also
+fixed: a result's TITLE paints before its Add button hydrates (0.61s later, measured), the
+stored skill waited for the title and then looked for the button ONCE, and its
+`ctx.see.best` fallback - a ranking with a winner when nothing fits - handed it the header
+cart button, so it passed one gate attempt and then 0 of 3 replays with Walmart's cart
+empty. `_acted_on_read` in `skills/refactor.py` now awaits a read whose result is PRESSED;
+the same stored skill with that one call rewritten filled the cart. The assumption that
+died is "one action is answered once" - a page answers in phases. Measure a screen by the
+ROUTE and the MOMENT it is read at - `/cart` reloaded from `/cart` after 4s says 1.000 and
+tells you nothing - and start a Walmart task at `/cart`, the only anchor that reaches
+1.000. This machine also
 geolocates to Canada, so walmart.com pins `fulfillment_method:Shipping` and anything
 store-fulfilled (all of Great Value) returns "We couldn't find a match".
 
