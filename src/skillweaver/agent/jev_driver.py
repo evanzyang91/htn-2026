@@ -17,7 +17,6 @@ move is one action OR one code block, so it becomes the block.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import sys
 from collections.abc import Collection, Mapping, Sequence
@@ -97,6 +96,11 @@ A real pause, not a reflex one: the policy saying the control it needs is not on
 YET, which no load event covers. Not the kind ``strip_reflex_waits`` removes, though a
 learned skill that keeps one will be told to justify it by the same gate."""
 
+_ACTIONS_IN: Mapping[str, int] = {"TYPE_TEXT": 3}
+"""Controller actions in the move this driver writes for an operation, when not one:
+:func:`_type_into` is click, chord, type. The explorer observes after each, and
+``DomPerceiver.rest_after`` needs to know which observation is the last."""
+
 SELECT_ALL_CHORD: tuple[str, str] = ("Meta", "a") if sys.platform == "darwin" else ("Control", "a")
 """The chord that selects a field's contents before it is retyped.
 
@@ -163,7 +167,7 @@ class JevDriver:
         if not history and self._steps:
             # No moves yet and steps on file: the explorer has begun another run.
             self._steps, self._taken = [], {}
-        state = _content_digest(snapshot)
+        state = snapshot.digest
         self._settle(snapshot, state, rejection)
         self._stop_if_inert(observation)
         exclude, restored = _exclusions(snapshot, dead_ends, self._spent(state))
@@ -172,6 +176,12 @@ class JevDriver:
             asked = dataclasses.replace(snapshot, can_go_back=False)
         decision = self._policy.decide(task.text, asked, self._steps, exclude)
         self._remember(decision, state)
+        if decision.operation not in ("DONE", "BLOCKED"):
+            self._perceiver.rest_after(
+                _ACTIONS_IN.get(decision.operation, 1),
+                snapshot,
+                waited=decision.operation == "WAIT",
+            )
         log.info(
             "jev.decide",
             operation=decision.operation,
@@ -219,7 +229,7 @@ class JevDriver:
         """Close the previous step with what LITERALLY became of the page, before asking.
 
         ``page_changed`` is upstream's field and upstream's meaning: did the page's
-        content differ afterwards (:func:`_content_digest`). It was the CRITIC's verdict
+        content differ afterwards (``DomSnapshot.digest``). It was the CRITIC's verdict
         here until 2026-09-20, and the two are different questions. Measured live on an
         option dialog: the policy scrolled the list twice, ticked the right add-on and
         added it to the order - the task, done - while ``state_changed`` called both
@@ -231,13 +241,24 @@ class JevDriver:
 
         The verdict is not lost: a move it failed is still a dead end in the explorer's
         memory and still withheld by :func:`_exclusions`.
+
+        ``refused`` is relayed only when the page does not contradict it. The explorer's
+        ``rejection`` is one string for two things - an answer refused BEFORE it ran, and
+        a move that ran and that the critic then failed - and the second is that same
+        per-move verdict arriving by another door. Measured on a results page whose cart
+        line updates in place: the policy's second move was the right *Add to cart* at
+        p=1.00, the page said so, and ``state_changed`` failed it (0.633). Told
+        ``page_changed: true`` AND "your last move did not work", it added the other nine
+        products one after another and never said ``DONE``. A page that literally changed
+        is a move that ran, so what is relayed is what the policy can act on: nothing
+        happened, and here is why.
         """
         if not self._steps:
             return
         last = self._steps[-1]
         last["page_changed"] = state != last["state"]
         last["url"] = snapshot.url
-        if rejection:
+        if rejection and not last["page_changed"]:
             last["refused"] = rejection
         elif last["kind"] == "CLICK" and last["element_id"]:
             self._taken.setdefault(last["state"], set()).add(last["element_id"])
@@ -262,7 +283,7 @@ class JevDriver:
         """``{operation: element ids}`` this exact page state has already used up.
 
         Two of upstream's rules, both proofs BY IDENTITY and so both keyed on the exact
-        :func:`_content_digest` rather than on fingerprint similarity. A click already
+        ``DomSnapshot.digest`` rather than on fingerprint similarity. A click already
         made from this state, when the run is standing on the state again, did not
         advance the goal however much it changed the page - that is what turns
         open/close into an oscillation. And whatever has changed nothing since the page
@@ -403,27 +424,6 @@ def _type_into(element_id: str, text: str) -> str:
         f"ctx.ctl.press({chord})\n"
         f"ctx.ctl.type_text({json.dumps(text)})\n"
     )
-
-
-def _content_digest(snapshot: DomSnapshot) -> str:
-    """Whether the page is LITERALLY the page it was: upstream's ``fingerprint``, here.
-
-    Address, visible text, every control with its value and state, and where things are
-    scrolled to. A change DETECTOR and an exact one, which is a different job from
-    identifying a screen: that stays ``StateFingerprinter`` and its calibrated similarity,
-    and nothing stored is ever keyed on this. It sees what the pixel identity cannot - a
-    ticked box, a list scrolled inside a dialog, a cart badge going from 0 to 1 - because
-    those are the changes a policy's history has to be honest about.
-    """
-    scroller = snapshot.scroller
-    content = [
-        snapshot.url,
-        snapshot.text,
-        [(c.element_id, c.value, c.checked, c.selected, c.expanded) for c in snapshot.controls],
-        snapshot.scroll_y,
-        None if scroller is None else (scroller.can_down, scroller.can_up),
-    ]
-    return hashlib.sha256(json.dumps(content).encode("utf-8")).hexdigest()[:16]
 
 
 def _exclusions(

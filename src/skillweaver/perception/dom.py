@@ -32,6 +32,7 @@ the rest of the page is reached.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,9 +58,11 @@ from skillweaver.perception.ocr import PerceptionCounters
 log = get_logger(__name__)
 
 __all__ = [
+    "ARRIVAL_REST_MS",
     "MAX_CONTROLS",
     "MAX_PAGE_TEXT",
     "MAX_TEXT_NODES",
+    "NO_CHANGE_REST_MS",
     "SNAPSHOT_ATTEMPTS",
     "SNAPSHOT_RETRY_MS",
     "DomControl",
@@ -69,6 +72,16 @@ __all__ = [
     "DomSnapshot",
     "ROLE_KINDS",
 ]
+
+ARRIVAL_REST_MS: tuple[float, float] = (150.0, 1500.0)
+"""``(quiet, cap)`` for a move that CHANGED THE ADDRESS: a navigation may still be
+materializing its content, and a decision belongs on a quiet page rather than on
+whatever rendered first. Upstream's numbers. See :meth:`DomPerceiver.rest_after`."""
+
+NO_CHANGE_REST_MS: tuple[float, float] = (120.0, 1000.0)
+"""``(quiet, cap)`` for a move after which the page reads EXACTLY as before: the effect may
+land asynchronously - a cart badge, a toast - so look once more before "no change" is
+what the policy is told. Upstream's numbers."""
 
 MAX_CONTROLS = 250
 """Controls reported from one frame, matching Jev's own cap: it bounds the policy's
@@ -242,6 +255,28 @@ class DomSnapshot:
     by_element_id: dict[str, DomControl] = field(default_factory=dict, compare=False, repr=False)
 
     @property
+    def digest(self) -> str:
+        """Whether the page is LITERALLY the page it was: upstream's ``fingerprint``.
+
+        Address, visible text, every control with its value and state, and where things
+        are scrolled to. A change DETECTOR and an exact one, which is a different job from
+        identifying a screen: that stays ``StateFingerprinter`` and its calibrated
+        similarity, and nothing stored is ever keyed on this. It sees what the pixel
+        identity cannot - a ticked box, a list scrolled inside a dialog, a cart badge
+        going from 0 to 1 - which are the changes a policy's history has to be honest
+        about.
+        """
+        scroller = self.scroller
+        content = [
+            self.url,
+            self.text,
+            [(c.element_id, c.value, c.checked, c.selected, c.expanded) for c in self.controls],
+            self.scroll_y,
+            None if scroller is None else (scroller.can_down, scroller.can_up),
+        ]
+        return hashlib.sha256(json.dumps(content).encode("utf-8")).hexdigest()[:16]
+
+    @property
     def can_scroll_down(self) -> bool:
         """Whether a wheel at the middle of the screen has anything below to reveal.
 
@@ -284,7 +319,7 @@ class DomPerceiver:
     Not thread-safe: :attr:`last` is one slot, so one perceiver drives one browser.
     """
 
-    __slots__ = ("_counters", "_fingerprinter", "_last")
+    __slots__ = ("_armed", "_counters", "_fingerprinter", "_last", "_rested_ms", "_rests")
 
     def __init__(
         self,
@@ -295,6 +330,9 @@ class DomPerceiver:
         self._fingerprinter = fingerprinter if fingerprinter is not None else StateFingerprinter()
         self._counters = counters if counters is not None else PerceptionCounters()
         self._last: DomSnapshot | None = None
+        self._armed: tuple[int, DomSnapshot, bool] | None = None
+        self._rests = 0
+        self._rested_ms = 0.0
 
     def __repr__(self) -> str:
         return f"DomPerceiver(counts={self._counters.snapshot()})"
@@ -313,6 +351,30 @@ class DomPerceiver:
         """
         return self._last
 
+    @property
+    def rests(self) -> tuple[int, float]:
+        """``(how many times, total milliseconds)`` :meth:`rest_after` made a frame wait."""
+        return self._rests, self._rested_ms
+
+    def rest_after(self, actions: int, basis: DomSnapshot, *, waited: bool = False) -> None:
+        """Arm ONE coming observation to be taken on a page that has come to rest.
+
+        An acting policy calls this as it answers: ``basis`` is the screen it decided
+        on, and ``actions`` how many controller actions its move performs - the explorer
+        observes after each, and the one worth waiting for is the LAST, which is the
+        frame the next decision is made on. That frame then gets upstream's two
+        conditions: the address changed (:data:`ARRIVAL_REST_MS`), or the page reads
+        exactly as ``basis`` did (:data:`NO_CHANGE_REST_MS`, skipped when the move WAS a
+        wait). Anything else is a page that visibly answered, and is not made to wait.
+
+        Armed per move rather than switched on, because every other reader of this
+        perceiver must stay untaxed: a warm replay, the admission gate's rest loop and a
+        skill's ``wait_for_text`` all observe in a loop, and a quiet window inside each
+        read is what ``AGENTS.md`` forbids ``_settle`` for. Re-arming replaces whatever
+        was armed, so a move that stopped early cannot leave a wait behind for long.
+        """
+        self._armed = (max(int(actions), 1), basis, waited)
+
     def observe(self, controller: Controller) -> Observation:
         """One frame: capture, ask the page, index, fingerprint.
 
@@ -325,6 +387,13 @@ class DomPerceiver:
         self._counters.captures += 1
         snapshot = self._read(controller, shot)
         self._counters.detections += 1
+        if self._rested(controller, snapshot):
+            # Capture AGAIN, then read: the frame and the controls must be one moment,
+            # and the frame taken before the wait is the moment being replaced.
+            shot = controller.capture()
+            self._counters.captures += 1
+            snapshot = self._read(controller, shot)
+            self._counters.detections += 1
         self._last = snapshot
         elements = _elements_of(snapshot)
         url = controller.url()
@@ -338,6 +407,32 @@ class DomPerceiver:
         )
         self._counters.observations += 1
         return observation
+
+    def _rested(self, controller: Controller, snapshot: DomSnapshot) -> bool:
+        """Whether this frame was the armed one AND the page was then made to rest."""
+        if self._armed is None:
+            return False
+        remaining, basis, waited = self._armed
+        if remaining > 1:
+            self._armed = (remaining - 1, basis, waited)
+            return False
+        self._armed = None
+        if snapshot.url != basis.url:
+            why, (quiet, cap) = "arrived", ARRIVAL_REST_MS
+        elif not waited and snapshot.digest == basis.digest:
+            why, (quiet, cap) = "unchanged", NO_CHANGE_REST_MS
+        else:
+            return False
+        quiesce = getattr(controller, "quiesce", None)
+        if not callable(quiesce):
+            return False
+        started = time.monotonic()
+        quiesce(quiet, cap)
+        spent = (time.monotonic() - started) * 1000.0
+        self._rests += 1
+        self._rested_ms += spent
+        log.info("dom.rest", why=why, waited_ms=round(spent), controls=len(snapshot.controls))
+        return True
 
     def _read(self, controller: Controller, shot: Screenshot) -> DomSnapshot:
         """Run :data:`_SNAPSHOT_JS` on the controller's page and parse the result.

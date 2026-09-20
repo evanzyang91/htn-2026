@@ -133,6 +133,33 @@ def _abort(route: Route) -> None:
         pass
 
 
+_QUIESCE_JS = """
+([quietMs, capMs]) => new Promise((resolve) => {
+  const start = performance.now();
+  let last = start;
+  const observer = new MutationObserver(() => { last = performance.now(); });
+  observer.observe(document.documentElement,
+    { subtree: true, childList: true, characterData: true });
+  const lastResource = () => {
+    const entries = performance.getEntriesByType('resource');
+    return entries.length ? entries[entries.length - 1].responseEnd : 0;
+  };
+  const tick = () => {
+    const now = performance.now();
+    if (now - Math.max(last, lastResource()) >= quietMs || now - start >= capMs) {
+      observer.disconnect();
+      resolve(Math.round(now - start));
+    } else {
+      setTimeout(tick, 40);
+    }
+  };
+  setTimeout(tick, 40);
+})
+"""
+"""Upstream Jev's ``SETTLE``: resolves once neither the DOM nor the network has moved for
+``quietMs``, or at ``capMs``. No attribute observation, so an animation alone does not
+hold it open. See :meth:`BrowserController.quiesce`."""
+
 _SCROLL_QUIET_MS = 80
 """How long nothing may scroll before a scroll counts as finished."""
 
@@ -444,6 +471,35 @@ class BrowserController:
             return page.evaluate(script)
         except PlaywrightError as exc:
             raise ControllerError(f"could not evaluate page script: {_brief(exc)}") from exc
+
+    def quiesce(self, quiet_ms: float, cap_ms: float) -> float | None:
+        """Wait until the page has been STILL for ``quiet_ms``, at most ``cap_ms``.
+
+        READ-ONLY, duck-typed like :meth:`evaluate`, and the milliseconds it waited -
+        or ``None`` when the wait was interrupted, which a navigating document does to
+        any evaluation. It is ADVISORY either way: nothing that already happened may fail
+        because the page would not hold still.
+
+        NOT called from :meth:`_settle`, and it must not be. ``AGENTS.md`` says a quiet
+        window taxes every action on every site, and measured here it is 164ms per call
+        on a page with nothing to wait for. So the caller decides when a still page is
+        worth that: the DOM perceiver, on the one observation that follows a policy's
+        move (:meth:`~skillweaver.perception.dom.DomPerceiver.rest_after`).
+
+        What it does and does not catch, measured through this class and
+        ``DomPerceiver``, n=5 per page, 5 of 5 agreeing. A results page that streams a
+        row every 90ms for ~900ms after ``load``: :meth:`_settle` hands over a frame with
+        2 of 20 controls at ~165ms; after this, 20 of 20, for ~906ms. A page that sits
+        idle and paints once at 700ms: 0 of 16 before and STILL 0 of 16 after, because
+        ``quiet_ms`` of nothing happening is satisfied before the paint. It waits for a
+        busy page to finish, not for an idle one to start - that second shape is what
+        ``ctx.wait_for_text`` is for.
+        """
+        page = self._live_page()
+        try:
+            return float(page.evaluate(_QUIESCE_JS, [quiet_ms, cap_ms]))
+        except PlaywrightError:
+            return None
 
     def describe(self) -> str:
         """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``.
