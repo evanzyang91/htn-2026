@@ -367,6 +367,7 @@ class Run:
         self.task, self.url = split_task(text)
         self.site: dict[str, Any] | None = None
         self.plan: dict[str, Any] | None = None
+        self.state = "starting"
         self.lines: list[str] = []
         self.done = False
         self.exit_code: int | None = None
@@ -382,6 +383,32 @@ class Run:
             self.lines.append(line)
             for q in self.listeners:
                 q.put(line)
+        self._track(line)
+
+    # The short state the launcher shows under each run: read off the log lines the
+    # stages and the agent print, so it costs the run nothing.
+    _STATES = (
+        ("1. choosing", "choosing a website"),
+        ("   site:", "site: {rest}"),
+        ("2. refining", "refining the request"),
+        ("   task:", "task: {rest}"),
+        ("3. launching", "launching the agent"),
+        ("harness.connect", "connecting to your Chrome"),
+        ("Allow remote debugging", "waiting for you to click Allow in Chrome"),
+        ("agent.warm.end_state", "checking the skill library"),
+        ("trajectory.start", "exploring the site"),
+        ("explore.move", "acting on the page"),
+        ("explore.solved", "task done - checking what it learned"),
+        ("skill.admit.stored", "stored a new skill"),
+        ("the run could not start", "{line}"),
+    )
+
+    def _track(self, line: str) -> None:
+        for needle, state in self._STATES:
+            if needle in line:
+                rest = line.split(":", 1)[1].strip() if ":" in line else line
+                self.state = state.format(rest=rest, line=line.strip())[:160]
+                return
 
     def _prepare(self) -> None:
         """prompt -> website -> concrete task and steps. Each stage is printed, and a
@@ -455,6 +482,12 @@ class Run:
         with self.lock:
             self.exit_code = exit_code
             self.done = True
+            if self.stopped:
+                self.state = "stopped"
+            elif exit_code == 0:
+                self.state = "done"
+            elif not self.state.startswith("the run could not start"):
+                self.state = f"failed (exit code {exit_code})"
             for q in self.listeners:
                 q.put(None)
 
@@ -508,6 +541,14 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/":
             return self._page("index.html")
+        if path == "/api/runs":
+            return self._json(
+                HTTPStatus.OK,
+                [
+                    {"id": r.id, "text": r.text, "task": r.task, "state": r.state, "done": r.done}
+                    for r in sorted(RUNS.values(), key=lambda r: -r.id)
+                ],
+            )
         m = re.fullmatch(r"/run/(\d+)", path)
         if m:
             if int(m.group(1)) not in RUNS:
@@ -525,6 +566,7 @@ class Handler(BaseHTTPRequestHandler):
                     "url": run.url,
                     "site": run.site,
                     "plan": run.plan,
+                    "state": run.state,
                     "done": run.done,
                 },
             )

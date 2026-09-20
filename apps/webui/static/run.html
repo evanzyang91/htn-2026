@@ -123,8 +123,12 @@
     if (line.startsWith('1.')) state.textContent = 'choosing a website';
     else if (line.startsWith('2.')) state.textContent = 'refining the request';
     else if (line.startsWith('3.')) state.textContent = 'running';
-    if (line.includes('harness.connect')) document.querySelector('.view .waiting').textContent =
-      'The agent is working in a background tab of your own Chrome.';
+    const waiting = document.querySelector('.view .waiting');
+    if (line.includes('harness.connect')) waiting.textContent =
+      'Connecting to your Chrome… if it asks to allow remote debugging, click Allow.';
+    else if (line.startsWith('the run could not start')) waiting.textContent = line;
+    else if (line.includes('trajectory.start') || line.includes('agent.warm.') || line.includes('skill.run'))
+      waiting.textContent = 'The agent is working in a background tab of your own Chrome. Look for a new tab in the Chrome window.';
   });
   source.addEventListener('done', (ev) => {
     const {exit_code} = JSON.parse(ev.data);
