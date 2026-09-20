@@ -14,10 +14,12 @@ nothing about the run is different from one typed into a terminal.
     uv run python apps/webui/serve.py -- --perception dom   # flags handed to every run
 
 A URL typed into the box (``add 2 apples to the cart on http://localhost:5173``) is
-lifted out and passed as ``--url``; everything else is the task, verbatim. With no URL
-a SIDE AGENT (:func:`pick_site`, one small model call) chooses the website from the
-task and its choice is printed at the top of the run; when it cannot choose, the run
-goes ahead without ``--url`` and the library resolves the domain itself.
+lifted out and passed as ``--url``. Otherwise a SIDE AGENT prepares the run in two
+small model calls before anything launches - prompt -> website (:func:`pick_site`) ->
+one concrete task sentence plus the steps it implies (:func:`refine`) -> launch - and
+each stage is printed at the top of the run tab. A stage that fails is printed and
+skipped: the run then launches on what the person typed, and with no website at all the
+library resolves the domain itself.
 """
 
 from __future__ import annotations
@@ -284,31 +286,68 @@ def _api_key() -> str | None:
     return None
 
 
-def pick_site(task: str) -> dict[str, Any]:
-    """Ask a small model for the site. Never prefilled - asked tolerantly and parsed."""
+_REFINE_PROMPT = """You prepare a task for a browser agent that sees the page and acts on it.
+The agent is not logged in anywhere and never pays: a task that would buy stops at the cart.
+
+The person asked: {task}
+The website chosen for it: {site} ({url})
+
+Rewrite the request as ONE concrete task sentence the agent will be given, and list the
+concrete steps a person would take on that site to do it. Answer with ONE JSON object and
+nothing else:
+{{"task": "one imperative sentence", "steps": ["step 1", "step 2", "..."]}}
+
+Rules for the task sentence:
+- Keep every specific value the person gave (names, quantities, products) and put each
+  one in double quotes, e.g. search for "Charles Babbage".
+- Name the site, say what to do and where it ends (the article open, the item in the cart).
+- Add nothing the person did not ask for. Short: one sentence, under 30 words.
+
+Rules for the steps: 3 to 8 of them, each one action on the page, in order, plain words.
+"""
+
+
+def _ask_json(prompt: str, *, max_tokens: int) -> dict[str, Any]:
+    """One small model call, asked tolerantly and parsed - never prefilled, which
+    ``claude-opus-5`` refuses (see ``_MAX_REPLY_TOKENS`` in ``skills/synthesize.py``)."""
     import anthropic
 
     key = _api_key()
     if not key:
-        return {"url": None, "site": None, "why": "no ANTHROPIC_API_KEY"}
+        raise RuntimeError("no ANTHROPIC_API_KEY in the environment or .env")
     client = anthropic.Anthropic(api_key=key)
     reply = client.messages.create(
         model=SITE_PICKER_MODEL,
-        max_tokens=300,
-        messages=[{"role": "user", "content": _SITE_PICKER_PROMPT.format(task=task)}],
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
     )
     text = "".join(getattr(block, "text", "") for block in reply.content)
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        return {"url": None, "site": None, "why": f"unparseable reply: {text[:120]!r}"}
-    try:
-        chosen = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {"url": None, "site": None, "why": f"unparseable reply: {text[:120]!r}"}
+        raise ValueError(f"unparseable reply: {text[:120]!r}")
+    return json.loads(match.group(0))
+
+
+def pick_site(task: str) -> dict[str, Any]:
+    """Stage one of the side agent: which website."""
+    chosen = _ask_json(_SITE_PICKER_PROMPT.format(task=task), max_tokens=300)
     url = chosen.get("url")
     if not isinstance(url, str) or not _URL.fullmatch(url.strip()):
         chosen["url"] = None
     return chosen
+
+
+def refine(task: str, site: str | None, url: str) -> dict[str, Any]:
+    """Stage two: the sentence the agent is launched with, and the steps it implies."""
+    plan = _ask_json(_REFINE_PROMPT.format(task=task, site=site or url, url=url), max_tokens=600)
+    sentence = plan.get("task")
+    steps = plan.get("steps")
+    if not isinstance(sentence, str) or not sentence.strip():
+        raise ValueError("the refinement carried no task sentence")
+    return {
+        "task": " ".join(sentence.split()),
+        "steps": [str(s) for s in steps] if isinstance(steps, list) else [],
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -327,6 +366,7 @@ class Run:
         self.extra = extra
         self.task, self.url = split_task(text)
         self.site: dict[str, Any] | None = None
+        self.plan: dict[str, Any] | None = None
         self.lines: list[str] = []
         self.done = False
         self.exit_code: int | None = None
@@ -343,24 +383,46 @@ class Run:
             for q in self.listeners:
                 q.put(line)
 
-    def _pump(self) -> None:
+    def _prepare(self) -> None:
+        """prompt -> website -> concrete task and steps. Each stage is printed, and a
+        stage that fails is printed too and skipped, so the run still launches on what
+        the person typed."""
         if self.url is None:
-            self._emit("choosing a website for this task...")
+            self._emit("1. choosing a website for this task...")
             try:
                 self.site = pick_site(self.task)
-            except Exception as exc:  # the run still goes ahead, on the library alone
+            except Exception as exc:
                 self.site = {"url": None, "site": None, "why": f"{type(exc).__name__}: {exc}"}
             if self.site.get("url"):
                 self.url = self.site["url"]
-                self._emit(f"site: {self.site.get('site')} - {self.site.get('why')}")
+                self._emit(f"   site: {self.site.get('site')} - {self.site.get('why')}")
             else:
                 self._emit(
-                    f"no site chosen ({self.site.get('why')}); "
+                    f"   no site chosen ({self.site.get('why')}); "
                     "the run will look for a stored skill that knows where to go"
                 )
+        else:
+            self._emit(f"1. website: {self.url} (named in the request)")
+        if self.stopped or self.url is None:
+            return
+        self._emit("2. refining the request into concrete steps...")
+        try:
+            plan = refine(self.task, (self.site or {}).get("site"), self.url)
+        except Exception as exc:
+            self._emit(f"   not refined ({type(exc).__name__}: {exc}); launching as typed")
+            return
+        self.plan = plan
+        self.task = plan["task"]
+        self._emit(f"   task: {plan['task']}")
+        for n, step in enumerate(plan["steps"], 1):
+            self._emit(f"   {n}) {step}")
+
+    def _pump(self) -> None:
+        self._prepare()
         if self.stopped:
             self._finish(-1)
             return
+        self._emit("3. launching the agent")
         env = dict(os.environ)
         env.update(
             PYTHONUNBUFFERED="1",
@@ -462,6 +524,7 @@ class Handler(BaseHTTPRequestHandler):
                     "task": run.task,
                     "url": run.url,
                     "site": run.site,
+                    "plan": run.plan,
                     "done": run.done,
                 },
             )

@@ -82,7 +82,7 @@
     taskEl.innerHTML = '';
     taskEl.append(info.task);
     if (info.url) { const s = document.createElement('small'); s.textContent = info.url; taskEl.append(s); }
-    else if (!info.done) setTimeout(() => location.reload(), 4000);  // the site is still being chosen
+    if (!info.plan && !info.done) setTimeout(() => location.reload(), 5000);  // still being prepared
   });
 
   function append(text, cls) {
@@ -120,7 +120,11 @@
   source.addEventListener('line', (ev) => {
     const line = JSON.parse(ev.data);
     append(line, line.startsWith('$ ') ? 'cmd' : '');
-    state.textContent = 'running';
+    if (line.startsWith('1.')) state.textContent = 'choosing a website';
+    else if (line.startsWith('2.')) state.textContent = 'refining the request';
+    else if (line.startsWith('3.')) state.textContent = 'running';
+    if (line.includes('harness.connect')) document.querySelector('.view .waiting').textContent =
+      'The agent is working in a background tab of your own Chrome.';
   });
   source.addEventListener('done', (ev) => {
     const {exit_code} = JSON.parse(ev.data);
