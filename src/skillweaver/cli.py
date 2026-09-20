@@ -21,7 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -552,7 +552,9 @@ def _do(
         _die(f"--reset-steps: {exc}")
     try:
         with bench.session(spec, budget) as agent:
-            report = agent.run(spec, learn=learn, warm=warm, cold=cold)
+            report = agent.run(
+                spec, learn=learn, warm=warm, cold=cold, on_solved=_say_solved(as_json)
+            )
     except SkillWeaverError as exc:
         _die(f"the run could not start: {exc}")
     if where.looked_up and not as_json:
@@ -562,6 +564,34 @@ def _do(
         _hint_at_cross_mode(report)
         _hint_at_reset(report, reset_url or reset_steps)
     raise typer.Exit(OK if report.ok else NO)
+
+
+def _say_solved(as_json: bool) -> Callable[[RunReport], None]:
+    """What ``Agent.run`` calls the moment a cold run is solved, before it learns from it.
+
+    The answer used to be printed only after synthesis and the admission gate - 21-45s
+    later on live splitkb.com for a task solved in 14s. Prose goes to stdout, where the
+    full report follows it. Under ``--json`` stdout stays ONE object for whatever parses
+    it, so the early line is one JSON object on STDERR; the final object carries the same
+    ``solved_ms`` and adds ``learning_ms``.
+    """
+
+    def say(report: RunReport) -> None:
+        if as_json:
+            early = {
+                "event": "solved",
+                "ok": report.ok,
+                "decision": report.decision,
+                "steps": report.steps,
+                "llm_calls": report.llm_calls,
+                "solved_ms": round(report.solved_ms),
+                "learning": "pending",
+            }
+            typer.echo(json.dumps(early), err=True)
+        else:
+            typer.echo(report.headline())
+
+    return say
 
 
 def _say_where(where: DomainChoice) -> None:
@@ -669,6 +699,8 @@ def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[s
         "warm_missed": report.warm_missed,
         "llm_calls": report.llm_calls,
         "steps": report.steps,
+        "solved_ms": round(report.solved_ms),
+        "learning_ms": round(report.learning_ms),
         "perception": {
             "observations": eyes.observations,
             "captures": eyes.captures,
