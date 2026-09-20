@@ -118,7 +118,26 @@ _CAPTURE_TIMEOUTS_S = (5.0, 20.0)
 """How long each ask for a frame may take. Two, because a heavy page in a background tab
 sometimes never delivers the first frame and delivers the second at once - upstream
 tolerates the loss because its policy reads no pictures, and this project cannot: the
-pixel path, the critic and the inspector all look at the frame."""
+pixel path, the critic and the inspector all look at the frame. For the same reason
+upstream's 0.5s bound and its skip-frames backoff are NOT ported: they return ``None`` for
+a frame, and ``Controller.capture`` has no ``None`` - every caller (``ComposedPerceiver``,
+``DomPerceiver``, the explorer's and the inspector's wrappers) takes a ``Screenshot`` or a
+``ControllerError``."""
+
+_CAPTURE_PARAMS: dict[str, Any] = {"format": "png", "optimizeForSpeed": True}
+"""``optimizeForSpeed`` picks the encoder's fast setting, and for PNG that is still
+lossless. Measured 2026-09-20 on this controller's own background tab, headed Chrome,
+1280x800, 8 interleaved pairs per page, median default -> fast: bbc.com 66 -> 43ms,
+amazon.com 87 -> 48ms, Wikipedia Main Page 55 -> 36ms; same 1280x800 size and 0 of
+1,024,000 pixels differing on all three, for 14-24% more bytes. That is not upstream's
+~1000 -> ~40ms, which was its JPEG path on a page holding the compositor; it is one
+encoder pass per observation. The OCR cache is keyed on these BYTES
+(``CachingTextReader``), so what matters as much as the pixels is that the fast encoder
+is deterministic - ``scripts/check_d_harness.py`` captures a still page twice and
+compares."""
+
+_NOT_BLANK_AND_COMPLETE = "location.href !== 'about:blank' && document.readyState === 'complete'"
+_COMPLETE = "document.readyState === 'complete'"
 
 
 class HarnessBrowserController:
@@ -247,7 +266,7 @@ class HarnessBrowserController:
         for timeout in _CAPTURE_TIMEOUTS_S:
             try:
                 data = self._call(
-                    "Page.captureScreenshot", _response_timeout=timeout, format="png"
+                    "Page.captureScreenshot", _response_timeout=timeout, **_CAPTURE_PARAMS
                 )["data"]
                 break
             except (RuntimeError, TimeoutError, KeyError) as exc:
@@ -471,6 +490,9 @@ class HarnessBrowserController:
             if shortcut and final.lower() in _EDIT_COMMANDS and bits & (4 if _MAC else 2):
                 extra["commands"] = [_EDIT_COMMANDS[final.lower()]]
             if text and not shortcut:
+                # The text is what makes the key DO something: Enter's is "\r", and without
+                # it the page hears a keydown and no keypress, so a form with no button -
+                # GitHub's search, upstream's 120-steps-to-5 case - never submits.
                 extra["text"] = text
             self._key("keyDown", final, code, virtual, bits, **extra)
             self._key("keyUp", final, code, virtual, bits)
@@ -496,7 +518,24 @@ class HarnessBrowserController:
         )
 
     def _navigate(self, url: str) -> str | None:
-        """Load ``url`` and wait for its load event."""
+        """Load ``url`` and wait for ITS load event, not the one ``about:blank`` already had.
+
+        The tab is opened on ``about:blank``, a document that reads ``complete`` for ever,
+        so a readiness poll that reaches it returns at once and the first observation is
+        of a blank page - upstream measured exactly that (Amazon: blocked at 0 steps).
+        Here the hole did NOT reproduce, measured 2026-09-20 on a plainly-launched Chrome
+        through this same daemon: the first ``location.href`` read after ``Page.navigate``
+        answered was already the new document in 55 of 55 loads from ``about:blank``
+        (a local page served after 0 and 400ms, Wikipedia, bbc.com, amazon.com,
+        github.com; headed and headless), because the call answers at COMMIT - 409ms for
+        the 400ms page - and not at the request. ``Back`` likewise: the first read, 3-39ms
+        after ``Page.navigateToHistoryEntry``, was the entry gone back to, 6 of 6. So the
+        requirement below has never yet been what held a load; it is kept because it is
+        free when the document has already changed, and because what it guards against is
+        a run decided on nothing. It is asked only of a navigation that is meant to LEAVE
+        ``about:blank``: not one aimed at it, and not an aborted one, where the blank tab
+        is the page that is showing.
+        """
         try:
             answer = self._call(
                 "Page.navigate",
@@ -515,7 +554,8 @@ class HarnessBrowserController:
             # is showing is still the answer, and the next observation will see it.
             self._settle()
             return f"navigate failed: {failed}"
-        if not self._await_load(self._navigation_timeout_ms):
+        leaves_blank = not failed and url.strip().lower() != "about:blank"
+        if not self._await_load(self._navigation_timeout_ms, off_blank=leaves_blank):
             return f"navigate timed out: {url} had not finished loading"
         self._settle()
         return None
@@ -543,13 +583,17 @@ class HarnessBrowserController:
         self._settle()
         return None
 
-    def _await_load(self, timeout_ms: float) -> bool:
+    def _await_load(self, timeout_ms: float, *, off_blank: bool = False) -> bool:
         """Poll until the document is ``complete``; ``False`` if ``timeout_ms`` ran out.
-        A failed probe is a navigation committing, which is what is being awaited."""
+        A failed probe is a navigation committing, which is what is being awaited.
+        ``off_blank`` also requires the document to be something other than the
+        ``about:blank`` the tab was opened on - see :meth:`_navigate`. Never for a
+        ``Back`` or a settle: both can rightly end on a page that was there all along."""
+        ready = _NOT_BLANK_AND_COMPLETE if off_blank else _COMPLETE
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
             try:
-                if self._expression("document.readyState") == "complete":
+                if self._expression(ready) is True:
                     return True
             except (RuntimeError, TimeoutError):
                 pass
