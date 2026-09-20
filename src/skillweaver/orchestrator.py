@@ -366,7 +366,7 @@ class RunReport:
             lines.append(
                 f"perception: {eyes.ocr_reads} OCR read(s) for {eyes.observations} "
                 f"observation(s) - {eyes.ocr_hits} served from cache "
-                f"({eyes.hit_rate:.0%}), {eyes.detections} detection(s)"
+                f"({eyes.hit_rate:.0%}), {eyes.looks}"
             )
         lines.append(self.headline())
         return "\n".join(lines)
