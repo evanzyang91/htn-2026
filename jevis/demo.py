@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .agent import Agent
-from .model import EFFORTS, refine_goal
+from .model import EFFORTS, refine_goal, suggest_url
 from .questions import MAX_STEPS
 
 ROOT = Path(__file__).parent
@@ -48,7 +48,8 @@ def refine_models():
 
 
 def response_state():
-    state = AGENT.snapshot() if AGENT else {"page": None, "status": "idle", "history": [], "decision": None}
+    idle = {"page": None, "status": "idle", "history": [], "decision": None, "chosen_url": None}
+    state = AGENT.snapshot() if AGENT else idle
     return {
         **state,
         "text_model": text_model(),
@@ -80,9 +81,13 @@ def command(name, body):
             raise ValueError("Enter 1–2,000 characters")
         if scenario == "custom":
             url = body.get("url", "").strip()
-            parts = urlparse(url)
-            if parts.scheme not in {"http", "https"} or not parts.hostname or len(url) > 2000:
-                raise ValueError("Enter a full http(s):// address")
+            if not url:
+                # The site decides how the goal must be worded, so choose it before refinement.
+                url = suggest_url(goal)
+            else:
+                parts = urlparse(url)
+                if parts.scheme not in {"http", "https"} or not parts.hostname or len(url) > 2000:
+                    raise ValueError("Enter a full http(s):// address")
         elif scenario == "flights":
             url = "https://www.google.com/travel/flights?hl=en"
         else:
@@ -99,11 +104,19 @@ def command(name, body):
         AGENT = Agent(
             url,
             goal,
-            screenshots=True,
+            # Frames are the developer view's replay. Watching the real window costs nothing, and a
+            # frame the page never shows still costs up to half a second per changed step.
+            screenshots=bool(body.get("dev")),
             record_dir=Path.cwd() / "artifacts" / "frames" if body.get("record") else None,
         )
         AGENT.state["scenario"] = scenario
         AGENT.state["refinement"] = refinement
+        AGENT.state["chosen_url"] = url
+    elif name == "focus":
+        # The agent owns a background tab, so it comes forward only when the user asks.
+        if AGENT is None:
+            raise ValueError("Start a demo first")
+        AGENT.browser.show()
     elif name == "model":
         # The helper reads TEXT_MODEL per call, so this takes effect on the next TYPE_TEXT of a
         # run already in progress, and persists as the default for the next one.

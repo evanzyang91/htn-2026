@@ -191,6 +191,13 @@ class Browser:
             # step that already executed. observe() retries its own reads.
             pass
 
+    def show(self):
+        """Raise the agent's background tab so the user can watch the real window."""
+        try:
+            cdp("Target.activateTarget", targetId=self.target)
+        except (RuntimeError, OSError):
+            pass  # Focus is a convenience; a tab that cannot be raised must not end the run.
+
     def close(self):
         if self.target:
             target, self.target = self.target, None

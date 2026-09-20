@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+from urllib.parse import urlparse
 
 import httpx
 
@@ -349,6 +350,33 @@ def refine_goal(goal, url, model=None, effort=None):
     except (ValueError, KeyError, TypeError):
         raise ValueError("Goal refinement returned no usable goal; retry or start with Refine off.") from None
     return value.strip(), info
+
+
+# Prompts belong beside the others in questions.py; this one stays here because that module is
+# owned elsewhere while this capability is added.
+SUGGEST_URL = """Choose the website a browser agent must start on to serve the user's request.
+Rules:
+- Return the site's entry point, for example "https://www.example.com". Never a deep link,
+  a search-results address, or any query string.
+- Prefer a well-known mainstream site for this kind of task.
+- Use only a domain you know exists. Never invent a domain.
+Return a JSON object with exactly one key, url: {"url": "https://www.example.com"}."""
+
+
+def suggest_url(goal):
+    """The site to start a request on, picked by the text model before any refinement."""
+    result, _, _ = text_completion("Site suggestion", SUGGEST_URL, json.dumps({"goal": goal}))
+    try:
+        url = json.loads(result["choices"][0]["message"]["content"])["url"]
+        # A whitespace-free single token, so urlparse reads the whole answer as one address.
+        if not isinstance(url, str) or len(url) >= 200 or url.split() != [url]:
+            raise ValueError()
+        parts = urlparse(url)
+        if parts.scheme not in {"http", "https"} or "." not in (parts.hostname or ""):
+            raise ValueError()
+    except (ValueError, KeyError, TypeError):
+        raise ValueError("Site suggestion returned no usable address; enter a starting address.") from None
+    return url
 
 
 class NoFieldValue(ValueError):

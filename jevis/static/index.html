@@ -4,185 +4,191 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta name="demo-token" content="__TOKEN__" />
-    <title>Jevis</title>
+    <title>Web Agent</title>
     <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
     <header>
-      <a href="/" aria-label="Homepage" class="brand"
-        >browser<span>use</span> <i>×</i> TypeSafe</a
-      >
-      <div class="local"><span class="dot"></span> Jevis</div>
+      <div class="brand">Web Agent</div>
+      <div class="header-right">
+        <span class="elapsed" id="elapsed" hidden>0.00 s</span>
+        <span class="elapsed model dev-only" id="model-elapsed" hidden></span>
+        <label class="mode"
+          ><input type="checkbox" id="dev-toggle" /> Developer</label
+        >
+      </div>
     </header>
+
     <main>
-      <section class="intro">
-        <div>
-          <p class="eyebrow">A BROWSER THAT CHOOSES</p>
-          <h1>Every page is a set of possibilities.</h1>
-          <p>
-            Jev picks the next action. A small language model handles the words.
-            <a href="/demo.mp4" target="_blank" rel="noopener">Watch the real Google Flights run ↗</a>
+      <div class="thread" id="thread">
+        <div class="intro" id="intro">
+          <h1>What should I do on the web?</h1>
+          <p class="sub">
+            Describe a task in your own words. I'll open a browser and do it
+            while you watch.
           </p>
-        </div>
-        <div class="model-tag">jev-latest <span>+ text helper</span></div>
-      </section>
-      <form id="task-form">
-        <div class="task-label">
-          <label for="goal"
-            >Give it a task<span class="category" id="refinement" hidden></span
-          ></label>
-          <div class="task-options">
-            <label class="overlay-control"
-              ><input name="refine" id="refine" type="checkbox" checked />
-              Refine my prompt</label
-            ><select
-              id="refine-model"
-              name="refine_model"
-              aria-label="Refinement model"
-            ></select
-            ><select
-              id="refine-effort"
-              name="refine_effort"
-              aria-label="Thinking level"
-            >
-              <option value="">thinking: default</option>
-              <option value="low">thinking: low</option>
-              <option value="medium">thinking: medium</option>
-              <option value="high">thinking: high</option>
-            </select
-            ><select id="scenario" name="scenario" aria-label="Demo scenario">
-            <option value="custom" selected>Any website · real web</option>
-            <option value="flights">Google Flights · real web</option>
-            <option value="travel">Travel planner · fixture</option>
-            <option value="research">Reading room · fixture</option>
-          </select>
+          <div class="examples" id="examples">
+            <button type="button" class="example">
+              Add the ingredients for a chocolate cake to my cart
+            </button>
+            <button type="button" class="example">
+              Find a highly rated wireless mouse under $50
+            </button>
+            <button type="button" class="example">
+              Open the Wikipedia article on Gödel's incompleteness theorems
+            </button>
           </div>
         </div>
-        <div class="task-row url-row" id="url-row">
-          <input
-            id="url"
-            name="url"
-            type="url"
-            value="https://www.walmart.ca/en"
-            placeholder="https://example.com — full address of the website"
-            aria-label="Website address"
-            spellcheck="false"
-          />
-        </div>
-        <div class="task-row">
+      </div>
+
+      <div class="composer-wrap">
+        <div id="error" role="alert" hidden></div>
+        <form id="task-form" class="composer">
           <textarea
             id="goal"
             name="goal"
-            rows="5"
-            placeholder="Describe one narrow task. Say when the agent must stop."
-          >
-Add all the ingredients needed to bake a cake to my cart</textarea
-          ><button type="submit" id="start" class="primary">
-            Start demo <span>↗</span>
+            rows="1"
+            placeholder="Ask anything…"
+          ></textarea>
+          <div class="composer-tools">
+            <input
+              id="url"
+              name="url"
+              type="text"
+              placeholder="Start on a site (optional)"
+              aria-label="Starting site, optional"
+              spellcheck="false"
+            />
+            <span class="tool-spacer"></span>
+            <label class="toggle" title="Let the agent run without prompting"
+              ><input name="autorun" id="autorun" type="checkbox" checked /> Auto</label
+            >
+            <button
+              type="button"
+              id="mic"
+              class="icon"
+              aria-label="Dictate"
+              title="Dictate"
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z" />
+                <path d="M19 11a7 7 0 0 1-14 0M12 18v3" />
+              </svg>
+            </button>
+            <button type="submit" id="start" class="send" aria-label="Start">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path d="M12 19V5M5 12l7-7 7 7" />
+              </svg>
+            </button>
+          </div>
+        </form>
+        <p class="hint" id="voice-status" hidden></p>
+        <div class="run-controls">
+          <button type="button" id="focus-browser" class="ghost" hidden>
+            Show browser window
           </button>
-        </div>
-      </form>
-      <div class="toolbar">
-        <div class="status">
-          <span class="dot" id="status-dot"></span
-          ><span id="status" role="status">Ready to explore</span
-          ><span class="elapsed" id="elapsed" hidden>0.00 s</span
-          ><span class="elapsed model" id="model-elapsed" hidden>model 0.00 s</span>
-        </div>
-        <div class="controls"><label class="overlay-control" for="text-model">Agent model</label
-          ><select id="text-model" name="text_model" aria-label="Model the agent types with"></select
-          ><label class="overlay-control"
-            ><input name="autorun" id="autorun" type="checkbox" checked /> Auto-run</label
-          ><label class="overlay-control"><input name="pace" id="pace" type="checkbox"> Slow motion</label>
-          <label class="overlay-control"
-            ><input name="overlays" id="overlays" type="checkbox" checked />
-            Targets</label
-          ><button type="button" id="choose" disabled>Choose next</button
-          ><button type="button" id="execute" disabled>Execute choice</button
-          ><button type="button" id="auto" disabled>Run automatically</button
-          ><button type="button" id="stop" hidden>Pause</button>
+          <button type="button" id="stop" class="ghost" hidden>Pause</button>
+          <span class="status-line"
+            ><span class="dot" id="status-dot"></span
+            ><span id="status" role="status">Ready</span></span
+          >
         </div>
       </div>
-      <div id="error" role="alert" hidden></div>
-      <section class="workspace">
-        <div class="browser-panel">
-          <div class="browser-bar">
-            <div class="traffic"><b></b><b></b><b></b></div>
-            <span id="url">Local demo browser</span
-            ><span class="live">LIVE</span>
-          </div>
-          <div class="viewport" id="viewport">
-            <div class="empty" id="empty">
-              <p class="empty-symbol">[ ↗ ]</p>
-              <h2>Watch the decision happen.</h2>
-              <p>
-                Start a task to see a real browser, its available<br />actions,
-                and the model's choice.
-              </p>
+
+      <!-- Developer view ------------------------------------------------ -->
+      <div class="dev-drawer dev-only">
+        <div class="dev-bar">
+          <span class="category" id="refinement" hidden></span>
+          <label class="control" for="text-model">Agent model</label
+          ><select id="text-model" name="text_model" aria-label="Agent model"></select>
+          <label class="control"
+            ><input name="refine" id="refine" type="checkbox" checked /> Refine</label
+          ><select id="refine-model" name="refine_model" aria-label="Refinement model"></select
+          ><select id="refine-effort" name="refine_effort" aria-label="Thinking level">
+            <option value="">thinking: default</option>
+            <option value="low">thinking: low</option>
+            <option value="medium">thinking: medium</option>
+            <option value="high">thinking: high</option>
+          </select>
+          <select id="scenario" name="scenario" aria-label="Scenario">
+            <option value="custom" selected>Any website</option>
+            <option value="flights">Google Flights</option>
+            <option value="travel">Travel planner · fixture</option>
+            <option value="research">Reading room · fixture</option>
+          </select>
+          <label class="control"
+            ><input name="pace" id="pace" type="checkbox" /> Slow motion</label
+          >
+          <label class="control"
+            ><input name="overlays" id="overlays" type="checkbox" checked /> Targets</label
+          >
+          <button type="button" id="choose">Choose next</button
+          ><button type="button" id="execute">Execute</button
+          ><button type="button" id="auto">Run automatically</button>
+        </div>
+
+        <div class="workspace">
+          <div class="browser-panel">
+            <div class="browser-bar">
+              <div class="traffic"><b></b><b></b><b></b></div>
+              <span id="url-bar">Live browser</span
+              ><span class="live-tag">LIVE</span>
             </div>
-            <img
-              id="screenshot"
-              alt="Live screenshot of the controlled browser"
-              hidden
-            />
-            <div id="targets"></div>
+            <div class="viewport" id="viewport">
+              <div class="empty" id="empty">
+                <p class="empty-symbol">[ ↗ ]</p>
+                <h2>Frames appear here</h2>
+                <p>Developer view replays what the agent saw.</p>
+              </div>
+              <img id="screenshot" alt="Screenshot of the controlled browser" hidden />
+              <div id="targets"></div>
+            </div>
+            <div class="browser-footer">
+              <span id="page-title">Agent tab</span
+              ><span>accessibility tree → typed actions → CDP</span>
+            </div>
           </div>
-          <div class="browser-footer">
-            <span id="page-title">Isolated demo tab</span
-            ><span>AX tree → typed actions → CDP</span>
+          <aside>
+            <div class="aside-header">
+              <div>
+                <p class="eyebrow">NEXT ACTION</p>
+                <h2 id="choice-detail">Waiting for a page</h2>
+              </div>
+              <span id="action-count">0 options</span>
+            </div>
+            <div id="plan" class="plan"></div>
+            <div class="metrics">
+              <div><span>Decision</span><strong id="latency">—</strong></div>
+              <div><span>Confidence</span><strong id="confidence">—</strong></div>
+              <div><span>Operation</span><strong id="completion">—</strong></div>
+            </div>
+            <div id="operation-choices" class="operation-choices"></div>
+            <p class="distribution-label">
+              Indexed elements <span id="ranking-note">Unranked</span>
+            </p>
+            <div id="choices" class="choices">
+              <p class="muted">Available actions will appear here.</p>
+            </div>
+          </aside>
+        </div>
+
+        <div class="trace">
+          <div class="trace-heading">
+            <h2>Decision trail <span id="step-count">0 actions</span></h2>
+            <button type="button" id="download">Export trace ↓</button>
+          </div>
+          <div id="history">
+            <p class="muted">Each executed action leaves an observed result.</p>
           </div>
         </div>
-        <aside>
-          <div class="aside-header">
-            <div>
-              <p class="eyebrow">NEXT ACTION</p>
-              <h2 id="choice-title">Waiting for a page</h2>
-            </div>
-            <span id="action-count">0 options</span>
-          </div>
-          <div id="plan" class="plan"></div>
-          <div class="metrics">
-            <div><span>Decision time</span><strong id="latency">—</strong></div>
-            <div>
-              <span>Target confidence</span><strong id="confidence">—</strong>
-            </div>
-            <div>
-              <span>Operation</span
-              ><strong id="completion">—</strong>
-            </div>
-          </div>
-          <div id="operation-choices" class="operation-choices"></div>
-          <p class="distribution-label">
-            Indexed elements
-            <span id="ranking-note">Choose next to rank</span>
-          </p>
-          <div id="choices" class="choices">
-            <p class="muted">Available actions will appear here.</p>
-          </div>
-          <p class="aside-note">
-            Operation and target are separate choices in one request.<br />Text is generated only for TYPE_TEXT.
-          </p>
-        </aside>
-      </section>
-      <section class="trace">
-        <div class="trace-heading">
-          <h2>Decision trail <span id="step-count">0 actions</span></h2>
-          <button type="button" id="download" disabled>Export trace ↓</button>
-        </div>
-        <div id="history">
-          <p class="muted">Each executed action leaves an observed result.</p>
-        </div>
-      </section>
-      <details>
-        <summary>What the model sees</summary>
-        <pre id="model-state">
-Start a demo to inspect its structured state.</pre>
-      </details>
-      <footer>
-        <span>Experimental baseline</span
-        ><span id="helper">Text helper loading</span>
-      </footer>
+
+        <details>
+          <summary>What the model sees</summary>
+          <pre id="model-state">Start a task to inspect its structured state.</pre>
+        </details>
+        <p class="muted" id="helper"></p>
+      </div>
     </main>
     <script type="module" src="/app.js"></script>
   </body>

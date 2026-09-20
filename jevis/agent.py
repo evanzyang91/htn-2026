@@ -8,6 +8,12 @@ from pathlib import Path
 from .browser import Browser, CoveredTarget, StalePage
 from .model import NoFieldValue, action_name, action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
+from .skills import Skills, remembered_decision
+
+# One move from memory, then the model decides again. Memory only repeats what happened before,
+# so letting it run costs the model the chance to notice the goal is met or the page has moved on:
+# at three in a row a measured run replayed its own detours and exhausted the step budget.
+REMEMBERED_RUN = 1
 
 
 class Agent:
@@ -32,6 +38,9 @@ class Agent:
         # state proves that action did not advance the goal, even though it changed the page: it is
         # what turns open/close into an endless oscillation. Re-offering it repeats the cycle.
         self.taken = {}
+        self.skills = Skills()
+        self.previous_action = None
+        self.remembered_streak = 0
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -186,17 +195,37 @@ class Agent:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
+            excluded = self.covered.get(state["page"]["fingerprint"], set()) | self.taken.get(
+                state["page"]["fingerprint"], set()
+            )
+            if self.speculation is None:
+                self.speculate(state)
+            # A repeated cycle has already been worked out once. Take the known move rather than
+            # paying for the same decision again — but only while it is the single candidate, never
+            # one a guard has ruled out, and never for long enough to talk past the end of the goal.
+            if self.remembered_streak < REMEMBERED_RUN:
+                move = self.skills.recall(state["page"], self.previous_action)
+                if move is not None and move["id"] not in excluded:
+                    self.remembered_streak += 1
+                    state["decision"] = remembered_decision(move)
+                    state["decisions"].append(
+                        {
+                            **state["decision"],
+                            "fingerprint": state["page"]["fingerprint"],
+                            "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
+                        }
+                    )
+                    state["status"] = "predicted"
+                    return self.snapshot()
+            self.remembered_streak = 0
             ask = (
                 state["page"],
                 state["goal"],
                 state["history"],
-                self.covered.get(state["page"]["fingerprint"], set())
-                | self.taken.get(state["page"]["fingerprint"], set()),
+                excluded,
                 {label for label, misses in self.inert.items() if misses >= 3}
                 | self.cycling(state["history"]),
             )
-            if self.speculation is None:
-                self.speculate(state)
             try:
                 state["decision"] = choose(*ask)
             except ValueError as invalid:
@@ -279,6 +308,8 @@ class Agent:
                 # Nothing executed. Remember the refusal against this exact page so the next
                 # decision cannot choose it again, then let the caller re-decide.
                 self.covered.setdefault(page["fingerprint"], set()).add(selected)
+                # A remembered move that will not execute is worse than no memory at all.
+                self.skills.forget(page["url"], self.previous_action)
                 raise
             except StalePage:
                 # Freshness can fail on churn the observation cannot see. If a new observation is
@@ -405,6 +436,11 @@ class Agent:
                 name = action["label"]
                 self.inert[name] = 0 if revealed else self.inert.get(name, 0) + 1
             self.taken.setdefault(page["fingerprint"], set()).add(selected)
+            # Remember this move only if it achieved something. Replaying a move that changed
+            # nothing would reproduce the waste instead of the work.
+            if state["history"][-1]["page_changed"]:
+                self.skills.learn(page["url"], self.previous_action, action)
+            self.previous_action = action
             if state["record"] and state["page"].get("screenshot"):
                 (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
                     base64.b64decode(state["page"]["screenshot"])

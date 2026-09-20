@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from jevis import agent as loop
-from jevis import model
+from jevis import model, skills
 from jevis.browser import StalePage, browser_operation, fingerprint
 
 
@@ -343,3 +343,32 @@ def test_scroll_that_reveals_nothing_counts_against_itself(runner):
         runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
     assert runner.inert["Scroll down"] == 3
     assert all(h["revealed"] == 0 for h in runner.state["history"])
+
+
+def action(kind, label, ident="e1"):
+    return {"id": ident, "kind": kind, "label": label, "node": 1}
+
+
+def test_shape_ignores_the_item_specific_tail():
+    # The same move on different items must compare equal, or a cycle never repeats.
+    assert skills.shape(action("click", "Add to cart - Robin Hood Flour")) == skills.shape(
+        action("click", "Add to cart - Redpath Sugar")
+    )
+    assert skills.shape(action("click", "Add to cart")) != skills.shape(action("click", "Go to cart"))
+
+
+def test_a_move_is_recalled_only_when_one_control_can_be_it():
+    memory = skills.Skills()
+    previous = action("fill", "Search")
+    one = {"url": "https://shop.test/s", "actions": [action("click", "Add to cart - Sugar", "e4")]}
+    memory.learn("https://shop.test/s", previous, action("click", "Add to cart - Flour", "e9"))
+    # One sighting is an anecdote: the first pass through a page is often the exploring one.
+    assert memory.recall(one, previous) is None
+    memory.learn("https://shop.test/s", previous, action("click", "Add to cart - Salt", "e7"))
+    assert memory.recall(one, previous)["id"] == "e4"
+    # Seven identical add buttons carry a choice this cannot make: defer to the model.
+    many = {"url": "https://shop.test/s", "actions": [
+        action("click", "Add to cart - Sugar", "e4"), action("click", "Add to cart - Salt", "e5")]}
+    assert memory.recall(many, previous) is None
+    # A different situation is not this one.
+    assert memory.recall(one, action("click", "Something else")) is None
