@@ -11,7 +11,12 @@ there is no second lookup table to drift. The answer still goes through
 performed and judged, because a move the graph cannot see would make a second run no
 cheaper than the first. Having no target is what puts it outside :func:`_exclusions`,
 hence :data:`BACK_SIGNATURE`. ``TYPE_TEXT`` is three actions - focus, clear, type - and a
-move is one action OR one code block, so it becomes the block.
+move is one action OR one code block, so it becomes the block. ``ENTER`` is one
+``press_key`` action on whatever holds focus, the explorer's own vocabulary for a key.
+
+Three loop rules are upstream's (``jev-ultrafast`` ``1489129``), each a PURE function here
+so it can be checked without a browser: :func:`cycling`, :func:`spent_controls`, and the
+one fresh look a ``DONE`` claim has to survive (:func:`fresh_look`).
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import dataclasses
 import json
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any
 
@@ -39,12 +45,20 @@ log = get_logger(__name__)
 
 __all__ = [
     "BACK_SIGNATURE",
+    "CONTROL_MISSES",
+    "CONTROL_OPERATIONS",
+    "CYCLE_REPEATS",
+    "CYCLE_WINDOW",
     "DEAD_END_OPERATIONS",
+    "DONE_LOOK_MS",
     "NO_CHANGE_LIMIT",
     "SCROLL_PIXELS",
     "SELECT_ALL_CHORD",
     "WAIT_MS",
     "JevDriver",
+    "cycling",
+    "fresh_look",
+    "spent_controls",
 ]
 
 DEAD_END_OPERATIONS: Mapping[str, str] = {"click": "CLICK"}
@@ -57,16 +71,24 @@ none either. Mapping ``scroll`` or ``drag`` in here would let a move the policy 
 made withhold a target it never tried, and mapping a failed click onto ``TYPE_TEXT``
 would take away the search box on the one screen whose task is to type in it.
 
-A TARGETLESS operation cannot be withheld this way at all, so the one that needs
-withholding carries its own constant; see :data:`BACK_SIGNATURE`.
+A TARGETLESS operation cannot be withheld this way at all: it is withheld by NAME, under
+the reserved ``CONTROLS`` key, by :func:`spent_controls`, and ``BACK`` additionally by
+:data:`BACK_SIGNATURE`.
 """
 
 BACK_SIGNATURE = "back"
 """The whole move signature ``Explorer._resolve`` gives a ``back``.
 
-``BACK`` is the only operation this driver produces with no target, which puts it out of
-:func:`_exclusions`' reach twice over, so withholding it means withholding the
-OPERATION: ``DomSnapshot.can_go_back`` turned off for that one ask.
+A target-less operation is out of the dead-end mapping's reach twice over, so withholding
+it means withholding the OPERATION: a back on this screen's dead-end list puts ``BACK`` in
+the reserved ``CONTROLS`` set, and :func:`_without` turns ``DomSnapshot.can_go_back`` off
+for that one ask as well, so the rule holds under a policy that does not read the key.
+
+It is the one control withheld on the CRITIC's say-so and on a first miss, against
+:data:`CONTROL_MISSES`' two literal ones, and only because it was measured. ``ENTER`` does
+not get the same: the per-move verdict is wrong on pages that answer in place, which is
+what a search box does, and a wrongly withheld Enter leaves a typed query with no way to
+be submitted.
 
 Measured on live en.wikipedia.org, the cost of not doing it: one back the critic degraded
 to "I do not know", then EIGHT more chosen at falling confidence and refused one after
@@ -97,14 +119,58 @@ A real pause, not a reflex one: the policy saying the control it needs is not on
 YET, which no load event covers. Not the kind ``strip_reflex_waits`` removes, though a
 learned skill that keeps one will be told to justify it by the same gate."""
 
+CONTROL_OPERATIONS: frozenset[str] = frozenset(
+    {"SCROLL_DOWN", "SCROLL_UP", "WAIT", "BACK", "ENTER"}
+)
+"""The operations with no target, which the reserved ``CONTROLS`` key may name. Never
+``DONE`` or ``BLOCKED``: a policy that can say neither has no honest way to stop."""
+
+CONTROL_MISSES = 2
+"""Literal no-change results, in one unchanged streak on one exact page state, after which a
+target-less operation is withheld. Upstream's number and its reason: results really can
+arrive during a second ``WAIT`` and a second scroll can reveal what the first did not, so
+one miss is patience and two are a loop. These operations are re-offered every step and
+nothing else can withhold them - a fingerprint-keyed dead end is keyed on a screen that
+repaints, and ``NO_CHANGE_LIMIT`` does not count a ``WAIT`` at all."""
+
+CYCLE_WINDOW = 8
+"""How many of the latest steps :func:`cycling` judges. Upstream's ``window``."""
+
+CYCLE_REPEATS = 6
+"""Fewer steps than this is too short a run to call churn. Upstream's ``repeats``."""
+
+DONE_LOOK_MS = 150
+"""The pause in the one fresh look a first ``DONE`` claim is answered with.
+
+Upstream's rule: ``DONE`` is judged on the frame the last action produced, often taken
+before the effect lands - a cart badge, a navigation, an availability notice - so the claim
+has to survive one look at the settled page. The driver holds no controller and cannot
+observe, so the look is a MOVE: a wait this long (upstream's quiet window), armed through
+``DomPerceiver.rest_after`` as NOT a wait, so an unchanged page gets its quiet window
+before the frame is taken. What that costs, read off ``TieredCritic``: the per-move verdict
+on a wait is the programmatic ``state_changed`` check, so no model call - against the
+escalated one a ``DONE`` judged on an optimistic frame buys and then loses. It does cost
+one step of ``max_steps``, one more policy call, and a wait in the trajectory, which
+``strip_reflex_waits`` keeps out of a skill. Deliberately not :data:`WAIT_MS`: the explorer
+refuses a repeat by signature, and a look that changed nothing must not make a later real
+``WAIT`` on that screen a known dead end.
+"""
+
+_RESERVED: frozenset[str] = frozenset({"CONTROLS", "LABELS"})
+"""The two keys of the ``exclude`` mapping that do not map an operation to element ids:
+``CONTROLS`` holds target-less operation names and ``LABELS`` control labels. Anything that
+counts or names withheld TARGETS steps over them."""
+
 _ERRAND_MARKER = "The errand: "
 """How ``Explorer._aimed`` introduces the task inside a borrowed step's goal. Read, never
 written, here; see :meth:`JevDriver._goal_shown` for what happens if it stops matching."""
 
-_ACTIONS_IN: Mapping[str, int] = {"TYPE_TEXT": 3}
-"""Controller actions in the move this driver writes for an operation, when not one:
-:func:`_type_into` is click, chord, type. The explorer observes after each, and
-``DomPerceiver.rest_after`` needs to know which observation is the last."""
+_ACTIONS_IN: Mapping[str, int] = {"TYPE_TEXT": 3, "ENTER": 1}
+"""Controller actions in the move this driver writes for an operation:
+:func:`_type_into` is click, chord, type, and ``ENTER`` is one key press - said rather
+than defaulted, because the frame after it is the one a submitted form arrives on. The
+explorer observes after each, and ``DomPerceiver.rest_after`` needs to know which
+observation is the last."""
 
 SELECT_ALL_CHORD: tuple[str, str] = ("Meta", "a") if sys.platform == "darwin" else ("Control", "a")
 """The chord that selects a field's contents before it is retyped.
@@ -134,7 +200,17 @@ class JevDriver:
             observation asked about, which means the two were not driving the same run.
     """
 
-    __slots__ = ("_decided_ms", "_perceiver", "_policy", "_refine", "_refined", "_steps", "_taken")
+    __slots__ = (
+        "_decided_ms",
+        "_done_seen",
+        "_looking",
+        "_perceiver",
+        "_policy",
+        "_refine",
+        "_refined",
+        "_steps",
+        "_taken",
+    )
 
     def __init__(
         self,
@@ -150,6 +226,10 @@ class JevDriver:
         self._steps: list[dict[str, Any]] = []
         self._taken: dict[str, set[str]] = {}
         self._decided_ms = 0.0
+        # Whether a DONE claim has had its fresh look since the last real action, and
+        # whether the move now in flight IS that look. See fresh_look.
+        self._done_seen = False
+        self._looking = False
 
     def __repr__(self) -> str:
         return f"JevDriver({self._policy.name()})"
@@ -194,39 +274,59 @@ class JevDriver:
         if not history and self._steps:
             # No moves yet and steps on file: the explorer has begun another run.
             self._steps, self._taken, self._refined = [], {}, {}
+            self._done_seen = self._looking = False
         state = snapshot.digest
         self._settle(snapshot, state, rejection)
         self._stop_if_inert(observation)
-        exclude, restored = _exclusions(snapshot, dead_ends, self._spent(state))
-        asked = snapshot
-        if snapshot.can_go_back and any(a.signature == BACK_SIGNATURE for a in dead_ends):
-            asked = dataclasses.replace(snapshot, can_go_back=False)
+        previous = self._steps[-1].get("page_changed") if self._steps else None
+        controls = spent_controls(self._steps, state)
+        if any(a.signature == BACK_SIGNATURE for a in dead_ends):
+            controls.add("BACK")
+        churned, labels = cycling(self._steps)
+        exclude, restored = _exclusions(
+            snapshot, dead_ends, self._spent(state), controls=controls | churned, labels=labels
+        )
+        asked = _without(snapshot, exclude.get("CONTROLS", ()))
         goal = self._goal_shown(task.text, observation.url or snapshot.url)
         decision = self._policy.decide(goal, asked, self._steps, exclude)
-        self._remember(decision, state)
-        if decision.operation not in ("DONE", "BLOCKED"):
-            self._perceiver.rest_after(
-                _ACTIONS_IN.get(decision.operation, 1),
-                snapshot,
-                waited=decision.operation == "WAIT",
-            )
+        looking, self._done_seen = fresh_look(decision.operation, self._done_seen)
+        if looking:
+            # Not a step: upstream's history holds what was PERFORMED, and a claim the
+            # policy is about to be asked again is not that. It is still this policy's time.
+            self._decided_ms += decision.latency_ms
+            self._perceiver.rest_after(1, snapshot, waited=False)
+        else:
+            self._remember(decision, state, _label_of(decision, snapshot))
+            if decision.operation not in ("DONE", "BLOCKED"):
+                self._perceiver.rest_after(
+                    _ACTIONS_IN.get(decision.operation, 1),
+                    snapshot,
+                    waited=decision.operation == "WAIT",
+                )
+        self._looking = looking
         log.info(
             "jev.decide",
             operation=decision.operation,
-            changed=self._steps[-2].get("page_changed") if len(self._steps) > 1 else None,
+            changed=previous,
             confidence=round(decision.confidence, 3),
             probability=round(decision.probability, 3),
             policy_ms=round(decision.policy_ms),
             latency_ms=round(decision.latency_ms),
             offered=len(snapshot.controls),
-            withheld=sum(len(ids) for ids in exclude.values()),
+            withheld=_withheld(exclude),
+            controls=sorted(exclude.get("CONTROLS", ())) or None,
+            labels=sorted(exclude.get("LABELS", ())) or None,
             restored=sorted(restored) or None,
+            looking=looking or None,
         )
         if decision.operation == "BLOCKED":
             raise PolicyBlocked(
                 f"the policy found no supported operation on {observation.url or 'this screen'}"
             )
-        return json.dumps(_answer(decision, catalog, snapshot, _note(exclude, restored)))
+        note = _note(exclude, restored)
+        if looking:
+            return json.dumps(_look_again(decision, note))
+        return json.dumps(_answer(decision, catalog, snapshot, note))
 
     def _goal_shown(self, text: str, url: str) -> str:
         """The goal as THE POLICY is shown it: refined when refinement is on, and the
@@ -316,10 +416,22 @@ class JevDriver:
         products one after another and never said ``DONE``. A page that literally changed
         is a move that ran, so what is relayed is what the policy can act on: nothing
         happened, and here is why.
+
+        After a fresh look (:func:`fresh_look`) the step was already closed and the move
+        just made was this driver's own wait, so only the late truth is taken: an effect
+        that landed during the look turns the step's ``page_changed`` true, which is what
+        the look was for. The explorer's ``rejection`` is then about the wait and is
+        relayed to nobody.
         """
         if not self._steps:
             return
         last = self._steps[-1]
+        if self._looking:
+            if state != last["state"]:
+                last["page_changed"] = True
+                last.pop("refused", None)
+            last["url"] = snapshot.url
+            return
         last["page_changed"] = state != last["state"]
         last["url"] = snapshot.url
         # Upstream's per-step split: what the models took to choose this move, against
@@ -336,17 +448,21 @@ class JevDriver:
         elif last["kind"] == "CLICK" and last["element_id"]:
             self._taken.setdefault(last["state"], set()).add(last["element_id"])
 
-    def _remember(self, decision: PolicyDecision, state: str) -> None:
+    def _remember(self, decision: PolicyDecision, state: str, label: str) -> None:
         """Open a step with what the policy asked for. :meth:`_settle` closes it.
 
-        ``state``, ``element_id`` and later ``url`` are this driver's own bookkeeping;
-        the request builder names the keys it sends, so they never reach the wire.
+        ``state``, ``label``, ``element_id`` and later ``url`` are this driver's own
+        bookkeeping; the request builder names the keys it sends, so they never reach the
+        wire. ``label`` is there because ``action`` cannot be compared: it is the policy's
+        ``why``, which carries an index and a probability that differ on every lap of a
+        loop that is otherwise the same two controls.
         """
         self._steps.append(
             {
                 "action": decision.why or decision.operation,
                 "kind": decision.operation,
                 "text": decision.text,
+                "label": label,
                 "state": state,
                 "element_id": decision.element_id,
                 "model_ms": decision.latency_ms,
@@ -362,9 +478,18 @@ class JevDriver:
         ``DomSnapshot.digest`` rather than on fingerprint similarity. A click already
         made from this state, when the run is standing on the state again, did not
         advance the goal however much it changed the page - that is what turns
-        open/close into an oscillation. And whatever has changed nothing since the page
-        last changed will change nothing now; a ``WAIT`` ends that streak, because time
+        open/close into an oscillation. And a TARGET that has changed nothing since the
+        page last changed will change nothing now - until a ``WAIT``, because time
         passing is a reason a dead control may work.
+
+        That last clause is where this departs from upstream ``1489129``, on purpose. It
+        dropped the ``WAIT`` reset from its streak because a streak that ends at every
+        wait can never hold two of them, so a ``WAIT`` could never be seen to miss
+        twice. Here those are two questions asked of one walk (:func:`_streak`):
+        :func:`spent_controls` counts THROUGH waits, which is all upstream needed, and a
+        target is spent only by the misses SINCE the last wait, as it was measured here.
+        A control that hydrates after the frame is drawn changes no digest, so the wait
+        is the only evidence this driver ever gets that a second click is worth offering.
 
         Exact on purpose, and it is the opposite call from
         :meth:`~skillweaver.agent.explorer.FailureMemory.near`. At the 0.26 same-state
@@ -375,10 +500,8 @@ class JevDriver:
         spent: dict[str, set[str]] = {}
         if state in self._taken:
             spent["CLICK"] = set(self._taken[state])
-        for step in reversed(self._steps):
-            if step.get("page_changed") is not False or step["kind"] == "WAIT":
-                break
-            if step["state"] != state:
+        for step in _streak(self._steps, state):
+            if step["kind"] == "WAIT":
                 break
             if step["kind"] in ("CLICK", "TYPE_TEXT") and step["element_id"]:
                 spent.setdefault(step["kind"], set()).add(step["element_id"])
@@ -414,6 +537,121 @@ class JevDriver:
             f"{where} did not change across the last {NO_CHANGE_LIMIT} moves ({tried}), "
             "so nothing more is spent on it"
         )
+
+
+# --------------------------------------------------------------------------------------
+# Upstream's loop rules, as pure functions of the step list
+# --------------------------------------------------------------------------------------
+
+
+def _streak(steps: Sequence[Mapping[str, Any]], state: str) -> list[Mapping[str, Any]]:
+    """The latest steps, newest first, that each LITERALLY changed nothing on ``state``.
+
+    It ends at the first step that changed the page, that has not been closed yet, or
+    that was decided on another page state: a step only speaks about the exact page it
+    was made on. A ``WAIT`` does not end it; see :meth:`JevDriver._spent` for who stops
+    at one and why.
+    """
+    streak: list[Mapping[str, Any]] = []
+    for step in reversed(steps):
+        if step.get("page_changed") is not False or step.get("state") != state:
+            break
+        streak.append(step)
+    return streak
+
+
+def spent_controls(steps: Sequence[Mapping[str, Any]], state: str) -> set[str]:
+    """Target-less operations that have missed :data:`CONTROL_MISSES` times on ``state``.
+
+    Upstream's ``repeated``: scroll, wait, back and enter are re-offered on every step,
+    so one that provably changes nothing can be chosen until the budget runs out. An
+    answer the explorer refused before it ran counts as a miss, and should: it is the
+    policy re-picking a move this screen cannot make, which is what ``BACK`` cost nine
+    calls doing (:data:`BACK_SIGNATURE`).
+    """
+    misses = Counter(
+        str(step["kind"]) for step in _streak(steps, state) if step["kind"] in CONTROL_OPERATIONS
+    )
+    return {operation for operation, count in misses.items() if count >= CONTROL_MISSES}
+
+
+def cycling(
+    steps: Sequence[Mapping[str, Any]],
+    window: int = CYCLE_WINDOW,
+    repeats: int = CYCLE_REPEATS,
+) -> tuple[set[str], set[str]]:
+    """``(operations, labels)`` the run is churning between, from the moves alone.
+
+    Upstream's ``Agent.cycling``, and its reason: no memory keyed on the page can see
+    these. A page that varies between laps - search suggestions, a timestamp, a
+    re-rendered overlay - is a new screen every time, so two or three moves alternate
+    until the budget is gone while each one "changes the page". Churn, not strict
+    alternation: the Amazon loop it was measured on doubles back (open, go, open, open,
+    go). And two or more, never one: a single move repeating - *Increase quantity by 1*,
+    *Load more*, a scroll - is usually progress, and a dead one is caught elsewhere.
+
+    A step is named by its control's label, or by its operation when it has no target,
+    and the two come back APART because they are withheld through different reserved
+    keys - so a button that happens to be labelled ``WAIT`` is still a label. ``DONE``
+    and ``BLOCKED`` are not moves and are not counted, as upstream's history never holds
+    them.
+    """
+    moves = [s for s in steps if s.get("kind") not in ("DONE", "BLOCKED")][-window:]
+    if len(moves) < repeats:
+        return set(), set()
+    named = {
+        (True, str(s["kind"]))
+        if s["kind"] in CONTROL_OPERATIONS
+        else (False, str(s.get("label") or ""))
+        for s in moves
+    }
+    if not 2 <= len(named) <= 3:
+        return set(), set()
+    # An unlabelled control counts towards the churn and cannot be withheld by a label.
+    return (
+        {name for targetless, name in named if targetless},
+        {name for targetless, name in named if not targetless and name},
+    )
+
+
+def fresh_look(operation: str, done_seen: bool) -> tuple[bool, bool]:
+    """``(answer with a fresh look instead, the new done_seen)`` for one decision.
+
+    The whole of upstream's ``done_seen``: the first ``DONE`` since a real action is
+    answered with a look and the policy asked again; a ``DONE`` that follows is the claim.
+    Any real action makes the next claim a claim about a new page. ``BLOCKED`` performs
+    nothing and leaves it alone - the explorer may ask the same screen again without its
+    borrowed workflow, and that is not a new page. A ``DONE`` the critic REFUSED leaves it
+    set too, so :meth:`JevDriver._stop_if_inert` still counts four claims as four steps
+    with no looks in between.
+    """
+    if operation == "DONE":
+        return not done_seen, True
+    if operation == "BLOCKED":
+        return False, done_seen
+    return False, False
+
+
+def _without(snapshot: DomSnapshot, controls: Collection[str]) -> DomSnapshot:
+    """``snapshot`` with each withheld control that a FLAG offers switched off.
+
+    The reserved key is the contract; this is the same fact said where a policy that does
+    not read the key will still see it, which is how ``BACK`` was withheld before the key
+    existed. ``can_press_enter`` is another worker's field and may not be here yet.
+    """
+    off: dict[str, bool] = {}
+    if "BACK" in controls and snapshot.can_go_back:
+        off["can_go_back"] = False
+    if "ENTER" in controls and getattr(snapshot, "can_press_enter", False):
+        off["can_press_enter"] = False
+    return dataclasses.replace(snapshot, **off) if off else snapshot
+
+
+def _label_of(decision: PolicyDecision, snapshot: DomSnapshot) -> str:
+    """What :func:`cycling` calls this move: the control's own label, as the reserved
+    ``LABELS`` key will be matched against it, or the operation when there is no target."""
+    control = snapshot.by_element_id.get(decision.element_id or "")
+    return control.label if control is not None else decision.operation
 
 
 # --------------------------------------------------------------------------------------
@@ -456,6 +694,19 @@ def _answer(
             "expect": "the page before this one is showing again",
             "done": False,
             "action": {"kind": "back"},
+        }
+    if operation == "ENTER":
+        # The explorer's own key action, one PressKey on whatever holds focus: it names no
+        # element, so there is nothing to ground, and the recorder and the synthesizer
+        # already know a key press. Upstream's reason for the operation: a field that
+        # submits only on Enter offers nothing to click (GitHub's search, 120 steps to 5).
+        field = str(getattr(snapshot, "enter_label", "") or "")
+        where = f"the field {field!r}" if field else "the focused field"
+        return {
+            "thought": f"the policy is pressing Enter to submit {where} {odds}",
+            "expect": f"{where} is submitted: its results, or the page it leads to, show",
+            "done": False,
+            "action": {"kind": "press_key", "keys": ["Enter"]},
         }
     if operation in ("SCROLL_DOWN", "SCROLL_UP"):
         down = operation == "SCROLL_DOWN"
@@ -500,6 +751,28 @@ def _answer(
     )
 
 
+def _look_again(decision: PolicyDecision, note: str = "") -> dict[str, Any]:
+    """The move a first ``DONE`` is answered with; see :data:`DONE_LOOK_MS`.
+
+    ``expect`` says what is true: nothing is promised to change, so a critic that fails
+    the wait on an unchanged page has said the page was already settled, not that the
+    run went wrong. ``done`` is false - the claim has not been made yet.
+    """
+    return {
+        "thought": (
+            "the policy reports every requirement is visibly satisfied "
+            f"{_odds(decision)}{note}; taking one fresh look at the settled page before "
+            "that claim is made"
+        ),
+        "expect": (
+            "nothing has to change: anything the last action set off - a badge, a "
+            "notice, a navigation - has landed, and the page is at rest"
+        ),
+        "done": False,
+        "action": {"kind": "wait", "ms": DONE_LOOK_MS},
+    }
+
+
 def _type_into(element_id: str, text: str) -> str:
     """The three lines that replace a field's contents. See the module docstring.
 
@@ -519,8 +792,11 @@ def _exclusions(
     snapshot: DomSnapshot,
     dead_ends: Sequence[Attempt],
     spent: Mapping[str, Collection[str]] | None = None,
+    *,
+    controls: Collection[str] = (),
+    labels: Collection[str] = (),
 ) -> tuple[dict[str, set[str]], set[str]]:
-    """``({operation: element ids to withhold}, {operations put back})``.
+    """``({operation: element ids to withhold, + the reserved keys}, {what was put back})``.
 
     A target already known to fail ON THIS SCREEN is not offered again. The explorer would
     refuse the repeat anyway, so this changes not what can happen but what it COSTS - one
@@ -537,6 +813,13 @@ def _exclusions(
 
     ``spent`` is :meth:`JevDriver._spent` - what this exact page state has used up by
     upstream's two identity rules - and rides the same put-back as everything else.
+
+    ``controls`` and ``labels`` go out under the reserved ``CONTROLS`` and ``LABELS`` keys,
+    present only when non-empty. ``labels`` rides the put-back too, worked out HERE from
+    the labels themselves rather than by asking :func:`targets_of`, so it holds whether or
+    not the policy on the other side reads the key yet: churn labels that would empty a
+    target head are dropped whole and ``"LABELS"`` is reported as put back. ``controls``
+    does not: with every target spent and every control twice inert, ``BLOCKED`` is true.
     """
     wanted: dict[str, set[str]] = {op: set(ids) for op, ids in (spent or {}).items() if ids}
     for attempt in dead_ends:
@@ -546,11 +829,19 @@ def _exclusions(
         operation = DEAD_END_OPERATIONS.get(move[0])
         if operation is not None:
             wanted.setdefault(operation, set()).add(move[1])
-    if not wanted:
-        return {}, set()
-    full, kept = targets_of(snapshot), targets_of(snapshot, wanted)
+    full = targets_of(snapshot)
+    kept = targets_of(snapshot, wanted) if wanted else full
     restored = {op for op in wanted if op in full and op not in kept}
-    return {op: ids for op, ids in wanted.items() if op not in restored}, restored
+    exclude = {op: ids for op, ids in wanted.items() if op not in restored}
+    if labels:
+        heads = targets_of(snapshot, exclude) if exclude else full
+        if any(all(c.label in labels for c in head.values()) for head in heads.values()):
+            restored.add("LABELS")
+        else:
+            exclude["LABELS"] = set(labels)
+    if controls:
+        exclude["CONTROLS"] = set(controls) & CONTROL_OPERATIONS
+    return {key: held for key, held in exclude.items() if held}, restored
 
 
 def _note(exclude: Mapping[str, Collection[str]], restored: Collection[str]) -> str:
@@ -558,21 +849,38 @@ def _note(exclude: Mapping[str, Collection[str]], restored: Collection[str]) -> 
 
     It goes on the move's ``thought``, the line ``Explorer._write_down`` records against
     the step, so a run where the policy chose from less than the whole screen says so
-    where anyone reading the run will see it.
+    where anyone reading the run will see it. The reserved keys get sentences of their
+    own: what they hold are operation names and labels, and counting those as targets
+    would tell the reader a number of elements that were never withheld.
     """
-    if restored:
-        return (
-            f"; every {'/'.join(sorted(restored)).lower()} target on this screen has already "
+    said: list[str] = []
+    operations = sorted(op for op in restored if op not in _RESERVED)
+    if operations:
+        said.append(
+            f"every {'/'.join(operations).lower()} target on this screen has already "
             "failed here, so they are offered again rather than reporting blocked"
         )
-    withheld = sum(len(ids) for ids in exclude.values())
-    if not withheld:
-        return ""
-    plural = "" if withheld == 1 else "s"
-    return (
-        f"; {withheld} target{plural} already used up on this screen "
-        f"{'was' if withheld == 1 else 'were'} withheld"
-    )
+    elif withheld := _withheld(exclude):
+        said.append(
+            f"{withheld} target{'' if withheld == 1 else 's'} already used up on this "
+            f"screen {'was' if withheld == 1 else 'were'} withheld"
+        )
+    if controls := sorted(exclude.get("CONTROLS", ())):
+        said.append(f"{', '.join(controls)} withheld as inert or churning on this screen")
+    if labels := sorted(exclude.get("LABELS", ())):
+        quoted = ", ".join(repr(label) for label in labels)
+        said.append(f"the run is churning between {quoted}, so those are withheld")
+    elif "LABELS" in restored:
+        said.append(
+            "the run is churning between a few controls, which are still offered because "
+            "withholding them would leave nothing to choose"
+        )
+    return "".join(f"; {sentence}" for sentence in said)
+
+
+def _withheld(exclude: Mapping[str, Collection[str]]) -> int:
+    """How many TARGETS ``exclude`` withholds: element ids, so not the reserved keys."""
+    return sum(len(ids) for op, ids in exclude.items() if op not in _RESERVED)
 
 
 def _odds(decision: PolicyDecision) -> str:
