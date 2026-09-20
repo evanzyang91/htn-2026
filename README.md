@@ -69,14 +69,23 @@ uv run python scripts/bench_all.py --model-latency-ms 2500
 
 | suite   | tasks | cold ok | warm ok | cold    | warm   | speedup | cold calls | warm calls |
 | ------- | ----- | ------- | ------- | ------- | ------ | ------- | ---------- | ---------- |
-| console | 14    | 100%    | 100%    | 21.1 s  | 4.0 s  | 5.33x   | 5.57       | 0.86       |
-| shop    | 10    | 100%    | 100%    | 18.6 s  | 3.8 s  | 4.86x   | 4.80       | 0.90       |
-| board   | 10    | 100%    | 100%    | 18.0 s  | 3.9 s  | 4.59x   | 4.40       | 0.90       |
-| **all** | 34    | 100%    | 100%    | 19.4 s  | 3.9 s  | **4.98x** | 5.00     | 0.88       |
+| console | 14    | 100%    | 100%    | 21.1 s  | 4.0 s  | 5.34x   | 5.57       | 0.86       |
+| shop    | 10    | 100%    | 90%     | 19.4 s  | 3.9 s  | 4.95x   | 5.00       | 0.89       |
+| board   | 10    | 100%    | 100%    | 18.5 s  | 5.8 s  | 3.20x   | 4.40       | 1.50       |
+| **all** | 34    | 100%    | 97%     | 19.8 s  | 4.5 s  | **4.43x** | 5.06     | 1.06       |
 
 Every run is a real Chromium driven through pixels, scored by each application's own
-state, which the agent never sees. Hand the task its parameters as well as its sentence
-and the warm path consults no model at all: 0.00 calls and 10.6x on the board.
+state, which the agent never sees.
+
+One warm task fails, and it is a trade that was made on purpose. A recalled end screen
+used to be able to REJECT a replay, which demoted skills briskly and kept the library
+small enough that ranking rarely had to choose. It also threw away correct work on real
+sites - a Wikipedia skill replayed for a new query, a shop listing recorded before it
+had finished drawing - so that screen is now corroboration: it can say yes and never
+no (`agent/critic.py`). Fewer skills are demoted, more of them compete, and
+`shop/add_two_levels` is where the ranking is not yet good enough to pick between them.
+That is a real defect and it is in the ranking, not in the critic; the alternative was
+an agent that cannot learn a website.
 
 The model is stood in for by a deterministic operator (`scripts/scripted_operator.py`)
 that reads the same prompt a model would and nothing else, so these numbers measure
