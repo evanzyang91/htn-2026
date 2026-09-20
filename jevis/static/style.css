@@ -206,11 +206,82 @@ body.idle .composer-wrap { padding-top: 22px; }
 .verdict { margin: 14px 0 0; font-size: 14.5px; }
 .verdict.ok { color: var(--green); }
 .verdict.bad { color: var(--red); }
+/* Results card: the number first, the saving second, the detail last. */
 .cost {
-  margin: 6px 0 0;
-  font: 12px ui-monospace, monospace;
+  margin: 16px 0 0;
+  padding: 22px 22px 18px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background:
+    radial-gradient(120% 90% at 0% 0%, var(--iris-soft), transparent 58%),
+    var(--raised);
+  box-shadow: var(--shadow);
+}
+.result-head { text-align: center; }
+.result-figure {
+  font: 600 clamp(38px, 6vw, 54px)/1 ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
-  color: var(--muted);
+  letter-spacing: -1.5px;
+  color: var(--ink);
+}
+.result-caption {
+  font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--muted); margin-top: 8px;
+}
+.saving {
+  display: flex; align-items: center; gap: 16px;
+  margin: 18px 0 0; padding: 14px 16px;
+  border: 1px solid var(--green-rule); border-radius: 14px;
+  background: var(--green-soft);
+}
+.saving-badge {
+  flex: none;
+  font: 600 27px/1 ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--green);
+  padding: 10px 14px;
+  border: 1px solid var(--green-rule); border-radius: 12px;
+  background: color-mix(in srgb, var(--raised) 60%, transparent);
+}
+.saving-text { font-size: 14px; color: var(--ink); line-height: 1.5; }
+.saving-text span { color: var(--muted); font-size: 12.5px; }
+.compare { margin-top: 16px; display: grid; gap: 8px; }
+.bar-row {
+  display: grid; grid-template-columns: 116px 1fr 74px;
+  align-items: center; gap: 12px;
+}
+.bar-name { font-size: 12.5px; color: var(--muted); }
+.bar-track {
+  height: 10px; border-radius: 999px; background: var(--line); overflow: hidden;
+}
+.bar-track i { display: block; height: 100%; border-radius: 999px; }
+.bar-row.mine .bar-track i { background: var(--green); }
+.bar-row.theirs .bar-track i { background: var(--red); }
+.bar-value {
+  text-align: right; font: 12px ui-monospace, monospace;
+  font-variant-numeric: tabular-nums; color: var(--ink);
+}
+.tiles {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+  margin-top: 18px; background: var(--line);
+  border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+}
+.tile {
+  background: var(--raised); padding: 12px 10px; text-align: center;
+  display: grid; gap: 3px; align-content: start;
+}
+.tile-label {
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+}
+.tile strong {
+  font: 600 17px/1.2 ui-monospace, monospace;
+  font-variant-numeric: tabular-nums; color: var(--ink);
+}
+.tile small { font: 11px ui-monospace, monospace; color: var(--muted); }
+.unpriced { margin: 12px 0 0; font-size: 12px; color: var(--muted); }
+@media (max-width: 560px) {
+  .tiles { grid-template-columns: repeat(2, 1fr); }
+  .saving { flex-direction: column; align-items: flex-start; }
 }
 
 /* ---- Composer ----------------------------------------------------------- */

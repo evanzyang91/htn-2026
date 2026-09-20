@@ -358,13 +358,93 @@ function money(usd) {
   if (!usd) return "$0";
   return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
-function costLine(spend) {
-  if (!spend?.tokens) return "";
-  const tokens = spend.tokens.toLocaleString();
-  const unpriced = spend.unpriced?.length
-    ? ` (${spend.unpriced.join(", ")} has no published rate)`
-    : "";
-  return `${tokens} tokens, about ${money(spend.usd)}${unpriced}`;
+function tile(label, value, note) {
+  const cell = document.createElement("div");
+  cell.className = "tile";
+  cell.append(
+    Object.assign(document.createElement("span"), { className: "tile-label", textContent: label }),
+    Object.assign(document.createElement("strong"), { textContent: value }),
+  );
+  if (note) cell.append(Object.assign(document.createElement("small"), { textContent: note }));
+  return cell;
+}
+// A results card, read at a glance: what it cost, what it saved, then the detail.
+function renderResults(panel, spend, run) {
+  panel.hidden = !spend?.tokens;
+  if (panel.hidden) return;
+  panel.replaceChildren();
+  const head = document.createElement("div");
+  head.className = "result-head";
+  head.append(
+    Object.assign(document.createElement("div"), {
+      className: "result-figure",
+      textContent: money(spend.usd),
+    }),
+    Object.assign(document.createElement("div"), {
+      className: "result-caption",
+      textContent: "total for this task",
+    }),
+  );
+  panel.append(head);
+
+  if (spend.rival?.times) {
+    const saving = document.createElement("div");
+    saving.className = "saving";
+    saving.append(
+      Object.assign(document.createElement("div"), {
+        className: "saving-badge",
+        textContent: `${Math.round(spend.rival.times)}×`,
+      }),
+      Object.assign(document.createElement("div"), {
+        className: "saving-text",
+        innerHTML: `cheaper than <b>${escape(spend.rival.model)}</b> driving the same task<br><span>about ${money(spend.rival.usd)} at published rates, for the same number of steps</span>`,
+      }),
+    );
+    panel.append(saving);
+  }
+
+  if (spend.rival?.usd) {
+    const compare = document.createElement("div");
+    compare.className = "compare";
+    // The rival fills the track; ours keeps a sliver so a near-zero share stays visible.
+    const share = Math.max(1.5, (spend.usd / spend.rival.usd) * 100);
+    for (const row of [
+      { name: "Jevis", usd: spend.usd, width: share, tone: "mine" },
+      { name: spend.rival.model, usd: spend.rival.usd, width: 100, tone: "theirs" },
+    ]) {
+      const line = document.createElement("div");
+      line.className = `bar-row ${row.tone}`;
+      const track = document.createElement("div");
+      track.className = "bar-track";
+      track.append(
+        Object.assign(document.createElement("i"), { style: `width:${row.width}%` }),
+      );
+      line.append(
+        Object.assign(document.createElement("span"), { className: "bar-name", textContent: row.name }),
+        track,
+        Object.assign(document.createElement("span"), { className: "bar-value", textContent: money(row.usd) }),
+      );
+      compare.append(line);
+    }
+    panel.append(compare);
+  }
+
+  const stats = document.createElement("div");
+  stats.className = "tiles";
+  stats.append(
+    tile("Steps", String(run.history?.length ?? 0)),
+    tile("Time", `${((run.elapsed_ms || 0) / 1000).toFixed(1)}s`),
+    tile("Policy", spend.policy_tokens.toLocaleString(), money(spend.policy_usd)),
+    tile("Writer", spend.writer_tokens.toLocaleString(), money(spend.writer_usd)),
+  );
+  panel.append(stats);
+  if (spend.unpriced?.length)
+    panel.append(
+      Object.assign(document.createElement("p"), {
+        className: "unpriced",
+        textContent: `${spend.unpriced.join(", ")} has no published rate, so its tokens are counted but not priced.`,
+      }),
+    );
 }
 let turn = null;
 function startTurn(request) {
@@ -425,8 +505,7 @@ function renderTurn() {
     turn.verdict.textContent = done
       ? "Done. The browser window shows the result."
       : "I could not finish this one. The browser window shows where I stopped.";
-    turn.cost.textContent = costLine(state.spend);
-    turn.cost.hidden = !state.spend?.tokens;
+    renderResults(turn.cost, state.spend, state);
   }
   document.body.classList.toggle("running", running);
   $("thread").scrollTop = $("thread").scrollHeight;

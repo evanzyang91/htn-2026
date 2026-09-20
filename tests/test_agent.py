@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from jevis import agent as loop
-from jevis import model, skills
+from jevis import model, pricing, skills
 from jevis.browser import StalePage, browser_operation, fingerprint
 
 
@@ -372,3 +372,48 @@ def test_a_move_is_recalled_only_when_one_control_can_be_it():
     assert memory.recall(many, previous) is None
     # A different situation is not this one.
     assert memory.recall(one, action("click", "Something else")) is None
+
+
+def priced_run():
+    return {
+        "decisions": [{"usage": {"input_tokens": 10_000, "output_tokens": 20}}],
+        "text_calls": [{"model": "gpt-5.6-luna", "usage": {"prompt_tokens": 1_000, "completion_tokens": 200}}],
+        "setup_calls": [
+            {"meter": "policy", "usage": {"input_tokens": 5_000, "output_tokens": 10}},
+            {"meter": "writer", "model": "gpt-5.6-luna", "usage": {"prompt_tokens": 400, "completion_tokens": 100}},
+        ],
+        "history": [{"step": 1}, {"step": 2}],
+    }
+
+
+def test_the_work_done_before_the_first_action_is_still_charged_for():
+    money = pricing.spend(priced_run())
+    assert money["policy_tokens"] == 15_030
+    assert money["writer_tokens"] == 1_700
+    assert money["tokens"] == 16_730
+    # Jev is input only: 15,000 read tokens at $0.042 per million.
+    assert money["policy_usd"] == pytest.approx(0.00063)
+    assert money["usd"] == pytest.approx(money["policy_usd"] + money["writer_usd"])
+
+
+def test_a_model_without_a_published_rate_is_counted_but_not_priced():
+    unknown = {"model": "moonshot", "usage": {"prompt_tokens": 900, "completion_tokens": 0}}
+    run = {**priced_run(), "text_calls": [unknown]}
+    money = pricing.spend(run)
+    assert money["unpriced"] == ["moonshot"]
+    assert money["writer_tokens"] == 1_400
+    assert money["writer_usd"] == pytest.approx(0.0002)  # the priced setup call alone
+
+
+def test_the_comparison_charges_the_rival_for_a_screenshot_of_every_step(monkeypatch):
+    monkeypatch.setenv("RIVAL_FRAME_TOKENS", "1000")
+    run = priced_run()
+    ours = pricing.spend(run)
+    theirs = pricing.rival(run, ours)
+    # 15,000 read tokens plus 1,000 a step at $10 per million, then 30 written at $50.
+    assert theirs["usd"] == pytest.approx(0.1715)
+    assert theirs["times"] == pytest.approx(round(0.1715 / ours["usd"], 1))
+
+
+def test_nothing_spent_means_nothing_to_compare():
+    assert pricing.rival({}, pricing.spend({})) is None

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .browser import Browser, CoveredTarget, StalePage
 from .model import NoFieldValue, action_name, action_space, choose, field_context, field_text
-from .pricing import spend
+from .pricing import rival, spend
 from .questions import MAX_STEPS
 from .skills import Skills, remembered_decision
 
@@ -155,7 +155,7 @@ class Agent:
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": action_space(self.state["page"]["actions"])[0],
-            "spend": spend(self.state),
+            "spend": {**spend(self.state), "rival": rival(self.state, spend(self.state))},
         }
 
     def command(self, name, body=None):

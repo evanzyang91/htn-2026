@@ -73,3 +73,38 @@ def spend(state):
         "usd": round(policy_cost + writer_cost, 6),
         "unpriced": sorted(unpriced),
     }
+
+
+# What the same task would cost driven end to end by a frontier computer-use model. Such an agent
+# reads a screenshot per step instead of an element table, so the estimate adds an image allowance
+# on top of the tokens actually measured. Tune it with RIVAL_FRAME_TOKENS; a 1280-wide capture is
+# on the order of 1,600 tokens.
+RIVAL = "gpt-6-astra"
+
+
+def rival(state, ours):
+    """An estimate, not a measurement: the same work at a frontier model's published rates.
+
+    It credits the rival with finishing in the same number of steps, which no screenshot-driven
+    agent manages in practice, so the multiple it reports is a floor rather than a boast.
+    """
+    price = TEXT_RATES.get(RIVAL)
+    if not price or not ours["tokens"]:
+        return None
+    frame_tokens = int(os.environ.get("RIVAL_FRAME_TOKENS", "1600"))
+    setup = state.get("setup_calls") or []
+    given = sum(
+        (d.get("usage") or {}).get("input_tokens", 0)
+        for d in [*state.get("decisions", []), *(c for c in setup if c.get("meter") == "policy")]
+    )
+    produced = sum(
+        (d.get("usage") or {}).get("output_tokens", 0)
+        for d in [*state.get("decisions", []), *(c for c in setup if c.get("meter") == "policy")]
+    )
+    given += len(state.get("history", [])) * frame_tokens
+    cost = given * price[0] / MILLION + produced * price[1] / MILLION
+    return {
+        "model": RIVAL,
+        "usd": round(cost, 4),
+        "times": round(cost / ours["usd"], 1) if ours["usd"] else None,
+    }
