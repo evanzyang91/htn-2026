@@ -46,7 +46,11 @@
     padding: 0 16px;
     display: flex;
     flex-direction: column;
-    justify-content: center;
+    justify-content: flex-start;
+    /* The heading and the box sit where a centred layout put them, and stay there:
+       runs stack below and scroll, instead of pushing the box up. */
+    padding-top: calc(50vh - 110px);
+    padding-bottom: 40px;
   }
   h1 { font-weight: 400; font-size: 30px; text-align: center; margin: 0 0 28px; }
   form {
