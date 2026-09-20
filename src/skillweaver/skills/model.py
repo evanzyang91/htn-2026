@@ -33,7 +33,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from skillweaver.contracts import Fingerprint, Provenance, Skill, SkillStats
+from skillweaver.contracts import Fingerprint, Precedent, Provenance, Skill, SkillStats
 from skillweaver.errors import AdmissionRejected, SkillWeaverError
 
 __all__ = [
@@ -525,6 +525,8 @@ def to_dict(skill: Skill, *, include_code: bool = True) -> dict[str, Any]:
             "last_ok_at": None if skill.stats.last_ok_at is None else _iso(skill.stats.last_ok_at),
         },
         "demoted_reason": skill.demoted_reason,
+        "action_signature": list(skill.action_signature),
+        "precedents": [{"task_text": p.task_text, "args": dict(p.args)} for p in skill.precedents],
     }
     if include_code:
         data["code"] = skill.code
@@ -601,6 +603,13 @@ def from_dict(
             version=int(data.get("version", 0)),
             stats=stats,
             demoted_reason=data.get("demoted_reason"),
+            # Both absent from anything stored before families existed, and an absent
+            # signature is the honest reading of that: nothing has earned one yet.
+            action_signature=tuple(str(t) for t in data.get("action_signature") or ()),
+            precedents=tuple(
+                Precedent(str(p["task_text"]), dict(p.get("args") or {}))
+                for p in data.get("precedents") or ()
+            ),
         )
     except KeyError as exc:
         raise SkillWeaverError(f"serialized skill is missing field {exc.args[0]!r}") from exc

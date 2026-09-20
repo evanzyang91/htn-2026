@@ -132,7 +132,13 @@ def searchable_text(skill: Skill) -> str:
     return f"{signature(skill)}\n{skill.provenance.task_text}\n{skill.summary}\n{skill.docstring}"
 
 
-def unaddressed(task: str, skill: Skill, args: Mapping[str, Any] | None = None) -> list[str]:
+def unaddressed(
+    task: str,
+    skill: Skill,
+    args: Mapping[str, Any] | None = None,
+    *,
+    family: Sequence[Skill] = (),
+) -> list[str]:
     """The words of ``task`` that ``skill`` neither talks about nor was handed.
 
     Ranking answers "which of these is closest?", which always has a winner. This
@@ -148,21 +154,42 @@ def unaddressed(task: str, skill: Skill, args: Mapping[str, Any] | None = None) 
 
     What is left over is the part of the errand nobody has promised to do.
 
+    Two more things may speak for a word, and both are EARNED rather than claimed.
+    The requests this skill is proven to have served
+    (:attr:`~skillweaver.contracts.Skill.precedents`) are part of its own text: a
+    skill learned as *add a box of ...* that then served *buy me a box of ...* and
+    passed its verifier has an account of *buy*. And ``family`` - skills that perform
+    the same workflow (:mod:`skillweaver.skills.family`), usually on other sites - may
+    vouch in their own words, because what one shop calls *purchase* is what another
+    learned as *add to cart*. The CALLER decides who is family and must have checked
+    intent as well as shape; this function only counts. The threshold it is compared
+    against does not move for either.
+
     Args:
         task: The request, in the words it was asked in.
         skill: The candidate.
         args: The arguments the skill would be called with, if they are known.
             ``None`` means judge the skill's text alone, which is stricter.
+        family: Relatives allowed to vouch for the request in their own words.
 
     Returns:
         The unaccounted words, in the order the task used them and without
         duplicates. Empty means every word of the request is spoken for.
     """
-    known = _stems(tokenize(searchable_text(skill)))
+    known = _stems(tokenize(_own_words(skill)))
+    for relative in family:
+        known |= _stems(tokenize(_own_words(relative)))
     if args:
         for value in args.values():
             known |= _stems(tokenize(str(value)))
     return [word for word in tokenize(task) if not _has_account(_stem(word), known)]
+
+
+def _own_words(skill: Skill) -> str:
+    """Everything ``skill`` can say for itself: its searchable text and every request
+    it is proven to have served."""
+    served = "\n".join(p.task_text for p in skill.precedents)
+    return f"{searchable_text(skill)}\n{served}"
 
 
 def _has_account(stem: str, known: set[str]) -> bool:
@@ -192,14 +219,20 @@ def _a_near_miss(left: str, right: str) -> bool:
     return len(short) >= 4 and len(long) - len(short) <= 2 and long.startswith(short)
 
 
-def accounted_for(task: str, skill: Skill, args: Mapping[str, Any] | None = None) -> float:
+def accounted_for(
+    task: str,
+    skill: Skill,
+    args: Mapping[str, Any] | None = None,
+    *,
+    family: Sequence[Skill] = (),
+) -> float:
     """What fraction of ``task``'s words :func:`unaddressed` finds an account of, in
     ``0.0..1.0``. ``1.0`` means nothing in the request is unexplained; an empty task
     scores ``1.0``, there being nothing left over."""
     words = tokenize(task)
     if not words:
         return 1.0
-    return 1.0 - len(unaddressed(task, skill, args)) / len(words)
+    return 1.0 - len(unaddressed(task, skill, args, family=family)) / len(words)
 
 
 class SkillRetriever:
@@ -272,14 +305,17 @@ class SkillRetriever:
 
         The body is the skill's summary, docstring, parameter names AND the sentence
         it was learned from; see the module docstring for why the last one earns its
-        place.
+        place. Every later request the skill is PROVEN to have served
+        (:attr:`~skillweaver.contracts.Skill.precedents`) counts the same way and for
+        the same reason - it is what a person typed to get this skill, and it worked.
         """
         if not task_tokens:
             return 0.0, [], []
         wanted = _stems(task_tokens)
         name_stems = _stems(tokenize(skill.name))
         body = f"{skill.summary} {skill.docstring} {' '.join(skill.params)} "
-        body_stems = _stems(tokenize(body + skill.provenance.task_text))
+        served = " ".join(p.task_text for p in skill.precedents)
+        body_stems = _stems(tokenize(f"{body}{skill.provenance.task_text} {served}"))
 
         shared = [t for t in task_tokens if _stem(t) in (name_stems | body_stems)]
         on_name = [t for t in task_tokens if _stem(t) in name_stems]

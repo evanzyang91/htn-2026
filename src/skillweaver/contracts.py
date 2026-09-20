@@ -714,6 +714,21 @@ class SkillStats:
 
 
 @dataclass(frozen=True, slots=True)
+class Precedent:
+    """One request a skill is PROVEN to have served: the sentence, and the arguments
+    it was run with when its verifier passed.
+
+    The first one is the admission gate's own re-run (the learned sentence and the
+    model's example arguments); later ones are warm runs that were reused under a
+    different wording and passed both the verifier and the critic. A run whose
+    verifier was skipped, or whose critic gave no verdict, never becomes one.
+    """
+
+    task_text: str
+    args: Mapping[str, Any] = field(default_factory=dict, hash=False)
+
+
+@dataclass(frozen=True, slots=True)
 class Skill:
     """A reusable, versioned piece of automation stored as Python source.
 
@@ -736,6 +751,12 @@ class Skill:
         stats: Performance record.
         demoted_reason: ``None`` for a healthy skill; the reason string once
             ``SkillStore.demote`` has retired it from retrieval.
+        action_signature: What the skill DOES, with every label, value and URL
+            abstracted away: ``("TYPE_TEXT(text_field)", "CLICK(button)", ...)``. Two
+            skills whose signatures are close are one FAMILY - see
+            :mod:`skillweaver.skills.family`. Empty until a verifier-passed run has
+            earned it; an empty signature belongs to no family.
+        precedents: The requests this skill is proven to have served, oldest first.
     """
 
     name: str
@@ -751,6 +772,8 @@ class Skill:
     version: int = 0
     stats: SkillStats = field(default_factory=SkillStats)
     demoted_reason: str | None = None
+    action_signature: tuple[str, ...] = ()
+    precedents: tuple[Precedent, ...] = ()
 
 
 @runtime_checkable

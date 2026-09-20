@@ -81,8 +81,8 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from functools import cache
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -133,6 +133,8 @@ from skillweaver.errors import BudgetExceeded, ControllerError, SkillWeaverError
 from skillweaver.logging_ import get_logger
 from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 from skillweaver.skills.api import SkillLimits, describe_action
+from skillweaver.skills.family import Subgoal, nearest_workflow, skeleton, tokens_of
+from skillweaver.skills.family import render as render_signature
 from skillweaver.skills.sandbox import SkillRunner
 
 __all__ = [
@@ -155,6 +157,15 @@ log = get_logger(__name__)
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "explore.md"
 """The acting prompt, used as the system prompt of every model call this loop makes."""
+
+MAX_STRAYS = 2
+"""How many moves in a row may fail to fit a borrowed workflow before it is dropped.
+Two, because one is a cookie banner."""
+
+LOOKAHEAD = 1
+"""How many steps of a borrowed workflow a move may skip and still be following it.
+One site submits a search with a button and the next submits on Enter inside the typing
+block, so the step after the current one is the furthest a fitting move can land."""
 
 MAX_BLOCK_ACTIONS = 8
 """Controller actions one model-written code block may perform.
@@ -696,6 +707,10 @@ class _Run:
     first: Observation
     current: Observation
     skills: tuple[Candidate, ...] = ()
+    skeleton: tuple[Subgoal, ...] = ()
+    skeleton_from: str = ""
+    at: int = 0
+    strays: int = 0
     history: list[str] = field(default_factory=list)
     rejection: str | None = None
     steps: int = 0
@@ -737,6 +752,9 @@ class Explorer:
             with the acting prompt and the screenshot, which is the path every stored
             skill in this project was learned on. An :class:`ActingPolicy` replaces that
             one step; see that Protocol for what it does NOT replace.
+        library: Every stored skill on every site, read ONCE per run to find a
+            workflow worth aiming at - see :meth:`_adopt_skeleton`. ``None`` means a
+            cold run is as blind as it always was.
         max_tokens: Cap on each acting reply.
         max_block_actions: Actions one code block may perform.
 
@@ -754,9 +772,11 @@ class Explorer:
         retriever: SkillRetriever | None = None,
         runner: SkillRunner | None = None,
         policy: ActingPolicy | None = None,
+        library: Callable[[], Sequence[Skill]] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         max_block_actions: int = MAX_BLOCK_ACTIONS,
     ) -> None:
+        self._library = library
         self._llm = llm
         self._perceiver = perceiver
         self._critic: Critic = critic if critic is not None else TieredCritic(llm)
@@ -821,6 +841,7 @@ class Explorer:
         """Observe, ask, act, judge, repeat - until solved or out of budget."""
         self._remember_state(task, run.current)
         run.skills = self._retrieve(task)
+        self._adopt_skeleton(task, run)
 
         while True:
             if self._exhausted(run):
@@ -832,6 +853,8 @@ class Explorer:
                 self._refuse_repeat(move, run)
             except _Invalid as exc:
                 self._reject(run, exc, answer)
+                continue
+            if self._only_the_subgoal_is_done(move, run):
                 continue
             if self._exhausted(run):
                 return
@@ -869,6 +892,7 @@ class Explorer:
                 run.rejection = f"your last move ({move.summary}) did not work: {verdict.reason}"
             else:
                 run.rejection = None
+            self._follow(run, performed, verdict.ok)
         elif move.acts:
             # A move that reached nothing is still a move that did not work, and it is
             # the one most likely to be proposed again verbatim: the screen that
@@ -898,6 +922,138 @@ class Explorer:
             f"the run with this one and disagreed: {verdict.reason}"
         )
 
+    # -- a relative's workflow, as something to aim at ---------------------------------
+
+    def _adopt_skeleton(self, task: TaskSpec, run: _Run) -> None:
+        """Give a cold run the workflow of the nearest stored relative, if there is one.
+
+        Why: an acting policy is handed the WHOLE errand on every decision, so every
+        decision re-plans it. Measured on walmart.com (run ``...0315307``): asked to
+        *add X to the cart, then open the cart*, the policy searched, opened the empty
+        cart, went back, searched again, added, opened the cart - DONE at action 10 -
+        and then typed the product into the search box again, 17 actions for a
+        five-step errand. A skill that has ALREADY done this kind of errand knows the
+        order, and its signature says it with no site's labels in it
+        (:mod:`skillweaver.skills.family`).
+
+        A PRIOR, NEVER A RAIL. Nothing here constrains what may be proposed,
+        grounded or performed; it changes only what the policy is told to aim at
+        (:meth:`_aimed`, :meth:`_workflow`). :meth:`_follow` drops it after
+        :data:`MAX_STRAYS` moves that do not fit, and a run never fails for leaving it.
+        """
+        if self._library is None:
+            return
+        try:
+            source = nearest_workflow(task.text, task.domain, self._library())
+        except SkillWeaverError as exc:
+            log.warning("explore.skeleton.unreadable", error=str(exc))
+            return
+        if source is None:
+            log.info("explore.skeleton.none", task=task.text)
+            return
+        run.skeleton = skeleton(source.action_signature)
+        run.skeleton_from = f"{source.name}@{source.domain}"
+        log.info(
+            "explore.skeleton.adopted",
+            task=task.text,
+            source=run.skeleton_from,
+            learned=source.provenance.task_text,
+            signature=render_signature(source.action_signature),
+        )
+
+    def _subgoal(self, run: _Run) -> Subgoal | None:
+        """The step being aimed at, or ``None`` once the skeleton is spent or dropped."""
+        return run.skeleton[run.at] if run.at < len(run.skeleton) else None
+
+    def _aimed(self, task: TaskSpec, run: _Run) -> TaskSpec:
+        """``task`` as an :class:`ActingPolicy` should be shown it RIGHT NOW.
+
+        While a skeleton is being followed the goal LEADS with the current subgoal and
+        carries the errand after it - the errand cannot be left out, because it is
+        where the value to type and the thing to click are named. Once the skeleton is
+        spent or dropped this is ``task`` itself, so "is every requirement satisfied?"
+        is asked about the whole errand, exactly as before.
+        """
+        subgoal = self._subgoal(run)
+        if subgoal is None:
+            return task
+        goal = (
+            f"{subgoal.text.capitalize()}. This is step {run.at + 1} of "
+            f"{len(run.skeleton)} of the errand, and the only step to do now. "
+            f"The errand: {task.text}"
+        )
+        return replace(task, text=goal)
+
+    def _workflow(self, run: _Run) -> str:
+        """The skeleton as a prompt section, for the default (prompted) policy."""
+        lines = [
+            "A WORKFLOW THAT ALREADY WORKED FOR THIS KIND OF ERRAND "
+            f"(from the stored skill {run.skeleton_from}; its labels and values were left "
+            "out on purpose). It is a PRIOR, not a rule: aim at the step marked NEXT, and "
+            "depart from it the moment this screen disagrees:"
+        ]
+        for index, step in enumerate(run.skeleton):
+            mark = "done" if index < run.at else ("NEXT" if index == run.at else "later")
+            lines.append(f"  {index + 1}. [{mark}] {step.text}")
+        if run.at >= len(run.skeleton):
+            lines.append("  Every step is done: check the whole task and say so if it is complete.")
+        return "\n".join(lines)
+
+    def _follow(self, run: _Run, performed: Sequence[_Performed], ok: bool) -> None:
+        """Move along the skeleton, or away from it, after one judged move.
+
+        A move that WORKED and is the current step (or the one after it - sites skip
+        steps) advances past it. Anything else that acted is a stray, and
+        :data:`MAX_STRAYS` strays in a row drop the skeleton: the screen has shown
+        this is not that workflow, and a wrong goal is worse than a vague one. A move
+        with no token - a scroll, a wait, a back - is how a page is reached, not a
+        step of the errand, and counts as neither.
+        """
+        if self._subgoal(run) is None:
+            return
+        tokens = tokens_of((p.action, p.before) for p in performed if p.result.ok)
+        if not tokens:
+            return
+        fitted = False
+        for token in tokens:
+            for ahead in range(run.at, min(run.at + 1 + LOOKAHEAD, len(run.skeleton))):
+                if ok and run.skeleton[ahead].matches(token):
+                    run.at, fitted = ahead + 1, True
+                    break
+        if fitted:
+            run.strays = 0
+            log.info("explore.skeleton.advanced", at=run.at, of=len(run.skeleton))
+            return
+        run.strays += 1
+        if run.strays >= MAX_STRAYS:
+            log.info(
+                "explore.skeleton.dropped",
+                source=run.skeleton_from,
+                at=run.at,
+                of=len(run.skeleton),
+                why=f"{run.strays} move(s) in a row did not fit it",
+            )
+            run.skeleton, run.at = (), 0
+
+    def _only_the_subgoal_is_done(self, move: Move, run: _Run) -> bool:
+        """Whether a ``done`` claim was about the STEP the policy was aimed at.
+
+        A policy shown a subgoal as its goal answers DONE when the subgoal is
+        satisfied, which is the right answer to the question it was asked and says
+        nothing about the errand. Settling it as a task claim would spend a critic
+        call and file a dead end against a policy that was correct. So while steps
+        remain, a bare DONE advances the skeleton and the policy is asked again; on
+        the last step, or with no skeleton, it is the task claim it always was.
+        """
+        if not move.done or move.acts or self._subgoal(run) is None:
+            return False
+        run.at += 1
+        run.history.append(
+            f"(step {run.at} of the borrowed workflow was already satisfied on this screen)"
+        )
+        log.info("explore.skeleton.step_satisfied", at=run.at, of=len(run.skeleton))
+        return True
+
     # -- asking the model --------------------------------------------------------------
 
     def _ask(self, task: TaskSpec, run: _Run, catalog: ElementCatalog) -> str:
@@ -912,7 +1068,7 @@ class Explorer:
         """
         if self._policy is not None:
             answer = self._policy.propose(
-                task,
+                self._aimed(task, run),
                 run.current,
                 catalog,
                 run.history,
@@ -976,6 +1132,8 @@ class Explorer:
                     for c in run.skills
                 )
             )
+        if run.skeleton:
+            sections.append(self._workflow(run))
         sections.append(
             "ALREADY TRIED ON THIS EXACT SCREEN AND FAILED - DO NOT PROPOSE ANY OF "
             "THESE AGAIN:\n" + self._dead_ends(run)

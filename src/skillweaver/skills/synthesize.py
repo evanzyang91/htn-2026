@@ -94,6 +94,7 @@ from skillweaver.contracts import (
     LLMMessage,
     Observation,
     Perceiver,
+    Precedent,
     Provenance,
     Screenshot,
     Skill,
@@ -107,6 +108,8 @@ from skillweaver.errors import SandboxViolation
 from skillweaver.logging_ import get_logger
 from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 from skillweaver.skills.api import SkillLimits
+from skillweaver.skills.family import derive_signature
+from skillweaver.skills.family import render as render_signature
 from skillweaver.skills.model import SkillInvalid, make_skill
 from skillweaver.skills.refactor import Hardening, harden
 from skillweaver.skills.sandbox import SkillRunner, scan_code
@@ -835,6 +838,49 @@ REST_POLL_MS = 120.0
 _sleep = time.sleep
 
 
+def _with_what_it_earned(skill: Skill, generation: _Generation, trajectory: Trajectory) -> Skill:
+    """``skill`` with its action signature and its first precedent, IF it earned them.
+
+    Called for a candidate the gate has just ADMITTED, and that is the whole point of
+    where it sits: by this line the exact code has run to completion in a reset world,
+    its own verifier has said yes to the end screen and no to the start screen, and
+    the critic has agreed. What a skill DOES (:mod:`skillweaver.skills.family`) and
+    the sentence-and-arguments it is proven to serve
+    (:class:`~skillweaver.contracts.Precedent`) are both claims other skills and later
+    requests will lean on, so neither is written from anything less.
+
+    A candidate with NO verifier is admitted on the critic alone, as it always was,
+    and gets neither: nothing checked its own account of its end state, so it joins
+    no family and lends nobody a template. Arguments that are not plain values are
+    left out of the precedent rather than stringified - a template is matched against
+    text, and a list has no place in a sentence.
+    """
+    if not skill.verifier_code:
+        log.info("skill.admit.no_signature", name=skill.name, why="it carries no verifier")
+        return skill
+    signature = derive_signature(skill.code, trajectory)
+    draft = generation.draft
+    example = dict(draft.example_args) if draft is not None else {}
+    plain = {
+        name: value
+        for name, value in example.items()
+        if name in skill.params and isinstance(value, str | int | float | bool)
+    }
+    log.info(
+        "skill.admit.signature",
+        name=skill.name,
+        domain=skill.domain,
+        signature=render_signature(signature),
+        precedent=trajectory.task,
+        args=plain,
+    )
+    return replace(
+        skill,
+        action_signature=signature,
+        precedents=(Precedent(trajectory.task, plain),),
+    )
+
+
 def _observe_at_rest(env: ReplayEnvironment) -> Observation:
     """Observe the environment once it has STOPPED CHANGING, and not before.
 
@@ -1097,7 +1143,9 @@ class Synthesizer:
             attempt = self._attempt(index, generation, trajectory, environment)
             attempts.append(attempt)
             if attempt.ok and attempt.skill is not None:
-                stored = self._store.put(attempt.skill)
+                stored = self._store.put(
+                    _with_what_it_earned(attempt.skill, generation, trajectory)
+                )
                 log.info(
                     "skill.admit.stored",
                     run_id=trajectory.run_id,

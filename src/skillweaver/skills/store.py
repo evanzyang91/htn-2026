@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from skillweaver.config import settings
-from skillweaver.contracts import Skill, SkillStats, utcnow
+from skillweaver.contracts import Precedent, Skill, SkillStats, utcnow
 from skillweaver.errors import SkillNotFound, SkillWeaverError
 from skillweaver.logging_ import get_logger
 from skillweaver.render_mode import MODES
@@ -75,6 +75,11 @@ RENDER_MODE_FILE = "recorded-in"
 MANIFEST_VERSION = 1
 
 _VERIFIER_FILE = "verify.py"
+
+MAX_PRECEDENTS = 12
+"""How many proven requests one skill keeps. Each is a template the binder tries, so
+the list is a cost on every warm lookup; a dozen wordings of one errand is already
+more than a person uses."""
 
 
 def _fold_mean(mean: float, count_before: int, value: float) -> float:
@@ -429,6 +434,35 @@ class FileSkillStore:
             ms=round(ms, 1),
             runs=stats.runs,
             successes=stats.successes,
+        )
+        return updated
+
+    def record_precedent(self, name: str, domain: str, precedent: Precedent) -> Skill:
+        """Append one PROVEN request to the latest version and return the updated skill.
+
+        The caller owns the proof - see :class:`~skillweaver.contracts.Precedent` for
+        what counts - and this only writes it down. A sentence already on record is
+        not recorded twice, and the list is capped at :data:`MAX_PRECEDENTS`, oldest
+        reuse dropped first and the admission run (the first entry) always kept,
+        because every one of them is a template binding is tried against.
+
+        Raises:
+            SkillNotFound: if the skill does not exist.
+        """
+        skill = self.get(name, domain)
+        asked = " ".join(precedent.task_text.casefold().split())
+        if any(" ".join(p.task_text.casefold().split()) == asked for p in skill.precedents):
+            return skill
+        kept = (*skill.precedents, precedent)
+        if len(kept) > MAX_PRECEDENTS:
+            kept = (kept[0], *kept[-(MAX_PRECEDENTS - 1) :])
+        updated = self._rewrite_meta(replace(skill, precedents=kept))
+        log.info(
+            "skills.record_precedent",
+            name=name,
+            domain=domain,
+            task=precedent.task_text,
+            precedents=len(kept),
         )
         return updated
 

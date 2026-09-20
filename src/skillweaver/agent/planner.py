@@ -97,7 +97,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -113,6 +113,7 @@ from skillweaver.contracts import (
     Observation,
     Perceiver,
     Plan,
+    Precedent,
     Route,
     RunOutcome,
     Skill,
@@ -128,20 +129,37 @@ from skillweaver.contracts import (
     Verdict,
     utcnow,
 )
-from skillweaver.errors import ControllerError, PerceptionError, SkillNotFound
+from skillweaver.errors import (
+    ControllerError,
+    PerceptionError,
+    SkillNotFound,
+    SkillWeaverError,
+)
 from skillweaver.graph.route import VERIFIED_ONLY, RoutingPolicy, find_route
 from skillweaver.logging_ import get_logger
 from skillweaver.skills.api import LimitExceeded
+from skillweaver.skills.family import (
+    earned,
+    head_verb,
+    intent_of,
+    relatives,
+    render,
+    same_intent,
+)
 from skillweaver.skills.retrieve import accounted_for, unaddressed
 
 __all__ = [
     "FRAME_WORDS",
+    "MEASURE_WORDS",
     "MIN_ACCOUNTED_FOR",
     "FailureStage",
+    "FamilyFit",
     "PlanFailure",
     "Planner",
     "Rejection",
+    "account_of",
     "bind_args",
+    "fit_through_family",
 ]
 
 log = get_logger(__name__)
@@ -150,6 +168,7 @@ FailureStage = Literal[
     "no_candidates",
     "unbindable_args",
     "unaccounted",
+    "other_intent",
     "no_route",
     "no_decomposition",
     "vanished",
@@ -157,10 +176,21 @@ FailureStage = Literal[
     "skill_failed",
     "rejected",
 ]
-"""Where the fast path gave up. The first five happen before anything is performed."""
+"""Where the fast path gave up. The first six happen before anything is performed.
+
+``other_intent`` is the one family reuse added: the request's words line up with a
+stored skill and its VERB does not, which is *remove ... from my cart* meeting a skill
+learned as *add ... to my cart*. See :func:`~skillweaver.skills.family.same_intent`."""
 
 _PERFORMED_NOTHING = frozenset(
-    {"no_candidates", "unbindable_args", "unaccounted", "no_route", "no_decomposition"}
+    {
+        "no_candidates",
+        "unbindable_args",
+        "unaccounted",
+        "other_intent",
+        "no_route",
+        "no_decomposition",
+    }
 )
 """Stages that are reached while planning, so the screen is untouched."""
 
@@ -246,6 +276,49 @@ class PlanFailure:
         return f"{self.stage}{who}: {self.reason}"
 
 
+@dataclass(frozen=True, slots=True)
+class _Reuse:
+    """How the single skill of the current plan came to be chosen.
+
+    ``how`` is ``"params"`` (the caller supplied the arguments), ``"diff"`` or
+    ``"template"`` (the two strict sentence readers), ``"slot"`` (read through a
+    proven sentence) or ``"family"`` (bound through a relative on another site). It
+    decides two things after the run: what a FAILURE is evidence against
+    (:data:`_WIDENED`), and whether a SUCCESS is worth writing down as a precedent.
+    """
+
+    skill: str
+    args: Mapping[str, Any]
+    how: str
+    vouchers: tuple[Skill, ...] = ()
+
+
+_WIDENED = frozenset({"slot", "family"})
+"""Bindings a failed run is evidence against, INSTEAD of the skill.
+
+A skill that fails after the strict readers bound it has failed at its own job and is
+demoted, as it always was. A skill that fails after one of these bound it may simply
+have been handed the wrong argument - the reader is newer and looser than the skill -
+so the run is reported as failed, nothing is recorded for it, and the skill keeps its
+place. Wrongly demoting a working skill costs every later run a cold start; wrongly
+sparing a broken one costs one more failed warm attempt, which demotes it the next time
+a strict reader reaches it."""
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyFit:
+    """One way a request can be run through a family: ``skill`` is the member filed
+    under the request's own domain and is what will RUN; ``via`` is the relative whose
+    proven sentence the request bound against; ``vouchers`` are the relatives of the
+    same intent whose words counted towards ``share``."""
+
+    skill: Skill
+    args: dict[str, Any]
+    via: Skill
+    vouchers: tuple[Skill, ...]
+    share: float
+
+
 class Planner:
     """A :class:`~skillweaver.contracts.Planner`: do it from memory, or say you cannot.
 
@@ -283,6 +356,7 @@ class Planner:
         "_perceiver",
         "_policy",
         "_retriever",
+        "_reuse",
         "_runner",
         "_store",
         "_top_k",
@@ -317,6 +391,7 @@ class Planner:
         self._top_k = top_k
         self._max_candidates = max_candidates
         self._last_failure: PlanFailure | None = None
+        self._reuse: _Reuse | None = None
 
     def __repr__(self) -> str:
         mode = "single+composite" if self._composer is not None else "single-skill"
@@ -386,10 +461,13 @@ class Planner:
             return None
 
         self._last_failure = None
+        self._remember(task, used)
         note = (
             f"warm path: {' -> '.join(used)} in {spend.steps} actions, "
             f"{spend.llm_calls} model call(s)"
         )
+        if self._reuse is not None and self._reuse.how in _WIDENED:
+            note += f" (bound by the {self._reuse.how} reader)"
         log.info(
             "planner.ok",
             task=task.text,
@@ -418,22 +496,20 @@ class Planner:
         reasons: list[str] = []
         looked_at: list[Rejection] = []
         stage: FailureStage = "no_candidates"
+        self._reuse = None
         for candidate in candidates[: self._max_candidates]:
             skill = candidate.skill
             args = bind_args(skill, task)
             if args is None:
-                stage = "unbindable_args"
-                reason = (
-                    f"{skill.name}: task supplies no value for a required parameter, and its "
-                    f"wording does not line up with {skill.provenance.task_text!r}"
-                )
+                stage, reason = _why_unbound(skill, task)
                 reasons.append(reason)
-                looked_at.append(Rejection(skill.name, candidate.score, "unbindable_args", reason))
+                looked_at.append(Rejection(skill.name, candidate.score, stage, reason))
                 continue
-            if accounted_for(task.text, skill, args) < MIN_ACCOUNTED_FOR:
+            share, vouchers = account_of(task, skill, args, self._library)
+            if share < MIN_ACCOUNTED_FOR:
                 # Only now is it worth naming the words: the happy path pays for the
                 # ratio and nothing else.
-                missing = unaddressed(task.text, skill, args)
+                missing = unaddressed(task.text, skill, args, family=vouchers)
                 stage = "unaccounted"
                 reason = (
                     f"{skill.name}: nothing in it or its arguments accounts for "
@@ -467,18 +543,72 @@ class Planner:
                 score=round(candidate.score, 3),
                 args=args,
                 route_steps=len(route.steps),
+                vouched_by=", ".join(f"{v.name}@{v.domain}" for v in vouchers) or None,
             )
-            return (
-                Plan(
-                    steps=(*route.steps, SkillCall(skill.name, skill.domain, args)),
-                    skills_used=(skill.name,),
-                    estimated_ms=route.cost + skill.stats.mean_ms,
-                ),
-                Usage(),
-            )
+            self._reuse = _Reuse(skill.name, args, _how_bound(skill, task), vouchers)
+            return self._single(skill, args, route), Usage()
+
+        fit = self._through_family(task, observation, reasons, looked_at)
+        if fit is not None:
+            return fit, Usage()
 
         self._report_miss(task, candidates, looked_at)
         return self._compose(task, observation, stage, reasons, looked_at)
+
+    @staticmethod
+    def _single(skill: Skill, args: dict[str, Any], route: Route) -> Plan:
+        return Plan(
+            steps=(*route.steps, SkillCall(skill.name, skill.domain, args)),
+            skills_used=(skill.name,),
+            estimated_ms=route.cost + skill.stats.mean_ms,
+        )
+
+    def _library(self) -> list[Skill]:
+        """Every healthy skill on every site: where relatives are looked for."""
+        return self._store.list()
+
+    def _through_family(
+        self,
+        task: TaskSpec,
+        observation: Observation,
+        reasons: list[str],
+        looked_at: list[Rejection],
+    ) -> Plan | None:
+        """The family path: run THIS site's member of a workflow the request binds
+        against on any site.
+
+        Reached only when no skill here could be run on its own words. Still entirely
+        model-free - :func:`fit_through_family` reads the library and nothing else -
+        and everything after it is the ordinary warm path: the member is routed to,
+        run behind its own precondition and verifier, and judged by the same critic.
+        """
+        shelf = self._store.list(domain=task.domain)
+        for fit in fit_through_family(task, shelf, self._library()):
+            skill = fit.skill
+            route = self._route_to(observation.fingerprint, skill.precondition)
+            if route is None:
+                reason = (
+                    f"{skill.name}: in the family of {fit.via.name}@{fit.via.domain}, which "
+                    f"binds this request, but no known route reaches its start screen"
+                )
+                reasons.append(reason)
+                looked_at.append(Rejection(skill.name, fit.share, "no_route", reason))
+                continue
+            log.info(
+                "planner.family_hit",
+                task=task.text,
+                skill=skill.name,
+                domain=skill.domain,
+                signature=render(skill.action_signature),
+                bound_through=f"{fit.via.name}@{fit.via.domain}",
+                learned=fit.via.provenance.task_text,
+                args=fit.args,
+                accounted_for=round(fit.share, 3),
+                vouched_by=", ".join(f"{v.name}@{v.domain}" for v in fit.vouchers),
+            )
+            self._reuse = _Reuse(skill.name, fit.args, "family", fit.vouchers)
+            return self._single(skill, fit.args, route)
+        return None
 
     def _report_miss(
         self, task: TaskSpec, candidates: Sequence[Candidate], looked_at: Sequence[Rejection]
@@ -635,12 +765,19 @@ class Planner:
             current = None
             if not result.ok:
                 reason = result.error or "the skill failed without saying why"
-                self._demote(skill, f"failed on the warm path: {reason}")
+                widened = self._reuse is not None and self._reuse.how in _WIDENED
+                if widened:
+                    reason = (
+                        f"{reason} [bound by the {self._reuse.how} reader, so this is "  # type: ignore[union-attr]
+                        "evidence against the binding and the skill is NOT demoted]"
+                    )
+                else:
+                    self._demote(skill, f"failed on the warm path: {reason}")
                 return used, PlanFailure(
                     stage="skill_failed",
                     reason=reason,
                     skill=skill.name,
-                    demoted=True,
+                    demoted=not widened,
                     trace=result.trace,
                 )
             used.append(skill.name)
@@ -677,6 +814,33 @@ class Planner:
             confidence=round(verdict.confidence, 3),
         )
         return PlanFailure("rejected", reason, skill=" + ".join(used) or None)
+
+    def _remember(self, task: TaskSpec, used: Sequence[str]) -> None:
+        """Write a proven request down as a :class:`~skillweaver.contracts.Precedent`.
+
+        Reached only after the skill ran, its OWN verifier passed and the critic said
+        the task is done - and the first of those is checked again here rather than
+        assumed, because a skill with no verifier has had nothing proved about it and
+        a precedent is a template every later request is bound against. A verdict the
+        critic could not reach comes back ``ok=False`` and never gets this far.
+
+        Only a single-skill run whose argument was read out of the TEXT is recorded:
+        a caller who supplied ``params`` taught the binder nothing about wording, and
+        a composed chain is the composer's reading, not a sentence this skill served.
+        """
+        reuse = self._reuse
+        if reuse is None or reuse.how == "params" or list(used) != [reuse.skill]:
+            return
+        skill = self._find(reuse.skill, task.domain)
+        record = getattr(self._store, "record_precedent", None)
+        if skill is None or record is None or not skill.verifier_code:
+            return
+        if not all(isinstance(v, str | int | float | bool) for v in reuse.args.values()):
+            return
+        try:
+            record(skill.name, skill.domain, Precedent(task.text, dict(reuse.args)))
+        except SkillWeaverError as exc:  # a note is not worth failing a good run for
+            log.warning("planner.precedent.unwritten", skill=skill.name, error=str(exc))
 
     def _demote(self, skill: Skill, reason: str) -> None:
         """Retire a skill from retrieval, tolerating one that has already gone."""
@@ -737,6 +901,126 @@ class Planner:
     def _mean_ms(self, call: SkillCall) -> float:
         skill = self._lookup(call)
         return skill.stats.mean_ms if skill is not None else 0.0
+
+
+def _how_bound(skill: Skill, task: TaskSpec) -> str:
+    """Which reader :func:`bind_args` used for a candidate it DID bind."""
+    if _bind_args(skill, task) is not None:
+        return "params"
+    name = _text_bound(skill, task)
+    found = _span_for(skill, name, task.text) if name is not None else None
+    return found[1] if found is not None else "params"
+
+
+def _vouchers(
+    task: TaskSpec, skill: Skill, args: Mapping[str, Any], library: Sequence[Skill]
+) -> tuple[Skill, ...]:
+    """The relatives of ``skill`` allowed to speak for ``task`` in their own words.
+
+    Shape AND intent, both: :func:`~skillweaver.skills.family.relatives` answers the
+    first from the action signatures, and
+    :func:`~skillweaver.skills.family.same_intent` the second, against each relative's
+    own learned sentence and against ``skill``'s. A skill with no earned signature has
+    no relatives, so for every library stored before families existed this is ``()``
+    and the gate is exactly what it was.
+    """
+    if not earned(skill):
+        return ()
+    outside = task.text
+    for value in args.values():
+        outside = _without(outside, str(value))
+    if not same_intent(task.text, skill, outside=outside):
+        return ()
+    return tuple(
+        other
+        for other in relatives(skill, library)
+        if same_intent(task.text, other, outside=outside)
+    )
+
+
+def account_of(
+    task: TaskSpec,
+    skill: Skill,
+    args: Mapping[str, Any],
+    library: Callable[[], Sequence[Skill]],
+) -> tuple[float, tuple[Skill, ...]]:
+    """``(how much of task is accounted for, the relatives that had to vouch)``.
+
+    The skill's own words are asked first and, when they clear
+    :data:`MIN_ACCOUNTED_FOR`, nobody else is consulted and ``library`` is never
+    called - so every run that was warm before families existed reads exactly the
+    libraries it read then. Only a candidate that falls short on its own is given its
+    family's words (:func:`_vouchers`), and the line it then has to clear is the same
+    one. WHAT COUNTS as an account was widened; how much of one is needed was not.
+    """
+    share = accounted_for(task.text, skill, args)
+    if share >= MIN_ACCOUNTED_FOR:
+        return share, ()
+    vouchers = _vouchers(task, skill, args, library())
+    if not vouchers:
+        return share, ()
+    return accounted_for(task.text, skill, args, family=vouchers), vouchers
+
+
+def fit_through_family(
+    task: TaskSpec, shelf: Sequence[Skill], library: Sequence[Skill]
+) -> list[FamilyFit]:
+    """Every way ``task`` can be run by a member of ``shelf`` through its family.
+
+    This is the captain's case: *adding to a cart is almost the same workflow
+    everywhere, so those runs should aid each other*. A request that does not line up
+    with the sentence THIS site's skill was learned from may line up with the sentence
+    another site's skill was learned from; when the two skills perform the same
+    workflow, the argument read through one is what the other needs.
+
+    A fit needs all of:
+
+    * the member and the relative are one family by SHAPE
+      (:func:`~skillweaver.skills.family.relatives`, which also requires that both
+      earned a signature from a verifier-passed run and still carry the verifier);
+    * the request binds against the relative's proven sentence, from its TEXT - the
+      whole of :func:`_bind_from_text`, guards and intent check included;
+    * each side has exactly one parameter for the text to fill, so which value goes
+      where is not a guess, and the value can be the member's declared type;
+    * the request is the same INTENT as the member's own learned sentence too;
+    * member, relatives and arguments together account for the request to the same
+      :data:`MIN_ACCOUNTED_FOR` as any other candidate.
+
+    Public and pure - it reads two lists - because
+    :func:`~skillweaver.orchestrator.resolve_domain` asks the same question before a
+    browser is open, and two implementations of "would the planner run this?" is the
+    defect that function's docstring is about.
+
+    Returns:
+        Fits, best accounted-for first; empty when there is none.
+    """
+    fits: list[FamilyFit] = []
+    for member in shelf:
+        if not earned(member):
+            continue
+        slot = _text_bound(member, task)
+        if slot is None:
+            continue
+        for relative in relatives(member, library):
+            bound = _bind_from_text(relative, task)
+            theirs = _text_bound(relative, task)
+            if bound is None or theirs is None:
+                continue
+            value = _as_declared(str(bound[theirs]), member.params[slot])
+            if value is _REFUSED:
+                continue
+            args: dict[str, Any] = {k: task.params[k] for k in member.params if k in task.params}
+            args[slot] = value
+            vouchers = _vouchers(task, member, args, library)
+            if relative not in vouchers:
+                continue  # the member's own learned sentence is a different errand
+            share = accounted_for(task.text, member, args, family=vouchers)
+            if share < MIN_ACCOUNTED_FOR:
+                continue
+            fits.append(FamilyFit(member, args, relative, vouchers, share))
+            break
+    fits.sort(key=lambda fit: (-fit.share, fit.skill.domain, fit.skill.name))
+    return fits
 
 
 def bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
@@ -851,6 +1135,10 @@ _TOKEN = re.compile(r"\w+|[^\w\s]")
 """One word or one punctuation mark. Whitespace is not a token, so a value's own
 spacing survives being sliced back out of the original text."""
 
+_CLAUSE_WORDS = frozenset({"and", "then", "also", "but", "after", "before"})
+"""Words that start a second clause. A value read out of UNQUOTED text may not
+introduce one: what follows it is a second errand, which is the composer's to read."""
+
 _MAX_VALUE_CHARS = 120
 """A bound argument longer than this is a sentence, not a value."""
 
@@ -924,16 +1212,25 @@ def _bind_from_text(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     if len(missing) != 1:
         return None
 
-    name = missing[0]
-    learned = skill.provenance.task_text or ""
-    span = _differing_span(learned, task.text)
-    if span is None:
-        span = _from_template(skill, name, learned, task.text)
-    if span is None:
+    found = _span_for(skill, missing[0], task.text)
+    if found is None:
         return None
+    span, how = found
+    name = missing[0]
 
     value = _as_declared(span, skill.params[name])
     if value is _REFUSED:
+        return None
+    if not same_intent(task.text, skill, outside=_without(task.text, span)):
+        log.info(
+            "planner.other_intent",
+            skill=skill.name,
+            domain=skill.domain,
+            task=task.text,
+            learned=skill.provenance.task_text,
+            asked_verb=head_verb(task.text),
+            learned_verb=head_verb(skill.provenance.task_text),
+        )
         return None
 
     args: dict[str, Any] = {k: task.params[k] for k in skill.params if k in task.params}
@@ -944,11 +1241,88 @@ def _bind_from_text(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
         domain=skill.domain,
         param=name,
         value=value,
-        learned=learned,
+        how=how,
+        learned=skill.provenance.task_text,
         task=task.text,
         args=args,
     )
     return args
+
+
+def _span_for(skill: Skill, name: str, asked: str) -> tuple[str, str] | None:
+    """``(the text of asked that is name's value, how it was found)``, or ``None``.
+
+    Three readers, strictest first, and the first to answer wins: the one-span diff
+    (:func:`_differing_span`), the quoted template (:func:`_from_template`) and the
+    slot (:func:`_through_slot`). ``how`` is ``"diff"``, ``"template"`` or ``"slot"``
+    and travels into the log and into what a failed run is allowed to demote.
+    """
+    learned = skill.provenance.task_text or ""
+    span = _differing_span(learned, asked)
+    if span is not None:
+        return span, "diff"
+    span = _from_template(skill, name, learned, asked)
+    if span is not None:
+        return span, "template"
+    span = _through_slot(skill, name, asked)
+    return (span, "slot") if span is not None else None
+
+
+def _without(text: str, span: str) -> str:
+    """``text`` with the bound value cut out, so a product called *Clear Glass Set* is
+    not read as the verb *clear* by the intent check."""
+    at = text.casefold().find(span.casefold())
+    return text if at < 0 else f"{text[:at]} {text[at + len(span) :]}"
+
+
+def _text_bound(skill: Skill, task: TaskSpec) -> str | None:
+    """The one required parameter ``task.params`` leaves for the task TEXT to supply,
+    or ``None`` when there is not exactly one."""
+    missing = [
+        name
+        for name, schema in skill.params.items()
+        if name not in task.params and not _has_default(schema)
+    ]
+    return missing[0] if len(missing) == 1 else None
+
+
+def _why_unbound(skill: Skill, task: TaskSpec) -> tuple[FailureStage, str]:
+    """The stage and the sentence for a candidate :func:`bind_args` turned down.
+
+    Asked only after the fact, so the happy path pays nothing for it. It separates the
+    two refusals a reader must never confuse: the sentence did not line up at all
+    (``unbindable_args``), and the sentence lined up but asks for a DIFFERENT errand
+    (``other_intent``) - *remove X from my cart* against a skill learned as *add X to
+    my cart*. The second is the one a family-widened library has to be seen to make.
+    """
+    name = _text_bound(skill, task)
+    found = _span_for(skill, name, task.text) if name is not None else None
+    if found is not None and _as_declared(found[0], skill.params[name]) is not _REFUSED:
+        asked, known = head_verb(task.text), head_verb(skill.provenance.task_text)
+        return (
+            "other_intent",
+            f"{skill.name}: the request lines up with {skill.provenance.task_text!r} but "
+            f"asks for a different errand - it leads with {asked!r} "
+            f"({intent_of(asked or '') or 'no known intent'}) where the skill was learned "
+            f"under {known!r} ({intent_of(known or '') or 'no known intent'}), or names an "
+            "opposing verb elsewhere - so it is not run",
+        )
+    asked, known = head_verb(task.text), head_verb(skill.provenance.task_text)
+    mine, theirs = intent_of(known or ""), intent_of(asked or "")
+    if mine is not None and theirs is not None and mine != theirs:
+        # Refused on alignment first - *from my cart* is not *to my cart* - but the
+        # sentence to show a reader is the one about the verb.
+        return (
+            "other_intent",
+            f"{skill.name}: the request leads with {asked!r} ({theirs}) and the skill was "
+            f"learned under {known!r} ({mine}); the same controls in the opposite "
+            "direction are a different errand, so it is not run",
+        )
+    return (
+        "unbindable_args",
+        f"{skill.name}: task supplies no value for a required parameter, and its "
+        f"wording does not line up with {skill.provenance.task_text!r}",
+    )
 
 
 def _differing_span(learned: str, asked: str) -> str | None:
@@ -983,6 +1357,11 @@ def _differing_span(learned: str, asked: str) -> str | None:
         return None
     if len(_words(asked_mid)) > max(3, len(_words(learned_mid)) + 2):
         return None  # the new span grew into something bigger than an argument
+    if (_words(asked_mid) & _CLAUSE_WORDS) - _words(learned_mid):
+        # *add a box of Tide and then check out* is one span against *add a box of
+        # Folgers ... to my cart*, framed and short enough - and it bound, as a product
+        # called "Tide and then check out", accounted for at 1.00 by its own argument.
+        return None
 
     value = asked[asked_mid[0].start : asked_mid[-1].end]
     return value if 0 < len(value) <= _MAX_VALUE_CHARS else None
@@ -1138,6 +1517,205 @@ def _anchored(learned: str, slot: _Slot, asked: str, found: _Slot) -> bool:
     if [t.key for t in tail_l[:1]] != [t.key for t in tail_a[:1]]:
         return False
     return abs(len(tail_a) - len(tail_l)) <= _MAX_TAIL_DRIFT
+
+
+# -- binding through the slot a PROVEN request left ---------------------------------------
+
+
+MEASURE_WORDS = frozenset(
+    """
+    bag bags bottle bottles box boxes bunch can cans carton cartons case cases copy copies
+    couple dozen jar jars item items pack packs package packet pair pairs piece pieces pound
+    pounds roll rolls set sets unit units
+    """.split()
+)
+"""Words that say HOW MUCH of a thing is wanted and nothing about which errand it is.
+
+*A box of* and *a bag of* frame the same slot in the same sentence, so they may differ
+between the learned wording and the asked one. A closed list, like
+:data:`FRAME_WORDS`: what is not on it is a content word, and a content word that
+changed outside the slot is a different request. They are neutral only for LINING THE
+SENTENCES UP - :func:`~skillweaver.skills.retrieve.accounted_for` still counts a
+measure word nobody has an account of against the candidate."""
+
+_CLAUSE_BREAKS = _CLAUSE_WORDS | frozenset({",", ";", ":", "."})
+"""Tokens an UNQUOTED value may not contain when it is read through a slot. A value
+that runs over one of these has swallowed a second clause - *Tide and then check out* -
+and a second clause is a bigger errand, which is the composer's job."""
+
+_NEUTRAL = (
+    FRAME_WORDS
+    | MEASURE_WORDS
+    | frozenset(
+        "please kindly can could would i we like want need help just now ok okay hey".split()
+    )
+)
+"""What is ignored when two sentence HEADS or TAILS are compared for being the same
+request: framing, measure and politeness. A word that is here is never the difference
+between two errands; every word that is not here must agree."""
+
+
+_LEAD_INS = frozenset({"a", "an", "the", "some", "me", "us", "my", "our"})
+"""What may stand between a bare verb and the value it governs."""
+
+
+def _content(tokens: Sequence[_Token]) -> list[str]:
+    """The words of a sentence fragment that say which errand it is, in order."""
+    return [t.key for t in tokens if t.word and t.key not in _NEUTRAL]
+
+
+def _same_head(learned: Sequence[_Token], asked: Sequence[_Token]) -> bool:
+    """Whether two sentence heads - everything before the value - ask for one thing.
+
+    Every content word must agree, in order, with one licence: the FIRST, which is
+    the verb in the imperative sentences tasks are written in, may differ. Whether the
+    two verbs mean the same errand is NOT decided here -
+    :func:`~skillweaver.skills.family.same_intent` decides it, over the whole request,
+    for every text binding - and keeping the two questions apart is what lets a
+    refusal say which one it was: *buy me a box of* lines up and is the same errand,
+    *remove a box of* lines up and is not (``other_intent``), and *add a review of*
+    does not line up at all.
+    """
+    mine, theirs = _content(learned), _content(asked)
+    return len(mine) == len(theirs) and mine[1:] == theirs[1:]
+
+
+_DIRECTIONS = frozenset({"to", "into", "onto", "from", "off", "out", "in", "on"})
+"""Framing words that carry the DIRECTION of an errand, so :func:`_tail_fits` compares
+them where every other comparison skips them. *To my cart* and *from my cart* differ in
+nothing else."""
+
+
+def _tail_fits(learned: Sequence[_Token], asked: Sequence[_Token]) -> bool:
+    """Whether what FOLLOWS the value is the learned sentence's own tail, or the start
+    of it, or nothing.
+
+    A request may stop early - *add a box of Tide* for a skill learned as *add a box
+    of ... to my cart* - because the verb already says the rest. It may never go on
+    LONGER or go somewhere else: *from my cart* is not a prefix of *to my cart* (the
+    direction of the errand lives in exactly that word, and ``from``/``to`` are
+    compared here although they are framing everywhere else), and a new clause is a
+    bigger errand.
+    """
+    mine = [t.key for t in learned if t.word and t.key not in (_NEUTRAL - _DIRECTIONS)]
+    theirs = [t.key for t in asked if t.word and t.key not in (_NEUTRAL - _DIRECTIONS)]
+    return theirs == mine[: len(theirs)]
+
+
+def _templates(skill: Skill, name: str) -> list[tuple[str, _Slot]]:
+    """Every sentence ``skill`` is proven to have served, with where ``name`` sat in it.
+
+    A :class:`~skillweaver.contracts.Precedent` records the sentence AND the arguments
+    of a verifier-passed run, so the slot is not inferred: it is wherever that run's
+    own value occurs, exactly once, in that run's own sentence. Newest first, because
+    the most recent wording is the likeliest to be repeated. A skill admitted before
+    precedents existed falls back to :func:`_learned_slot`, which reads the slot out
+    of a quotation or the parameter's described example.
+    """
+    found: list[tuple[str, _Slot]] = []
+    for precedent in reversed(skill.precedents):
+        value = precedent.args.get(name)
+        if not isinstance(value, str | int | float) or isinstance(value, bool):
+            continue
+        slot = _sole_occurrence(precedent.task_text, str(value))
+        if slot is not None:
+            found.append((precedent.task_text, slot))
+    learned = skill.provenance.task_text or ""
+    if not any(sentence == learned for sentence, _ in found):
+        slot = _learned_slot(skill, name, learned)
+        if slot is not None:
+            found.append((learned, slot))
+    return found
+
+
+def _through_slot(skill: Skill, name: str, asked: str) -> str | None:
+    """``asked``'s value for ``name``, read through a sentence that is KNOWN to work.
+
+    The two readers before this one compare whole sentences, so they answer only when
+    the request is the learned sentence with one framed span changed. Measured on
+    2026-09-19 against a skill learned from *add a box of Folgers classic roast ground
+    coffee to my cart*::
+
+        add a box of Starbucks classic roast ground coffee    does not bind
+        add a bag of Starbucks Pike Place coffee to my cart   does not bind
+        buy me a box of Tide laundry detergent                does not bind
+
+    The first fails because the diff is *Folgers* -> *Starbucks* and the word after it,
+    *classic*, is not a framing word - the reader cannot know the value runs on for
+    four more words. But the SKILL knows: the run that proved it recorded the value it
+    was given (:func:`_templates`), so where the value sat is a fact. With the slot in
+    hand a request is read as ``head + value + tail``, and it binds when the head asks
+    for the same thing (:func:`_same_head`) and the tail is the learned one or stops
+    short of it (:func:`_tail_fits`).
+
+    It still declines more than it binds. A value that is not quoted has to end
+    somewhere, and the only places it may end are where the learned tail begins or at
+    the end of the request - and then only if it swallowed no clause break and none of
+    the learned tail's own words, so *add a box of Tide to the basket* is not read as
+    a product called *Tide to the basket*.
+    """
+    rhs = _tokens(asked)
+    quoted = _quoted_spans(asked)
+    for sentence, slot in _templates(skill, name):
+        head = _tokens(sentence[: slot.start])
+        tail = _tokens(sentence[slot.end :])
+        if len(quoted) == 1:
+            found = quoted[0]
+            if _same_head(head, _tokens(asked[: found.start])) and _tail_fits(
+                tail, _tokens(asked[found.end :])
+            ):
+                return found.value
+            continue
+        if quoted:
+            continue  # several quotations: which one is the value is a guess
+        value = _unquoted_value(head, tail, rhs, asked, len(_tokens(slot.value)))
+        if value is not None:
+            return value
+    return None
+
+
+def _unquoted_value(
+    head: Sequence[_Token],
+    tail: Sequence[_Token],
+    rhs: Sequence[_Token],
+    asked: str,
+    learned_words: int,
+) -> str | None:
+    """The span of ``asked`` between a head that matches and a tail that fits."""
+    head_words = [t for t in head if t.word]
+    if not head_words:
+        return None  # a sentence that OPENS with its value has no head to line up
+    anchor = head_words[-1].key
+    # The value starts after the token that framed it in the learned sentence - or,
+    # when that token was the verb itself, after the asked sentence's own verb.
+    starts = [i + 1 for i, t in enumerate(rhs) if t.key == anchor]
+    if not starts and anchor == head_verb(" ".join(t.key for t in head_words)):
+        verb = head_verb(asked)
+        starts = [i + 1 for i, t in enumerate(rhs) if t.key == verb][:1]
+        # *buy me the Tide pods*: what follows a bare verb may open with an article
+        # or a pronoun that belongs to the sentence and not to the product.
+        while starts and starts[0] < len(rhs) - 1 and rhs[starts[0]].key in _LEAD_INS:
+            starts[0] += 1
+    tail_words = [t.key for t in tail if t.word]
+    for start in starts:
+        if not _same_head(head, rhs[:start]):
+            continue
+        ends = [i for i in range(start + 1, len(rhs)) if tail_words and rhs[i].key == tail_words[0]]
+        for end in [*ends, len(rhs)]:
+            span = rhs[start:end]
+            if not _is_a_value(span) or not _tail_fits(tail, rhs[end:]):
+                continue
+            keys = {t.key for t in span}
+            if keys & _CLAUSE_BREAKS:
+                continue
+            if end == len(rhs) and keys & set(tail_words):
+                continue  # it ran to the end THROUGH the learned tail's own words
+            if len(_words(span)) > max(3, learned_words + 2):
+                continue
+            value = asked[span[0].start : span[-1].end]
+            if 0 < len(value) <= _MAX_VALUE_CHARS:
+                return value
+    return None
 
 
 def _framed(tokens: Sequence[_Token], head: int, tail: int) -> bool:

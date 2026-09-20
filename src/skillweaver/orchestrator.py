@@ -66,7 +66,14 @@ from typing import Any, Literal
 from skillweaver.agent.compose import Composer
 from skillweaver.agent.critic import TieredCritic
 from skillweaver.agent.explorer import ActingPolicy, Explorer
-from skillweaver.agent.planner import MIN_ACCOUNTED_FOR, PlanFailure, Planner, bind_args
+from skillweaver.agent.planner import (
+    MIN_ACCOUNTED_FOR,
+    PlanFailure,
+    Planner,
+    account_of,
+    bind_args,
+    fit_through_family,
+)
 from skillweaver.config import Settings, settings
 from skillweaver.contracts import (
     Budget,
@@ -116,7 +123,7 @@ from skillweaver.reset_actions import (
     world_reset_from_actions,
 )
 from skillweaver.skills.embed import embedder_for, load_embedder
-from skillweaver.skills.retrieve import SkillRetriever, accounted_for
+from skillweaver.skills.retrieve import SkillRetriever
 from skillweaver.skills.sandbox import SkillRunner
 from skillweaver.skills.store import FileSkillStore
 from skillweaver.skills.synthesize import (
@@ -1473,7 +1480,7 @@ def resolve_domain(
         # they do not - because what binds them there is the composer, which costs a
         # model call and cannot run before the browser is even open.
         args = bind_args(skill, probe) or probe.params
-        share = accounted_for(text, skill, args)
+        share, _ = account_of(probe, skill, args, _whole_library(retriever))
         if share < MIN_ACCOUNTED_FOR:
             passed_over.append(f"{skill.name}@{skill.domain} (accounts for {share:.0%})")
             continue
@@ -1498,6 +1505,34 @@ def resolve_domain(
             ),
         )
 
+    # Nothing answers in its own words. A request may still bind against a RELATIVE's
+    # proven sentence - the same workflow learned on another site - and the member of
+    # that family filed under this perception path then names the domain. It is the
+    # planner's own function, so this cannot say yes to something the planner declines.
+    everything = _whole_library(retriever)()
+    shelf = [skill for skill in everything if path_of(skill.domain) == path]
+    for fit in fit_through_family(probe, shelf, everything):
+        log.info(
+            "domain.resolved",
+            task=text,
+            domain=fit.skill.domain,
+            skill=fit.skill.name,
+            through=f"{fit.via.name}@{fit.via.domain}",
+            accounted_for=round(fit.share, 3),
+        )
+        return DomainChoice(
+            domain=fit.skill.domain,
+            start_url=_where_it_starts(graph, fit.skill) or url,
+            source="library",
+            skill=fit.skill.name,
+            score=fit.share,
+            why=(
+                f"the library answered through a family: this request binds against "
+                f"{fit.via.name} ({fit.via.domain}), which does what {fit.skill.name} does, "
+                f"and {fit.skill.name} is filed under {fit.skill.domain}"
+            ),
+        )
+
     log.info(
         "domain.unresolved",
         task=text,
@@ -1513,6 +1548,24 @@ def resolve_domain(
             f"request ({_or_nothing(passed_over)}), so the target's own name is used"
         ),
     )
+
+
+def _whole_library(retriever: SkillRetriever) -> Callable[[], list[Skill]]:
+    """Every healthy skill behind ``retriever``, read only if somebody asks.
+
+    Relatives are looked for across every site, and a retriever is handed here
+    rather than a store. One that does not expose its store has no families to offer,
+    which is the honest answer for a test double.
+    """
+
+    def read() -> list[Skill]:
+        store = getattr(retriever, "store", None)
+        try:
+            return list(store.list()) if store is not None else []
+        except SkillWeaverError:
+            return []
+
+    return read
 
 
 def _or_nothing(passed_over: Sequence[str]) -> str:
@@ -1926,6 +1979,7 @@ def build_agent(
         retriever=retriever,
         runner=runner,
         policy=policy,
+        library=store.list,
     )
 
     synthesis: SynthesisFactory | None = None
