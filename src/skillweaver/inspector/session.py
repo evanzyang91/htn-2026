@@ -1170,9 +1170,10 @@ def _dom_reader(controller: Controller) -> Any:
     puts the world back may read the page's own names, and nothing else here may. See
     ``AGENTS.md`` on why a real site's cart button has no readable name.
     """
-    from skillweaver.controllers.browser import BrowserController, BrowserGroundTruth
+    from skillweaver.controllers.browser import BrowserGroundTruth
 
-    return BrowserGroundTruth(controller) if isinstance(controller, BrowserController) else None
+    reads_pages = callable(getattr(controller, "evaluate", None))
+    return BrowserGroundTruth(controller) if reads_pages else None
 
 
 def _undo_dir() -> Path:

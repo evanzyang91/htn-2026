@@ -190,6 +190,22 @@ our own is allowed, contradicting the browser with a spoofed fingerprint or user
 never is. `REAL_CHROME_CHANNEL` in `controllers/browser.py` still carries what the
 profile alone is measured to fix.
 
+**The default browser is now the person's OWN running Chrome, driven the way
+`jev_ultrafast` drives it** (`--browser harness`, `SKILLWEAVER_BROWSER`,
+`controllers/harness.py`): Browser Harness holds one connection to the Chrome already
+open, the run gets a background tab of its own, and every action is a raw DevTools call -
+no Playwright, no fresh profile. `--browser playwright` is everything described above and
+is what `--headless` or `--chrome-profile` still select (`browser_backend`, `config.py`),
+because both describe a browser this project starts. Three things to know. It is the real,
+LOGGED-IN browser, so a task addressed to it can act on real accounts. Chrome must have
+remote debugging allowed once, by hand, at `chrome://inspect/#remote-debugging` -
+`uv run browser-harness --doctor` says whether it is. And to exercise it WITHOUT touching
+that browser, start a `ChromeProcess` and point the harness at it with `BU_CDP_URL` plus a
+`BU_NAME` of your own, which is how it was proven: Wikipedia search learned cold in 4
+actions / 7 model calls / 40s wall, stored, and replayed warm in 5 actions / 0 model calls
+/ 4.5s, `--perception dom --policy jev`, 2026-09-20. A synthetic Cmd+A selects nothing on
+macOS unless the key event carries `commands=["selectAll"]` (`_EDIT_COMMANDS`).
+
 Three rules go with all of it, every one already paid for: give every run its OWN
 directory, because a profile is exclusive and concurrent runs sharing one spoil the state
 that made it worth having; nothing in this project defeats a human-verification page - no

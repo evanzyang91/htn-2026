@@ -802,7 +802,9 @@ class BrowserGroundTruth:
     light DOM only, and it does not test whether one element is painted over another.
     """
 
-    def __init__(self, controller: BrowserController) -> None:
+    def __init__(self, controller: Any) -> None:
+        """``controller`` is any browser controller: it is asked only for ``evaluate`` and
+        ``url``, which the Playwright and the Browser Harness controllers both answer."""
         self._controller = controller
 
     def elements(self) -> list[Element]:
@@ -837,25 +839,12 @@ class BrowserGroundTruth:
 
     def url(self) -> str:
         """The exact current URL, ``""`` when there is none."""
-        return self._controller._live_page().url or ""
+        return self._controller.url() or ""
 
     def _read_dom(self) -> dict:
-        """Run the reader script, once more if a navigation pulled the rug out.
-
-        A mid-navigation document destroys the execution context; that is a moment, not a
-        broken page. A second failure is real.
-        """
-        page = self._controller._live_page()
-        try:
-            return page.evaluate(_GROUND_TRUTH_JS)
-        except PlaywrightError as exc:
-            if "context was destroyed" not in str(exc) and "navigating" not in str(exc):
-                raise ControllerError(f"could not read the DOM: {_brief(exc)}") from exc
-        try:
-            page.wait_for_load_state("load")
-            return page.evaluate(_GROUND_TRUTH_JS)
-        except PlaywrightError as exc:
-            raise ControllerError(f"could not read the DOM: {_brief(exc)}") from exc
+        """Run the reader script. The controller's ``evaluate`` already asks once more
+        when a navigation pulled the rug out, which is a moment and not a broken page."""
+        return self._controller.evaluate(_GROUND_TRUTH_JS)
 
 
 def _stable_id(kind: ElementKind, text: str, box: Box) -> str:

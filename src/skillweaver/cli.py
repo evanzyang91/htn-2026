@@ -27,7 +27,7 @@ from typing import Annotated, Any
 
 import typer
 
-from skillweaver.config import POLICIES, Settings, check_settings, load_settings, settings
+from skillweaver.config import BROWSERS, POLICIES, Settings, check_settings, load_settings, settings
 from skillweaver.contracts import Skill, Transition, UIState, action_to_dict
 from skillweaver.errors import ConfigError, SkillNotFound, SkillWeaverError
 from skillweaver.orchestrator import (
@@ -173,6 +173,21 @@ def root(
             show_default=False,
         ),
     ] = None,
+    browser: Annotated[
+        str | None,
+        typer.Option(
+            "--browser",
+            help="Which browser a run drives: 'harness' (the DEFAULT - the Chrome you "
+            "already have open, through Browser Harness and raw DevTools-protocol calls, "
+            "with no automation framework; the run works in a background tab of its own "
+            "and closes it) or 'playwright' (a browser this project starts, which most "
+            "real shops refuse). 'harness' IS YOUR REAL, LOGGED-IN BROWSER: a task "
+            "addressed to it can act on your accounts. Chrome asks once to allow remote "
+            "debugging. --headless and --chrome-profile describe a browser this project "
+            "starts, so either one selects 'playwright'. Overrides SKILLWEAVER_BROWSER.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Open the memories every subcommand reads from. Nothing expensive happens here."""
     if ctx.obj is not None:  # a caller (a test, an embedder) supplied its own
@@ -187,6 +202,7 @@ def root(
                 chrome_attach,
                 perception,
                 policy,
+                browser,
             )
         )
     except ConfigError as exc:
@@ -201,6 +217,7 @@ def _settings(
     chrome_attach: bool | None = None,
     perception: str | None = None,
     policy: str | None = None,
+    browser: str | None = None,
 ) -> Settings:
     """Configuration with the global flags on top. Every flag is TRI-STATE: ``None`` means
     it was not written and the configured value stands. A plain ``bool`` for
@@ -231,6 +248,11 @@ def _settings(
         if chosen not in POLICIES:
             raise ConfigError(f"--policy {policy!r} must be one of {POLICIES}")
         changes["policy"] = chosen
+    if browser is not None:
+        chosen = browser.lower()
+        if chosen not in BROWSERS:
+            raise ConfigError(f"--browser {browser!r} must be one of {BROWSERS}")
+        changes["browser"] = chosen
     if not changes:
         return resolved
     # Re-checked after the flags land: --chrome-attach and the directory it needs can

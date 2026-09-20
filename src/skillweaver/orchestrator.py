@@ -40,7 +40,7 @@ from skillweaver.agent.planner import (
     bind_args,
     fit_through_family,
 )
-from skillweaver.config import Settings, settings
+from skillweaver.config import Settings, browser_backend, settings
 from skillweaver.contracts import (
     Budget,
     Candidate,
@@ -1683,9 +1683,10 @@ def _dom_of(controller: Controller) -> Any:
     camera can read them - DoorDash's quick-add and header cart are icon-only, with only an
     ``aria-label``, and a search of that page's visible text finds nothing.
     """
-    from skillweaver.controllers.browser import BrowserController, BrowserGroundTruth
+    from skillweaver.controllers.browser import BrowserGroundTruth
 
-    return BrowserGroundTruth(controller) if isinstance(controller, BrowserController) else None
+    reads_pages = callable(getattr(controller, "evaluate", None))
+    return BrowserGroundTruth(controller) if reads_pages else None
 
 
 def _is_read_only(task: TaskSpec) -> bool:
@@ -1711,6 +1712,10 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
                 "Use --perception pixels, which is the default."
             )
         controller = DesktopController()
+    elif browser_backend(config) == "harness":
+        from skillweaver.controllers.harness import HarnessBrowserController
+
+        controller = HarnessBrowserController(start_url=task.params.get("start_url"))
     else:
         from skillweaver.controllers.browser import BrowserController
 

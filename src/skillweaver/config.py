@@ -46,6 +46,16 @@ DEFAULT_CHROME_ATTACH = False
 """Start real Chrome ourselves and attach, for a site that refuses even real Chrome when
 the framework launched it (measured at ``PLAINLY_LAUNCHED`` in ``controllers.chrome_launch``,
 which also states what this must never become). Needs ``chrome_profile``."""
+DEFAULT_BROWSER = "harness"
+"""``harness`` drives the Chrome the person already has open, through Browser Harness and
+raw DevTools-protocol calls, the way ``jev_ultrafast`` does (``controllers.harness``).
+``playwright`` is the framework-driven browser every earlier run used, and the only one
+of the two that can run headless or without a Chrome already open. The default moved
+because the framework-driven browser is refused by most real shops, fresh profile and all,
+and a browser a site will not serve has no other property worth having."""
+
+BROWSERS = ("harness", "playwright")
+
 DEFAULT_PERCEPTION = PIXELS
 """Pixels: what every stored skill was learned against. ``--perception dom`` is opt-in
 and browser-only; see ``perception_mode`` and ``AGENTS.md``."""
@@ -72,6 +82,7 @@ class Settings:
     headless: bool = DEFAULT_HEADLESS
     chrome_profile: Path | None = DEFAULT_CHROME_PROFILE
     chrome_attach: bool = DEFAULT_CHROME_ATTACH
+    browser: str = DEFAULT_BROWSER
     perception: str = DEFAULT_PERCEPTION
     policy: str = DEFAULT_POLICY
     claude_model: str = DEFAULT_CLAUDE_MODEL
@@ -190,6 +201,10 @@ def load_settings(
     if policy not in POLICIES:
         raise ConfigError(f"SKILLWEAVER_POLICY={policy!r} must be one of {POLICIES}")
 
+    browser = (merged.get("SKILLWEAVER_BROWSER") or DEFAULT_BROWSER).lower()
+    if browser not in BROWSERS:
+        raise ConfigError(f"SKILLWEAVER_BROWSER={browser!r} must be one of {BROWSERS}")
+
     defaults = Budget()
     budget = Budget(
         max_steps=_number(merged, "SKILLWEAVER_MAX_STEPS", defaults.max_steps, int),
@@ -204,6 +219,7 @@ def load_settings(
         headless=_flag(merged, "SKILLWEAVER_HEADLESS", DEFAULT_HEADLESS),
         chrome_profile=_path(merged, "SKILLWEAVER_CHROME_PROFILE", DEFAULT_CHROME_PROFILE),
         chrome_attach=_flag(merged, "SKILLWEAVER_CHROME_ATTACH", DEFAULT_CHROME_ATTACH),
+        browser=browser,
         perception=perception,
         policy=policy,
         claude_model=merged.get("SKILLWEAVER_CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL,
@@ -236,6 +252,19 @@ def check_settings(settings: Settings) -> Settings:
             "--chrome-profile, and give every run its own directory"
         )
     return settings
+
+
+def browser_backend(settings: Settings) -> str:
+    """Which of :data:`BROWSERS` a run opens.
+
+    ``--headless`` and ``--chrome-profile`` each describe a browser THIS PROJECT starts,
+    and the person's own Chrome is neither headless nor on a directory of our choosing,
+    so either one selects ``playwright`` rather than being silently ignored. That keeps
+    every command written before the default moved meaning what it meant.
+    """
+    if settings.browser == "harness" and (settings.headless or settings.chrome_profile):
+        return "playwright"
+    return settings.browser
 
 
 @lru_cache(maxsize=1)
