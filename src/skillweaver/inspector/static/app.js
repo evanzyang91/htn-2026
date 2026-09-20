@@ -114,7 +114,7 @@ async function poll() {
 // The clock is excluded because it always moves; renderElapsed() draws it on its own timer.
 let shownKey = "";
 function changed(data) {
-  const { elapsed_ms, spend, ...rest } = data;
+  const { elapsed_ms, clock_ms, spend, ...rest } = data;
   const { seconds: _seconds, ...spent } = spend || {};
   // The half-minute bucket is what keeps "recorded 17s ago" honest on an idle page.
   const key = JSON.stringify([rest, spent, Math.floor(Date.now() / 30000)]);
@@ -161,8 +161,9 @@ function renderElapsed() {
   const active = state && state.status !== "idle";
   $("elapsed").hidden = $("spend").hidden = !active;
   if (!active) return;
-  const running = !TERMINAL.includes(state.status);
-  const ms = (state.elapsed_ms || 0) + (running ? performance.now() - stateAt : 0);
+  // The server's figure is fresh on every poll and already holds the move in flight, so
+  // this only carries it between polls - and only while the agent is actually stepping.
+  const ms = (state.clock_ms ?? state.elapsed_ms ?? 0) + (state.clock_running ? performance.now() - stateAt : 0);
   $("elapsed").textContent = seconds(ms);
   const s = state.spend || {};
   $("spend").textContent =
@@ -181,8 +182,11 @@ function controls() {
   const working = busy || state?.busy || running();
   const can = state?.can || {};
   const live = isLive();
+  // The prompt bar is held only by THIS page's own request in flight. A run that is busy
+  // or running automatically does not lock it: a new Start is the newest request and wins,
+  // queued right behind the move in flight (see server.py).
   for (const id of ["start", "url", "goal", "reset-url", "reset-steps", "read-only", "max-steps", "max-usd"])
-    $(id).disabled = working;
+    $(id).disabled = busy;
   const adjustable = Boolean(state?.options?.adjustable);
   $("refine").disabled = $("text-model").disabled = $("text-effort").disabled = working || !adjustable;
   $("refine-model").disabled = working || !adjustable || !$("refine").checked;
@@ -355,8 +359,8 @@ function renderHistory() {
     : '<p class="muted">Each move leaves what was decided, what was executed, what came back, and the verdict.</p>';
   const s = state.spend || {};
   const t = state.timing || {};
-  // `stepping` is the agent's own time; the clock beside the status also counts the time
-  // a person spent reading between presses, which is nobody's latency.
+  // `stepping` and the clock beside the status are the same time: the agent's own. Time a
+  // person spends reading between presses is nobody's latency and is not on either.
   $("step-count").textContent =
     `${state.moves || 0} moves · ${state.steps || 0} actions · ${seconds(t.wall_ms || 0)} stepping · ` +
     `${seconds(t.model_ms || 0)} model · ${seconds(t.site_ms || 0)} site · ${seconds(t.frame_ms || 0)} frames` +

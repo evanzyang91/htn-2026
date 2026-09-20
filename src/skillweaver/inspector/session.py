@@ -603,7 +603,6 @@ class LiveSession:
         self._log: list[StepRecord] = []
         self._frame = 0
         self._frame_png = b""
-        self._started_at: float | None = None
         self._resets: list[dict[str, Any]] = []
         self._concluded = True
         self._last_run_id = ""
@@ -640,7 +639,6 @@ class LiveSession:
         """Everything the page draws, as JSON-safe data."""
         run, task = self._run, self._task
         observation = run.current if run is not None else None
-        elapsed = (time.perf_counter() - self._started_at) if self._started_at else 0.0
         spend = run.spend if run is not None else None
         return {
             "status": self._status,
@@ -655,7 +653,10 @@ class LiveSession:
             "decision": self._decision_json(),
             "history": [record.as_json() for record in self._log],
             "resets": self._resets[-8:],
-            "elapsed_ms": round(elapsed * 1000),
+            # The RUN's clock: time the agent spent stepping, zeroed by `_begin`. Not time
+            # since the run began - that also counts a person reading between presses,
+            # and it kept counting after the run had stopped.
+            "elapsed_ms": round(self._total.wall_ms),
             "timing": {
                 **self._total.as_json(),
                 "first_load_ms": round(self._first_load.site_ms + self._first_load.other_ms),
@@ -982,7 +983,6 @@ class LiveSession:
         self._note = ""
         self._log = []
         self._frame_png = b""
-        self._started_at = None
         self._total = _Split()
         self._first_load = _Split()
 
@@ -1248,7 +1248,6 @@ class LiveSession:
         self._run = run
         self._pending = None
         self._log = []
-        self._started_at = time.perf_counter()
         self._status = "ready"
         self._note = ""
         self._frame_from(observation)

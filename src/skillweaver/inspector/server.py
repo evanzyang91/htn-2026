@@ -156,6 +156,7 @@ class _Worker(threading.Thread):
         self._lock = threading.Lock()
         self._busy = False
         self._doing = ""
+        self._busy_since = 0.0
 
     # -- posting work ------------------------------------------------------------------
 
@@ -215,6 +216,13 @@ class _Worker(threading.Thread):
             state = dict(self._published)
             state["busy"] = self._busy
             state["doing"] = self._doing
+            # The published snapshot is only as new as the last finished job, so the move
+            # IN FLIGHT is added here, at read time. Without it the page re-anchored a
+            # stale figure on every poll and the clock snapped back once a second.
+            stepping = self._busy and self._doing in _STEPPING
+            in_flight = (time.perf_counter() - self._busy_since) * 1000 if stepping else 0.0
+            state["clock_ms"] = round(float(state.get("elapsed_ms") or 0.0) + in_flight)
+            state["clock_running"] = stepping
             state["frame"] = self._frame_id
             state["auto"] = self._auto
             state["auto_note"] = self._auto_note
@@ -247,6 +255,7 @@ class _Worker(threading.Thread):
                 continue
             with self._lock:
                 self._busy, self._doing = True, slot.what
+                self._busy_since = time.perf_counter()
             try:
                 job(self._session)
             except SkillWeaverError as exc:
@@ -301,6 +310,9 @@ class _Worker(threading.Thread):
 
 
 _AUTO = "auto"
+
+_STEPPING = frozenset({"predict", "act", "tick", _AUTO})
+"""The jobs whose time is the run's: a start or a reset is not the agent stepping."""
 """What the worker's own moves are called in ``doing``, as ``tick`` names a pressed one."""
 
 
@@ -528,7 +540,12 @@ class Inspector:
         # One command at a time, refused rather than queued: a second press of Choose
         # while the first is still thinking would otherwise buy a second model call for
         # an answer nobody is going to look at.
-        if not self._gate.acquire(blocking=False):
+        # EXCEPT a new run, which the newest request wins: it waits for the move in flight
+        # (one thread owns the browser, so that move cannot be cancelled) and then
+        # replaces the run, instead of being refused because the old one was busy.
+        if not self._gate.acquire(
+            blocking=name == "start", timeout=self._step_timeout if name == "start" else -1
+        ):
             raise SessionBusy("A step is already running - wait for it, or pause.")
         try:
             self._worker.submit(name, job, timeout=self._step_timeout)
