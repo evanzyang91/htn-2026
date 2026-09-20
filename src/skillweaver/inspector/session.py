@@ -50,6 +50,22 @@ the alternatives it can see - every control the screen offered, with the withhel
 marked - and says plainly that the per-target odds are not exposed. Upstream Jev's own
 inspector draws bars from ``target_probabilities``; this one will too, the day a decision
 carries them. Nothing here fabricates a number to fill the space.
+
+Whose time a step took
+----------------------
+
+Upstream's inspector splits every step three ways - MODEL, LOAD and FRAME - because one
+number called "latency" hid a screenshot that cost more than the site did. The same split
+is drawn here from clocks this project already keeps, read and never re-derived:
+``JevDriver.policy_ms`` is the policy's own models, ``DomPerceiver.site_ms`` is performing,
+settling, observing and resting, and :class:`_WatchedController` times every ``capture``
+that passes through it. A capture happens INSIDE an observation, so it is taken back out of
+the site's share: the picture is what a viewer looks at, and on a heavy page charging it to
+the site reports the website as slow for work the website never did. What is left of the
+wall clock is judging and recording - the critic, the graph, the trajectory - and is shown
+as its own number so the three never have to be stretched to add up. Every read is
+tolerant (``getattr``): a perceiver or a policy that keeps no clock yields a split that
+says less, never one that raises.
 """
 
 from __future__ import annotations
@@ -73,7 +89,7 @@ from skillweaver.agent.explorer import (
 )
 from skillweaver.agent.explorer import _Invalid as InvalidAnswer
 from skillweaver.agent.explorer import _Run as ExplorerRun
-from skillweaver.config import Settings
+from skillweaver.config import DEFAULT_TEXT_MODEL, TEXT_EFFORTS, Settings
 from skillweaver.contracts import (
     Action,
     ActionResult,
@@ -89,6 +105,7 @@ from skillweaver.contracts import (
     TaskSpec,
     Usage,
     Verdict,
+    Wait,
     action_to_dict,
 )
 from skillweaver.errors import SkillWeaverError
@@ -120,10 +137,13 @@ log = get_logger(__name__)
 
 __all__ = [
     "STATES",
+    "TEXT_MODEL_CHOICES",
     "LiveSession",
     "SessionBusy",
     "SessionError",
     "StepRecord",
+    "run_overrides",
+    "text_models",
 ]
 
 STATES = ("idle", "ready", "predicted", "done", "blocked", "stopped")
@@ -161,6 +181,61 @@ class SessionBusy(SessionError):
 
 
 # --------------------------------------------------------------------------------------
+# What the page may change about a run
+# --------------------------------------------------------------------------------------
+
+TEXT_MODEL_CHOICES = (DEFAULT_TEXT_MODEL, "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5.4-nano")
+"""The text writers the page offers beside the configured one: the rows of the table at
+``DEFAULT_TEXT_MODEL`` in ``config.py`` that answered in under a second. An allowlist and
+not a text box, because the value goes into a request to a paid endpoint and a typo there
+is a run that dies at its first ``TYPE_TEXT``. Anything else is still reachable the way it
+always was, through ``SKILLWEAVER_TEXT_MODEL``, which :func:`text_models` lists first."""
+
+
+def text_models(settings: Settings) -> list[str]:
+    """What the model selectors offer: the configured models, then the measured ones."""
+    configured = [settings.text_model, settings.refine_model or ""]
+    names = [name for name in (*configured, *TEXT_MODEL_CHOICES) if name]
+    return list(dict.fromkeys(names))
+
+
+def run_overrides(body: Mapping[str, Any], settings: Settings) -> dict[str, Any]:
+    """The run-scoped settings a ``start`` body asks for, validated, as ``replace`` fields.
+
+    Only what is safe to change per run: whether the goal is refined for the policy's
+    eyes, and the text writer's model and effort. A key that is absent is not an
+    override, so a client that knows nothing of these gets the configured run.
+
+    They apply when a run is STARTED and not in the middle of one, which is where this
+    departs from upstream's selector. Upstream's helper reads ``TEXT_MODEL`` on every
+    call; this project's ``OpenAITextWriter`` is built once with its model and effort and
+    offers no way to change them, and the refiner is a closure handed to ``JevDriver`` at
+    construction. Reaching into either from here would be the inspector rewriting another
+    module's private state under a run in flight.
+
+    Raises:
+        SessionError: for a model that is not offered or an effort that does not exist.
+    """
+    out: dict[str, Any] = {}
+    if "refine_goal" in body:
+        out["refine_goal"] = bool(body["refine_goal"])
+    offered = text_models(settings)
+    for key in ("text_model", "refine_model"):
+        value = str(body.get(key) or "").strip()
+        if not value:
+            continue
+        if value not in offered:
+            raise SessionError(f"{value!r} is not one of the offered models: {offered}.")
+        out[key] = value
+    if "text_effort" in body:
+        effort = str(body["text_effort"] or "").strip().lower()
+        if effort and effort not in TEXT_EFFORTS:
+            raise SessionError(f"The effort must be one of {TEXT_EFFORTS}, or blank.")
+        out["text_effort"] = effort or None
+    return out
+
+
+# --------------------------------------------------------------------------------------
 # What one step leaves behind
 # --------------------------------------------------------------------------------------
 
@@ -172,6 +247,10 @@ class StepRecord:
     Every field is filled from something that HAPPENED. ``verdict_ok`` is ``None`` for a
     move that reached nothing - there was no after-screen to judge - and for one that was
     refused before it was performed; those two are told apart by ``refused``.
+
+    ``wall_ms`` is ``decide_ms + act_ms``, and ``model_ms``, ``site_ms``, ``frame_ms`` and
+    ``other_ms`` are whose time that was - see the module docstring. They never sum past
+    the wall: :class:`_Split` is what holds that.
     """
 
     number: int
@@ -187,6 +266,11 @@ class StepRecord:
     probability: float | None
     decide_ms: float
     act_ms: float
+    wall_ms: float
+    model_ms: float
+    site_ms: float
+    frame_ms: float
+    other_ms: float
     actions: tuple[str, ...]
     delivered: bool
     error: str | None
@@ -219,11 +303,16 @@ class _WatchedController:
     real controller's lifetime.
     """
 
-    __slots__ = ("_inner", "seen")
+    __slots__ = ("_inner", "capture_ms", "performed_ms", "seen")
 
     def __init__(self, inner: Controller) -> None:
         self._inner = inner
         self.seen: list[tuple[Action, ActionResult]] = []
+        # The FRAME clock: milliseconds spent inside ``capture``.
+        self.capture_ms = 0.0
+        # What the actions reported taking. Read only when the perceiver keeps no site
+        # clock of its own, which is the pixel path.
+        self.performed_ms = 0.0
 
     @property
     def inner(self) -> Controller:
@@ -235,10 +324,15 @@ class _WatchedController:
     def perform(self, action: Action) -> ActionResult:
         result = self._inner.perform(action)
         self.seen.append((action, result))
+        self.performed_ms += float(getattr(result, "elapsed_ms", 0.0) or 0.0)
         return result
 
     def capture(self) -> Screenshot:
-        return self._inner.capture()
+        started = time.perf_counter()
+        try:
+            return self._inner.capture()
+        finally:
+            self.capture_ms += (time.perf_counter() - started) * 1000
 
     def viewport(self) -> Box:
         return self._inner.viewport()
@@ -306,13 +400,14 @@ class _WatchedPolicy:
     numbers as numbers. The driver is unchanged and does not know this is here.
     """
 
-    __slots__ = ("_inner", "last", "last_exclude", "last_snapshot")
+    __slots__ = ("_inner", "last", "last_exclude", "last_reserved", "last_snapshot")
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
         self.last: PolicyDecision | None = None
         self.last_snapshot: DomSnapshot | None = None
         self.last_exclude: dict[str, list[str]] = {}
+        self.last_reserved: dict[str, list[str]] = {}
 
     def name(self) -> str:
         return str(self._inner.name())
@@ -330,8 +425,20 @@ class _WatchedPolicy:
         decision = self._inner.decide(goal, snapshot, history, exclude)
         self.last = decision
         self.last_snapshot = snapshot
-        self.last_exclude = {op: sorted(ids) for op, ids in (exclude or {}).items() if ids}
+        # ``exclude`` is ``{operation: element ids}`` plus the two RESERVED keys, whose
+        # values are not element ids at all; filed apart so nothing tests an id against
+        # an operation name or a label.
+        held = {key: sorted(map(str, ids)) for key, ids in (exclude or {}).items() if ids}
+        self.last_reserved = {key: held.pop(key) for key in RESERVED_EXCLUDES if key in held}
+        self.last_exclude = held
         return decision
+
+
+RESERVED_EXCLUDES = ("CONTROLS", "LABELS")
+"""The two keys of a policy's ``exclude`` mapping that name no operation: ``CONTROLS`` is
+target-less operations withheld from this step's offer (a scroll, wait or back that has
+changed nothing twice) and ``LABELS`` is control labels withheld from EVERY targeted
+operation (one the run is churning between). ``agent/jev_driver.py`` produces them."""
 
 
 def _check_explorer_seam() -> None:
@@ -359,6 +466,62 @@ def _check_explorer_seam() -> None:
 # --------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _Split:
+    """Whose time a stretch of wall clock was. See the module docstring.
+
+    The shares are CLAMPED to the wall, in the order frame, model, site. Two clocks kept
+    by two modules can overlap - a text value written while a page settles is both model
+    time and site time - and a split that sums past its own wall is a number nobody can
+    check. What the clamp takes is never more than the overlap.
+    """
+
+    wall_ms: float = 0.0
+    model_ms: float = 0.0
+    site_ms: float = 0.0
+    frame_ms: float = 0.0
+
+    @property
+    def other_ms(self) -> float:
+        return max(self.wall_ms - self.model_ms - self.site_ms - self.frame_ms, 0.0)
+
+    @classmethod
+    def of(cls, wall: float, model: float, site: float, frame: float) -> _Split:
+        wall = max(wall, 0.0)
+        frame = min(max(frame, 0.0), wall)
+        model = min(max(model, 0.0), wall - frame)
+        site = min(max(site, 0.0), wall - frame - model)
+        return cls(wall, model, site, frame)
+
+    def __add__(self, other: _Split) -> _Split:
+        return _Split(
+            self.wall_ms + other.wall_ms,
+            self.model_ms + other.model_ms,
+            self.site_ms + other.site_ms,
+            self.frame_ms + other.frame_ms,
+        )
+
+    def as_json(self) -> dict[str, int]:
+        return {
+            "wall_ms": round(self.wall_ms),
+            "model_ms": round(self.model_ms),
+            "site_ms": round(self.site_ms),
+            "frame_ms": round(self.frame_ms),
+            "other_ms": round(self.other_ms),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _Marks:
+    """The three clocks read at one instant, so a stretch is two of these subtracted."""
+
+    at: float
+    model_ms: float
+    site_ms: float | None
+    frame_ms: float
+    performed_ms: float
+
+
 @dataclass(slots=True)
 class _Pending:
     """A decision made and not yet performed."""
@@ -368,6 +531,7 @@ class _Pending:
     decide_ms: float
     at_fingerprint: str
     decision: PolicyDecision | None
+    split: _Split
 
 
 class LiveSession:
@@ -401,6 +565,10 @@ class LiveSession:
         from skillweaver.orchestrator import _open_model, _open_policy, _open_world
 
         self._settings = settings
+        # What THIS run was started with: the configured settings plus whatever the
+        # prompt bar overrode. Every rebuild within a run (Reset browser) reads this one,
+        # so a run cannot change its text writer halfway by being given a new browser.
+        self._run_settings = settings
         self._open_world = open_world or _open_world
         self._open_model = open_model or _open_model
         self._open_policy = open_policy or _open_policy
@@ -424,6 +592,8 @@ class LiveSession:
         self._resets: list[dict[str, Any]] = []
         self._concluded = True
         self._last_run_id = ""
+        self._total = _Split()
+        self._first_load = _Split()
 
         self._graph = InMemorySiteGraph(store=JSONGraphStore(settings.graphs_dir))
         self._trajectories = TrajectoryFileStore(settings.trajectories_dir)
@@ -471,6 +641,12 @@ class LiveSession:
             "history": [record.as_json() for record in self._log],
             "resets": self._resets[-8:],
             "elapsed_ms": round(elapsed * 1000),
+            "timing": {
+                **self._total.as_json(),
+                "first_load_ms": round(self._first_load.site_ms + self._first_load.other_ms),
+                "first_frame_ms": round(self._first_load.frame_ms),
+                "site_clock": self._site_clock() is not None,
+            },
             "run_id": self._last_run_id if self._concluded else "",
             "moves": run.moves if run else 0,
             "steps": run.steps if run else 0,
@@ -483,8 +659,26 @@ class LiveSession:
                 "chrome_attach": bool(self._settings.chrome_attach),
                 "browser": self._controller.describe() if self._controller else "",
                 "model": self._explorer_model(),
+                "text_model": self._run_settings.text_model,
+                "text_effort": self._run_settings.text_effort or "",
+                "refine_goal": bool(self._run_settings.refine_goal),
+                "refine_model": self._run_settings.refine_model or "",
+                "goal_shown": self._goal_shown(),
+            },
+            "options": {
+                "text_models": text_models(self._settings),
+                "efforts": ["", *TEXT_EFFORTS],
+                "configured": {
+                    "text_model": self._settings.text_model,
+                    "text_effort": self._settings.text_effort or "",
+                    "refine_goal": bool(self._settings.refine_goal),
+                    "refine_model": self._settings.refine_model or "",
+                },
+                # The writer and the refiner only exist under the Jev policy.
+                "adjustable": self._settings.policy == "jev",
             },
             "can": {
+                "advance": self._status in ("ready", "predicted"),
                 "predict": self._status in ("ready", "predicted"),
                 "act": self._status == "predicted",
                 "reset_run": self._task is not None,
@@ -505,8 +699,12 @@ class LiveSession:
         read_only: bool = False,
         budget: Budget | None = None,
         domain: str | None = None,
+        overrides: Mapping[str, Any] | None = None,
     ) -> None:
         """Open a world on ``url`` and begin a run for ``goal``.
+
+        ``overrides`` is :func:`run_overrides`' answer: settings fields this run is built
+        with instead of the configured ones. They last until the next ``start``.
 
         Called again on an already-open session, this replaces the run and the browser:
         a new task may want a different start URL and a clean history, and reusing a
@@ -540,15 +738,21 @@ class LiveSession:
         except ValueError as exc:
             raise SessionError(f"The undo does not parse: {exc}") from exc
 
+        try:
+            settings = dataclasses.replace(self._settings, **dict(overrides or {}))
+        except TypeError as exc:
+            raise SessionError(f"That is not a setting a run can be started with: {exc}") from exc
+
         self.close()
         self._task = spec
-        controller, perceiver = self._open_world(self._settings, spec)
+        self._run_settings = settings
+        controller, perceiver = self._open_world(settings, spec)
         self._controller = controller
         self._watched = _WatchedController(controller)
         self._perceiver = perceiver
         try:
-            llm = self._open_model(self._settings)
-            policy = self._open_policy(self._settings, perceiver, llm)
+            llm = self._open_model(settings)
+            policy = self._open_policy(settings, perceiver, llm)
             self._policy = _WatchedPolicy(policy._policy) if _has_inner_policy(policy) else None
             if self._policy is not None:
                 policy._policy = self._policy  # noqa: SLF001 - see _WatchedPolicy
@@ -600,7 +804,7 @@ class LiveSession:
         if pending is None:
             raise SessionError("Choose a move first - there is nothing to execute.")
         if pending.at_fingerprint != run.current.fingerprint.value:
-            self._pending = None
+            self._drop_pending()
             self._status = "ready"
             raise SessionError(
                 "The screen changed after that choice was made, so it has been "
@@ -614,6 +818,18 @@ class LiveSession:
         self.predict()
         if self._status == "predicted":
             self.act()
+
+    def advance(self) -> None:
+        """One move of an automatic run: execute what is being shown, or choose and execute.
+
+        What ``tick`` is for a loop that may be switched on while a choice is already on
+        the table. ``tick`` there would ask AGAIN and pay a second model call for a move
+        the person was looking at when they pressed the switch.
+        """
+        if self._status == "predicted" and self._pending is not None:
+            self.act()
+        else:
+            self.tick()
 
     # -- the reset buttons -------------------------------------------------------------
 
@@ -652,7 +868,7 @@ class LiveSession:
         budget = self._run.spend.budget if self._run else self._settings.default_budget
         if self._controller is not None:
             self._controller.close()
-        controller, perceiver = self._open_world(self._settings, task)
+        controller, perceiver = self._open_world(self._run_settings, task)
         self._controller = controller
         self._watched = _WatchedController(controller)
         self._perceiver = perceiver
@@ -747,6 +963,8 @@ class LiveSession:
         self._log = []
         self._frame_png = b""
         self._started_at = None
+        self._total = _Split()
+        self._first_load = _Split()
 
     # -- the two halves of one step ----------------------------------------------------
 
@@ -758,28 +976,37 @@ class LiveSession:
         so the next press asks again with that refusal in hand.
         """
         catalog = ElementCatalog(run.current.elements)
-        started = time.perf_counter()
+        if self._policy is not None:
+            # A driver may answer WITHOUT asking its policy; the decision on file would
+            # then be the previous step's, shown beside a move it never chose.
+            self._policy.last = None
+        before = self._marks()
         try:
             answer = explorer._ask(run.task, run, catalog)  # noqa: SLF001
         except PolicyBlocked as exc:
+            self._total += self._split_since(before, asked=True)
             self._stop("blocked", str(exc) or "the policy reported no supported operation")
             return
-        decide_ms = (time.perf_counter() - started) * 1000
+        split = self._split_since(before, asked=True)
+        decide_ms = split.wall_ms
         try:
             move = explorer._ground(answer, catalog, self._watched)  # noqa: SLF001
             explorer._refuse_repeat(move, run)  # noqa: SLF001
         except InvalidAnswer as refusal:
             explorer._reject(run, refusal, answer)  # noqa: SLF001
-            self._record_refusal(run, str(refusal), decide_ms)
+            self._total += split
+            self._record_refusal(run, str(refusal), split)
             self._status = "ready"
             self._note = "The answer was refused; press Choose again."
             return
+        self._drop_pending()
         self._pending = _Pending(
             move=move,
             catalog=catalog,
             decide_ms=decide_ms,
             at_fingerprint=run.current.fingerprint.value,
             decision=self._policy.last if self._policy else None,
+            split=split,
         )
         self._status = "predicted"
         self._note = ""
@@ -792,9 +1019,12 @@ class LiveSession:
         self._watched.forget()
         if self._critic is not None:
             self._critic.last = None
-        started = time.perf_counter()
-        explorer._make_move(run.task, move, pending.catalog, self._watched, run)  # noqa: SLF001
-        act_ms = (time.perf_counter() - started) * 1000
+        marks = self._marks()
+        try:
+            explorer._make_move(run.task, move, pending.catalog, self._watched, run)  # noqa: SLF001
+        finally:
+            acted = self._split_since(marks, asked=False)
+            self._total += pending.split + acted
 
         performed = list(self._watched.seen)
         verdict = self._critic.last if self._critic else None
@@ -806,7 +1036,7 @@ class LiveSession:
             verdict,
             url_before,
             before.fingerprint,
-            act_ms,
+            acted,
         )
         self._frame_from(run.current)
         if run.ok:
@@ -829,9 +1059,10 @@ class LiveSession:
         verdict: Verdict | None,
         url_before: str,
         before: Fingerprint,
-        act_ms: float,
+        acted: _Split,
     ) -> None:
         decision = pending.decision
+        whole = pending.split + acted
         failed = [result.error for _action, result in performed if not result.ok and result.error]
         self._append(
             StepRecord(
@@ -842,12 +1073,13 @@ class LiveSession:
                 expect=move.expect,
                 claimed_done=move.done,
                 signature=move.signature,
-                operation=decision.operation if decision else _operation_of(move),
+                operation=_shown_operation(move, decision),
                 target=_target_of(move, pending.catalog, decision),
                 confidence=decision.confidence if decision else None,
                 probability=decision.probability if decision else None,
                 decide_ms=round(pending.decide_ms),
-                act_ms=round(act_ms),
+                act_ms=round(acted.wall_ms),
+                **whole.as_json(),
                 actions=tuple(_action_line(a, r) for a, r in performed),
                 delivered=bool(performed) and all(r.ok for _a, r in performed),
                 error=failed[0] if failed else (run.rejection if verdict is None else None),
@@ -864,7 +1096,7 @@ class LiveSession:
             )
         )
 
-    def _record_refusal(self, run: ExplorerRun, why: str, decide_ms: float) -> None:
+    def _record_refusal(self, run: ExplorerRun, why: str, split: _Split) -> None:
         """A proposal the loop would not use. It cost a call, so it is a step."""
         self._append(
             StepRecord(
@@ -879,8 +1111,9 @@ class LiveSession:
                 target="",
                 confidence=None,
                 probability=None,
-                decide_ms=round(decide_ms),
+                decide_ms=round(split.wall_ms),
                 act_ms=0.0,
+                **split.as_json(),
                 actions=(),
                 delivered=False,
                 error=why,
@@ -897,6 +1130,67 @@ class LiveSession:
             )
         )
 
+    # -- whose time it was -------------------------------------------------------------
+
+    def _drop_pending(self) -> None:
+        """Let go of a choice that will never be performed - re-asked, outrun by the page,
+        or undone by a reset. It was paid for, so its time stays in the run's totals even
+        though no step will ever carry it."""
+        if self._pending is not None:
+            self._total += self._pending.split
+        self._pending = None
+
+    def _site_clock(self) -> float | None:
+        """``DomPerceiver.site_ms``, or ``None`` from a perceiver that keeps no such clock."""
+        value = getattr(self._perceiver, "site_ms", None)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    def _marks(self) -> _Marks:
+        policy = self._explorer._policy if self._explorer is not None else None  # noqa: SLF001
+        model = getattr(policy, "policy_ms", 0.0)
+        watched = self._watched
+        return _Marks(
+            at=time.perf_counter(),
+            model_ms=float(model) if isinstance(model, (int, float)) else 0.0,
+            site_ms=self._site_clock(),
+            frame_ms=watched.capture_ms if watched else 0.0,
+            performed_ms=watched.performed_ms if watched else 0.0,
+        )
+
+    def _split_since(self, before: _Marks, *, asked: bool) -> _Split:
+        """The stretch from ``before`` to now, shared out. See the module docstring.
+
+        ``asked`` says the stretch was the DECIDE half. With no acting policy that half
+        is one call to the prompted model and nothing else, so all of it is model time;
+        with one, the policy's own clock says how much was.
+        """
+        now = self._marks()
+        wall = (now.at - before.at) * 1000
+        frame = now.frame_ms - before.frame_ms
+        policy = self._explorer._policy if self._explorer is not None else None  # noqa: SLF001
+        if hasattr(policy, "policy_ms"):
+            model = now.model_ms - before.model_ms
+        else:
+            model = wall - frame if asked else 0.0
+        if now.site_ms is not None and before.site_ms is not None:
+            # Every capture is taken inside an observation, which that clock counts.
+            site = now.site_ms - before.site_ms - frame
+        else:
+            site = now.performed_ms - before.performed_ms
+        return _Split.of(wall, model, site, frame)
+
+    def _goal_shown(self) -> str:
+        """The refined goal the policy is being shown, or ``""`` when it sees the task as
+        typed. Read off the driver tolerantly: it is another module's private memo, and
+        the page loses a line, not a run, if it moves."""
+        policy = self._explorer._policy if self._explorer is not None else None  # noqa: SLF001
+        refined = getattr(policy, "_refined", None)
+        task = self._task
+        if not isinstance(refined, dict) or task is None:
+            return ""
+        shown = [str(v) for v in refined.values() if str(v) != task.text]
+        return shown[-1] if shown else ""
+
     def _append(self, record: StepRecord) -> None:
         self._log.append(record)
         if len(self._log) > MAX_LOG_STEPS:
@@ -912,9 +1206,14 @@ class LiveSession:
         self._conclude()
         explorer._recorder.start(task.text, task.domain)  # noqa: SLF001
         self._concluded = False
+        self._total = _Split()
+        assert self._watched is not None
+        marks = self._marks()
         if navigate:
             self._go_to_start(task)
-        observation = self._perceiver.observe(self._controller)
+        # Through the watcher, like every later observation, so this frame is timed too.
+        observation = self._perceiver.observe(self._watched)
+        self._first_load = self._split_since(marks, asked=False)
         run = ExplorerRun(
             task=task,
             spend=Spend(budget).start(),
@@ -999,9 +1298,9 @@ class LiveSession:
         """Re-observe without stepping - what a reset needs so the page shows the undo."""
         if self._perceiver is None or self._controller is None or self._run is None:
             return
-        observation = self._perceiver.observe(self._controller)
+        observation = self._perceiver.observe(self._watched or self._controller)
         self._run.current = observation
-        self._pending = None
+        self._drop_pending()
         if self._status == "predicted":
             self._status = "ready"
         self._frame_from(observation)
@@ -1052,7 +1351,11 @@ class LiveSession:
         """
         if not element_id or self._policy is None:
             return []
-        return [op for op, ids in self._policy.last_exclude.items() if element_id in ids]
+        held = [op for op, ids in self._policy.last_exclude.items() if element_id in ids]
+        label = getattr(self._controls_by_id().get(element_id), "label", "")
+        if label and label in self._policy.last_reserved.get("LABELS", ()):
+            held.append("every operation (label churned)")
+        return held
 
     def _decision_json(self) -> dict[str, Any] | None:
         """The held decision, or ``None``. See the module docstring on what is absent."""
@@ -1068,7 +1371,7 @@ class LiveSession:
             "done": move.done,
             "signature": move.signature,
             "target": _target_of(move, pending.catalog, decision),
-            "operation": decision.operation if decision else _operation_of(move),
+            "operation": _shown_operation(move, decision),
             "confidence": decision.confidence if decision else None,
             "probability": decision.probability if decision else None,
             "policy_ms": round(decision.policy_ms) if decision else None,
@@ -1080,6 +1383,13 @@ class LiveSession:
                 op: list(ids)
                 for op, ids in (self._policy.last_exclude if self._policy else {}).items()
             },
+            "withheld_controls": list(
+                self._policy.last_reserved.get("CONTROLS", ()) if self._policy else ()
+            ),
+            "withheld_labels": list(
+                self._policy.last_reserved.get("LABELS", ()) if self._policy else ()
+            ),
+            "fresh_look": _is_fresh_look(move, decision),
             "ranked": self._policy is not None,
             "decided_by": self._explorer_model(),
         }
@@ -1094,7 +1404,9 @@ class LiveSession:
         the control's own label, and it invents nothing: the label comes from the page's
         snapshot, falling back to the element's text and then to its id.
         """
-        operation = decision.operation if decision else _operation_of(move)
+        if _is_fresh_look(move, decision):
+            return "DONE claimed → one fresh look before it is accepted"
+        operation = _shown_operation(move, decision)
         element_id = decision.element_id if decision else None
         if element_id is None:
             aimed = signature_move(move.signature)
@@ -1188,6 +1500,27 @@ def _operation_of(move: Move) -> str:
     if move.action is None:
         return "DONE" if move.done else "NONE"
     return str(getattr(move.action, "kind", "")).upper()
+
+
+def _is_fresh_look(move: Move, decision: PolicyDecision | None) -> bool:
+    """Whether this move is the driver's second look at a ``DONE`` claim.
+
+    The driver makes a ``DONE`` survive one fresh observation before passing it on - a
+    cart badge or a navigation may not have landed - and what reaches the loop is a short
+    wait that claims nothing. Shown raw that is a policy saying ``DONE`` beside an
+    executed ``wait 150ms``, which reads as a bug. Recognised by that same disagreement,
+    so it needs nothing from the driver and says nothing when the driver does not do it.
+    """
+    if decision is None or decision.operation != "DONE" or move.done:
+        return False
+    return isinstance(move.action, Wait)
+
+
+def _shown_operation(move: Move, decision: PolicyDecision | None) -> str:
+    """The operation to SHOW: the policy's, unless the move it became is a different one."""
+    if decision is None or _is_fresh_look(move, decision):
+        return _operation_of(move)
+    return decision.operation
 
 
 def _target_of(move: Move, catalog: ElementCatalog, decision: PolicyDecision | None) -> str:
