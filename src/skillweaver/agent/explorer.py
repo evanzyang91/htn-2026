@@ -1082,17 +1082,46 @@ class Explorer:
         unenforceable.
         """
         if self._policy is not None:
-            answer = self._policy.propose(
-                self._aimed(task, run),
-                run.current,
-                catalog,
-                run.history,
-                run.memory.near(run.current.fingerprint),
-                run.rejection,
-            )
+            try:
+                answer = self._propose(self._aimed(task, run), run, catalog)
+            except PolicyBlocked:
+                if self._subgoal(run) is None:
+                    raise
+                # BLOCKED is the policy's answer to the question it was ASKED, and it
+                # was asked about a borrowed step - so it may not end the run. The
+                # skeleton goes, and the same screen is asked about the whole errand;
+                # a second BLOCKED is the policy's answer to THAT and stands.
+                # Measured on the sandbox shop, 2026-09-20, and stated exactly because
+                # the first reading was wrong: a workflow learned on a site that opens
+                # on its search box was handed to an errand that opens on a Mail
+                # screen, and the run ended BLOCKED at 0 moves. With this in place the
+                # skeleton was dropped, the whole errand was asked - and that was
+                # BLOCKED too. The skeleton had not caused the failure; it had only
+                # been in a position to, which is reason enough for the guard.
+                self._charge(run, at_least=1)
+                log.info(
+                    "explore.skeleton.dropped",
+                    source=run.skeleton_from,
+                    at=run.at,
+                    of=len(run.skeleton),
+                    why="the policy reported BLOCKED on a borrowed step",
+                )
+                run.skeleton, run.at = (), 0
+                answer = self._propose(task, run, catalog)
             self._charge(run, at_least=1)
             return answer
         return self._ask_model(task, run, catalog)
+
+    def _propose(self, task: TaskSpec, run: _Run, catalog: ElementCatalog) -> str:
+        assert self._policy is not None
+        return self._policy.propose(
+            task,
+            run.current,
+            catalog,
+            run.history,
+            run.memory.near(run.current.fingerprint),
+            run.rejection,
+        )
 
     def _ask_model(self, task: TaskSpec, run: _Run, catalog: ElementCatalog) -> str:
         """One model call: the whole situation in one user turn, plus the screenshot.

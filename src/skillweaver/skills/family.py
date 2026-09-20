@@ -119,28 +119,35 @@ MAX_FAMILY_DISTANCE = 0.34
 """How far apart two signatures may be and still be one family, as a fraction of the
 longer one (:func:`distance`). ``0.34`` admits one edit in three tokens.
 
-Chosen by measuring, 2026-09-20, over the eleven signatures this project then had:
-five from the live Wikipedia library, three learned on walmart.com, and three on
-splitkb.com - one per perception path from the homepage, and the older one-click skill
-from a product page. ``scripts/measure_families.py`` prints the whole table and
-re-runs in a second. All 55 pairs, read by what the two skills are FOR:
+Chosen by measuring, 2026-09-20, over the twelve signatures this project then had:
+five from the live Wikipedia library, three learned on walmart.com, three on
+splitkb.com (one per perception path from the homepage, and the older one-click skill
+from a product page) and one on the sandbox shop. ``scripts/measure_families.py``
+prints the whole table and re-runs in a second. All 66 pairs, read by what the two
+skills are FOR:
 
-    the same errand (search, then add to the cart), across sites,
-    sentences and perception paths                         nine pairs, 0.12 to 0.30
-        splitkb pixels ~ splitkb DOM ~ Walmart add-and-open-cart   0.12, 0.12, 0.12
-        the rest, Walmart to splitkb and Walmart to Walmart        0.20 to 0.30
-    the two Wikipedia search-and-open skills                       0.00
-    one pair that is arguably the same errand and is NOT admitted  0.40
-        Walmart's three-step "add X" against its five-step "add X,
-        then open the cart" with a trailing click
-    different errands                                      every other pair, >= 0.50
-        any shop skill to any Wikipedia skill                      0.50 to 0.88
+    the same errand (find the thing, add it to the cart), across four
+    sites' worth of sentences and both perception paths      fourteen pairs
+        eleven of them                                              0.12 to 0.33
+        Walmart's three-step "add X" ~ its five-step "add X, then
+        open the cart"                                              0.40
+        the sandbox shop (six steps: open the tab, search, pick the
+        restaurant, the dish, the portion, add) ~ splitkb pixels    0.42
+        the sandbox shop ~ Walmart's three-step skill               0.50
+    the two Wikipedia search-and-open skills                        0.00
+    different errands                                        every other pair, >= 0.50
 
-The cut sits between 0.30 and 0.40. That is a narrow margin below and a wide one
-above, and the asymmetry is the right way round: a relative wrongly left out costs a
-slower run, a stranger wrongly let in lends its sentence to an errand it does not
-perform. It is RELATIVE so that length matters - one edit is a sixth of a six-step
-workflow and the whole of a one-step one.
+So the two populations TOUCH at 0.50 and no cut separates them: the same errand done
+in six steps on one site and three on another is as far apart as a shop is from an
+encyclopedia. ``0.34`` admits eleven of the fourteen true pairs and none of the false
+ones, with 0.16 of room above it; ``0.45`` would admit thirteen with 0.05 of room. The
+lower one is kept because the two ways of being wrong are not equal: a relative left
+out costs a slower run, a stranger let in lends its sentence to an errand it does not
+perform. The values are quantised - a distance is a count of half-edits over a length -
+so the 0.33 pairs sitting 0.007 under the cut are not at the mercy of noise, but they
+ARE at the mercy of one more step: the sandbox skill is family to the splitkb DOM
+skill and to nothing on the pixel path. It is RELATIVE so that length matters - one
+edit is a sixth of a six-step workflow and the whole of a one-step one.
 
 Two things this measurement showed that the cut cannot fix, both handled elsewhere:
 
