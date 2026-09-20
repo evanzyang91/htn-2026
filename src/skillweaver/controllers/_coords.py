@@ -1,25 +1,11 @@
-"""Coordinate arithmetic for the browser controller.
+"""Coordinate arithmetic for the browser controller: the ONE place a logical pixel
+becomes a physical one, or back. Pure - no Playwright, no I/O, no state.
 
-This module is the ONE place where a logical pixel becomes a physical one, or the
-other way round. It is pure: no Playwright, no I/O, no state, so every rule here
-can be unit-tested on its own.
-
-Why so little of it is needed on the action path
-------------------------------------------------
-Playwright's ``page.mouse`` speaks CSS pixels, which are exactly the LOGICAL pixels
-of :mod:`skillweaver.contracts`. A click target therefore travels from the agent to
-the browser unconverted, and :func:`within_viewport` is all the controller needs
-before handing a point over.
-
-The conversion matters on the *capture* path instead. A screenshot's PNG is at the
-display's PHYSICAL resolution - twice the logical size on a Retina-style page - so
-:func:`scale_for` derives ``Screenshot.scale`` from the PNG the capture actually
-produced rather than from what the browser was asked for. Anything that then works
-on those native pixels (a YOLO detector, OCR) converts back with
-:func:`point_to_logical` or :func:`box_to_logical` before building a contract value.
-
-A click that lands at exactly twice the intended coordinates is a missing call to
-something in this file.
+Little of it is needed on the ACTION path, because Playwright's ``page.mouse`` already
+speaks CSS pixels: :func:`within_viewport` is all the controller needs. It matters on the
+CAPTURE path, where a PNG is at physical resolution, so :func:`scale_for` derives
+``Screenshot.scale`` from the bytes rather than from what the browser was asked for. A
+click that lands at exactly twice the intended coordinates is a missing call to this file.
 """
 
 from __future__ import annotations
@@ -33,12 +19,11 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
 def check_scale(scale: float) -> float:
-    """Return ``scale`` if it is a usable physical-per-logical ratio.
+    """``scale`` if it is a usable physical-per-logical ratio.
 
     Raises:
-        ValueError: if ``scale`` is not finite or is not greater than zero. A zero
-            or negative scale would silently collapse every coordinate to the
-            origin, so it is refused rather than clamped.
+        ValueError: not finite or not positive. A zero or negative scale would collapse
+            every coordinate to the origin, so it is refused rather than clamped.
     """
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError(f"scale must be a finite positive number, got {scale!r}")
@@ -46,13 +31,10 @@ def check_scale(scale: float) -> float:
 
 
 def png_size(png: bytes) -> tuple[int, int]:
-    """Read ``(width, height)`` in PHYSICAL pixels out of a PNG's IHDR header.
-
-    Cheaper than decoding the image, and used by the controller to check that the
-    frame it reports matches the bytes it captured.
+    """``(width, height)`` in PHYSICAL pixels from a PNG's IHDR header, without decoding.
 
     Raises:
-        ValueError: if ``png`` is not a PNG or its header is truncated.
+        ValueError: not a PNG, or the header is truncated.
     """
     if len(png) < 24 or not png.startswith(_PNG_MAGIC):
         raise ValueError("not a PNG image")
@@ -63,13 +45,11 @@ def png_size(png: bytes) -> tuple[int, int]:
 
 
 def scale_for(physical: int, logical: int) -> float:
-    """The physical-per-logical ratio that turns ``logical`` into ``physical``.
-
-    This is how ``Screenshot.scale`` is derived: measured from the PNG that was
-    actually captured, so the reported scale and the bytes can never disagree.
+    """The physical-per-logical ratio, measured from the PNG actually captured so that
+    ``Screenshot.scale`` and the bytes cannot disagree.
 
     Raises:
-        ValueError: if either side is not positive.
+        ValueError: either side is not positive.
     """
     if physical <= 0 or logical <= 0:
         raise ValueError(f"sizes must be positive, got physical={physical}, logical={logical}")
@@ -77,11 +57,7 @@ def scale_for(physical: int, logical: int) -> float:
 
 
 def physical_size(width: int, height: int, scale: float) -> tuple[int, int]:
-    """The PNG size in physical pixels for a ``width`` x ``height`` logical viewport.
-
-    Matches the ``Screenshot`` docstring: ``round(width * scale)`` by
-    ``round(height * scale)``.
-    """
+    """The PNG size in physical pixels for a ``width`` x ``height`` logical viewport."""
     check_scale(scale)
     return round(width * scale), round(height * scale)
 
@@ -93,19 +69,16 @@ def point_to_physical(point: Point, scale: float) -> Point:
 
 
 def point_to_logical(x: float, y: float, scale: float) -> Point:
-    """Convert a raw physical image coordinate to a logical :class:`Point`.
-
-    Use this on anything read out of ``Screenshot.to_array(logical=False)``.
-    """
+    """A raw physical image coordinate as a logical :class:`Point`."""
     check_scale(scale)
     return Point(round(x / scale), round(y / scale))
 
 
 def box_to_physical(box: Box, scale: float) -> Box:
-    """Convert a logical :class:`Box` to physical image pixels.
+    """A logical :class:`Box` in physical image pixels.
 
-    Both edges are converted before the size is taken, so the result always spans
-    the same pixels the corners do.
+    Both edges convert before the size is taken, so the result spans the same pixels the
+    corners do.
     """
     check_scale(scale)
     x0, y0 = round(box.x * scale), round(box.y * scale)
@@ -114,10 +87,10 @@ def box_to_physical(box: Box, scale: float) -> Box:
 
 
 def box_to_logical(x: float, y: float, w: float, h: float, scale: float) -> Box:
-    """Convert a raw physical image rectangle to a logical :class:`Box`.
+    """A raw physical image rectangle as a logical :class:`Box`.
 
-    Edges are converted independently and the size derived from them, so adjacent
-    boxes stay adjacent and a box never gains or loses a pixel to rounding twice.
+    Edges convert independently and the size derives from them, so adjacent boxes stay
+    adjacent and no box gains or loses a pixel to rounding twice.
     """
     check_scale(scale)
     x0, y0 = round(x / scale), round(y / scale)
@@ -128,19 +101,17 @@ def box_to_logical(x: float, y: float, w: float, h: float, scale: float) -> Box:
 def within_viewport(viewport: Box, point: Point) -> bool:
     """Whether a logical action coordinate falls inside ``viewport``.
 
-    Action coordinates are relative to the viewport's top-left corner (see
-    ``Controller.viewport``), so only ``viewport``'s size is consulted, never its
-    offset. The right and bottom edges are exclusive, matching ``Box.contains``.
+    Action coordinates are viewport-relative, so only the SIZE is consulted, never the
+    offset. Right and bottom edges are exclusive, matching ``Box.contains``.
     """
     return 0 <= point.x < viewport.w and 0 <= point.y < viewport.h
 
 
 def clip_to_viewport(box: Box, viewport: Box) -> Box:
-    """Trim ``box`` to the part of it that is actually on screen.
+    """Trim ``box`` to the part of it on screen; zero area when none of it is.
 
-    Returns a zero-area box when nothing of it is visible. Ground truth uses this
-    so an element hanging off the edge is labelled with the rectangle a detector
-    could plausibly see, not with one reaching outside the frame.
+    Ground truth uses this so an element hanging off the edge is labelled with the
+    rectangle a detector could plausibly see.
     """
     x0 = max(box.x, 0)
     y0 = max(box.y, 0)

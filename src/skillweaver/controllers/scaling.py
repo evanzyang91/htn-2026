@@ -1,36 +1,22 @@
 """Every coordinate conversion a desktop controller needs, in one pure place.
 
-Nothing here imports a screen, a backend or a model - only :mod:`math` and the
-shared value types - so it can be read, reasoned about and tested by hand. That is
-the point: a click that lands at exactly twice the intended offset is an arithmetic
-bug, and arithmetic bugs belong in a file small enough to check line by line.
-
-Three coordinate spaces exist, and only the first two ever leave this package:
+Three coordinate spaces, of which only the first two leave this package:
 
 ``local logical``
-    What the rest of skillweaver speaks: logical pixels with the origin at the
-    top-left of ``Controller.viewport()``. Every :class:`~skillweaver.contracts.Point`
-    and :class:`~skillweaver.contracts.Box` in the codebase is in this space.
-
+    Logical pixels with the origin at the top-left of ``Controller.viewport()``. Every
+    ``Point`` and ``Box`` in the codebase is in this space.
 ``global logical``
-    Logical pixels with the origin at the top-left of the primary display. This is
-    what the OS pointer APIs want, and what a display's bounds are expressed in. A
-    display left of the primary one has a negative ``x``; negatives are handled
-    throughout. Convert with :func:`to_global` / :func:`to_local`.
-
+    Logical pixels with the origin at the primary display. What the OS pointer APIs
+    want; a display left of the primary has a negative ``x``. :func:`to_global` /
+    :func:`to_local` convert.
 ``physical``
-    Raw bitmap pixels of a capture. On a Retina Mac there are two of them per
-    logical pixel in each direction, so a 1512x982 display grabs as 3024x1964.
-    Physical values are deliberately **not** ``Point`` or ``Box`` - they are plain
-    ints and tuples - so that a physical coordinate cannot be mistaken for a logical
-    one by a type checker or by a reader.
+    Raw bitmap pixels. Deliberately NOT ``Point`` or ``Box`` - plain ints and tuples -
+    so a physical coordinate cannot be mistaken for a logical one.
 
-Rounding is half-up (``floor(v + 0.5)``) everywhere, never Python's bankers'
-rounding, so that the same input always gives the same output and the tests can
-state the expected number outright. Boxes are the exception: converting a box
-*down* from physical grows it outwards (floor the near edge, ceil the far edge) so
-that a detection never loses the pixels at its border. Both directions round-trip
-exactly at integer scales - see the tests.
+Rounding is half-up (``floor(v + 0.5)``) everywhere, never bankers' rounding, so a test
+can state the expected number outright. Boxes converting DOWN from physical are the
+exception and grow outwards (floor the near edge, ceil the far one), so a detection never
+loses the pixels at its border.
 """
 
 from __future__ import annotations
@@ -55,12 +41,8 @@ __all__ = [
 
 
 def _round_half_up(value: float) -> int:
-    """Round to the nearest integer with ties going up, for positives and negatives.
-
-    ``2.5`` becomes ``3`` and ``-2.5`` becomes ``-2``. Python's built-in ``round``
-    would give ``2`` and ``-2``; the difference matters only at half-pixels, but a
-    rule you can apply in your head matters everywhere.
-    """
+    """Ties up, positives and negatives: ``2.5`` -> ``3``, ``-2.5`` -> ``-2``. Built-in
+    ``round`` gives ``2`` and ``-2``; a rule you can apply in your head matters here."""
     return math.floor(value + 0.5)
 
 
@@ -68,7 +50,7 @@ def _check_scale(scale: float) -> float:
     """Reject a scale that would make every conversion nonsense.
 
     Raises:
-        ValueError: if ``scale`` is not a finite number greater than zero.
+        ValueError: ``scale`` is not a finite number greater than zero.
     """
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"scale must be a finite positive number, got {scale!r}")
@@ -78,14 +60,12 @@ def _check_scale(scale: float) -> float:
 def scale_for(physical: int, logical: int) -> float:
     """The backing scale factor implied by a capture: physical / logical.
 
-    Measure the scale from the bitmap you actually got rather than assuming ``2.0``
-    because the machine is a Mac. A display connected at a non-Retina scale factor,
-    a screen-recording backend configured for nominal resolution, and an external
-    1080p monitor all report a real ``1.0``, and a wrong assumption here is exactly
-    the doubling bug this module exists to prevent.
+    Measured from the bitmap actually got, never assumed to be ``2.0`` because the machine
+    is a Mac: a non-Retina scale factor, a nominal-resolution backend and an external
+    1080p monitor all report a real ``1.0``.
 
     Raises:
-        ValueError: if either size is not a positive integer.
+        ValueError: either size is not a positive integer.
     """
     if physical <= 0 or logical <= 0:
         raise ValueError(f"sizes must be positive, got physical={physical}, logical={logical}")
@@ -93,59 +73,37 @@ def scale_for(physical: int, logical: int) -> float:
 
 
 def logical_to_physical(value: float, scale: float) -> int:
-    """One logical pixel coordinate or length as a physical one.
-
-    ``logical_to_physical(100, 2.0) == 200``.
-
-    Raises:
-        ValueError: if ``scale`` is not finite and positive.
-    """
+    """One logical pixel coordinate or length as a physical one."""
     return _round_half_up(value * _check_scale(scale))
 
 
 def physical_to_logical(value: float, scale: float) -> int:
     """One physical pixel coordinate or length as a logical one.
 
-    ``physical_to_logical(200, 2.0) == 100``. This is the conversion a detector owes
-    the rest of the system: raw image coordinates are physical, and nothing above
-    the control layer may see them.
-
-    Raises:
-        ValueError: if ``scale`` is not finite and positive.
+    The conversion a detector owes the rest of the system: raw image coordinates are
+    physical, and nothing above the control layer may see them.
     """
     return _round_half_up(value / _check_scale(scale))
 
 
 def point_to_physical(point: Point, scale: float) -> tuple[int, int]:
-    """A logical :class:`~skillweaver.contracts.Point` as a physical ``(x, y)`` pair.
-
-    Raises:
-        ValueError: if ``scale`` is not finite and positive.
-    """
+    """A logical ``Point`` as a physical ``(x, y)`` pair."""
     scale = _check_scale(scale)
     return (_round_half_up(point.x * scale), _round_half_up(point.y * scale))
 
 
 def point_from_physical(x: float, y: float, scale: float) -> Point:
-    """A physical ``(x, y)`` pair as a logical :class:`~skillweaver.contracts.Point`.
-
-    Raises:
-        ValueError: if ``scale`` is not finite and positive.
-    """
+    """A physical ``(x, y)`` pair as a logical ``Point``."""
     scale = _check_scale(scale)
     return Point(_round_half_up(x / scale), _round_half_up(y / scale))
 
 
 def box_to_physical(box: Box, scale: float) -> tuple[int, int, int, int]:
-    """A logical :class:`~skillweaver.contracts.Box` as a physical ``(x, y, w, h)``.
+    """A logical ``Box`` as a physical ``(x, y, w, h)``.
 
-    Both edges are converted and the width is their difference, so two boxes that
-    share an edge logically still share it physically - scaling the width on its own
-    would let a rounding difference open a one-pixel gap. Negative widths and
-    heights are treated as zero.
-
-    Raises:
-        ValueError: if ``scale`` is not finite and positive.
+    Both edges convert and the width is their difference, so two boxes sharing an edge
+    logically still share it physically - scaling the width alone would open a one-pixel
+    gap. Negative sizes are treated as zero.
     """
     scale = _check_scale(scale)
     left = _round_half_up(box.x * scale)
@@ -156,17 +114,12 @@ def box_to_physical(box: Box, scale: float) -> tuple[int, int, int, int]:
 
 
 def box_from_physical(x: float, y: float, w: float, h: float, scale: float) -> Box:
-    """A physical ``(x, y, w, h)`` rectangle as a logical
-    :class:`~skillweaver.contracts.Box`.
+    """A physical ``(x, y, w, h)`` rectangle as a logical ``Box``.
 
-    The near edges floor and the far edges ceil, so the logical box always covers
-    every physical pixel the detection touched. At an integer scale this is exact
-    and round-trips with :func:`box_to_physical`; at a fractional one it grows by at
-    most one logical pixel per side, which is the safe direction for a click target.
-    Negative widths and heights are treated as zero.
-
-    Raises:
-        ValueError: if ``scale`` is not finite and positive.
+    Near edges floor and far edges ceil, so the logical box covers every physical pixel
+    the detection touched: exact at an integer scale, at most one logical pixel larger per
+    side at a fractional one, which is the safe direction for a click target. Negative
+    sizes are treated as zero.
     """
     scale = _check_scale(scale)
     left = math.floor(x / scale)
@@ -179,14 +132,9 @@ def box_from_physical(x: float, y: float, w: float, h: float, scale: float) -> B
 def clamp_point(point: Point, bounds: Box) -> Point:
     """The point nearest ``point`` that is actually inside ``bounds``.
 
-    ``bounds`` covers ``x <= px < x + w``, so the largest addressable coordinate is
-    ``bounds.x + bounds.w - 1``: clamping ``Point(1512, 0)`` into a 1512-wide display
-    gives ``1511``, the rightmost real pixel, not ``1512``, which is off the screen.
-    A degenerate bound (zero or negative width or height) collapses that axis onto
-    its origin.
-
-    This is a *correction*, not a check. Use ``bounds.contains(point)`` when you
-    need to refuse an out-of-range action instead of quietly moving it.
+    ``bounds`` covers ``x <= px < x + w``, so clamping ``Point(1512, 0)`` into a 1512-wide
+    display gives ``1511``. A degenerate bound collapses that axis onto its origin. This
+    is a CORRECTION, not a check - use ``bounds.contains`` to refuse instead.
     """
     max_x = bounds.x + bounds.w - 1 if bounds.w > 0 else bounds.x
     max_y = bounds.y + bounds.h - 1 if bounds.h > 0 else bounds.y
@@ -199,10 +147,9 @@ def clamp_point(point: Point, bounds: Box) -> Point:
 def clamp_box(box: Box, bounds: Box) -> Box:
     """The part of ``box`` that lies inside ``bounds``.
 
-    Edges are half-open here, unlike :func:`clamp_point`: a box may end at
-    ``bounds.x + bounds.w`` because that edge is exclusive, while a *point* may not
-    sit on it because there is no pixel there. A box entirely outside ``bounds``
-    comes back with zero area, flush against the edge it was beyond.
+    Edges are half-open here, unlike :func:`clamp_point`: a box may END at
+    ``bounds.x + bounds.w``, while a POINT may not sit there because there is no pixel.
+    A box entirely outside comes back with zero area, flush against the edge.
     """
     left = min(max(box.x, bounds.x), bounds.x + max(bounds.w, 0))
     top = min(max(box.y, bounds.y), bounds.y + max(bounds.h, 0))
@@ -212,17 +159,14 @@ def clamp_box(box: Box, bounds: Box) -> Box:
 
 
 def to_global(point: Point, viewport: Box) -> Point:
-    """A viewport-relative logical point as a display-global logical point.
+    """A viewport-relative logical point as a display-global one.
 
-    The OS pointer APIs address the whole desktop, so a controller driving the
-    second display - whose bounds might be ``Box(1512, 0, 1920, 1080)`` - must add
-    that origin before it moves the cursor. Inside skillweaver, ``Point(0, 0)`` is
-    always the top-left of the viewport.
+    The OS pointer APIs address the whole desktop, so a controller on the second display
+    must add that origin before it moves the cursor.
     """
     return Point(point.x + viewport.x, point.y + viewport.y)
 
 
 def to_local(point: Point, viewport: Box) -> Point:
-    """A display-global logical point as a viewport-relative one; inverse of
-    :func:`to_global`."""
+    """A display-global logical point as a viewport-relative one; inverse of :func:`to_global`."""
     return Point(point.x - viewport.x, point.y - viewport.y)

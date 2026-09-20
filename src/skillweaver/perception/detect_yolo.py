@@ -1,41 +1,17 @@
-"""The YOLO element detector: a :class:`~skillweaver.contracts.Detector` over pixels.
+"""The YOLO element detector: a ``Detector`` over pixels, never over the DOM.
 
-This is how the agent sees a button. It takes a :class:`Screenshot` and returns
-:class:`Element` boxes with an :class:`ElementKind`, in LOGICAL pixels, with real
-confidences and ``source=ElementSource.yolo``. It never reads the DOM - the whole
-premise of the project is that it does not have one.
+``Screenshot`` in, ``Element`` boxes out in LOGICAL pixels with real confidences and
+``source=yolo``. The weights ship with the repository at ``data/models/ui_detector.pt`` -
+the one file under ``data/`` that is not git-ignored - and there is currently no in-repo
+path to regenerate them.
 
-Weights ship with the repository at ``data/models/ui_detector.pt`` - the one file
-under ``data/`` that is not git-ignored - so a clean clone detects immediately, with
-no training step and no network. They are produced by :mod:`scripts.train_detector`,
-which fine-tunes a small YOLO model on a dataset labelled by ``BrowserGroundTruth``
-(see :mod:`scripts.build_ui_dataset`); that dataset stays ignored because it is
-large and regenerable.
+What they have SEEN is a local demo app and live public pages. An earlier version trained
+on the demo app alone was very good at it and close to useless anywhere else, so a page
+from a site the training set never held is still the weakest case.
 
-**What the shipped weights have actually seen.** The sandbox app and live Wikipedia,
-in several layouts each. The first version of these weights was trained on the
-sandbox alone and was very good at it and close to useless anywhere else; what that
-cost, and what the real pages bought back, is measured on held-out frames in
-``tests/perception/fixtures/README.md``. Wikipedia is the only real site in the
-training set, so a page from somewhere else is still the weakest case - the same
-file says by how much. ``build_ui_dataset.py --bench`` re-measures all of it.
-
-A detector still has to cope with them being gone, because ``SKILLWEAVER_DATA_DIR``
-can point anywhere and a demo laptop is not a clean clone.
-
-**Missing weights raise.** Returning an empty list would be indistinguishable from
-a blank screen, and an agent told it sees nothing on a full page of buttons fails
-in a way nobody can debug. :class:`PerceptionError` with the path and the command
-that builds it is the honest answer.
-
-Loading is lazy: constructing a ``YoloDetector`` touches no file and imports no
-torch, so ``from skillweaver.perception.detect_yolo import YoloDetector`` stays
-cheap for code that may never detect anything.
-
-Typical use::
-
-    detector = YoloDetector()                      # nothing loaded yet
-    elements = detector.detect(controller.capture())
+Missing weights RAISE: an empty list is indistinguishable from a blank screen, and an
+agent told it sees nothing on a page of buttons fails in a way nobody can debug. Loading
+is lazy, so importing this module costs nothing.
 """
 
 from __future__ import annotations
@@ -63,61 +39,32 @@ DEFAULT_IOU = 0.5
 value would merge two adjacent buttons into one box."""
 
 DEFAULT_MAX_DETECTIONS = 300
-"""Ceiling on boxes per frame, kept at 300 on the measurement below rather than on
-the worry it was originally written with.
+"""Ceiling on boxes per frame. It does NOT bind on a real page: across sixteen dense live
+page/viewport pairs the detection count at this cap equalled the count at
+``max_detections=3000`` every time, the largest being 135 on an MDN page whose DOM reports
+402 elements. What loses elements on a dense page is RECALL, by a factor of three, and
+the cap loses none. The only frame that
+reaches it is a synthetic grid of 900 buttons (307 uncapped), where the boxes either side
+of rank 300 score 0.269 to 0.250, so the cut can only bite inside the
+:data:`DEFAULT_CONFIDENCE` floor band.
 
-**It does not bind on a real page.** A page CAN carry more than 300 elements - a
-Hacker News front page has 320 by the DOM, and a frame in the training set has 306
-- but that is a count of what is THERE, not of what this detector returns. Across
-sixteen dense live page/viewport pairs, the number of detections at this cap
-equalled the number with the cap effectively removed (``max_detections=3000``)
-every single time; the largest was 135, on an MDN reference page whose DOM reports
-402 elements at 1440x2000. The densest committed fixture returns 177
-(``rec_selected``), and Hacker News itself returns 9. What loses elements on a
-dense page is RECALL - see ``tests/perception/fixtures/README.md`` - and it loses
-them by a factor of three, while the cap loses none. Raising the cap would not
-have made one more control clickable on any page measured here.
+Both reasons previously recorded for not raising it are WRONG. It does not buy back OCR
+time - the reader reads the whole frame and caches on pixels, and ``ocr_reads`` is
+identical at 300 and 3000 - nor NMS time, which was flat at 69.5/68.1/69.4 ms for
+300/1000/3000. What more detections cost is ``merge_elements``, which is quadratic: 20.9 ms
+for 133 detections, 180.8 for 1064, 1057.6 for 3059, and paid on EVERY observation
+including one the text cache serves free. So the cap bounds that quadratic for the frame
+where the model melts down; raising it raises a quadratic. Making the merge cheap enough
+that the ceiling stops mattering is the follow-up.
 
-The only frame found that reaches it at all is a synthetic grid of 900 real
-``<button>`` elements, which returns 307 uncapped. Even there the cut is not
-arbitrary: the boxes either side of rank 300 score 0.269 down to 0.250, so the cap
-can only ever bite inside the :data:`DEFAULT_CONFIDENCE` floor band - it discards
-what the model was already barely willing to admit.
-
-**Both reasons previously recorded for not raising it are wrong, and the right one
-is a different cost entirely.** It does not buy back OCR time: the reader reads the
-WHOLE FRAME and its cache is keyed on pixels, so the number of detections cannot
-change how much text is read - measured, ``ocr_reads`` and the line count are
-identical at 300 and at 3000. Nor does it buy back NMS time: on the same dense
-frame, median detect time was 69.5 / 68.1 / 69.4 ms at a cap of 300 / 1000 / 3000,
-which is flat, against 1809 ms for that frame's text read (96% of one uncached
-observation).
-
-What more detections actually cost is downstream and superlinear.
-:func:`~skillweaver.perception.elements.merge_elements` compares every candidate
-against every cluster it has opened, so on that frame's own boxes the merge takes
-20.9 ms for 133 detections, 180.8 ms for 1064 and 1057.6 ms for 3059 - and unlike
-the text read it is paid on EVERY observation, including one the text cache serves
-for free. So the cap earns its place as a bound on that quadratic for the frame
-where the model does melt down, not as a saving on any frame that exists. Making
-the merge cheap enough that the ceiling stops mattering is the follow-up; until
-then, raising this number raises a quadratic.
-
-One side effect worth knowing, since the cap sits in front of a cache: at the cap,
-a 3-pixel scroll of that synthetic grid swapped one element out of the surviving
-set and one in (Jaccard 0.992, against 1.000 uncapped), because the cut reshuffles
-inside the confidence floor. It did not reach state identity - the fingerprint
-scored 1.000 either way - and no real page measured comes within 2.2x of the cap,
-so this is a property to remember if the detector ever gets much denser, not a
-live defect.
-
-Timings are medians on one machine at load average 4.6-5.6, quoted only against
-each other."""
+One side effect, since the cap sits in front of a cache: at the cap a 3-pixel scroll of
+that synthetic grid swapped one element out of the surviving set and one in (Jaccard
+0.992 against 1.000 uncapped). It did not reach state identity and no real page comes
+within 2.2x of the cap."""
 
 _BUILD_HINT = (
-    "build it with:\n"
-    "  uv run python scripts/build_ui_dataset.py --out data/models/ui-dataset\n"
-    "  uv run python scripts/train_detector.py --data data/models/ui-dataset/data.yaml"
+    "The detector ships with the repository at data/models/ui_detector.pt; there is "
+    "currently no in-repo path to regenerate it, so restore that file from version control."
 )
 
 
@@ -129,20 +76,18 @@ def default_weights_path() -> Path:
 class YoloDetector:
     """A ``contracts.Detector`` backed by an ultralytics YOLO model.
 
+    Safe to share between threads: the one-time load is guarded by a lock.
+
     Args:
         weights: Path to a ``.pt`` file. ``None`` means :func:`default_weights_path`.
         confidence: Minimum score for a detection to be returned.
         iou: Non-maximum-suppression IoU threshold.
         max_detections: Hard ceiling on boxes returned for one frame.
-        device: Torch device string (``"cpu"``, ``"mps"``, ``"cuda:0"``). ``None``
-            lets ultralytics choose.
-
-    The instance is safe to share between threads: the one-time model load is
-    guarded by a lock, and inference itself goes straight to ultralytics.
+        device: Torch device string; ``None`` lets ultralytics choose.
 
     Raises:
-        PerceptionError: from :meth:`detect` (never from ``__init__``) when the
-            weights are missing or unloadable, or when inference fails.
+        PerceptionError: from :meth:`detect`, never ``__init__``, when the weights are
+            missing or unloadable or inference fails.
     """
 
     def __init__(
@@ -167,18 +112,16 @@ class YoloDetector:
     def detect(self, screenshot: Screenshot) -> list[Element]:
         """Detect UI elements, highest confidence first, boxes in LOGICAL pixels.
 
-        Inference runs on the screenshot's native PHYSICAL pixels, because that is
-        the sharpest image available and a Retina frame carries real extra detail.
-        Every box is therefore divided by ``screenshot.scale`` on the way out, and
-        clipped to the logical viewport - a model is free to predict a box that
-        runs off the edge of the frame, and a click target that does is a bug.
+        Inference runs on native PHYSICAL pixels - the sharpest image available - so every
+        box is divided by ``scale`` on the way out and clipped to the logical viewport: a
+        model may predict a box off the edge of the frame, and a click target that is is a bug.
 
         Raises:
-            PerceptionError: if the weights are missing or inference fails.
+            PerceptionError: the weights are missing or inference failed.
         """
         model = self._load()
-        # ultralytics reads a numpy array as BGR, and torch refuses the negative
-        # stride a bare ``[..., ::-1]`` view would hand it.
+        # ultralytics reads a numpy array as BGR, and torch refuses the negative stride a
+        # bare ``[..., ::-1]`` view would hand it.
         image = np.ascontiguousarray(screenshot.to_array(logical=False)[:, :, ::-1])
         try:
             results = model.predict(
@@ -206,11 +149,7 @@ class YoloDetector:
         return self._weights if self._weights is not None else default_weights_path()
 
     def _load(self) -> Any:
-        """Load the model once, on first use.
-
-        Raises:
-            PerceptionError: if the file is absent or ultralytics cannot read it.
-        """
+        """Load the model once, on first use."""
         if self._model is not None:
             return self._model
         with self._lock:
@@ -220,7 +159,8 @@ class YoloDetector:
             if not path.is_file():
                 raise PerceptionError(
                     f"YOLO detector weights not found at {path}. "
-                    f"Set SKILLWEAVER_DATA_DIR or pass weights=..., or {_BUILD_HINT}"
+                    f"Set SKILLWEAVER_DATA_DIR, or pass weights=..., if they live "
+                    f"elsewhere. {_BUILD_HINT}"
                 )
             try:
                 YOLO = _import_yolo()
@@ -235,12 +175,11 @@ class YoloDetector:
             return model
 
     def _check_classes(self, model: Any, path: Path) -> None:
-        """Refuse weights whose class map is not the one in ``labeling.CLASS_NAMES``.
+        """Refuse weights whose class map is not ``labeling.CLASS_NAMES``.
 
-        Class ids are positional, so a checkpoint trained against a different map
-        would report perfectly confident nonsense - every button relabelled as a
-        checkbox - and nothing downstream could tell. Failing here is loud and
-        cheap; the alternative is a week of debugging the agent.
+        Class ids are POSITIONAL, so a checkpoint trained against a different map would
+        report confident nonsense - every button relabelled a checkbox - and nothing
+        downstream could tell.
         """
         names = getattr(model, "names", None)
         if not names:
@@ -249,7 +188,7 @@ class YoloDetector:
         if ordered != CLASS_NAMES:
             raise PerceptionError(
                 f"YOLO weights at {path} were trained on classes {ordered}, but this "
-                f"build expects {CLASS_NAMES}; retrain the detector - {_BUILD_HINT}"
+                f"build expects {CLASS_NAMES}. {_BUILD_HINT}"
             )
 
     def _elements_of(self, result: Any, scale: float, viewport: Box) -> list[Element]:
@@ -288,17 +227,12 @@ class YoloDetector:
 def _import_yolo():  # noqa: ANN202 - the ultralytics class, imported lazily
     """Import ``YOLO`` and undo the one side effect ultralytics has on the process.
 
-    Importing ultralytics replaces ``PIL.Image.open`` with a wrapper that, the first
-    time a decode fails, tries to register a HEIF plugin - and registering it runs
-    ``pip install pi-heif``. Two things then go wrong for everybody else in the
-    process, not just for this detector: a corrupt PNG raises ``ModuleNotFoundError``
-    instead of the ``UnidentifiedImageError`` that ``Screenshot.to_array`` promises to
-    turn into a ``PerceptionError``, and code that should never touch the network
-    starts a package install. A test suite that imports this module once inherits both.
-
-    skillweaver decodes screenshots, which are PNGs, so the wrapper buys nothing here.
-    Putting the original back is the smallest fix that keeps the contract honest. If a
-    future ultralytics stops exposing the original, the patch simply stays in place.
+    It replaces ``PIL.Image.open`` with a wrapper that, on the first failed decode, tries
+    to register a HEIF plugin - which runs ``pip install pi-heif``. Process-wide, that
+    turns a corrupt PNG into ``ModuleNotFoundError`` instead of the
+    ``UnidentifiedImageError`` ``Screenshot.to_array`` promises, and starts a package
+    install from code that should never touch the network. Screenshots are PNGs, so the
+    wrapper buys nothing here.
     """
     import PIL.Image
     from ultralytics import YOLO
@@ -315,8 +249,8 @@ def _import_yolo():  # noqa: ANN202 - the ultralytics class, imported lazily
 def _to_logical(x1: float, y1: float, x2: float, y2: float, scale: float) -> Box:
     """A physical-pixel ``xyxy`` corner pair as a logical-pixel :class:`Box`.
 
-    Both corners are converted before the size is taken, so a box never grows or
-    shrinks by a pixel through independent rounding of its origin and its width.
+    Both corners convert before the size is taken, so independent rounding of origin and
+    width cannot grow or shrink the box by a pixel.
     """
     left, top = round(x1 / scale), round(y1 / scale)
     right, bottom = round(x2 / scale), round(y2 / scale)

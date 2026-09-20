@@ -1,40 +1,22 @@
 """The Claude backend: ``contracts.LLMClient`` over the Anthropic Messages API.
 
-This is skillweaver's primary reasoning backend. It translates the
-provider-neutral :class:`~skillweaver.contracts.LLMMessage` conversation into
-Messages API content blocks and translates the reply back, so nothing above this
-module knows an Anthropic SDK type.
+Translates the provider-neutral ``LLMMessage`` conversation into Messages API content
+blocks and back, so nothing above this module knows an Anthropic SDK type.
 
-Three things worth knowing before changing it:
+Sampling parameters are DROPPED, not forwarded: current Claude models reject
+``temperature``, and the contract says an adapter drops it rather than failing, so a
+caller written against Gemini's surface still works here.
 
-**Sampling parameters are dropped, not forwarded.** Current Claude models reject
-``temperature``; the contract says an adapter must silently drop it rather than
-fail, so a caller written against Gemini's surface still works here.
+Thinking is left at the MODEL DEFAULT. On Claude Opus 5 that is adaptive thinking, which
+- unlike the older fixed-budget mode - does not require the caller to echo thinking
+blocks back on the next turn. That is what lets ``LLMMessage`` stay lossy.
 
-**Thinking is left at the model default.** On Claude Opus 5 that is adaptive
-thinking, which - unlike the older fixed-budget mode - does not require the caller
-to echo thinking blocks back on the next turn. That is what lets
-:class:`LLMMessage` stay lossy: it carries text, images and tool calls, and
-nothing else has to survive the round trip.
+Retries are OURS: the SDK client is built with ``max_retries=0`` so the backoff here is
+the only one. Anything not retryable is re-raised as ``ProviderError``.
 
-**Retries are ours, not the SDK's.** The constructed SDK client is built with
-``max_retries=0`` so the backoff here is the only one, which makes it observable
-and testable. Anything not on the retryable list is re-raised as
-:class:`~skillweaver.errors.ProviderError` with the real cause attached.
-
-.. note::
-   **Verification status: proven against the live API.** On 2026-09-19 this
-   adapter made real ``claude-opus-5`` calls for all three cassette scenarios -
-   a plain completion, a completion with an attached screenshot, and a
-   completion returning a tool call - and the replies in
-   ``tests/fixtures/cassettes/anthropic_basics.json`` are those real responses.
-   The offline suite replays them, so the request shapes below are confirmed by
-   a live round trip, not only by the docs. Re-record with
-   ``python tests/llm/record_fixtures.py --live``.
-
-   Not yet exercised live: the computer-use toolset entry
-   (:data:`COMPUTER_USE_TOOL`), ``effort``, and the ``workspace_id`` header.
-   Those follow the current docs but no live call has used them.
+Proven against the live API on 2026-09-19 for a plain completion, one with an attached
+screenshot, and one returning a tool call. NOT yet exercised live: the computer-use
+toolset entry (:data:`COMPUTER_USE_TOOL`), ``effort``, and the ``workspace_id`` header.
 """
 
 from __future__ import annotations
@@ -61,14 +43,10 @@ COMPUTER_USE_TOOL: Final[Mapping[str, Any]] = MappingProxyType(
 )
 """The computer-use toolset entry, ready to put in a request's ``tools``.
 
-The 2026-08-01 toolset is schema-less on purpose: member names are fixed by the
-version, and coordinates are always in the pixel space of the screenshots you
-send back, so ``name``, ``display_width_px``, ``display_height_px`` and
-``display_number`` are all *rejected*. It needs no beta header.
-
-The explorer should pass ``computer_use=True`` to :class:`AnthropicClient` rather
-than hand-rolling this; the constant is exported so a test can assert on it.
-"""
+The 2026-08-01 toolset is schema-less on purpose: member names are fixed by the version
+and coordinates are always in the pixel space of the screenshots you send back, so
+``name``, ``display_width_px``, ``display_height_px`` and ``display_number`` are all
+REJECTED. It needs no beta header. Pass ``computer_use=True`` rather than hand-rolling it."""
 
 COMPUTER_USE_ACTIONS: Final[tuple[str, ...]] = (
     "screenshot",
@@ -91,11 +69,9 @@ COMPUTER_USE_ACTIONS: Final[tuple[str, ...]] = (
 )
 """Every member tool of :data:`COMPUTER_USE_TOOL`, in the order the docs list them.
 
-A returned :class:`ToolCall` uses one of these as its ``name``. Screen
-coordinates arrive as ``[x, y]`` in the pixel space of the screenshot that was
-sent - which, because :class:`~skillweaver.contracts.Screenshot.to_array` hands
-out a logical-size image, is LOGICAL pixels. Do not rescale them.
-"""
+A returned ``ToolCall`` uses one as its ``name``. Coordinates arrive in the pixel space
+of the screenshot that was sent - which, since ``Screenshot.to_array`` hands out a
+logical-size image, is LOGICAL pixels. Do not rescale them."""
 
 COMPUTER_USE_MODELS: Final[frozenset[str]] = frozenset(
     {
@@ -145,8 +121,8 @@ class AnthropicClient:
             (which reads both the environment and ``.env``) and then to the SDK's own
             resolution (auth token, stored profile).
         client: A ready-made SDK client, or any object exposing
-            ``messages.create(**kwargs)``. Tests pass a stub here; when given,
-            ``api_key``, ``workspace_id`` and ``timeout`` are ignored.
+            ``messages.create(**kwargs)``. When given, ``api_key``, ``workspace_id``
+            and ``timeout`` are ignored.
         workspace_id: Sent as the ``anthropic-workspace-id`` header. Required when
             the key is scoped to an organization rather than a workspace - such a
             key gets a 400 on EVERY endpoint without it, ``models.list`` included.
@@ -156,7 +132,7 @@ class AnthropicClient:
         max_attempts: Total tries per call, including the first. ``1`` disables retry.
         base_delay / max_delay: Exponential backoff bounds in seconds.
         timeout: Per-request timeout in seconds for a client built here.
-        sleep / jitter: Injected for tests, so a retry test costs no wall time.
+        sleep / jitter: Injectable, so a retry need not cost wall time.
     """
 
     def __init__(

@@ -1,33 +1,17 @@
 """Replay a recorded trajectory against a controller and report where it diverged.
 
-Replay is how a trajectory earns its keep after the run that produced it: the
-admission gate replays a candidate skill's trajectory to prove it still works, and
-the evaluation harness replays a library run to see whether a site has moved.
+The admission gate replays a candidate skill's trajectory to prove it still works and the
+eval harness replays a library run to see whether a site has moved. Both want the same
+answer, and it is not a boolean - it is WHICH step went wrong, what was expected there,
+and what happened instead (:attr:`ReplayReport.first_divergence`).
 
-Both want the same answer, and it is not a boolean - it is *which step went wrong,
-what was expected there, and what happened instead*::
+Per step, in order: the action was refused where the recording succeeded (or the reverse);
+with a ``Perceiver``, the fingerprint after the action is less than ``min_similarity`` like
+the recorded one; else, if both have one, the URL went elsewhere. With neither - a bare
+desktop controller - only the first check runs, which :attr:`ReplayReport.compared` says.
 
-    report = replay(trajectory, controller, perceiver=perceiver)
-    if not report.ok:
-        first = report.first_divergence
-        print(first.index, first.reason, first.expected, "->", first.observed)
-
-What counts as a divergence, in the order it is checked per step:
-
-1. **the action was refused** - the controller reported ``ok=False`` where the
-   recording reported ``ok=True`` (or the reverse);
-2. **the screen went somewhere else** - with a ``Perceiver``, the fingerprint after
-   the action is less than ``min_similarity`` like the recorded one;
-3. **the URL went somewhere else** - the fallback when there is no perceiver and
-   both the controller and the recording have a URL.
-
-With no perceiver and no URL (a bare desktop controller) only the first check runs,
-and the report says so through :attr:`ReplayReport.compared`.
-
-A **dry run** (``dry_run=True``) never touches the controller. It checks the
-trajectory itself - contiguous step indices, actions that survive a serialization
-round trip, action kinds this controller supports, points inside its viewport - so a
-harness can reject a trajectory it could not replay without opening a browser.
+``dry_run=True`` never touches the controller: it checks the trajectory itself, so a
+harness can reject one it could not replay without opening a browser.
 """
 
 from __future__ import annotations
@@ -65,8 +49,8 @@ DivergenceReason = Literal[
     "url",
     "controller_error",
 ]
-"""Why a step did not replay. The first four are found without acting (a dry run
-finds exactly these); the rest need the controller."""
+"""Why a step did not replay. The first four are found without acting - a dry run finds
+exactly these - and the rest need the controller."""
 
 Compared = Literal["fingerprint", "url", "result_only"]
 """How far replay could check each step: the strongest comparison available."""
@@ -76,14 +60,7 @@ Compared = Literal["fingerprint", "url", "result_only"]
 class Divergence:
     """One place a replay stopped matching its recording.
 
-    Attributes:
-        index: The ``TrajectoryStep.index`` that diverged.
-        reason: Which check failed.
-        expected: What the recording says, as a short human-readable string.
-        observed: What happened instead.
-        similarity: Fingerprint similarity in ``0.0..1.0`` for a ``fingerprint``
-            divergence, ``None`` for every other reason.
-        action: The action being replayed when this was found.
+    ``similarity`` is set only for a ``fingerprint`` divergence.
     """
 
     index: int
@@ -105,16 +82,8 @@ class Divergence:
 class ReplayReport:
     """The structured outcome of a replay.
 
-    Attributes:
-        run_id: The trajectory that was replayed.
-        ok: True when nothing diverged.
-        dry_run: Whether the controller was left untouched.
-        steps_replayed: How many steps were actually performed (``0`` for a dry run).
-        steps_total: How many steps the trajectory has.
-        divergences: Every divergence found, in step order. With the default
-            ``stop_on_divergence`` there is at most one.
-        compared: The strongest per-step comparison replay was able to make.
-        elapsed_ms: Wall-clock milliseconds the replay took.
+    ``divergences`` is in step order, and holds at most one under the default
+    ``stop_on_divergence``. ``steps_replayed`` is ``0`` for a dry run.
     """
 
     run_id: str
@@ -154,13 +123,10 @@ def _points(action: Action) -> tuple[Point, ...]:
 def validate(trajectory: Trajectory, controller: Controller) -> list[Divergence]:
     """Everything wrong with ``trajectory`` that can be found without acting.
 
-    Checks that step indices run ``0, 1, 2, ...``, that every action survives a
-    round trip through :func:`~skillweaver.contracts.action_to_dict`, that the
-    controller supports each action's kind, and that every point lies inside the
-    controller's viewport. Returns them in step order; empty means replayable.
+    Contiguous step indices, actions that survive a ``action_to_dict`` round trip, kinds
+    this controller supports, points inside its viewport. Empty means replayable.
 
-    Steps the RECORDING already shows failing (``result.ok`` is false - a refused
-    ``Navigate``, a click off the edge) are exempt from the support and viewport
+    Steps the RECORDING already shows failing are exempt from the support and viewport
     checks: a controller refusing them again reproduces the recording rather than
     diverging from it.
     """
@@ -218,30 +184,22 @@ def replay(
 ) -> ReplayReport:
     """Re-issue ``trajectory``'s actions against ``controller`` and report the result.
 
+    Coordinates are LOGICAL pixels exactly as recorded; replay never rescales a point.
+    Divergence is REPORTED, never raised - a ``ControllerError`` becomes a
+    ``controller_error`` divergence, so a harness replaying a thousand runs survives one
+    broken browser.
+
     Args:
         trajectory: The recording to replay.
         controller: Where to replay it. Left untouched when ``dry_run``.
-        perceiver: Used to observe the screen after each action so fingerprints can
-            be compared. Without it, replay falls back to comparing URLs, and
-            without those, to the action results alone.
-        dry_run: Only validate the trajectory (see :func:`validate`); perform
-            nothing.
-        min_similarity: A step's fingerprint must be at least this like the recorded
-            one. ``1.0`` demands the same screen; lower it to tolerate a clock, a
+        perceiver: Observes after each action so fingerprints can be compared. Without
+            it replay falls back to URLs, and without those to action results alone.
+        dry_run: Only :func:`validate`; perform nothing.
+        min_similarity: ``1.0`` demands the same screen; lower it to tolerate a clock, a
             cart count or an ad.
-        stop_on_divergence: Stop at the first divergence (the default - the state is
-            no longer the recorded one, so later steps would compare against
-            nonsense). ``False`` replays every step and collects everything, which
-            is what an offline forensic pass wants.
-
-    The controller's coordinates are LOGICAL pixels, exactly as recorded; replay
-    never rescales a point.
-
-    Returns:
-        A :class:`ReplayReport`. Divergence is reported, never raised - including a
-        :class:`~skillweaver.errors.ControllerError`, which becomes a
-        ``controller_error`` divergence so a harness replaying a thousand runs
-        survives one broken browser.
+        stop_on_divergence: Stop at the first one (the default - the state is no longer
+            the recorded one, so later steps compare against nonsense). ``False``
+            collects everything, which is what an offline forensic pass wants.
     """
     started = time.perf_counter()
     divergences = validate(trajectory, controller)

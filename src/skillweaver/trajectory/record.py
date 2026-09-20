@@ -1,22 +1,13 @@
 """``Recorder``: writes a run to disk as it happens, one line per action.
 
-The recorder is deliberately not a buffer that saves at the end. It appends each
-step to ``trajectory.jsonl`` and fsyncs it before returning, so a run that is killed
-- by a budget, a crash, or an impatient demo operator - leaves a directory that
-:class:`~skillweaver.trajectory.store.TrajectoryFileStore` can still load: the header
-and every step that completed, with ``ok=False``. That partial run is exactly what
-exploration produces most of the time, and it is still worth reading.
+Deliberately not a buffer that saves at the end. Each step is appended and FSYNCED before
+returning, so a run killed by a budget, a crash or an impatient demo operator still leaves
+a loadable directory - the header and every completed step, with ``ok=False``. That
+partial run is what exploration produces most of the time and is still worth reading.
 
-Screenshots are written before the step line that names them, and by content digest,
-so a step line never points at a PNG that is missing or half written and two steps
-showing the same screen cost one file.
-
-::
-
-    recorder = Recorder()                       # settings().trajectories_dir
-    run_id = recorder.start(task.text, task.domain)
-    recorder.step(action, before, after, result)
-    trajectory = recorder.finish(ok=True)       # the file is already complete
+Screenshots are written BEFORE the step line that names them, and by content digest, so a
+step line never points at a missing or half-written PNG and two steps showing one screen
+cost one file.
 
 The format lives in :mod:`skillweaver.trajectory.store`; this module only writes it.
 """
@@ -64,18 +55,13 @@ def new_run_id() -> str:
 class Recorder:
     """A ``contracts.TrajectoryRecorder`` that writes each step through to disk.
 
+    ONE RUN AT A TIME: :meth:`start` on a recorder already recording raises, rather than
+    silently interleaving two runs into one file.
+
     Args:
-        root: Directory to create run directories in. ``None`` means
-            ``settings().trajectories_dir``; the path is never hardcoded here.
-        clock: Source of UTC timestamps, injectable so tests can be deterministic.
+        root: ``None`` means ``settings().trajectories_dir``; no path is hardcoded here.
+        clock: Source of UTC timestamps, injectable for determinism.
         run_ids: Source of run identifiers, injectable for the same reason.
-
-    Inspection, for callers and tests: ``run_id`` (``None`` when idle), ``path``
-    (the current run's directory, ``None`` when idle), ``steps`` (how many are
-    recorded so far).
-
-    One run at a time: :meth:`start` on a recorder that is already recording raises,
-    rather than silently interleaving two runs into one file.
     """
 
     def __init__(
@@ -118,8 +104,7 @@ class Recorder:
         """Begin a run: create its directory, write the header line, return the id.
 
         Raises:
-            SkillWeaverError: if a run is already in progress, or the directory
-                cannot be created.
+            SkillWeaverError: a run is in progress, or the directory cannot be created.
         """
         if self._run_id is not None:
             raise SkillWeaverError(f"run {self._run_id} is still in progress")
@@ -158,7 +143,7 @@ class Recorder:
         """Append one step: its screenshots first, then its line, then fsync.
 
         Raises:
-            SkillWeaverError: if no run is in progress, or the step cannot be written.
+            SkillWeaverError: no run is in progress, or the step cannot be written.
         """
         if self._run_id is None or self._path is None:
             raise SkillWeaverError("no run in progress: call start() first")
@@ -178,12 +163,8 @@ class Recorder:
     def finish(self, ok: bool, note: str = "") -> Trajectory:
         """Write the footer, close the run and return the finished trajectory.
 
-        The file on disk is already complete when this returns; passing the result
-        to ``TrajectoryFileStore.save`` rewrites the same content and is optional.
-
-        Raises:
-            SkillWeaverError: if no run is in progress, or the footer cannot be
-                written.
+        The file is already complete when this returns; handing the result to
+        ``TrajectoryFileStore.save`` rewrites the same content and is optional.
         """
         if self._run_id is None or self._started_at is None:
             raise SkillWeaverError("no run in progress: call start() first")
@@ -207,7 +188,7 @@ class Recorder:
     # -- internals ---------------------------------------------------------------------
 
     def _append(self, line: dict[str, Any]) -> None:
-        """Append one JSON line and force it to the platter before returning."""
+        """Append one JSON line and fsync it before returning."""
         assert self._path is not None  # noqa: S101 - callers check; this documents the invariant
         path = self._path / TRAJECTORY_FILE
         text = json.dumps(line, ensure_ascii=False) + "\n"

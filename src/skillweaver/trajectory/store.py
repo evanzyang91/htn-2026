@@ -1,39 +1,23 @@
 """The on-disk trajectory format, and :class:`TrajectoryFileStore` over it.
 
-This module owns the format that four other parts of the project read: skill
-synthesis compiles from it, the admission gate replays against it, the evaluation
-harness scores it, and the dashboard shows it as a screenshot filmstrip. Those four
-want very different slices of a run, so the layout separates them::
+Four parts of the project read this: skill synthesis compiles from it, the admission gate
+replays against it, the eval harness scores it, the dashboard shows it as a filmstrip.
+They want different slices, so the layout separates them::
 
     <settings().trajectories_dir>/
         20260919T120000000000Z__a1b2c3d4e5f6/       one directory per run
             trajectory.jsonl                        append-only, one JSON object per line
             screens/2f6c1b3d9a04e7f5.png            one file per DISTINCT screenshot
 
-``trajectory.jsonl`` holds exactly three kinds of line, always in this order:
+``trajectory.jsonl`` holds one ``header`` line, one ``step`` line per action, and one
+``footer``, in that order. A file WITHOUT a footer is a run that crashed: it still loads,
+as the steps that reached the disk, with ``ok=False``.
 
-``{"type": "header", "schema": 1, "run_id": ..., "task": ..., ...}``
-    Written once, first, by :meth:`TrajectoryRecorder.start`.
-``{"type": "step", "index": 0, "action": {...}, "before": {...}, ...}``
-    One per action, appended as it happens. Observations reference their screenshot
-    by content digest instead of inlining the bytes.
-``{"type": "footer", "ok": true, "finished_at": ..., "note": ...}``
-    Written once, last, by ``finish``. A file WITHOUT it is a run that crashed: it
-    still loads, as the steps that made it to disk, with ``ok=False``.
-
-What each consumer reads, and what it costs:
-
-============================  ========================================================
-:meth:`~TrajectoryFileStore.list`       one ``scandir``; no file is opened at all
-:meth:`~TrajectoryFileStore.summaries`  header + footer line per run; no steps, no PNGs
-:meth:`~TrajectoryFileStore.frames`     the step lines; PNG *paths*, not their bytes
-``load(run_id, screenshots=False)``     the step lines; actions and elements, no PNGs
-``load(run_id)``                        everything, each distinct PNG read exactly once
-============================  ========================================================
-
-The directory name carries the run's start time so that listing a thousand runs
-oldest-first is a name sort and never a read. Screenshots are stored once per
-distinct image and referenced by digest, because a run's PNGs outweigh its JSON by
+Each read costs what it needs: :meth:`~TrajectoryFileStore.list` is one ``scandir`` and no
+open; ``summaries`` reads two lines per run; ``frames`` reads the step lines and returns
+PNG PATHS; ``load(screenshots=False)`` skips the images; ``load`` reads each distinct PNG
+once. The directory name carries the start time so listing oldest-first is a name sort,
+and screenshots are stored by content digest because a run's PNGs outweigh its JSON by
 three orders of magnitude and consecutive steps share a screen.
 """
 
@@ -88,17 +72,9 @@ _DIR_TIME_FORMAT = "%Y%m%dT%H%M%S%f"
 _DIR_RE = re.compile(r"^\d{8}T\d{12}Z__(?P<run_id>[A-Za-z0-9_-]+)$")
 
 
-# --------------------------------------------------------------------------------------
-# Directory layout
-# --------------------------------------------------------------------------------------
-
-
 def run_dir_name(started_at: datetime, run_id: str) -> str:
-    """The directory name for a run: a sortable UTC start time, then the ``run_id``.
-
-    Sorting these names is sorting runs oldest-first, which is why
-    :meth:`TrajectoryFileStore.list` never has to open a file.
-    """
+    """A sortable UTC start time, then the ``run_id``: sorting these names is sorting runs
+    oldest-first, which is why :meth:`TrajectoryFileStore.list` opens no file."""
     stamp = started_at.astimezone(UTC).strftime(_DIR_TIME_FORMAT)
     return f"{stamp}Z__{run_id}"
 
@@ -115,10 +91,10 @@ def screenshot_digest(png: bytes) -> str:
 
 
 def write_screenshot(screens_dir: Path, png: bytes) -> str:
-    """Store ``png`` under its digest if it is not already there, and return the digest.
+    """Store ``png`` under its digest if it is not there, and return the digest.
 
-    Writing is atomic (temporary file then ``os.replace``), so a crash mid-write
-    never leaves a half PNG that a later step line would claim to be whole.
+    Atomic (temp file then ``os.replace``), so a crash mid-write never leaves a half PNG a
+    later step line would claim to be whole.
     """
     digest = screenshot_digest(png)
     path = screens_dir / f"{digest}.png"
@@ -129,11 +105,6 @@ def write_screenshot(screens_dir: Path, png: bytes) -> str:
     tmp.write_bytes(png)
     os.replace(tmp, path)
     return digest
-
-
-# --------------------------------------------------------------------------------------
-# Encoding: contract values to JSON-safe dicts
-# --------------------------------------------------------------------------------------
 
 
 def _iso(moment: datetime) -> str:
@@ -187,7 +158,7 @@ def decode_element(data: Mapping[str, Any]) -> Element:
 def encode_observation(observation: Observation, digest: str) -> dict[str, Any]:
     """An :class:`Observation` as a dict, its screenshot referenced by ``digest``.
 
-    The ``index`` is not stored: it is a view over ``elements`` and is rebuilt on load.
+    ``index`` is not stored: it is a view over ``elements``, rebuilt on load.
     """
     shot = observation.screenshot
     return {
@@ -271,8 +242,8 @@ def decode_header(data: Mapping[str, Any]) -> Header:
     """Read a ``header`` line.
 
     Raises:
-        SkillWeaverError: if the schema version is not :data:`SCHEMA_VERSION`, or a
-            required field is missing.
+        SkillWeaverError: the schema version is not :data:`SCHEMA_VERSION`, or a required
+            field is missing.
     """
     schema = data.get("schema")
     if schema != SCHEMA_VERSION:
@@ -396,13 +367,11 @@ def _decode_step(
 def read_lines(path: Path) -> Iterator[dict[str, Any]]:
     """Yield the JSON objects of a trajectory file, tolerating a truncated tail.
 
-    A run killed mid-write leaves a partial final line. That line is dropped and the
-    lines before it are yielded, because an interrupted run is still evidence. A
-    line that is unreadable with more lines after it is real corruption and raises.
+    A partial FINAL line is dropped - an interrupted run is still evidence - while an
+    unreadable line with more after it is real corruption.
 
     Raises:
-        SkillWeaverError: on a malformed line that is not the last one, or if the
-            file cannot be read.
+        SkillWeaverError: a malformed line that is not the last, or an unreadable file.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -427,14 +396,11 @@ def read_lines(path: Path) -> Iterator[dict[str, Any]]:
 def read_ends(path: Path) -> tuple[Header, Footer | None]:
     """Read only the first and last line of a trajectory file.
 
-    This is what a listing wants: the header says what the run was, the footer says
-    how it ended, and the steps in between - kilobytes of elements per action - are
-    never touched. The footer is ``None`` for a run that crashed, whose last line is
-    a step or a torn fragment of one.
+    What a listing wants: the steps in between are kilobytes of elements per action and
+    are never touched. The footer is ``None`` for a run that crashed.
 
     Raises:
-        SkillWeaverError: if the file cannot be read or its first line is not a
-            usable header.
+        SkillWeaverError: the file cannot be read, or its first line is not a header.
     """
     try:
         with open(path, "rb") as handle:
@@ -466,22 +432,15 @@ def read_ends(path: Path) -> tuple[Header, Footer | None]:
     return header, None
 
 
-# --------------------------------------------------------------------------------------
-# A minimal element index for reloaded observations
-# --------------------------------------------------------------------------------------
-
-
 def _reading_order(element: Element) -> tuple[int, int]:
     return (element.box.y, element.box.x)
 
 
 class ReplayElementIndex:
-    """A small ``contracts.ElementIndex`` over the elements of a reloaded observation.
+    """A small ``contracts.ElementIndex`` over a reloaded observation's elements.
 
-    A loaded :class:`Observation` needs an index and its original one was a view, not
-    data. This is a deliberately plain implementation - enough to inspect a recorded
-    screen. Pass ``index_factory`` to :class:`TrajectoryFileStore` to use the
-    project's real index instead.
+    A loaded ``Observation`` needs an index and its original was a view, not data.
+    Deliberately plain; pass ``index_factory`` to use the project's real index.
     """
 
     def __init__(self, elements: Sequence[Element]) -> None:
@@ -547,18 +506,12 @@ class ReplayElementIndex:
         return [element for _, element in scored]
 
 
-# --------------------------------------------------------------------------------------
-# Cheap views: what a harness or a filmstrip reads instead of a whole run
-# --------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class TrajectorySummary:
     """One run at a glance: everything but its steps and its pixels.
 
-    ``complete`` is ``False`` for a run whose file has no footer - it was killed
-    while running - in which case ``ok`` is ``False`` and ``finished_at`` is the
-    start time. ``path`` is the run's directory.
+    ``complete`` is ``False`` for a run whose file has no footer - it was killed - in
+    which case ``ok`` is ``False`` and ``finished_at`` is the start time.
     """
 
     run_id: str
@@ -574,10 +527,7 @@ class TrajectorySummary:
 
 @dataclass(frozen=True, slots=True)
 class Frame:
-    """Where one step's two screenshots live, without reading either of them.
-
-    The dashboard's filmstrip walks these and loads only the frames it shows.
-    """
+    """Where one step's two screenshots live, without reading either of them."""
 
     index: int
     before: Path
@@ -599,23 +549,16 @@ def _summarize(header: Header, footer: Footer | None, directory: Path) -> Trajec
     )
 
 
-# --------------------------------------------------------------------------------------
-# The store
-# --------------------------------------------------------------------------------------
-
-
 class TrajectoryFileStore:
     """A ``contracts.TrajectoryStore`` over the directory layout described above.
+
+    Never caches: every call reads what is on disk now, so a recorder writing a run and a
+    store reading it can be different processes.
 
     Args:
         root: The directory holding run directories. ``None`` means
             ``settings().trajectories_dir``; nothing here hardcodes a path.
-        index_factory: Builds the ``ElementIndex`` of a loaded observation. Defaults
-            to :class:`ReplayElementIndex`.
-
-    A store never caches: every call reads what is on disk now, so a
-    :class:`~skillweaver.trajectory.record.Recorder` writing a run and a store
-    reading it can be different processes.
+        index_factory: Builds a loaded observation's ``ElementIndex``.
     """
 
     def __init__(
@@ -632,11 +575,11 @@ class TrajectoryFileStore:
     def save(self, trajectory: Trajectory) -> None:
         """Write ``trajectory`` whole, replacing any run with the same ``run_id``.
 
-        A recorder has usually written this file already, step by step; saving the
-        finished trajectory over it is the same bytes and is safe to repeat.
+        A recorder has usually written this file step by step already; saving over it is
+        the same bytes and safe to repeat.
 
         Raises:
-            SkillWeaverError: if the data directory cannot be written.
+            SkillWeaverError: the data directory cannot be written.
         """
         directory = self._existing_dir(trajectory.run_id) or self.root / run_dir_name(
             trajectory.started_at, trajectory.run_id
@@ -674,16 +617,12 @@ class TrajectoryFileStore:
     def load(self, run_id: str, *, screenshots: bool = True) -> Trajectory:
         """Return one trajectory, whole.
 
-        With ``screenshots=False`` every ``Screenshot.png`` is ``b""`` and no PNG is
-        read - what skill synthesis wants, since it reasons over actions and
-        elements. Use :meth:`frames` to fetch individual images afterwards.
-
-        A run whose file has no footer (it was killed) loads as the steps that
-        reached the disk, with ``ok=False`` and ``note=`` :data:`INCOMPLETE_NOTE`.
+        With ``screenshots=False`` every ``Screenshot.png`` is ``b""`` and no PNG is read -
+        what skill synthesis wants. A run whose file has no footer loads as the steps that
+        reached the disk, with ``ok=False`` and :data:`INCOMPLETE_NOTE`.
 
         Raises:
-            SkillWeaverError: if ``run_id`` is unknown, its schema version is not
-                supported, or its data is unreadable.
+            SkillWeaverError: unknown ``run_id``, unsupported schema, or unreadable data.
         """
         directory = self._require_dir(run_id)
         screens = directory / SCREENS_DIR
@@ -726,28 +665,19 @@ class TrajectoryFileStore:
         )
 
     def list(self) -> list[str]:
-        """Every stored ``run_id``, oldest first.
-
-        Reads directory entries only: no trajectory file and no screenshot is
-        opened, so listing a thousand runs costs one ``scandir``.
-        """
+        """Every stored ``run_id``, oldest first, from one ``scandir`` and no open."""
         return [run_id for run_id, _ in self._run_dirs()]
 
     # -- cheap views -------------------------------------------------------------------
 
     def summary(self, run_id: str) -> TrajectorySummary:
-        """One run's header and footer, reading neither its steps nor its pixels.
-
-        Raises:
-            SkillWeaverError: if ``run_id`` is unknown or its header is unreadable.
-        """
+        """One run's header and footer, reading neither its steps nor its pixels."""
         directory = self._require_dir(run_id)
         return _summarize(*read_ends(directory / TRAJECTORY_FILE), directory)
 
     def summaries(self) -> list[TrajectorySummary]:
-        """A :meth:`summary` per stored run, oldest first. Skips runs that fail to
-        parse rather than failing the whole listing - one bad run must not hide the
-        other nine hundred and ninety-nine."""
+        """A :meth:`summary` per stored run, oldest first. Unparseable runs are skipped:
+        one bad run must not hide the other nine hundred and ninety-nine."""
         out: list[TrajectorySummary] = []
         for _, directory in self._run_dirs():  # one scandir, then two reads per run
             try:
@@ -757,11 +687,7 @@ class TrajectoryFileStore:
         return out
 
     def frames(self, run_id: str) -> list[Frame]:
-        """Where each step's screenshots live, in step order; reads no image bytes.
-
-        Raises:
-            SkillWeaverError: if ``run_id`` is unknown or a step line is unreadable.
-        """
+        """Where each step's screenshots live, in step order; reads no image bytes."""
         directory = self._require_dir(run_id)
         screens = directory / SCREENS_DIR
         out: list[Frame] = []
@@ -782,11 +708,7 @@ class TrajectoryFileStore:
         return out
 
     def path_of(self, run_id: str) -> Path:
-        """The directory holding ``run_id``.
-
-        Raises:
-            SkillWeaverError: if ``run_id`` is unknown.
-        """
+        """The directory holding ``run_id``."""
         return self._require_dir(run_id)
 
     # -- internals ---------------------------------------------------------------------

@@ -1,34 +1,8 @@
-"""A ``contracts.Controller`` that drives a real browser page through Playwright.
+"""A ``contracts.Controller`` driving a real browser page through Playwright.
 
-The controller is deliberately blind. It moves a pointer and presses keys at
-coordinates, exactly as a person would, and never resolves a CSS selector on the
-agent's behalf - if the agent could name an element, the project would not be
-learning to see. Everything crossing this boundary is in LOGICAL pixels, which for
-a browser are CSS pixels relative to the top-left of the viewport.
-
-Two classes live here:
-
-:class:`BrowserController`
-    Eyes and hands. Screenshots in, synthetic input out.
-
-:class:`BrowserGroundTruth`
-    An OFFLINE TEACHER that reads the DOM. It is constructed explicitly and is
-    never handed out by the controller; see its docstring for why.
-
-Typical use::
-
-    with BrowserController(headless=True, viewport=(1280, 800)) as ctl:
-        ctl.perform(Navigate("https://example.com"))
-        shot = ctl.capture()
-        ctl.perform(Click(Point(640, 400)))
-
-A site that refuses an automated browser needs the REAL Chrome and a profile that
-outlives the run - ``BrowserController(user_data_dir=...)``, and
-:data:`REAL_CHROME_CHANNEL` for what that is and what it is measured to fix. A site that
-refuses even THAT needs a Chrome the framework did not start:
-``BrowserController(user_data_dir=..., attach=True)``, and
-:data:`~skillweaver.controllers.chrome_launch.PLAINLY_LAUNCHED` for the three-way
-measurement that says why.
+Deliberately blind: it moves a pointer and presses keys at LOGICAL (CSS) pixel
+coordinates and never resolves a selector for the agent. :class:`BrowserGroundTruth`
+reads the DOM and is an OFFLINE TEACHER only - see its docstring.
 """
 
 from __future__ import annotations
@@ -78,101 +52,47 @@ SOMETIMES_ONLY_OVERLAYS: tuple[re.Pattern[str], ...] = (
     re.compile(r"Special:RecordImpression"),
     re.compile(r"geoiplookup"),
 )
-"""Requests that serve an overlay a page renders only SOMETIMES, aborted by default.
+"""Requests serving an overlay a page renders only SOMETIMES, aborted by default.
 
-A measurement wants one page to be one screen. Everything downstream of this
-controller compares two screens of the same URL - the admission gate against the
-screen the recording started on, the critic against the screen before the move,
-``find_route`` against where it thinks it already is - and every one of those
-comparisons is a lie when a page is a full-width appeal on one load and not on the
-next. The identity cannot be taught to forgive this one: see ``SAME_STATE_THRESHOLD``
-in :mod:`skillweaver.perception.fingerprint`, which refuses a full-screen takeover on
-purpose, because a screen that is two thirds gone is not that screen.
+A measurement wants one page to be one screen, and everything downstream compares two
+screens of the same URL. Measured on live ``en.wikipedia.org`` 2026-09-19: of thirty
+plain ``/wiki/Main_Page`` loads, five rendered a 531px CentralNotice appeal and the two
+groups fingerprint at 0.132, far below the 0.26 same-state cut; two of fifteen live
+learning runs threw away a correct skill because of it. Ten loads with these patterns
+aborted rendered it zero times.
 
-Measured on live ``en.wikipedia.org`` on 2026-09-19. Thirty plain loads of
-``/wiki/Main_Page``, each in a fresh context and no blocking: FIVE rendered a
-CentralNotice fundraising appeal 531px tall in an 800px viewport and twenty-five
-rendered nothing, and the two groups fingerprint against each other at 0.132 - far
-below the 0.26 same-state cut. That is the whole defect: of fifteen live learning runs
-of one task, the two that met the appeal both threw away a correct skill, one because
-the recorded starting screen could no longer be stood on (0.09) and one because it
-never was (0.12). Ten loads with these patterns aborted rendered it zero times.
-
-Waiting for a one-in-six event is no way to check this, so force it:
-``?banner=<name>&force=1`` renders the appeal on every load. Ten forced loads with
-nothing blocked were the appeal ten times out of ten and the ordinary screen zero
-times out of ten; ten with the block on were the ordinary screen ten times out of ten.
-
-**Regexes, not the glob patterns this looks like it should use.** CentralNotice serves
-the appeal from ``meta.wikimedia.org/w/index.php?title=Special:BannerLoader&...`` -
-the name is in the QUERY STRING, and a Playwright glob matches path segments, so
-``**/Special:BannerLoader*`` matches nothing on a real Wikipedia load. On one forced
-load the glob aborted 0 requests and the appeal rendered at 531px; the regex aborted 1
-and it did not render at all.
-
-This is not ad-blocking for its own sake and it hides nothing a run needs: the page is
-fully readable and every link on it still works. Pass ``block=()`` to a controller
-that is deliberately measuring the overlay itself, or patterns of your own - a regex,
-or a `Playwright URL glob <https://playwright.dev/python/docs/network>`_ where the
-thing to block really is a path - for another site's version of the same problem.
+REGEXES, not the Playwright globs this looks like: CentralNotice serves the appeal from
+``index.php?title=Special:BannerLoader&...``, so the name is in the QUERY STRING and
+``**/Special:BannerLoader*`` matches nothing. Force the appeal with ``?banner=<name>&force=1``
+to re-check. Pass ``block=()`` to measure the overlay itself.
 """
 
 REAL_CHROME_CHANNEL = "chrome"
-"""Playwright's name for the Google Chrome INSTALLED ON THIS MACHINE, as opposed to the
-Chromium build Playwright ships with. Half of what it takes to be served by a real site.
+"""Playwright's name for the Google Chrome INSTALLED ON THIS MACHINE, not the bundled
+Chromium. Half of what it takes to be served by a site that refuses an automated browser;
+the other half is ``launch_persistent_context(<dir>)``, a profile that SURVIVES the run.
 
-A REAL SITE CAN REFUSE AN AUTOMATED BROWSER OUTRIGHT, and doordash.com does: a plain
-``chromium.launch()``, whose profile Playwright throws away after the run, gets
-Cloudflare's "Verify you are human" on every URL, while an ordinary Chrome window on the
-same machine loads the site. TWO ordinary browser settings are what close that gap:
-
-1. this channel - the real Google Chrome build, not bundled Chromium;
-2. ``launch_persistent_context(<dir>)`` - a profile directory that SURVIVES the run, so
-   whatever a site stored on one run is still there on the next.
-
-Measured on 2026-09-19 against live doordash.com, signed out, no address entered: the
-front page came back titled ``DoorDash: Food, Grocery and Retail - Fast Same Day
-Delivery``, a city listing page carried 32k characters of real stores and a store page a
-real priced menu - no interstitial on any of them.
-
-**That access is not a guarantee, and this mode does not make it one.** Later the same
-day the same profile got the interstitial on every load, and a bare hand-probe with no
-controller in it got the same - so what changed was the site's opinion of us, not the
-launch. Two causes we could see, both our own doing: MANY loads from one address in a
-few minutes, and SHARING one profile directory between concurrent runs, which fight over
-the lock and leave the stored clearance unreliable. Give each run its own directory, and
-do not hammer a site to find out whether it is still letting you in.
-
-**Nothing here masks automation and nothing here may.** No
-``--disable-blink-features=AutomationControlled``, no spoofed fingerprint, no
-user-agent edit, no proxy, no retry-until-it-passes loop: re-measured WITHOUT any such
-argument, the two settings above carried the whole result on their own, and
-``navigator.webdriver`` stays true. If a human-verification page appears, the run fails
-and says so, and a person clears it by hand, once, in the profile - which is exactly what
-a profile that outlives the run is for.
-
-What this mode is, then, is a browser LAUNCH configuration, and it is correct or not on
-its own terms: it opens the real Chrome, on a profile that persists, with the viewport,
-scale, blocking and start URL every other run gets. Whether a particular site then serves
-that browser is the site's business."""
+Measured 2026-09-19 against live doordash.com: those two settings alone loaded the front
+page, a city listing and a store menu with no interstitial, and nothing masks automation
+to get there - ``navigator.webdriver`` stays true and a re-measurement without any such
+argument carried the whole result. Access is not a guarantee: the same profile got the
+interstitial hours later after many loads from one address and a profile shared between
+concurrent runs. Give each run its own directory; a human-verification page FAILS the run
+and a person clears it by hand, once, in that profile."""
 
 _SUPPORTED_ACTIONS: frozenset[str] = frozenset(
     {"click", "move", "drag", "type_text", "press_key", "scroll", "wait", "navigate", "back"}
 )
-"""Every action kind in the contract. A browser can do all of them, ``navigate`` and
-``back`` included - those are the two a raw desktop controller does not have, because
-both are session history and a desktop has none."""
+"""A browser can do every kind. ``navigate`` and ``back`` are the two a desktop
+controller lacks, because both are session history and a desktop has none."""
 
 
 class _ThreadDriver(threading.local):
     """The Playwright driver for ONE thread, shared by every controller on it.
 
-    Playwright's sync API runs its own event loop per thread and refuses a second
-    ``sync_playwright().start()`` while the first is live, so two controllers in
-    one thread - an eval harness comparing two browsers, a notebook, a test module
-    - have to share one driver. It is started on the first controller and stopped
-    when the last one closes. A controller on another thread gets its own, which
-    is what Playwright requires anyway.
+    Playwright's sync API refuses a second ``sync_playwright().start()`` while the first
+    is live, so two controllers on one thread have to share. Started on the first
+    controller, stopped when the last one closes.
     """
 
     playwright: Playwright | None = None
@@ -183,7 +103,6 @@ _THREAD_DRIVER = _ThreadDriver()
 
 
 def _acquire_driver() -> Playwright:
-    """Start this thread's Playwright driver if needed and claim a reference."""
     if _THREAD_DRIVER.playwright is None:
         _THREAD_DRIVER.playwright = sync_playwright().start()
         _THREAD_DRIVER.users = 0
@@ -206,9 +125,8 @@ def _release_driver() -> None:
 
 
 def _abort(route: Route) -> None:
-    """Refuse one request. A route handler that raises kills the page, and a
-    request can be gone - the page navigated away - by the time this runs, so the
-    abort is best-effort and a failure to abort is not an error."""
+    """Refuse one request. A handler that raises kills the page, and the request may
+    already be gone, so aborting is best-effort."""
     try:
         route.abort()
     except Exception:  # noqa: BLE001 - a request that is already gone is blocked enough
@@ -219,8 +137,7 @@ _SCROLL_QUIET_MS = 80
 """How long nothing may scroll before a scroll counts as finished."""
 
 _SCROLL_QUIET_DEADLINE_MS = 2_000
-"""Hard ceiling on waiting for a scroll, so an endlessly animating page cannot
-wedge the controller."""
+"""Ceiling, so an endlessly animating page cannot wedge the controller."""
 
 _SCROLL_QUIET_JS = """
 ([quietMs, deadlineMs]) => new Promise((resolve) => {
@@ -245,70 +162,38 @@ _SCROLL_QUIET_JS = """
 class BrowserController:
     """Playwright-backed eyes and hands on one browser page.
 
-    Headless by default. Use it as a context manager so the browser is always torn
-    down, even when the body raises::
-
-        with BrowserController(headless=False) as ctl:
-            ...
+    Headless by default. Use it as a context manager so the browser is always torn down.
 
     Args:
-        headless: Run without a visible window. ``False`` opens a real one, which
-            is what the demo uses.
-        viewport: ``(width, height)`` of the page in LOGICAL pixels.
-        device_scale_factor: Physical pixels per logical pixel. ``2.0`` makes
-            captures Retina-sharp at the same logical size; ``Screenshot.scale``
-            will report it back. It survives ``user_data_dir`` and is not dropped
-            there, but it becomes a LAUNCH option rather than a per-context one: a
-            persistent profile IS the browser, so one process can hold exactly one
-            scale and there is no second context to give another. Measured on real
-            Chrome, headed and headless alike, a 640x400 viewport at ``2.0`` captures
-            1280x800 with ``devicePixelRatio`` 2, on the page the browser opened
-            itself - which is the page this controller adopts.
+        headless: Run without a visible window.
+        viewport: ``(width, height)`` in LOGICAL pixels.
+        device_scale_factor: Physical pixels per logical pixel, reported back as
+            ``Screenshot.scale``. Under ``user_data_dir`` it becomes a LAUNCH option
+            rather than a per-context one: a persistent profile IS the browser, so one
+            process holds exactly one scale.
         browser: Which Playwright engine to launch.
-        settle_ms: How long to wait after each action for the page to react.
-            Set to ``0`` for the fastest possible replay of a known-good script.
-        type_delay_ms: Pause between characters in :class:`TypeText`. A few
-            milliseconds is enough for input handlers that debounce keystrokes.
-        drag_steps: Intermediate pointer positions in a :class:`Drag`, so
-            handlers that track movement see a real gesture rather than a jump.
+        settle_ms: Wait after each action for the page to react; ``0`` for fastest replay.
+        type_delay_ms: Pause between characters, for handlers that debounce keystrokes.
+        drag_steps: Intermediate pointer positions, so movement handlers see a gesture.
         navigation_timeout_ms: Ceiling on a single :class:`Navigate`.
-        settle_timeout_ms: Ceiling on waiting for the page to finish reacting to
-            an action, including a navigation the action set off. Settling is
-            best-effort, so reaching this is not an error.
-        user_data_dir: A PERSISTENT Chrome profile directory. Given, the controller
-            drives the REAL Google Chrome installed on this machine out of that
-            directory instead of a bundled Chromium with a throwaway profile, which
-            is what it takes to be served by a site that refuses an automated browser
-            - see :data:`REAL_CHROME_CHANNEL`. The directory is created if it is
-            missing, is NOT deleted on teardown - persisting cookies between runs is
-            the whole point - and is exclusive: Chrome locks a profile, so a window
-            already open on it makes the launch fail rather than share it. ``None``
-            leaves today's launch path exactly as it was.
-        attach: Start that real Chrome as an ORDINARY PROCESS and attach to it over
-            Chrome's own debugging interface, rather than letting Playwright launch it.
-            Requires ``user_data_dir``. This is the only one of the three launch
-            configurations a live DoorDash serves, and what it changes is the flags
-            Playwright adds when IT starts the browser - see
-            :data:`~skillweaver.controllers.chrome_launch.PLAINLY_LAUNCHED` for the
-            measurement, and for the boundary this mode must never be extended past.
-            ``headless``, ``block``, ``start_url`` and ``device_scale_factor`` all behave
-            as they do in the other modes; the ONE difference is that ``viewport`` is
-            applied to the adopted page rather than given to a context that does not
-            exist here, so a headed window is sized to match but the page is what is
-            authoritative.
-        chrome_binary: Where Google Chrome is, for ``attach``, or ``None`` to look in
-            this platform's usual places.
-        start_url: Loaded once at construction, if given.
-        block: URL patterns whose requests are aborted, on the context, so they
-            are blocked for every page and every navigation. A regex matches
-            anywhere in the URL; a string is a Playwright path glob. ``None``
-            means :data:`SOMETIMES_ONLY_OVERLAYS` - read that constant before
-            changing it; ``()`` blocks nothing.
+        settle_timeout_ms: Ceiling on settling. Best-effort, so reaching it is not an error.
+        user_data_dir: A PERSISTENT Chrome profile directory; drives the REAL Chrome out
+            of it - see :data:`REAL_CHROME_CHANNEL`. Created if missing, never deleted,
+            and EXCLUSIVE: Chrome locks a profile, so an open window fails the launch.
+        attach: Start that Chrome as an ORDINARY PROCESS and attach over its debugging
+            port - the only one of the three launch configurations a live DoorDash serves;
+            see :data:`~skillweaver.controllers.chrome_launch.PLAINLY_LAUNCHED`. Requires
+            ``user_data_dir``. The one behavioural difference is that ``viewport`` is
+            applied to the adopted page, there being no context of ours to give it to.
+        chrome_binary: Where Chrome is, for ``attach``, or ``None`` to search.
+        start_url: Loaded once at construction.
+        block: URL patterns aborted on the CONTEXT. A regex matches anywhere in the URL;
+            a string is a Playwright path glob. ``None`` means
+            :data:`SOMETIMES_ONLY_OVERLAYS`; ``()`` blocks nothing.
 
     Raises:
-        ControllerError: if the browser cannot be launched. A ``user_data_dir`` whose
-            real Chrome is missing fails HERE, by name; it never quietly falls back to
-            the bundled Chromium, which is the build the bot wall blocks.
+        ControllerError: the browser could not be launched. A missing real Chrome fails
+            HERE, by name, rather than falling back to the Chromium a bot wall blocks.
     """
 
     def __init__(
@@ -367,19 +252,14 @@ class BrowserController:
             playwright = _acquire_driver()
             self._holds_driver = True
             engine = getattr(playwright, browser)
-            # Chromium animates wheel scrolling, so a scroll would still be moving
-            # when perform() returned and the next capture would catch a half-
-            # scrolled frame. Turning the animation off makes a wheel land at once;
-            # _await_scroll_quiet below covers pages that animate scrolling
-            # themselves, and engines where this flag does not exist.
+            # Chromium animates wheel scrolling, so a scroll would still be moving when
+            # perform() returned; _await_scroll_quiet covers pages that animate it
+            # themselves and engines without this flag.
             args = ["--disable-smooth-scrolling"] if browser == "chromium" else []
             view = {"width": int(width), "height": int(height)}
             if self._attach:
-                # Playwright does not start this browser: an ordinary Chrome process
-                # does, and Playwright is handed the address it published. ``args``
-                # above belongs to a launch that is not happening here, so the same
-                # scroll setting is passed to the process instead - see
-                # :meth:`ChromeProcess._spawn`.
+                # Playwright does not launch here, so ``args`` cannot apply; the same
+                # scroll setting is passed to the process instead.
                 assert self._profile_dir is not None  # checked above
                 self._chrome = ChromeProcess(
                     user_data_dir=self._profile_dir,
@@ -389,14 +269,13 @@ class BrowserController:
                     window=(int(width), int(height)),
                 )
                 self._browser = engine.connect_over_cdp(self._chrome.endpoint)
-                # Take the context and page the browser already has. Making more is how
-                # a run ends up driving a blank tab while the demo watches another.
+                # Adopt what the browser already has; a new one would leave the demo
+                # watching a tab nobody drives.
                 contexts = self._browser.contexts
                 self._context = contexts[0] if contexts else self._browser.new_context()
             elif self._profile_dir is not None:
-                # The persistent context IS the launch: there is no Browser to make a
-                # second context on, and ``self._browser`` stays None. Closing the
-                # context is what shuts the process down.
+                # The persistent context IS the launch: no Browser handle, and closing
+                # the context is what shuts the process down.
                 self._context = engine.launch_persistent_context(
                     str(self._profile_dir),
                     channel=REAL_CHROME_CHANNEL,
@@ -411,21 +290,16 @@ class BrowserController:
                     viewport=view,
                     device_scale_factor=device_scale_factor,
                 )
-            # On the CONTEXT, not the page: the route then survives every
-            # navigation and covers a popup the page opens, which is where an
-            # appeal reappears if the block is installed one page at a time.
+            # On the CONTEXT: the route then survives every navigation and covers popups.
             for pattern in self._blocked:
                 self._context.route(pattern, _abort)
-            # Real Chrome opens a window of its own, so a persistent context already
-            # has a page. ADOPT it rather than opening a second one: the one nobody
-            # drives would stay on screen for the whole demo.
+            # A persistent context already has a page; ADOPT it rather than opening a
+            # second one nobody drives.
             existing = self._context.pages if self._profile_dir is not None else []
             self._page = existing[0] if existing else self._context.new_page()
             if self._attach:
-                # The viewport is a property of the LAUNCH in the other two modes. Here
-                # the launch was an ordinary one, so the size is set on the page that
-                # came back - which is what every capture and every coordinate is
-                # measured against anyway.
+                # The launch was an ordinary one, so the size goes on the page - which is
+                # what every capture and coordinate is measured against anyway.
                 self._page.set_viewport_size(view)
             if start_url is not None:
                 self._page.goto(start_url, timeout=self._navigation_timeout_ms)
@@ -440,41 +314,32 @@ class BrowserController:
     def headless(self) -> bool:
         """Whether this browser runs without a visible window.
 
-        Readable because the answer OUTLIVES the browser: a screen recorded here is
-        stored and compared later, and the two modes render one page differently
-        enough that a cross-mode comparison cannot succeed. ``describe()`` says the
-        same thing in prose for a prompt; this says it as a fact for
-        :func:`skillweaver.render_mode.mode_of` to read, so nothing has to parse a
-        sentence written for a human.
+        Readable because the answer OUTLIVES the browser: the two modes render one page
+        differently enough that a cross-mode comparison cannot succeed, and
+        :func:`skillweaver.render_mode.mode_of` needs that as a fact, not as prose.
         """
         return self._headless
 
     @property
     def profile_dir(self) -> Path | None:
-        """The persistent Chrome profile this controller drives, or ``None`` for the
-        ordinary bundled-Chromium launch. Readable for the same reason as
-        :attr:`headless`: it changes which browser rendered a screen, and a person
-        asking why a site served them has to be able to see which one they got."""
+        """The persistent Chrome profile, or ``None`` for the bundled-Chromium launch.
+        Readable for the same reason as :attr:`headless`: it changes which browser
+        rendered a screen."""
         return self._profile_dir
 
     @property
     def attached(self) -> bool:
-        """Whether this browser was started as an ordinary process and attached to,
-        rather than launched by Playwright. Readable for the same reason as
-        :attr:`headless` and :attr:`profile_dir`: it is the difference between a screen a
-        live site served and an interstitial it served instead."""
+        """Whether the browser was started plainly and attached to. Readable for the same
+        reason as :attr:`headless`: it is the difference between a screen a live site
+        served and an interstitial it served instead."""
         return self._attach
 
     @property
     def cdp_endpoint(self) -> str | None:
-        """``http://127.0.0.1:<port>`` for the attached browser, or ``None`` in the
-        other modes.
+        """``http://127.0.0.1:<port>`` for the attached browser, else ``None``.
 
-        Readable so this controller is not the only thing that can use the browser it
-        opened: anything else that speaks Chrome's debugging protocol - a policy that
-        reads the DOM rather than the pixels, a person with DevTools - attaches to the
-        same process at this address. The process stays owned here and dies with this
-        controller, so a second user of it is a guest for the run, not an owner.
+        Readable so anything else speaking Chrome's debugging protocol can attach to the
+        same process. The process stays owned here and dies with this controller.
         """
         return None if self._chrome is None else self._chrome.endpoint
 
@@ -494,10 +359,8 @@ class BrowserController:
     def capture(self) -> Screenshot:
         """Grab the current viewport.
 
-        ``width``/``height`` are the logical viewport and ``scale`` is MEASURED from
-        the PNG that was actually produced rather than from the scale factor the
-        browser was asked for, so the reported geometry and the bytes can never
-        drift apart.
+        ``scale`` is MEASURED from the PNG actually produced rather than from what the
+        browser was asked for, so geometry and bytes cannot drift apart.
         """
         page = self._live_page()
         try:
@@ -519,9 +382,8 @@ class BrowserController:
     def perform(self, action: Action) -> ActionResult:
         """Deliver one action as synthetic input, then let the page settle.
 
-        Anything that stops the action being delivered - an off-screen point, an
-        empty key chord, a navigation that fails - comes back as
-        ``ActionResult(ok=False, error=...)``. Only a dead controller raises.
+        Anything that stops delivery comes back as ``ActionResult(ok=False, error=...)``;
+        only a dead controller raises.
         """
         page = self._live_page()
         started = time.perf_counter()
@@ -561,25 +423,15 @@ class BrowserController:
     def evaluate(self, script: str) -> Any:
         """Run ``script`` in the page and return its JSON-able result. READ-ONLY.
 
-        The one hook the DOM perception path needs
-        (:class:`~skillweaver.perception.dom.DomPerceiver`), and deliberately the only
-        thing that path adds to this class. It is not an action plane and must not
-        become one: a click still goes through :meth:`perform` as a
-        :class:`~skillweaver.contracts.Click` at a point, so Playwright, the launch path
-        and every stored skill are untouched by the choice of eyes. See ``AGENTS.md``
-        for the standing rule this serves and how far it is relaxed.
-
-        It is not on the :class:`~skillweaver.contracts.Controller` Protocol - that is
-        shared surface, and a desktop controller has no page to evaluate anything in -
-        so callers duck-type on its presence and say so when it is absent.
-
-        A document that is mid-navigation destroys the execution context under the
-        script. That is a moment rather than a broken page, so the new document is
-        waited for and the script asked once more, exactly as
-        :class:`BrowserGroundTruth` does; a second failure is real.
+        The one hook the DOM perception path needs, and deliberately the only thing it
+        adds to this class: a click still goes through :meth:`perform` as a point. Not on
+        the ``Controller`` Protocol - that is shared surface and a desktop has no page -
+        so callers duck-type on its presence. A document mid-navigation destroys the
+        execution context, which is a moment rather than a broken page, so the script is
+        asked once more after the new document loads; a second failure is real.
 
         Raises:
-            ControllerError: if the script cannot be run, or fails twice.
+            ControllerError: the script cannot be run, or fails twice.
         """
         page = self._live_page()
         try:
@@ -596,9 +448,8 @@ class BrowserController:
     def describe(self) -> str:
         """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``.
 
-        A persistent profile says ``chrome`` rather than ``chromium``, because that is
-        the build a page was actually served to, and an attached one says ``chrome+cdp``,
-        because being started plainly is what a live site is reading.
+        A persistent profile says ``chrome`` and an attached one ``chrome+cdp``, because
+        being started plainly is what a live site is reading.
         """
         view = self._viewport if self._closed else self.viewport()
         mode = "" if self._headless else " headed"
@@ -611,19 +462,12 @@ class BrowserController:
         return f"playwright {engine} {view.w}x{view.h} @{self._requested_scale:g}x{mode}"
 
     def close(self) -> None:
-        """Shut the page, context, browser and Playwright driver down. Idempotent
-        and never raises: closing a half-dead browser must not mask the real error.
+        """Shut the page, context, browser and driver down. Idempotent, never raises.
 
-        A persistent profile directory is LEFT ON DISK. There is no browser handle to
-        close in that mode - the context is the process - and the cookies in that
-        directory are what the next run needs; deleting it would put the agent back
-        behind the bot wall one run later.
-
-        An ATTACHED browser is torn down the other way round. Closing its page or its
-        context would be asking a browser this controller does not own to dismantle
-        itself, so those handles are only dropped; what actually ends the browser is
-        killing the process this run started, which happens last and happens even when
-        the page is already wedged. A Chrome this run did not start is never touched.
+        A persistent profile directory is LEFT ON DISK: its cookies are what the next run
+        needs. An ATTACHED browser's handles are only DROPPED - closing them would ask a
+        browser we do not own to dismantle itself - and what ends it is killing the
+        process this run started. A Chrome this run did not start is never touched.
         """
         self._closed = True
         handles = ("_browser",) if self._attach else ("_page", "_context", "_browser")
@@ -646,12 +490,8 @@ class BrowserController:
     # -- internals ---------------------------------------------------------------------
 
     def _launch_failed(self, exc: BaseException) -> str:
-        """Why the browser did not open, named precisely enough to act on.
-
-        A missing real Chrome is its own sentence: the alternative would be to retry
-        on bundled Chromium, and that is the build a site's bot wall turns away, so a
-        silent fallback would trade a loud failure for a run that is quietly blocked.
-        """
+        """Why the browser did not open. A missing real Chrome is its own sentence: the
+        alternative is a silent fallback to the Chromium a bot wall turns away."""
         if self._attach:
             return (
                 f"could not start and attach to a plainly-launched Google Chrome on "
@@ -736,10 +576,8 @@ class BrowserController:
     def _navigate(self, page: Page, url: str) -> str | None:
         """Load ``url``, retrying once if a previous navigation got in the way.
 
-        An agent that tries a dead URL and then a good one would otherwise see the
-        good one fail: the error page from the first is still committing, and
-        Chromium reports that as this navigation being interrupted. The URL is
-        fine, so the retry is the honest answer rather than a spurious refusal.
+        A dead URL's error page is still committing when the next ``goto`` starts, and
+        Chromium reports that as this navigation being interrupted.
         """
         for attempt in (1, 2):
             try:
@@ -751,8 +589,7 @@ class BrowserController:
                 message = _brief(exc)
                 if attempt == 1 and "interrupted by another navigation" in message:
                     continue
-                # Let a failed navigation's error page finish committing, so the
-                # next action does not trip over it.
+                # Let the error page finish committing before the next action.
                 self._settle(page)
                 return f"navigate failed: {message}"
             self._settle(page)
@@ -762,12 +599,9 @@ class BrowserController:
     def _go_back(self, page: Page) -> str | None:
         """Pop one entry off the page's session history.
 
-        Playwright answers ``None`` when there was nothing behind the current page, and
-        that is the only authority on the question - a page's own ``history.length``
-        counts entries in both directions and never says where in the stack you are. So
-        an empty stack is REFUSED here rather than reported as a move that happened,
-        which is what keeps a policy from being told a back succeeded onto the same
-        screen it was already on.
+        Playwright answering ``None`` is the only authority on an empty stack - a page's
+        ``history.length`` counts both directions - so an empty stack is REFUSED rather
+        than reported as a move, which would tell a policy it went back onto this screen.
         """
         before = page.url
         try:
@@ -802,29 +636,20 @@ class BrowserController:
         return None
 
     def _await_scroll_quiet(self, page: Page) -> None:
-        """Block until nothing on the page has scrolled for a short quiet period.
+        """Block until nothing has scrolled for a short quiet period.
 
-        A wheel event is delivered asynchronously and a page may animate the
-        scroll it triggers, so the position right after ``mouse.wheel`` is a
-        position in motion. Listening for scroll events in the capture phase
-        catches any scroller, not just the window, and the deadline guarantees
-        this returns even on a page that scrolls forever.
+        A wheel event is asynchronous and a page may animate the scroll, so the position
+        right after ``mouse.wheel`` is one in motion. Capture-phase listening catches any
+        scroller, not just the window; the deadline covers a page that scrolls forever.
         """
         page.evaluate(_SCROLL_QUIET_JS, [_SCROLL_QUIET_MS, _SCROLL_QUIET_DEADLINE_MS])
 
     def _settle(self, page: Page) -> None:
-        """Give the page its moment to react, and to finish arriving if the action
-        sent it somewhere.
+        """Give the page its moment to react, and to finish arriving.
 
-        A click on a link sets off a navigation that is still committing when the
-        click itself has been delivered, so an action that returned immediately
-        would hand the next ``capture()`` a blank half-loaded frame. Waiting for
-        ``document.readyState`` to reach ``complete`` is what actually catches
-        that; a bare ``wait_for_load_state`` can return mid-commit.
-
-        On a page that is already idle this costs one round trip. A page that
-        never finishes loading must not wedge the controller, so running out of
-        ``settle_timeout_ms`` means settling is done, not that anything failed.
+        Waiting for ``document.readyState`` to reach ``complete`` is what catches a
+        navigation a click set off; a bare ``wait_for_load_state`` can return mid-commit.
+        Running out of ``settle_timeout_ms`` means settling is done, not that it failed.
         """
         if self._settle_ms > 0:
             page.wait_for_timeout(self._settle_ms)
@@ -835,16 +660,14 @@ class BrowserController:
                 if page.evaluate("() => document.readyState") == "complete":
                     return
             except PlaywrightError:
-                # The context vanished under the probe: a navigation just
-                # committed, which is exactly what there is to wait for.
+                # The context vanished: a navigation committed, which is what we await.
                 pass
             remaining_ms = (deadline - time.monotonic()) * 1000.0
             if remaining_ms <= 0:
                 return
             try:
                 page.wait_for_load_state("load", timeout=remaining_ms)
-                # wait_for_load_state can return while a navigation is still
-                # committing, so pause before re-probing rather than spinning.
+                # It can return mid-commit, so pause before re-probing.
                 page.wait_for_timeout(min(25.0, max(remaining_ms, 1.0)))
             except PlaywrightError:
                 return
@@ -865,10 +688,6 @@ def _brief(exc: BaseException) -> str:
     head = text[0] if text else exc.__class__.__name__
     return head[:200]
 
-
-# --------------------------------------------------------------------------------------
-# Offline teacher
-# --------------------------------------------------------------------------------------
 
 _KIND_VALUES = {kind.value for kind in ElementKind}
 
@@ -973,29 +792,14 @@ _GROUND_TRUTH_JS = """
 class BrowserGroundTruth:
     """Perfect element knowledge read from the DOM. AN OFFLINE TEACHER ONLY.
 
-    **The agent must never see this.** Its whole job is to know things the agent is
-    supposed to learn to see, so it exists for exactly two callers: the labeller
-    that builds detector training data, and the evaluation harness that scores how
-    close pixel-derived perception got to the truth.
+    **The agent must never see this.** It knows what the agent is supposed to learn to
+    see, so it has exactly two callers: the detector's labeller and the evaluation
+    harness. That is why it is constructed explicitly and why :class:`BrowserController`
+    hands one out nowhere; code that legitimately needs it takes it as an argument.
 
-    That is why it is a separate class you construct yourself::
-
-        truth = BrowserGroundTruth(controller)   # visible at the call site
-
-    and why :class:`BrowserController` has no method that hands one out. A
-    perceiver, explorer, planner, skill runner or generated skill that reaches this
-    class has broken the premise of the project. Code that legitimately needs it
-    takes it as an explicit argument.
-
-    Boxes are in LOGICAL pixels in the controller's own coordinate space - the same
-    space clicks are expressed in - clipped to the viewport, so a label always
-    describes a rectangle a detector could actually have seen. Elements that are
-    ``display:none``, ``visibility:hidden``, transparent, zero-sized or entirely
-    off-screen are filtered out. Elements are returned in reading order.
-
-    Known limits: it reads the main frame's light DOM only, so content inside
-    iframes or a shadow root is not reported, and it does not test whether one
-    element is painted over another.
+    Boxes are LOGICAL pixels in the controller's own space, clipped to the viewport, in
+    reading order; invisible, zero-sized and off-screen elements are dropped. Main frame,
+    light DOM only, and it does not test whether one element is painted over another.
     """
 
     def __init__(self, controller: BrowserController) -> None:
@@ -1009,8 +813,8 @@ class BrowserGroundTruth:
         viewport = Box(0, 0, int(width), int(height))
         elements: list[Element] = []
         for raw in data["elements"]:
-            # getBoundingClientRect already reports CSS pixels, so the conversion is
-            # at scale 1: what matters is that edges round the same way everywhere.
+            # getBoundingClientRect is already CSS pixels; scale 1 keeps edge rounding
+            # identical to every other path.
             box = _coords.clip_to_viewport(
                 _coords.box_to_logical(raw["x"], raw["y"], raw["w"], raw["h"], 1.0), viewport
             )
@@ -1038,10 +842,8 @@ class BrowserGroundTruth:
     def _read_dom(self) -> dict:
         """Run the reader script, once more if a navigation pulled the rug out.
 
-        A page that is mid-navigation - a redirect chain, a click that has just
-        committed - destroys the execution context under the script. That is a
-        moment in time rather than a broken page, so wait for the new document and
-        ask again. A second failure is real and is raised.
+        A mid-navigation document destroys the execution context; that is a moment, not a
+        broken page. A second failure is real.
         """
         page = self._controller._live_page()
         try:
@@ -1059,8 +861,8 @@ class BrowserGroundTruth:
 def _stable_id(kind: ElementKind, text: str, box: Box) -> str:
     """Identity for "the same element across observations of the same screen".
 
-    Kind and text plus position rounded to a 16-pixel grid, so a label that shifts
-    by a pixel or two keeps its identity while a different control never borrows it.
+    Position is rounded to a 16-pixel grid, so a label that shifts a pixel or two keeps
+    its identity while a different control never borrows it.
     """
     seed = f"{kind.value}|{text}|{box.x // 16}|{box.y // 16}"
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]

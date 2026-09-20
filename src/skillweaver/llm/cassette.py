@@ -1,25 +1,18 @@
-"""Record and replay LLM calls, so tests can exercise real provider replies offline.
+"""Record and replay LLM calls, so a run can be re-driven against real provider replies
+offline.
 
-A cassette is one JSON file under ``tests/fixtures/cassettes/`` holding
-``(request, response)`` pairs. :class:`CassetteClient` is itself an
-``LLMClient``, so it wraps :class:`~skillweaver.llm.anthropic_.AnthropicClient` or
-:class:`~skillweaver.llm.gemini_.GeminiClient` transparently and the code under
-test cannot tell which - or whether anything is behind it at all.
+A cassette is one JSON file of ``(request, response)`` pairs. :class:`CassetteClient` is
+itself an ``LLMClient``, so it wraps an adapter transparently and the code above it cannot
+tell which - or whether anything is behind it at all.
 
-Two properties make this trustworthy:
+The digest is PROVIDER-NEUTRAL: computed from the ``complete()`` arguments, not from wire
+bytes, so one cassette shape works for every adapter. And scrubbing happens BEFORE the
+digest, so replay matches on the scrubbed form and a key that leaked into a prompt is
+redacted on disk while the call still matches under a different key.
 
-**The digest is provider-neutral.** It is computed from the ``complete()``
-arguments, not from provider wire bytes, so the same cassette shape works for
-every adapter and a request that "looks the same" to skillweaver replays.
-
-**Scrubbing happens before the digest, not after.** The recorded request is
-scrubbed first and then hashed, so replay matches on the scrubbed form. A key that
-leaked into a prompt is redacted on disk *and* the cassette still matches when the
-same call is made with a different key.
-
-Images are recorded by SHA-256 and byte length rather than inline: a screenshot
-does not change what reply to replay, and a megabyte of base64 per turn makes the
-fixtures unreviewable.
+Images are recorded by SHA-256 and byte length rather than inline: a screenshot does not
+change what reply to replay, and a megabyte of base64 per turn makes a cassette
+unreadable.
 """
 
 from __future__ import annotations
@@ -359,7 +352,7 @@ class CassetteClient:
 
     @property
     def cassette(self) -> Cassette:
-        """The loaded cassette, for assertions in tests."""
+        """The loaded cassette."""
         return self._cassette
 
     @property

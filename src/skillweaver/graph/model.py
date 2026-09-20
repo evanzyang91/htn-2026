@@ -1,31 +1,17 @@
 """The in-memory site graph: screens as nodes, replayable action sequences as edges.
 
-Implements ``contracts.SiteGraph``. States are keyed by ``Fingerprint.value`` and
-edges by ``(src, dst, actions)``, matching the identity rules in ``contracts``.
+Implements ``contracts.SiteGraph``. States are keyed by ``Fingerprint.value``, edges by
+``(src, dst, actions)``.
 
-Why node lookup is fuzzy
-------------------------
+Node lookup is FUZZY - nearest match above :attr:`InMemorySiteGraph.match_threshold` by
+``Fingerprint.similarity`` - because two visits to one screen never fingerprint
+identically, and an exact-match graph grows a pile of singletons with no edges between
+them. The first fingerprint seen becomes the node's canonical id; later near-matches fold
+into it.
 
-Two visits to the same screen never fingerprint identically. A cart badge ticks
-from 2 to 3, an ad rotates, a timestamp advances - the ``value`` hash changes and
-an exact-match graph grows a brand new node for a screen it already knows. Do that
-a few dozen times and the graph is a pile of singletons with no edges between them,
-which is worth nothing.
-
-So node identity here is *nearest match above a threshold*, using
-``Fingerprint.similarity`` (the fraction of agreeing ``parts`` sub-hashes). The
-first fingerprint seen for a screen becomes that node's canonical id and later
-near-matches fold into it. :attr:`InMemorySiteGraph.match_threshold` tunes how
-forgiving that is: too low and two genuinely different screens collapse into one
-node whose edges lead somewhere unpredictable, too high and the graph fragments
-again. It is a constructor argument because the right value depends on what the
-fingerprinter puts in ``parts``.
-
-Fuzziness stops at the node table. ``route`` and ``neighbors`` match exactly on
-``Fingerprint.value``, as ``contracts.GraphView`` specifies; pass
-``approximate=True`` to opt into the same near-match lookup, which is usually what
-you want when the fingerprint came straight off a fresh observation. The explicit
-way to do it is :meth:`InMemorySiteGraph.resolve`.
+Fuzziness stops at the node table: ``route`` and ``neighbors`` match exactly on
+``value``, per ``contracts.GraphView``, unless ``approximate=True`` (which is usually
+what a fingerprint straight off a live observation wants).
 """
 
 from __future__ import annotations
@@ -51,25 +37,15 @@ from skillweaver.graph.route import (
 from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 
 DEFAULT_MATCH_THRESHOLD = SAME_STATE_THRESHOLD
-"""Similarity at or above which two fingerprints are taken to be the same screen.
+"""Similarity at or above which two fingerprints are the same screen.
 
-The project holds ONE number for "am I looking at the screen I recorded", and this
-is that question asked of a graph node, so this is that number - see
-:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` for the two corpora
-it is calibrated on and for what it refuses.
+The project holds ONE number for "am I looking at the screen I recorded", and a threshold
+is only meaningful against the SHAPE of the signal it judges, so a fingerprinter and the
+graph keying on it cannot pick cuts independently. This was an independent ``0.6``,
+reasoned about a fingerprint of three parts; the shipped one emits ~175, whose same-state
+floor is 0.305, and 0.6 rejects every screen that moved.
 
-Deferring to it rather than carrying a separate constant is not tidiness. A
-threshold is only meaningful against the SHAPE of the signal it judges, so a
-fingerprinter and the graph that keys on it cannot pick their cuts independently.
-This value used to be an independent ``0.6``, reasoned about a fingerprint of three
-parts; the shipped fingerprinter emits around 175, whose same-state floor is 0.305,
-and against that a cut of 0.6 rejects every screen that moved and hands the graph
-back the pile of singletons it exists to avoid.
-
-Pass ``match_threshold`` to :class:`InMemorySiteGraph` to override it - ``1.0``
-demands exact equality and disables near matching entirely - and re-derive it if a
-fingerprinter changes what it puts in ``parts``.
-"""
+``match_threshold=1.0`` demands exact equality and disables near matching."""
 
 _EdgeKey = tuple[str, str, tuple[Action, ...]]
 
@@ -78,9 +54,8 @@ _EdgeKey = tuple[str, str, tuple[Action, ...]]
 class GraphSnapshot:
     """One domain's states and transitions, detached from any graph.
 
-    The unit of persistence and of merging: :mod:`skillweaver.graph.store` writes
-    and reads exactly this. Detached means nothing here aliases a live graph, so a
-    snapshot is safe to hold, compare or merge while the graph keeps changing.
+    The unit of persistence and of merging; :mod:`skillweaver.graph.store` reads and
+    writes exactly this. Detached, so it is safe to hold while the graph changes.
     """
 
     domain: str
@@ -90,12 +65,10 @@ class GraphSnapshot:
 
 @runtime_checkable
 class GraphPersistence(Protocol):
-    """Where a graph puts its domains. ``JSONGraphStore`` in
-    :mod:`skillweaver.graph.store` is the implementation; this Protocol exists so
-    the model does not import the store and the two stay independently testable."""
+    """Where a graph puts its domains. A Protocol so the model does not import the store."""
 
     def load(self, domain: str) -> GraphSnapshot:
-        """One domain as stored; an empty snapshot when nothing is stored for it."""
+        """One domain as stored; an empty snapshot when nothing is."""
         ...
 
     def save_merged(self, snapshot: GraphSnapshot) -> GraphSnapshot:
@@ -143,17 +116,16 @@ class InMemorySiteGraph:
     def resolve(self, fp: Fingerprint) -> UIState | None:
         """The known state ``fp`` refers to, or ``None`` when this screen is new.
 
-        An exact ``value`` match wins immediately. Otherwise the most similar known
-        state at or above :attr:`match_threshold` wins; ties go to the state seen
-        first, so the answer does not depend on dict ordering. Never raises.
+        Exact ``value`` wins; otherwise the most similar at or above
+        :attr:`match_threshold`, ties to the state seen first so dict order cannot decide.
         """
         exact = self._states.get(fp.value)
         if exact is not None:
             return exact
         if self.match_threshold >= 1.0:
             return None
-        # The same rule as ``route.same_state``, but this loop needs the SCORE to pick
-        # the BEST match among several candidates, not just a yes or no.
+        # Same rule as ``route.same_state``, but this needs the SCORE to pick the best of
+        # several candidates, not a yes or no.
         best: UIState | None = None
         best_score = -1.0
         for state in self._states.values():
@@ -169,22 +141,18 @@ class InMemorySiteGraph:
         return best
 
     def canonical(self, fp: Fingerprint) -> Fingerprint:
-        """``fp`` mapped onto the node it belongs to, or ``fp`` itself when new.
-
-        The id every edge and lookup should be keyed by. Idempotent.
-        """
+        """``fp`` mapped onto the node it belongs to, or ``fp`` itself when new. Idempotent."""
         known = self.resolve(fp)
         return known.fingerprint if known is not None else fp
 
     # -- SiteGraph: writes -------------------------------------------------------
 
     def upsert_state(self, state: UIState) -> UIState:
-        """Add ``state``, or refresh the label, URL pattern and thumbnail of the node
-        it resolves to. ``first_seen`` and the canonical fingerprint of an existing
-        node are kept. Returns the stored state.
+        """Add ``state``, or refresh the label, URL pattern and thumbnail of the node it
+        resolves to, keeping ``first_seen`` and the canonical fingerprint.
 
-        A near match updates the node it matched, so re-observing a screen whose
-        fingerprint drifted enriches the existing node instead of forking a new one.
+        A near match updates the node it matched, so a drifted fingerprint enriches the
+        existing node instead of forking one.
         """
         known = self.resolve(state.fingerprint)
         if known is None:
@@ -210,16 +178,10 @@ class InMemorySiteGraph:
     ) -> Transition:
         """Record one attempt at the edge ``(src, dst, actions)`` and return it updated.
 
-        Both fingerprints are resolved to existing nodes first, so a drifted
-        fingerprint reinforces the edge it belongs to rather than creating a
-        parallel one. Unknown states are added under ``src``'s domain when that is
-        known, else ``""``.
-
-        Statistics fold in place, without keeping any history: ``attempts`` always
-        rises, ``successes`` rises only when ``ok``, and ``mean_ms`` is the running
-        mean over SUCCESSFUL traversals only - a failure's duration says nothing
-        about how long the edge takes when it works. ``last_verified`` stamps the
-        latest success.
+        Both fingerprints are resolved first, so a drifted one reinforces the edge it
+        belongs to. Statistics fold in place with no history: ``mean_ms`` is the running
+        mean over SUCCESSFUL traversals only, a failure's duration saying nothing about
+        how long the edge takes when it works.
         """
         src_fp = self.canonical(src)
         dst_fp = self.canonical(dst)
@@ -247,20 +209,15 @@ class InMemorySiteGraph:
     ) -> Route | None:
         """The lowest-cost known route, or ``None`` when no path is known.
 
-        Matching is exact on ``Fingerprint.value`` and only proven edges are used,
-        per ``contracts.GraphView.route``; both are consequences of the defaults,
-        so a graph built with a different ``policy`` routes by that policy instead.
-        Never raises for unknown fingerprints.
+        Exact on ``Fingerprint.value``, proven edges only, per ``contracts.GraphView`` -
+        both consequences of the defaults, so another ``policy`` routes by that policy.
 
         Args:
-            approximate: Resolve both endpoints through :meth:`resolve` first. Use
-                it when the fingerprints came from live observations rather than
-                from the graph.
+            approximate: Resolve both endpoints through :meth:`resolve` first, for
+                fingerprints that came from live observations.
         """
         # ``find_route`` treats endpoints within SAME_STATE_THRESHOLD as one screen,
-        # which is right for a live fingerprint and wrong for this method: the contract
-        # says exact. ``approximate=True`` is how a caller asks for the other behavior,
-        # and then :meth:`canonical` has already mapped both onto real node ids.
+        # which is right for a live fingerprint and wrong here: the contract says exact.
         return find_route(
             src_fp,
             dst_fp,
@@ -271,11 +228,7 @@ class InMemorySiteGraph:
         )
 
     def neighbors(self, fp: Fingerprint, *, approximate: bool = False) -> list[Transition]:
-        """Outgoing edges of ``fp``, most reliable first, then fastest.
-
-        Empty list when the state is unknown or has no edges. ``approximate``
-        resolves ``fp`` through :meth:`resolve` first.
-        """
+        """Outgoing edges of ``fp``, most reliable first then fastest; empty when unknown."""
         if approximate:
             fp = self.canonical(fp)
         return sorted(self._outgoing(fp.value), key=lambda e: (-success_rate(e), e.mean_ms))
@@ -291,10 +244,7 @@ class InMemorySiteGraph:
         return sorted({s.domain for s in self._states.values()})
 
     def transitions(self, domain: str | None = None) -> list[Transition]:
-        """Every edge, or only those whose source state belongs to ``domain``.
-
-        In insertion order, which is the order the edges were first observed.
-        """
+        """Every edge, or only those sourced in ``domain``, in first-observed order."""
         if domain is None:
             return list(self._edges.values())
         nodes = {s.fingerprint.value for s in self._states.values() if s.domain == domain}
@@ -313,15 +263,12 @@ class InMemorySiteGraph:
     def absorb(self, snapshot: GraphSnapshot, *, resolve: bool = False) -> None:
         """Fold a snapshot's states and edges into this graph.
 
-        Verbatim by default: every state keeps its own fingerprint, so a snapshot
-        that legitimately holds two similar-but-distinct screens is not collapsed.
-        That is what makes a save/load round-trip exact.
+        Verbatim by default, so a snapshot legitimately holding two similar-but-distinct
+        screens is not collapsed and a save/load round-trip is exact.
 
         Args:
-            resolve: Route each state and edge endpoint through :meth:`resolve`
-                first, consolidating near matches against what is already here.
-                Use it when folding in a graph recorded by another run, whose
-                fingerprints for the same screens will have drifted.
+            resolve: Consolidate near matches against what is already here, for a graph
+                recorded by another run whose fingerprints will have drifted.
         """
         for state in snapshot.states:
             if resolve:
@@ -348,24 +295,16 @@ class InMemorySiteGraph:
     def unsaved(self, domain: str) -> GraphSnapshot:
         """What this graph has OBSERVED of ``domain`` since it last met the store.
 
-        The snapshot :meth:`save` hands over, and the reason a count means what it
-        says. The store SUMS statistics, because its job is to combine observations
-        that two runs made independently - so handing it the whole in-memory graph
-        hands it back the counts it just supplied through :meth:`load`, and every
-        save doubles them. A graph loaded and saved ten times reported 1023 attempts
-        on an edge walked ten times, and routing then preferred whichever edges had
-        been PERSISTED most often.
+        The store SUMS statistics, so handing it the whole in-memory graph hands back the
+        counts :meth:`load` just supplied and every save DOUBLES them - a graph loaded and
+        saved ten times reported 1023 attempts on an edge walked ten, and routing then
+        preferred whichever edges had been persisted most often. So edges here carry
+        DIFFERENCES, exactly the inverse of :func:`merge_transitions`'s weighting; an edge
+        with nothing new is left out, an edge the store never saw is passed whole. States
+        go in full: they hold no summed statistics.
 
-        So the edges here carry DIFFERENCES: attempts and successes minus what was
-        already exchanged, and a ``mean_ms`` over only the new successful traversals,
-        which is exactly the inverse of :func:`merge_transitions`'s weighting. An
-        edge with nothing new to say is left out entirely; an edge the store has
-        never seen is passed whole. States are always sent in full - they hold no
-        summed statistics, so merging one twice changes nothing.
-
-        The baseline is per domain, and is set by :meth:`load` and by :meth:`save`.
-        A domain this graph never loaded has an empty one, so its first save
-        persists everything.
+        The baseline is per domain, set by :meth:`load` and :meth:`save`, so a domain this
+        graph never loaded persists everything on its first save.
         """
         already = self._exchanged.get(domain, {})
         states = self.states(domain)
@@ -381,18 +320,12 @@ class InMemorySiteGraph:
     def save(self) -> None:
         """Persist every loaded domain, merging with what is already stored.
 
-        A no-op when this graph has no store. Merging rather than overwriting is
-        the point: several runs write the same domain concurrently, and
-        last-write-wins would silently drop the other run's observations. What is
-        handed over is :meth:`unsaved`, not the whole graph - see there for why the
-        difference is the whole difference between a count and a doubling.
-
-        Saving twice with nothing observed in between is therefore a no-op on the
-        numbers, which is what lets a run persist at every exit without inflating
-        anything.
+        Merging rather than overwriting because several runs write one domain
+        concurrently. What is handed over is :meth:`unsaved`, not the whole graph, so
+        saving twice with nothing observed in between changes no number.
 
         Raises:
-            SkillWeaverError: if the data directory cannot be written.
+            SkillWeaverError: the data directory cannot be written.
         """
         if self.store is None:
             return
@@ -403,8 +336,7 @@ class InMemorySiteGraph:
     def load(self, domain: str) -> None:
         """Load ``domain`` from storage, replacing what is in memory for it.
 
-        A domain with nothing stored loads as empty; never raises for "missing".
-        A graph with no store simply drops the domain.
+        Nothing stored loads as empty; a graph with no store simply drops the domain.
         """
         self.forget(domain)
         if self.store is None:
@@ -431,10 +363,9 @@ class InMemorySiteGraph:
     def _mark_exchanged(self, domain: str) -> None:
         """Record this domain's edges as the baseline :meth:`unsaved` measures against.
 
-        Called after a load and after a save, which are the two moments at which
-        what is in memory and what is on disk are known to agree about what THIS
-        graph has contributed. A later writer's additions are not in the baseline
-        and are not meant to be: the next :meth:`load` is where they arrive.
+        Called after a load and a save - the two moments memory and disk are known to
+        agree about what THIS graph contributed. A later writer's additions arrive at the
+        next :meth:`load`.
         """
         nodes = {s.fingerprint.value for s in self.states(domain)}
         self._exchanged[domain] = {
@@ -451,13 +382,12 @@ class InMemorySiteGraph:
 def merge_transitions(left: Transition, right: Transition) -> Transition:
     """Combine two observations of the SAME edge by summing their statistics.
 
-    Attempts and successes add. ``mean_ms`` becomes the success-weighted mean of
-    the two means, which is exactly the mean of all successful traversals on both
-    sides - a plain average would let one side's single lucky run outvote the
-    other's hundred. ``last_verified`` is the later of the two.
+    ``mean_ms`` is the success-WEIGHTED mean of the two, which is the mean over all
+    successful traversals on both sides; a plain average would let one side's single
+    lucky run outvote the other's hundred.
 
     Raises:
-        ValueError: if the two are not the same edge.
+        ValueError: the two are not the same edge.
     """
     if (left.src.value, left.dst.value, left.actions) != (
         right.src.value,
@@ -481,8 +411,7 @@ def merge_transitions(left: Transition, right: Transition) -> Transition:
 
 
 def merge_states(left: UIState, right: UIState) -> UIState:
-    """Combine two records of the same node, keeping the earliest sighting and
-    preferring ``left``'s non-empty descriptive fields."""
+    """Combine two records of one node: earliest sighting, ``left``'s non-empty fields."""
     return replace(
         left,
         domain=left.domain or right.domain,
@@ -496,20 +425,14 @@ def merge_states(left: UIState, right: UIState) -> UIState:
 def subtract_transitions(edge: Transition, already: Transition | None) -> Transition | None:
     """What ``edge`` has to say beyond ``already``, or ``None`` when it says nothing.
 
-    The inverse of :func:`merge_transitions`: attempts and successes are the
-    differences, and ``mean_ms`` averages only the successes that are new, so that
-    merging the result back onto ``already`` reproduces ``edge`` exactly.
-    ``last_verified`` is carried only when there IS a new success - a delta of pure
-    failures has verified nothing.
+    The inverse of :func:`merge_transitions`, so merging the result back onto ``already``
+    reproduces ``edge`` exactly. ``last_verified`` is carried only when there IS a new
+    success - a delta of pure failures has verified nothing. ``already`` of ``None``
+    returns the whole edge.
 
-    ``already`` of ``None`` means the other side has never seen this edge, so the
-    whole edge is new and is returned unchanged. A delta of zero attempts and zero
-    successes is ``None``: there is nothing to merge and nothing to write.
-
-    Negative differences cannot arise from :meth:`InMemorySiteGraph.save`, whose
-    baseline is always a past state of the same graph, and are clamped to zero
-    rather than trusted, because a statistic that can go backwards is worse than a
-    statistic that stalls.
+    Negative differences cannot arise from :meth:`InMemorySiteGraph.save`, whose baseline
+    is a past state of the same graph, and are clamped rather than trusted: a statistic
+    that can go backwards is worse than one that stalls.
     """
     if already is None:
         return edge

@@ -1,22 +1,14 @@
-"""Loading, saving, resizing and converting :class:`~skillweaver.contracts.Screenshot`.
+"""Loading, saving, resizing and converting ``Screenshot``.
 
-Every helper here exists to keep ONE invariant true: a ``Screenshot`` carries its PNG
-at PHYSICAL resolution while ``width``/``height`` are LOGICAL pixels, and
-``scale = physical / logical``. Get that wrong and every click in the system lands at
-twice (or half) the intended coordinates, so the conversions live in one place instead
-of being re-derived by each caller.
+Every helper keeps ONE invariant: the PNG is at PHYSICAL resolution while
+``width``/``height`` are LOGICAL pixels and ``scale = physical / logical``. Get it wrong
+and every click lands at twice or half the intended coordinates.
 
-The three sizes to keep straight:
+``shot.width``/``height`` are logical; ``physical_size(shot)`` is what the bytes decode to;
+``shot.to_array()`` is logical-sized by default, so ``array[y, x]`` IS ``Point(x, y)``.
 
-``shot.width``, ``shot.height``
-    Logical. What a ``Box`` or ``Point`` is measured in.
-``physical_size(shot)``
-    What the PNG bytes actually decode to.
-``shot.to_array()``
-    Logical-sized by default, so ``array[y, x]`` IS ``Point(x, y)``.
-
-Use :func:`rescale` (change pixel density, keep the logical frame) and :func:`resize`
-(change the logical frame, keep the density) rather than resizing arrays by hand.
+:func:`rescale` changes pixel density and keeps the logical frame; :func:`resize` changes
+the frame and keeps the density.
 """
 
 from __future__ import annotations
@@ -54,13 +46,9 @@ def _check_scale(scale: float) -> float:
 
 
 def decode_png(png: bytes) -> np.ndarray:
-    """Decode PNG bytes into an ``H x W x 3`` ``uint8`` RGB array at native size.
+    """PNG bytes as an ``H x W x 3`` ``uint8`` RGB array at native size.
 
-    No resizing happens: the result is at PHYSICAL resolution, so coordinates taken
-    from it must be divided by the screenshot's ``scale``.
-
-    Raises:
-        PerceptionError: if the bytes cannot be decoded as an image.
+    PHYSICAL resolution, so coordinates from it must be divided by ``scale``.
     """
     import numpy as np
     from PIL import Image, UnidentifiedImageError
@@ -74,12 +62,7 @@ def decode_png(png: bytes) -> np.ndarray:
 
 
 def encode_png(array: np.ndarray) -> bytes:
-    """Encode an ``H x W x 3`` (or ``H x W x 4``, or grayscale ``H x W``) ``uint8``
-    array as PNG bytes.
-
-    Raises:
-        PerceptionError: if the array is not an encodable image.
-    """
+    """An ``H x W x 3``, ``H x W x 4`` or grayscale ``uint8`` array as PNG bytes."""
     import numpy as np
     from PIL import Image
 
@@ -97,11 +80,7 @@ def encode_png(array: np.ndarray) -> bytes:
 
 
 def physical_size(shot: Screenshot) -> tuple[int, int]:
-    """The ``(width, height)`` the PNG decodes to, derived from ``scale``.
-
-    This is what the bytes are *expected* to be; :func:`load_screenshot` is what
-    guarantees the stored bytes agree with it.
-    """
+    """The ``(width, height)`` the PNG is EXPECTED to decode to, derived from ``scale``."""
     return (round(shot.width * shot.scale), round(shot.height * shot.scale))
 
 
@@ -113,9 +92,8 @@ def logical_size(shot: Screenshot) -> tuple[int, int]:
 def to_array(shot: Screenshot, *, logical: bool = True) -> np.ndarray:
     """``shot.to_array(logical=logical)``, spelled as a function.
 
-    ``logical=True`` gives a logical-sized array whose indices are logical pixels;
     ``logical=False`` gives the sharper native-resolution array, which is what OCR and
-    detectors should run on before dividing their coordinates by ``shot.scale``.
+    detectors run on before dividing their coordinates by ``shot.scale``.
     """
     return shot.to_array(logical=logical)
 
@@ -126,15 +104,10 @@ def from_array(
     scale: float = 1.0,
     captured_at: datetime | None = None,
 ) -> Screenshot:
-    """Build a ``Screenshot`` from an array of PHYSICAL pixels.
+    """A ``Screenshot`` from an array of PHYSICAL pixels.
 
-    The array's own size is the physical size, so the logical size becomes
-    ``array.shape[1] / scale`` by ``array.shape[0] / scale``. Passing a
-    logical-resolution array with ``scale=2.0`` is therefore a bug: the resulting
-    screenshot would claim to be half the size it looks.
-
-    Raises:
-        PerceptionError: if ``scale`` is not positive or the array is not an image.
+    The array's size IS the physical size, so passing a logical-resolution array with
+    ``scale=2.0`` is a bug: the screenshot would claim half the size it looks.
     """
     scale = _check_scale(scale)
     png = encode_png(array)
@@ -156,15 +129,10 @@ def from_png(
     height: int | None = None,
     captured_at: datetime | None = None,
 ) -> Screenshot:
-    """Build a ``Screenshot`` from PNG bytes of PHYSICAL pixels.
+    """A ``Screenshot`` from PNG bytes of PHYSICAL pixels.
 
-    The logical size is derived from the decoded size and ``scale``. Pass ``width``
-    and ``height`` only when the true logical size is known independently (a viewport
-    reported by the controller) and rounding would otherwise be ambiguous.
-
-    Raises:
-        PerceptionError: if ``scale`` is not positive or the bytes are not a decodable
-            image.
+    Pass ``width``/``height`` only when the true logical size is known independently (a
+    viewport the controller reported) and rounding would otherwise be ambiguous.
     """
     scale = _check_scale(scale)
     array = decode_png(png)
@@ -186,14 +154,10 @@ def load_screenshot(
     height: int | None = None,
     captured_at: datetime | None = None,
 ) -> Screenshot:
-    """Read a PNG file into a ``Screenshot`` whose ``scale`` is ``scale``.
+    """Read a PNG file into a ``Screenshot``.
 
-    The file is treated as PHYSICAL pixels, exactly as a capture would be, so a 2x
-    Retina fixture must be loaded with ``scale=2.0`` for its boxes to come out in
-    logical pixels.
-
-    Raises:
-        PerceptionError: if the file is missing or is not a decodable image.
+    The file is PHYSICAL pixels, exactly as a capture is, so a 2x Retina fixture must be
+    loaded with ``scale=2.0`` for its boxes to come out logical.
     """
     file = Path(path)
     try:
@@ -204,14 +168,10 @@ def load_screenshot(
 
 
 def save_screenshot(shot: Screenshot, path: str | Path) -> Path:
-    """Write ``shot.png`` to ``path`` verbatim and return the path.
+    """Write ``shot.png`` to ``path`` verbatim.
 
-    Only the pixels are written: ``scale`` lives outside the file, so whoever reads it
-    back must pass the same ``scale`` to :func:`load_screenshot`. Parent directories
-    are created.
-
-    Raises:
-        PerceptionError: if the file cannot be written.
+    Only the pixels: ``scale`` lives outside the file, so a reader must pass the same
+    ``scale`` to :func:`load_screenshot`.
     """
     file = Path(path)
     try:
@@ -223,14 +183,11 @@ def save_screenshot(shot: Screenshot, path: str | Path) -> Path:
 
 
 def rescale(shot: Screenshot, scale: float) -> Screenshot:
-    """Change pixel density while keeping the LOGICAL frame identical.
+    """Change pixel density, keeping the LOGICAL frame identical.
 
-    Every ``Box`` computed against the result is still valid against ``shot``, which is
-    what makes this safe: ``rescale(shot, 1.0)`` is the cheap way to hand a Retina
-    capture to something that ignores ``scale``.
-
-    Raises:
-        PerceptionError: if ``scale`` is not positive or the PNG cannot be decoded.
+    Every ``Box`` computed against the result is still valid against ``shot``, so
+    ``rescale(shot, 1.0)`` is the cheap way to hand a Retina capture to something that
+    ignores ``scale``.
     """
     scale = _check_scale(scale)
     if scale == shot.scale:
@@ -251,16 +208,15 @@ def resize(
     width: int | None = None,
     height: int | None = None,
 ) -> Screenshot:
-    """Change the LOGICAL frame, keeping ``scale`` - and therefore pixel density - as
-    it was.
+    """Change the LOGICAL frame, keeping ``scale`` and so the pixel density.
 
-    Give one of ``width``/``height`` to scale proportionally, or both to force a size.
-    Boxes do NOT survive this: coordinates from the result are in the new frame and
-    must be scaled by ``shot.width / result.width`` to mean anything on the original.
+    One of ``width``/``height`` scales proportionally, both force a size. Boxes do NOT
+    survive: coordinates from the result are in the new frame and must be scaled by
+    ``shot.width / result.width`` to mean anything on the original.
 
     Raises:
-        PerceptionError: if neither dimension is given, a dimension is not positive, or
-            the PNG cannot be decoded.
+        PerceptionError: neither dimension given, a non-positive dimension, or an
+            undecodable PNG.
     """
     if width is None and height is None:
         raise PerceptionError("resize needs width, height or both")
