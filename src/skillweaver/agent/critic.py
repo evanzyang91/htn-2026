@@ -1,93 +1,26 @@
 """The critic: "did that actually work?", answered as cheaply as it honestly can be.
 
-Nothing else in this project can learn without an answer to that question. The explorer
-needs it to know which action to keep, synthesis needs it to admit a skill, and the warm
-path - replaying a saved skill instead of thinking - is only trustworthy because a critic
-re-checks the result. So the critic is on the hot path of every run, which makes its
-second job cost: *most of this project's efficiency claim is not asking a vision model a
-question a free check already answered.*
+Most of this project's efficiency claim is not asking a vision model a question a free
+check already answered. :class:`TieredCritic` stops at the first tier that concludes:
+run the programmatic checks; if any FAILED, or every EVIDENCE check passed and there was
+one, return that with no model call; if a CORROBORATING check passed, a free yes; only
+then escalate to the vision model.
 
-The cost policy
----------------
+**The three roles are not symmetric, and conflating them is how a critic starts lying.**
+EVIDENCE proves success and failure, so only give it a check whose failure really is the
+task failing. A VETO can only prove failure - ``state_changed()`` passing means only
+that something moved, and clicking the wrong button also changes the screen.
+CORROBORATION is the mirror: passing is decisive, failing decides nothing.
 
-:class:`TieredCritic` decides in four tiers, and stops at the first one that reaches a
-conclusion:
+Corroboration exists because of a measured bug. The warm path handed :meth:`judge` the
+fingerprint of the ORIGINAL learned run's end screen as ``expected_state`` - decisive
+evidence - which fails any task whose end screen depends on its argument: a skill
+learned from "Search Wikipedia for computer vision" and replayed for "machine learning"
+ran clean, passed its own verifier and was still rejected at similarity 0.120.
 
-1. **Run the programmatic checks** from :mod:`skillweaver.agent.checks`. They are
-   deterministic, take microseconds, and each can return ``passed``, ``failed`` or
-   ``unknown``.
-2. **If they are decisive, return that verdict and make NO model call at all.** Decisive
-   means either of:
-
-   * any check FAILED - a failing check is proof of failure, so nothing is gained by
-     paying a model to agree. This covers the two commonest outcomes in practice: the
-     screen did not change, and an error message appeared.
-   * every *evidence* check PASSED, and there was at least one. See below for why a
-     passing veto is not enough.
-
-3. **If a corroborating check passed**, return a decisive yes, again with no model
-   call. Corroboration is evidence that can only say yes (see below).
-4. **Only when the checks are genuinely inconclusive**, send the before and after
-   screenshots plus the goal to the vision model, and return its judgment with
-   ``source="model"``. Inconclusive means no evidence or veto failed AND there was
-   nothing that could establish success - no evidence check was configured, one of
-   them returned ``unknown``, or the corroboration did not come through.
-
-Evidence, corroboration and vetoes
-----------------------------------
-
-The three roles are not symmetric, and conflating them is how a critic starts lying.
-
-An **evidence** check can prove success *and* failure: ``element_present("Payment
-confirmed")``, ``matches_state(the one screen this can possibly end on)``, whatever the
-caller passes in. When all of them pass, the goal was reached; when one fails, it was
-not. It is authority, so only give it a check whose failure really is the task failing.
-
-A **veto** can only prove failure. ``state_changed()`` failing means the step did nothing;
-``state_changed()`` *passing* means only that something moved, which is not success -
-clicking the wrong button also changes the screen. ``no_error_state()`` is the same shape.
-So vetoes are consulted for a decisive no and are worth nothing towards a yes, and a
-critic configured with vetoes alone escalates every time it is asked about a screen that
-merely changed.
-
-A **corroboration** check is the mirror image of a veto: it can only prove success.
-Passing is a decisive yes; failing decides nothing and falls through to the model. It
-exists because of a measured bug. The warm path used to hand :meth:`judge` the
-fingerprint of the screen the ORIGINAL learned run ended on as ``expected_state`` -
-decisive evidence - and for any task whose end screen depends on its argument that turns
-a correct replay into a failure. A skill learned from "Search Wikipedia for computer
-vision" and replayed for "machine learning" ran clean, passed its own verifier, and was
-still rejected: one run ends on /wiki/Computer_vision and the other on
-/wiki/Machine_learning, similarity 0.120. A recalled end screen is a *shortcut to a free
-yes*, never a reason to call a working skill broken, and ``corroborating_state`` is that
-shortcut with its authority removed. What still fails such a run is unchanged: the
-vetoes, any real evidence check, and the model that is now asked when the shortcut misses.
-
-Which path was taken
---------------------
-
-:meth:`TieredCritic.judge` returns a :class:`CriticVerdict` - a real
-:class:`~skillweaver.contracts.Verdict`, so any caller typed against the Protocol is
-unaffected - carrying ``escalated``, a ``policy`` slug naming the rule that fired, and
-``checks``, the full verdict of every check that ran. A reader can therefore see not only
-what the critic decided but what it cost and why, which is the only way a cost policy
-stays honest once it is out of sight.
-
-Failure behavior
-----------------
-
-* A model reply that cannot be parsed, or that claims success without naming any visible
-  evidence, **degrades to an honest low-confidence "I do not know"** (``ok=False``,
-  ``confidence=0.0``, ``source="model"``) rather than to a false success.
-* A model *call* that fails raises :class:`~skillweaver.errors.ProviderError`, per the
-  :class:`~skillweaver.contracts.Critic` Protocol. It is not degraded: a provider outage
-  is an infrastructure problem the caller must see, not a judgment about the screen.
-* With no model configured at all (``llm=None``), an inconclusive case returns
-  ``ok=False, confidence=0.0`` and says so, and never pretends a model was asked.
-
-The adapters in :mod:`skillweaver.llm` are verified against recorded cassettes and have
-not yet made a live call; this module codes against the
-:class:`~skillweaver.contracts.LLMClient` interface and is tested the same way.
+An unparseable model reply, or one claiming success without naming visible evidence,
+degrades to an honest ``ok=False, confidence=0.0``. A failing model CALL raises
+ProviderError instead: an outage is infrastructure, not a judgment about the screen.
 """
 
 from __future__ import annotations
@@ -129,20 +62,14 @@ PROMPT_PATH = Path(__file__).parent / "prompts" / "critic.md"
 MODEL_CONFIDENCE_CAP = 0.9
 """Ceiling applied to the model's self-reported confidence.
 
-A model is only ever consulted here because the deterministic evidence was absent, so by
-construction its answer rests on a reading of pixels rather than on a match. Capping it
-below the ``1.0`` a fingerprint match earns keeps ``confidence`` comparable across the two
-sources - a caller sorting verdicts by confidence should never see a model's opinion
-outrank a measurement.
-"""
+A model is consulted here only because the deterministic evidence was absent, so its
+answer rests on a reading of pixels rather than a match. Capping it below the ``1.0`` a
+fingerprint match earns keeps ``confidence`` comparable across the two sources."""
 
 MIN_EVIDENCE_CHARS = 12
-"""Shortest ``evidence`` string accepted alongside a claimed success.
-
-The prompt demands something concrete and visible. ``"yes"``, ``"done"`` and ``"it
-worked"`` are all shorter than this, and all of them are the model agreeing rather than
-looking. A success claim with less evidence than this degrades to "I do not know".
-"""
+"""Shortest ``evidence`` string accepted alongside a claimed success. ``"yes"``,
+``"done"`` and ``"it worked"`` are all shorter, and all of them are the model agreeing
+rather than looking; a claim with less evidence degrades to "I do not know"."""
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -159,16 +86,15 @@ def load_prompt() -> str:
 
 @dataclass(frozen=True, slots=True)
 class CriticVerdict(Verdict):
-    """A :class:`~skillweaver.contracts.Verdict` that shows its own cost.
+    """A Verdict that shows its own cost.
 
     Attributes:
-        escalated: ``True`` exactly when a model call was made. ``False`` on every
-            verdict the programmatic checks decided - assert this to prove a path is free.
+        escalated: ``True`` exactly when a model call was made - assert this to prove a
+            path is free.
         policy: A slug naming the rule that fired, one of ``"check-failed"``,
             ``"evidence-passed"``, ``"corroborated"``, ``"inconclusive-no-model"``,
             ``"model"``, ``"model-unparseable"`` or ``"model-unevidenced"``.
-        checks: Every check that ran, in order, with its own verdict. Present on an
-            escalated verdict too, so the reader can see what was inconclusive.
+        checks: Every check that ran, in order. Present on an escalated verdict too.
     """
 
     escalated: bool = False
@@ -185,33 +111,25 @@ class CriticVerdict(Verdict):
 
 
 class TieredCritic:
-    """A :class:`~skillweaver.contracts.Critic` that pays for a model only when it must.
+    """A Critic that pays for a model only when it must.
 
     Args:
-        llm: The vision model consulted when the checks are inconclusive. ``None`` means
-            programmatic-only: an inconclusive case then returns an honest
-            ``ok=False, confidence=0.0`` instead of asking anyone.
-        evidence: Checks that can prove success. When every one of them passes the
-            verdict is a decisive yes; when any fails it is a decisive no.
-        expected_state: Shorthand for adding ``matches_state(expected_state)`` to
-            ``evidence`` - the way a run that can only end on ONE screen says so.
-            A task whose end screen depends on its argument wants
-            ``corroborating_state`` instead; see the module docstring.
-        corroboration: Checks that can only prove success. All of them passing is a
-            decisive yes; one failing decides nothing and escalates.
-        corroborating_state: Shorthand for adding ``matches_state(corroborating_state)``
-            to ``corroboration`` - a recalled end screen offered as a free shortcut to
-            "yes" with no power to say "no".
+        llm: Consulted when the checks are inconclusive. ``None`` means
+            programmatic-only, returning an honest ``ok=False, confidence=0.0``.
+        evidence: Checks that can prove success. All passing is a decisive yes; one
+            failing is a decisive no.
+        expected_state: Shorthand for ``matches_state(...)`` in ``evidence`` - how a run
+            that can only end on ONE screen says so. A task whose end screen depends on
+            its argument wants ``corroborating_state``.
+        corroboration: Checks that can only prove success. One failing escalates.
+        corroborating_state: ``matches_state(...)`` in ``corroboration``: a recalled end
+            screen as a free shortcut to "yes" with no power to say "no".
         require_change: Adds ``state_changed()`` as a veto (default). Turn it off for a
-            step that is meant to leave the screen alone, or the critic will call every
-            such step a failure.
+            step meant to leave the screen alone.
         check_errors: Adds ``no_error_state()`` as a veto (default).
-        vetoes: Extra checks that can only prove failure.
-        max_tokens: Cap on the escalated reply. The prompt asks for a small JSON object,
-            so this is deliberately tight.
 
     The configuration is per-critic because :meth:`judge`'s signature is fixed by the
-    Protocol. Use :meth:`expecting` to derive a critic for one particular step.
+    Protocol; use :meth:`expecting` to derive a critic for one step.
     """
 
     def __init__(
@@ -293,9 +211,8 @@ class TieredCritic:
     ) -> CriticVerdict:
         """Judge whether ``goal`` was achieved going from ``before`` to ``after``.
 
-        Follows the cost policy in the module docstring. The returned verdict says which
-        tier decided it (``escalated``, ``policy``) and carries every check's own verdict
-        (``checks``).
+        The verdict says which tier decided it (``escalated``, ``policy``) and carries
+        every check's own verdict.
 
         Raises:
             ProviderError: if a model was needed and the call failed.
@@ -305,10 +222,9 @@ class TieredCritic:
         vetoes = run_all(self._vetoes, before, after)
         results = tuple(evidence + corroboration + vetoes)
 
-        # Corroboration is deliberately absent from this list. A check that can only
-        # prove success has no vote on failure; letting one in here is exactly the bug
-        # that demoted a warm replay for landing on the right screen for a DIFFERENT
-        # argument than the one the skill was learned with.
+        # Corroboration is deliberately absent: a check that can only prove success has
+        # no vote on failure. Letting one in here is the bug that demoted a warm replay
+        # for landing on the right screen for a DIFFERENT argument.
         failures = [r for r in evidence + vetoes if r.outcome is Outcome.failed]
         if failures:
             return CriticVerdict(
@@ -435,10 +351,10 @@ class TieredCritic:
     ) -> LLMMessage:
         """The one user turn: the goal, what the cheap checks found, and both frames.
 
-        The corroboration is quoted in a section of its own, and said to be worthless
-        as evidence of failure. Folding it into the main trail would hand the model a
-        line reading "the screen is not the expected state" and invite it to agree -
-        which is the veto this role exists to remove, laundered through the model.
+        The corroboration is quoted separately and said to be worthless as evidence of
+        failure: folding it into the main trail would hand the model a line reading "the
+        screen is not the expected state" and invite it to agree, which is the veto this
+        role exists to remove, laundered through the model.
         """
         lines = [f"GOAL: {goal}"]
         if expectation:
@@ -486,10 +402,9 @@ class TieredCritic:
 def _parse_reply(text: str) -> dict[str, Any] | None:
     """The JSON object in a model reply, or ``None`` when there is not one.
 
-    Tolerates a code fence and surrounding prose - both are things models do despite
-    being asked not to, and neither is a reason to throw away a real answer. Returns
-    ``None`` for anything else, including valid JSON that is not an object or that never
-    says ``ok``, because a verdict without a decision in it is not a verdict.
+    Tolerates a code fence and surrounding prose. ``None`` for anything else, including
+    valid JSON that is not an object or never says ``ok``, because a verdict without a
+    decision in it is not a verdict.
     """
     if not text or not text.strip():
         return None
@@ -508,11 +423,9 @@ def _parse_reply(text: str) -> dict[str, Any] | None:
 
 
 def _as_confidence(value: Any) -> float:
-    """A model-supplied confidence clamped into ``0.0..1.0``; ``0.5`` when unusable.
-
-    A missing or nonsense confidence is not a reason to discard an otherwise good
-    judgment, but it must not become a confident one either, so it lands in the middle.
-    """
+    """A model-supplied confidence clamped into ``0.0..1.0``; ``0.5`` when unusable. A
+    nonsense confidence is not a reason to discard an otherwise good judgment, but it
+    must not become a confident one either."""
     try:
         return min(1.0, max(0.0, float(value)))  # type: ignore[arg-type]
     except (TypeError, ValueError):

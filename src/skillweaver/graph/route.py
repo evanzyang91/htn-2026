@@ -1,84 +1,32 @@
-"""Shortest-path routing over the transitions of a site graph.
+"""Shortest-path routing over the transitions of a site graph: the "without asking a
+model" half of the site graph.
 
-The point of the site graph is that a screen the agent has reached before can be
-reached again without asking a model. This module is the "without asking a model"
-part: given the edges, it picks the cheapest believable way from one screen to
-another and hands back the concrete actions to replay.
+An edge costs EXPECTED milliseconds, ``mean_ms / success_rate``. ``mean_ms`` averages only
+SUCCESSFUL traversals, so dividing by the rate is what charges an edge for its failures -
+an edge that works half the time costs twice its happy path, because on average it is
+walked twice. That one formula is why slow-but-certain beats fast-and-flaky with no
+special-casing. :class:`RoutingPolicy` adds two adjustments: a never-verified edge has no
+happy path to average and is priced at a prior times a penalty (or refused outright, which
+is the :data:`VERIFIED_ONLY` default and what ``contracts.GraphView.route`` specifies), and
+an edge with enough attempts to judge and a success rate under the floor is DROPPED -
+otherwise Dijkstra routes through a 1%-reliable edge whenever nothing else connects, and
+"no route" plus a fresh exploration serves the agent better.
 
-Cost model
-----------
+"Am I already there?" is NOT an exact-match question. A route's endpoints are usually a
+LIVE screen and a RECORDED one, and a live page never fingerprints identically twice, so
+comparing ``value`` answers "no" for a screen the agent is standing on and reports
+``no_route`` for a journey of zero steps - which is how the first skill learned on live
+Wikipedia became unusable the moment it was stored. :func:`find_route` settles that case
+with ``SAME_STATE_THRESHOLD``; ``same_state_threshold=1.0`` demands equality, which
+``InMemorySiteGraph.route`` passes. Tolerance stops at the endpoints: intermediate hops
+match exactly, because those values ARE node ids.
 
-The cost of an edge is **expected milliseconds**, not measured milliseconds::
+A stored route replays fast, free and confident whether or not its numbers mean anything -
+the graph once carried 262144 successes on an edge walked a few dozen times - so
+:func:`explain_edge` and :func:`explain_route` give the pricing with its counts, through
+the same :func:`_price` the router uses.
 
-    cost = mean_ms / success_rate
-
-``mean_ms`` averages only SUCCESSFUL traversals (see :class:`~skillweaver.contracts.Transition`),
-so dividing by the success rate is what charges an edge for its failures: an edge
-that works half the time costs twice its happy-path latency, because on average it
-has to be walked twice. That single formula is why a slow-but-certain path beats a
-fast-and-flaky one without any extra special-casing.
-
-Two adjustments sit on top of it, both controlled by :class:`RoutingPolicy`:
-
-**Never-verified edges are penalized, not trusted.** An edge with no successes has
-no ``mean_ms`` at all - there is no happy path to average - so there is nothing
-honest to divide. It is priced at a configured prior
-(:attr:`RoutingPolicy.unverified_ms`) multiplied by
-:attr:`RoutingPolicy.unverified_penalty`, which keeps it usable as a last resort
-while making it lose to any proven edge of the same nominal latency. By default
-(:data:`VERIFIED_ONLY`) such edges are not used at all, which is what
-``contracts.GraphView.route`` specifies.
-
-**Hopeless edges are refused outright.** An edge with enough attempts on record to
-be judged (:attr:`RoutingPolicy.min_attempts_for_cap`) and a success rate below
-:attr:`RoutingPolicy.min_success_rate` is dropped from the search. Without the cap
-a 1%-reliable edge is merely expensive, and Dijkstra will still route through it
-when nothing else connects; the agent is better served by "no route" and a fresh
-exploration than by replaying something that reliably does not work.
-
-Being already there is not an exact-match question
---------------------------------------------------
-
-The endpoints of a route are usually a LIVE screen on one side and a RECORDED one on
-the other - "get me from what I am looking at to the screen this skill starts on" -
-and a live page never fingerprints identically twice. Asking whether those two are
-the same state by comparing ``Fingerprint.value`` therefore answers "no" for a screen
-the agent is already standing on, and the caller is told ``no_route`` for a journey of
-zero steps. That is not a hypothetical: it is how the first skill ever learned on live
-Wikipedia became unusable the moment it was stored.
-
-So :func:`find_route` settles the trivial case with
-:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`, the project's one
-calibrated answer to "am I looking at the screen I recorded", and returns the empty
-route when the two endpoints are the same screen by that measure. Pass ``same_state=1.0``
-to demand exact equality instead; ``InMemorySiteGraph.route`` does exactly that, because
-``contracts.GraphView.route`` specifies exact matching for the graph's own query method.
-
-Tolerance stops there, and deliberately. Only the endpoints are compared this way; the
-hops in between are matched exactly on ``Fingerprint.value``, because those values ARE
-node ids and a node id is never a drifted observation. A caller holding a live
-fingerprint that should be resolved onto a known node passes ``resolve``.
-
-Why an edge was preferred
--------------------------
-
-Every number above comes off a stored edge, and a route replayed from stored edges
-runs fast, free and confident whether or not those numbers mean anything - the graph
-once carried 262144 successes on an edge walked a few dozen times. So the pricing
-decision is available with its reasons attached: :func:`explain_edge` gives one edge's
-cost and the counts it rests on, :func:`explain_route` gives that hop by hop for a
-whole route. Both come through the same :func:`_price` as :func:`edge_cost`, so the
-explanation is the decision rather than a second opinion about it. The string it
-builds costs nothing worth counting here: a graph has tens of edges and a route is
-computed once per warm attempt, against a perception step that dominates every run.
-
-Failure behavior
-----------------
-
-:func:`find_route` returns ``None`` when no route exists, matching
-``contracts.GraphView.route``. :func:`require_route` is the only function here that
-raises :class:`~skillweaver.errors.RouteNotFound`, for callers that want to fail
-loudly rather than branch on ``None``.
+:func:`find_route` returns ``None`` when no route exists; :func:`require_route` raises.
 """
 
 from __future__ import annotations
@@ -94,11 +42,8 @@ from skillweaver.errors import RouteNotFound
 from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 
 Outgoing = Callable[[str], Iterable[Transition]]
-"""Supplies the outgoing edges of a node, keyed by ``Fingerprint.value``.
-
-Routing never needs the node table, only this lookup, which is what keeps this
-module independent of how a graph stores itself.
-"""
+"""Outgoing edges of a node, keyed by ``Fingerprint.value``. Routing needs no node table,
+which is what keeps this module independent of how a graph stores itself."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,23 +51,19 @@ class RoutingPolicy:
     """How much the router is willing to gamble.
 
     Attributes:
-        min_success_rate: An edge whose success rate is strictly below this is
-            refused, provided it has at least ``min_attempts_for_cap`` attempts on
-            record. ``0.0`` disables the cap.
-        min_attempts_for_cap: How many attempts an edge needs before
-            ``min_success_rate`` may condemn it. One unlucky first attempt is not
-            evidence that an edge is hopeless, so the cap holds its fire until
-            there is a sample worth believing.
-        allow_unverified: Whether edges with no successes may be routed through at
-            all. ``False`` reproduces ``contracts.GraphView.route`` exactly.
-        unverified_ms: The assumed latency of a never-verified edge, in
-            milliseconds, since it has no measured one.
-        unverified_penalty: Multiplier applied to ``unverified_ms``. Must be at
-            least ``1.0``; anything higher makes an unverified edge lose to a
-            proven edge of equal nominal latency.
+        min_success_rate: An edge below this is refused, provided it has at least
+            ``min_attempts_for_cap`` attempts. ``0.0`` disables the cap.
+        min_attempts_for_cap: Attempts needed before ``min_success_rate`` may condemn an
+            edge - one unlucky first attempt is not evidence.
+        allow_unverified: Whether edges with no successes may be routed through.
+            ``False`` reproduces ``contracts.GraphView.route`` exactly.
+        unverified_ms: Assumed latency of a never-verified edge, having no measured one.
+        unverified_penalty: Multiplier on ``unverified_ms``; at least ``1.0``, and
+            anything higher makes an unverified edge lose to a proven edge of equal
+            nominal latency.
 
     Raises:
-        ValueError: if any value is out of range.
+        ValueError: any value is out of range.
     """
 
     min_success_rate: float = 0.2
@@ -147,15 +88,11 @@ class RoutingPolicy:
 
 
 VERIFIED_ONLY = RoutingPolicy()
-"""The default policy: proven edges only, exactly as ``contracts.GraphView.route``
-specifies. Under it every edge costs ``mean_ms / success_rate`` and a
-:class:`~skillweaver.contracts.Route`'s ``cost`` is the contract's expected
-milliseconds."""
+"""Proven edges only, exactly as ``contracts.GraphView.route`` specifies."""
 
 EXPLORATORY = RoutingPolicy(allow_unverified=True)
-"""Same cost model, but a never-verified edge may be used as a last resort at
-``unverified_ms * unverified_penalty``. For an agent that would rather try a
-remembered-but-unproven path than fall back to the model."""
+"""Same cost model, but a never-verified edge is usable as a last resort, for an agent
+that would rather try a remembered-but-unproven path than fall back to the model."""
 
 
 def success_rate(edge: Transition) -> float:
@@ -164,33 +101,22 @@ def success_rate(edge: Transition) -> float:
 
 
 def is_verified(edge: Transition) -> bool:
-    """Whether ``edge`` has ever been seen to work.
-
-    Equivalent to ``edge.last_verified is not None`` for any edge built through
-    ``SiteGraph.observe_transition``, which stamps both together.
-    """
+    """Whether ``edge`` has ever been seen to work."""
     return edge.successes > 0
 
 
 def edge_cost(edge: Transition, policy: RoutingPolicy = VERIFIED_ONLY) -> float | None:
     """The expected milliseconds of traversing ``edge``, or ``None`` to refuse it.
 
-    ``None`` means the router must not use this edge at all: either it is hopeless
-    under the policy's cap, or it is unverified and the policy does not allow that.
-    Never raises. :func:`explain_edge` is the same decision with its reasons kept.
+    ``None`` means hopeless under the cap, or unverified under a policy that forbids it.
+    :func:`explain_edge` is the same decision with its reasons kept.
     """
     return _price(edge, policy)[0]
 
 
 def _price(edge: Transition, policy: RoutingPolicy) -> tuple[float | None, str]:
-    """The cost decision and the sentence that justifies it, from ONE place.
-
-    :func:`edge_cost` and :func:`explain_edge` both come through here, so the number
-    the router uses and the reason a person is shown can never drift apart. That
-    matters more here than the duplication it saves: an agent replaying a stored
-    route runs fast, free and confident, and the only way to catch it doing that on
-    a number that means nothing is to be able to ask why.
-    """
+    """The cost decision and the sentence justifying it, from ONE place, so the number
+    the router uses and the reason a person is shown cannot drift apart."""
     rate = success_rate(edge)
     if edge.attempts >= policy.min_attempts_for_cap and rate < policy.min_success_rate:
         return None, (
@@ -214,13 +140,8 @@ def _price(edge: Transition, policy: RoutingPolicy) -> tuple[float | None, str]:
 
 @dataclass(frozen=True, slots=True)
 class EdgeVerdict:
-    """Why the router priced one edge the way it did.
-
-    Attributes:
-        edge: The edge judged.
-        cost: Its expected milliseconds, or ``None`` when the policy refuses it.
-        reason: One line naming the statistics the decision rests on.
-    """
+    """Why the router priced one edge the way it did: its cost, or ``None`` when refused,
+    and one line naming the statistics that decided it."""
 
     edge: Transition
     cost: float | None
@@ -231,22 +152,14 @@ class EdgeVerdict:
 
 
 def explain_edge(edge: Transition, policy: RoutingPolicy = VERIFIED_ONLY) -> EdgeVerdict:
-    """:func:`edge_cost`, with the counts the answer rests on kept alongside it.
-
-    The counts are load-bearing - an edge is preferred for its success RATE and its
-    measured latency - so a route that looks wrong has to be answerable with the
-    numbers that chose it rather than with a re-reading of this module. Never raises.
-    """
+    """:func:`edge_cost` with the counts it rests on, so a route that looks wrong is
+    answerable with the numbers that chose it."""
     cost, reason = _price(edge, policy)
     return EdgeVerdict(edge=edge, cost=cost, reason=reason)
 
 
 def explain_route(route: Route, policy: RoutingPolicy = VERIFIED_ONLY) -> tuple[EdgeVerdict, ...]:
-    """One :class:`EdgeVerdict` per hop of ``route``, in the order it is walked.
-
-    The empty tuple for a zero-hop route - being already there costs nothing and
-    rests on no edge statistics at all.
-    """
+    """One :class:`EdgeVerdict` per hop, in walk order; empty for a zero-hop route."""
     return tuple(explain_edge(edge, policy) for edge in route.edges)
 
 
@@ -255,10 +168,9 @@ def same_state(
 ) -> bool:
     """Whether these two fingerprints name the same screen.
 
-    Equal ``value`` always says yes. Otherwise it is
-    :meth:`~skillweaver.contracts.Fingerprint.similarity` against ``threshold``, which
-    is how a live screen is recognised as one seen before although it never reproduces
-    its id. ``threshold >= 1.0`` demands exact equality. Never raises.
+    Equal ``value`` always says yes; otherwise ``similarity`` against ``threshold``, which
+    is how a live screen is recognised although it never reproduces its id.
+    ``threshold >= 1.0`` demands exact equality.
     """
     if left.value == right.value:
         return True
@@ -276,24 +188,16 @@ def find_route(
 ) -> Route | None:
     """The lowest-cost known route from ``src`` to ``dst``, or ``None``.
 
-    Dijkstra over :func:`edge_cost`, which is non-negative, so the first time a node
-    is settled it is settled with its best cost. An unknown fingerprint simply has no
-    outgoing edges and yields ``None`` rather than an error.
-
-    A route from a state to the SAME state is ``Route((), 0.0, ())``, and sameness is
-    :func:`same_state` rather than equality - see "Being already there" in the module
-    docstring for why that is the whole point of this function. Intermediate hops are
-    matched exactly on ``Fingerprint.value``.
-
-    Ties are broken by insertion order - the order ``outgoing`` yields edges - so
-    the same graph always produces the same route.
+    Dijkstra over :func:`edge_cost`, which is non-negative. An unknown fingerprint simply
+    has no outgoing edges. A route to the SAME state is ``Route((), 0.0, ())``, and
+    sameness is :func:`same_state`, not equality; intermediate hops match exactly. Ties
+    break by the order ``outgoing`` yields edges, so one graph always gives one route.
 
     Args:
-        same_state_threshold: How alike the two endpoints must be to count as one
-            screen. ``1.0`` restores exact matching on ``Fingerprint.value``.
-        resolve: Maps each endpoint onto the node it belongs to before the search.
-            For a caller holding fingerprints taken from live observations rather than
-            from the graph; ``InMemorySiteGraph.route(approximate=True)`` passes its own.
+        same_state_threshold: How alike the endpoints must be to count as one screen.
+            ``1.0`` restores exact matching.
+        resolve: Maps each endpoint onto the node it belongs to first, for fingerprints
+            taken from live observations.
     """
     if resolve is not None:
         src, dst = resolve(src), resolve(dst)
@@ -335,7 +239,7 @@ def require_route(
     policy: RoutingPolicy = VERIFIED_ONLY,
     **kwargs: object,
 ) -> Route:
-    """:func:`find_route`, but insisting on an answer. Keyword arguments pass through.
+    """:func:`find_route`, insisting on an answer.
 
     Raises:
         RouteNotFound: when :func:`find_route` would return ``None``.
@@ -349,7 +253,6 @@ def require_route(
 def _assemble(
     src: Fingerprint, dst: Fingerprint, came_from: dict[str, Transition], cost: float
 ) -> Route:
-    """Walk the predecessor chain back from ``dst`` and flatten it into a Route."""
     edges: list[Transition] = []
     node = dst.value
     while node != src.value:

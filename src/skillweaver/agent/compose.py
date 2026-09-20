@@ -1,37 +1,21 @@
 """Decomposing a task into skills the library already holds - one model call, checked.
 
-The planner's warm path answers a task it has seen before with **no model call at
-all**. This module is the next rung down: the task is new, but its *parts* are not.
-"Pay the Acme invoice and archive it" is unknown; ``search_invoice``, ``pay_invoice``
-and ``archive_invoice`` are all known. One cheap text call proposes the ordering, and
-from then on the run is model-free again.
+The task is new, but its PARTS are not: "Pay the Acme invoice and archive it" is
+unknown while ``search_invoice``, ``pay_invoice`` and ``archive_invoice`` are known.
+One cheap text call proposes the ordering, and the run is model-free again after it.
 
-That single call is the only place in the fast path where a model speaks, which is
-why everything here is built around not trusting it:
+That call is the only place in the fast path where a model speaks, so everything here
+is built around not trusting it. The proposal is validated against the store before
+anything is performed - a model asked to pick from a list will eventually return a name
+that is not on it - and a proposal with one bad name is rejected WHOLE, because
+executing the good half on a real screen and discovering the rest mid-run is worse than
+exploring. Declining is a valid answer: ``{"steps": []}`` falls through to exploration,
+and a composer that bluffs to look useful poisons the library's growth.
 
-**The proposal is validated against the store before anything is performed.** A
-model asked to pick from a list will, sooner or later, return a name that is not on
-it - a skill it remembers from another site, a plausible-sounding invention, a
-misspelling. :meth:`Composer.compose` resolves every name against
-:class:`~skillweaver.contracts.SkillStore` and checks every argument against the
-skill's declared parameters *before* the planner is given a plan. A proposal with
-one bad name is rejected **whole**: the agent explores instead, which is slower and
-correct, rather than executing the good half of a plan on a real screen and
-discovering the rest mid-run.
-
-**Declining is a valid answer.** ``{"steps": []}`` comes back as a
-:class:`Decomposition` with no steps and a reason, and the planner falls through to
-exploration. The library grows by exploring things it could not compose; a composer
-that bluffs to look useful poisons that.
-
-**The sequence is capped.** :data:`MAX_STEPS` bounds how much a single unverified
-model answer may set in motion.
-
-Routing between the chosen skills is deliberately *not* decided here. A stored skill
-declares the screen it starts on but not the screen it ends on, so where step *k*
-leaves the agent is a fact about the live world, not about the library. The planner
-re-reads the screen before each step and routes to that step's precondition from
-wherever it actually is - see :mod:`skillweaver.agent.planner`.
+Routing between the chosen skills is deliberately NOT decided here. A stored skill
+declares the screen it starts on but not the one it ends on, so where step *k* leaves
+the agent is a fact about the live world; the planner re-reads the screen before each
+step.
 """
 
 from __future__ import annotations
@@ -76,11 +60,9 @@ log = get_logger(__name__)
 MAX_STEPS = 4
 """How many stored skills one unverified model answer may chain by default.
 
-Four is enough for the errands a demo actually strings together ("search, open, pay,
-confirm") and short enough that a wrong proposal is cheap to abandon. A task that
-needs a longer chain is a task the library does not really know, so it belongs to the
-explorer.
-"""
+Four is enough for the errands a demo strings together and short enough that a wrong
+proposal is cheap to abandon. A task needing a longer chain is one the library does not
+really know, so it belongs to the explorer."""
 
 _MAX_SCREEN_ELEMENTS = 12
 """Element texts shown to the composer. It is choosing between stored skills, not
@@ -99,19 +81,14 @@ _OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 class Decomposition:
     """What the composer decided, and what it cost.
 
-    Exactly one of two shapes:
+    Exactly one of two shapes: ``steps`` non-empty with ``rejected is None``, a
+    validated chain safe to execute in order; or ``steps`` empty with ``rejected`` a
+    short reason - the model declined or its proposal failed validation, NOTHING has
+    been performed, and the caller should explore.
 
-    * ``steps`` non-empty and ``rejected is None`` - a validated chain. Every name
-      exists in the store, every argument is declared by its skill, and the length is
-      within the cap. It is safe to execute in this order.
-    * ``steps`` empty and ``rejected`` a short reason - either the model declined or
-      its proposal failed validation. Either way NOTHING has been performed, and the
-      caller should explore.
-
-    ``usage`` is the cost of the one model call (zero when no call was made, as when
-    the library is empty). ``why`` is the model's own one-line justification, kept
-    for the log and the dashboard. ``raw`` is the unparsed reply, kept because a
-    rejected proposal is the most useful thing there is for improving the prompt.
+    ``usage`` is the cost of the one model call, zero when none was made. ``raw`` is the
+    unparsed reply, kept because a rejected proposal is the most useful thing there is
+    for improving the prompt.
     """
 
     steps: tuple[SkillCall, ...] = ()
@@ -137,25 +114,18 @@ class Decomposition:
 
 @cache
 def load_template() -> str:
-    """The decomposition prompt as shipped in ``prompts/compose.md``.
-
-    Cached: it is a file that cannot change inside one run, and the composer is on
-    the latency path.
-    """
+    """The decomposition prompt as shipped in ``prompts/compose.md``. Cached: it cannot
+    change inside one run, and the composer is on the latency path."""
     return resources.files("skillweaver.agent.prompts").joinpath("compose.md").read_text("utf-8")
 
 
 class ScreenNames:
     """Human names for screens, so the prompt can talk about them.
 
-    A :class:`~skillweaver.contracts.Fingerprint` is a hash. Putting one in a prompt
-    tells the model nothing it can reason about and invites it to treat the hash as
-    meaningful, so this turns the fingerprints the site graph has labelled into the
-    names a person uses - "the invoice list", "an open invoice" - and says plainly
-    that the rest are screens the agent will route to by itself.
-
-    Built from whatever :class:`~skillweaver.contracts.GraphView` the composer was
-    given; with no graph, every screen is simply unnamed, which reads fine.
+    A Fingerprint is a hash; putting one in a prompt tells the model nothing it can
+    reason about and invites it to treat the hash as meaningful. This turns the
+    fingerprints the site graph has labelled into the names a person uses and says
+    plainly that the rest are screens the agent will route to by itself.
     """
 
     __slots__ = ("_labels",)
@@ -185,10 +155,9 @@ class ScreenNames:
 def render_skills(skills: Sequence[Skill], screens: ScreenNames | None = None) -> str:
     """The available skills as the prompt shows them: real signatures, nothing else.
 
-    The model is told to answer only with names from this block, so this block must
-    be the truth about the store - rendered from
-    :func:`~skillweaver.skills.model.signature`, the same function that would build
-    the call site, rather than from anything written by hand.
+    The model answers only with names from this block, so the block must be the truth
+    about the store - rendered from :func:`~skillweaver.skills.model.signature`, the same
+    function that would build the call site.
     """
     known = screens if screens is not None else ScreenNames()
     lines: list[str] = []
@@ -235,9 +204,8 @@ def _render(template: str, **values: str) -> str:
 def parse_proposal(reply: str) -> tuple[list[dict[str, Any]], str, str | None]:
     """``(raw steps, why, rejection reason)`` from a model reply.
 
-    Tolerant about the wrapping a chat model adds - a code fence, a sentence before
-    the JSON - and strict about the shape inside it. Nothing here touches the store:
-    this only establishes that the model said something of the right form.
+    Tolerant about the wrapping a chat model adds and strict about the shape inside it.
+    Nothing here touches the store.
     """
     text = reply.strip()
     if not text:
@@ -282,19 +250,14 @@ class Composer:
     """Turns a task no single skill covers into a chain of skills that exist.
 
     Args:
-        llm: The model that proposes the ordering. Called at most ONCE per
-            :meth:`compose`, and not at all when the library holds nothing for the
-            task's domain.
-        store: The library the proposal is checked against. This is the authority:
-            what the model says a skill is called does not matter, only what is in
-            here does.
-        graph: Optional site graph, used only to give screens their human names in
-            the prompt. It is never routed over here; the planner does that.
-        max_steps: Cap on the chain length (see :data:`MAX_STEPS`).
-        max_tokens: Reply cap. A decomposition is a few dozen tokens of JSON; a
-            model rambling past this has not answered the question.
-        template: Prompt override, for tests and experiments. ``None`` loads
-            ``prompts/compose.md``.
+        llm: Called at most ONCE per :meth:`compose`, and not at all when the library
+            holds nothing for the task's domain.
+        store: The library the proposal is checked against. This is the authority: what
+            the model says a skill is called does not matter.
+        graph: Optional, used only to give screens their human names in the prompt. It is
+            never routed over here; the planner does that.
+        max_tokens: Reply cap. A decomposition is a few dozen tokens of JSON.
+        template: Prompt override. ``None`` loads ``prompts/compose.md``.
     """
 
     __slots__ = ("_graph", "_llm", "_max_steps", "_max_tokens", "_store", "_template")
@@ -398,10 +361,9 @@ class Composer:
     ) -> tuple[tuple[SkillCall, ...], str | None]:
         """Check a parsed proposal against the library.
 
-        Returns the calls to make, or ``(), reason`` for a proposal that must not be
-        executed. The checks are all-or-nothing on purpose: a chain is a sequence of
-        real actions on a real screen, and stopping halfway through one leaves the
-        world somewhere nobody planned for.
+        Returns the calls to make, or ``(), reason``. All-or-nothing on purpose: a chain
+        is a sequence of real actions on a real screen, and stopping halfway through one
+        leaves the world somewhere nobody planned for.
         """
         if not proposed:
             return (), "the model declined: no chain of stored skills covers this task"
@@ -435,12 +397,10 @@ class Composer:
 def _charge_one_call(reported: Usage) -> Usage:
     """The usage of the one ``complete`` that :meth:`Composer.compose` just made.
 
-    The planner's headline number is a model-CALL count, so it is counted here, where
-    the call demonstrably happened, rather than read back out of whatever the provider
-    chose to report. A client that does not fill in ``calls`` - a cassette replaying a
-    recording, a stub, a fake - would otherwise make a composed run indistinguishable
-    from a warm one, which is the single measurement this project cannot afford to get
-    wrong. Token counts and cost stay exactly as reported.
+    The planner's headline number is a model-CALL count, so it is counted here, where the
+    call demonstrably happened, rather than read out of whatever the provider reported: a
+    client that does not fill in ``calls`` would make a composed run indistinguishable
+    from a warm one. Token counts and cost stay exactly as reported.
     """
     return reported if reported.calls >= 1 else replace(reported, calls=1)
 
@@ -448,9 +408,8 @@ def _charge_one_call(reported: Usage) -> Usage:
 def _check_args(skill: Skill, args: Mapping[str, Any], position: int) -> str | None:
     """``None`` when ``args`` fit ``skill``'s declared parameters, else why not.
 
-    An undeclared argument is as fatal as a missing one: ``run(ctx, **args)`` would
-    raise ``TypeError`` inside the sandbox, which is a real failure recorded against
-    a skill that did nothing wrong.
+    An undeclared argument is as fatal as a missing one: ``run(ctx, **args)`` would raise
+    ``TypeError`` inside the sandbox, recorded against a skill that did nothing wrong.
     """
     declared = dict(skill.params)
     unknown = sorted(set(args) - set(declared))

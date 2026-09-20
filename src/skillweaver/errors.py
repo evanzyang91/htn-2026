@@ -1,9 +1,5 @@
-"""Exception hierarchy for skillweaver.
-
-Every error the project raises on purpose derives from :class:`SkillWeaverError`,
-so callers at a boundary (CLI, eval harness, dashboard) can catch one type.
-Raise the most specific subclass; put the human-readable cause in the message.
-"""
+"""Exception hierarchy. Every deliberate failure derives from ``SkillWeaverError``
+so a boundary (CLI, eval harness, dashboard) can catch one type."""
 
 from __future__ import annotations
 
@@ -13,11 +9,7 @@ class SkillWeaverError(Exception):
 
 
 class ControllerError(SkillWeaverError):
-    """A controller could not capture the screen or is unusable (closed, crashed).
-
-    Note that a single action failing is normally reported through
-    ``ActionResult(ok=False, ...)`` rather than raised; this is for a broken controller.
-    """
+    """The controller itself is broken; a single failed action is an ``ActionResult(ok=False)``."""
 
 
 class PerceptionError(SkillWeaverError):
@@ -25,10 +17,7 @@ class PerceptionError(SkillWeaverError):
 
 
 class BudgetExceeded(SkillWeaverError):
-    """A run exhausted its :class:`~skillweaver.contracts.Budget`.
-
-    Raised by ``Spend.check()``. The message names the limit that was hit.
-    """
+    """A run exhausted its ``Budget``; the message names the limit hit."""
 
 
 class SandboxViolation(SkillWeaverError):
@@ -48,11 +37,7 @@ class SkillNotFound(SkillWeaverError):
 
 
 class RouteNotFound(SkillWeaverError):
-    """No path between two UI states is known to the site graph.
-
-    ``SiteGraph.route`` returns ``None`` instead of raising; this is for callers
-    that require a route and want to fail loudly.
-    """
+    """No path between two UI states is known; ``SiteGraph.route`` returns ``None`` instead."""
 
 
 class ProviderError(SkillWeaverError):

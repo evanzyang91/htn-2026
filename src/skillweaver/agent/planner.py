@@ -1,96 +1,8 @@
-"""The warm fast path: doing a known task with no model in the action loop.
+"""The warm fast path: do a known task with no model in the action loop.
 
-This is the module the project's claim rests on. Everything else - the controllers,
-the perception stack, the sandbox, the site graph, the synthesizer - exists so that
-the *second* time the agent is asked to do something, it can do it like this:
-
-    retrieve a stored skill -> route to the screen it starts on -> run it -> verify
-
-and consult **no model for a single click**. Not a cheaper model, not a smaller
-prompt: none. A warm run's cost is a screenshot, some graph arithmetic and the
-skill's own Python.
-
-That is a claim, so it is measured rather than asserted. Every warm run returns a
-:class:`~skillweaver.contracts.RunOutcome` whose ``spend.llm_calls`` is the number of
-model calls the planner caused, and ``tests/agent/test_planner.py`` asserts it is
-exactly zero. The structure backs the number up: a :class:`Planner` has no
-:class:`~skillweaver.contracts.LLMClient`. The only object here that can reach a
-model is the optional :class:`~skillweaver.agent.compose.Composer`, and it is touched
-only after single-skill retrieval has already failed.
-
-What "warm" costs
------------------
-
-One :class:`~skillweaver.contracts.Perceiver` observation before each skill and one
-after the last, because the critic needs a *before* and an *after* and the router
-needs to know where the agent is. Route actions are replayed straight from the site
-graph. Retrieval may embed the task text if an embedder is configured - that is a
-retrieval cost, paid once, before the loop, and it is not a call in the action loop.
-
-Plain English, still model-free
--------------------------------
-
-A caller who supplies ``TaskSpec.params`` hands the planner its arguments and nothing
-has to be worked out. A caller who just says what they want - "Search Wikipedia for
-machine learning" - used to cost one model call, because the composer was the only
-thing here that could read a sentence.
-
-It no longer does, for the one case that is not a guess. A stored skill remembers the
-sentence it was learned from, so when the new task is that sentence with one thing
-changed, the change is the argument (:func:`_bind_from_text`). That path declines
-loudly more often than it binds - see its guards - and every binding it does make is
-logged as ``planner.bound_from_text`` with both sentences and the values derived, so
-an argument this code invented is findable in one look. Everything downstream is
-unchanged: a skill bound this way is routed to, run and verified exactly like one the
-caller supplied arguments for.
-
-Failing usefully
-----------------
-
-The planner's job includes knowing when it does not know. It returns ``None`` rather
-than improvising, and leaves :attr:`Planner.last_failure` describing why, so the
-caller can hand that context to an :class:`~skillweaver.contracts.Explorer` instead
-of starting the task cold::
-
-    outcome = planner.attempt(task, observation)
-    if outcome is None:
-        outcome = explorer.explore(task, controller, budget)  # with planner.last_failure
-
-Ranking picks a winner; this decides whether to run one
--------------------------------------------------------
-
-Retrieval answers "which stored skill is closest to this request?", and that question
-has an answer even when the honest answer is "none of them". On 2026-09-19 the
-ordering suite asked for *order two Vegetable Rolls from Sakura Counter, then open the
-Orders tab and confirm the order is listed there* and the closest skill in the library
-was a navigation skill that opens a tab. It bound, it routed, it ran in four seconds,
-it consulted no model, and it got the task wrong every time - the cheapest possible
-way to be wrong, and the one a wall-clock table rewards.
-
-So a candidate now has to pass one more test before any action is spent on it: every
-word of the request must be accounted for, either by the skill's own text or by the
-arguments it is about to be handed (:data:`MIN_ACCOUNTED_FOR`). A skill whose
-declared end state has no account of *Vegetable Rolls*, *Sakura Counter* or
-*confirm* is not what was asked for, whatever it ranked. Rejected candidates are
-recorded as rejections and the task falls through to the composer and then
-to exploration, which is what happens for any other task the library cannot do.
-
-What demotion means
--------------------
-
-A skill that *ran and did not work* - it raised, failed a ``ctx.expect``, or its own
-``verifier_code`` rejected its result - is demoted with the reason, so retrieval
-stops offering it and the explorer gets a chance to learn a replacement.
-
-Nothing else demotes, and the line is deliberate. A skill's verifier answers "did
-THIS SKILL do its job"; the critic answers "is THE TASK done", which is a different
-question with other reasons to be false. The commonest is a task no single skill
-covers: ``search_invoice`` does exactly what it promises and the errand is still
-unfinished. Demoting on a critic's no would retire correct skills for being
-incomplete, and a library that deletes its working parts whenever it is asked
-something bigger does not grow. A rejected verdict is reported instead, and the
-explorer takes over. A route that could not be walked, a missing argument or a broken
-controller are not evidence against a skill either.
+A Planner holds no LLMClient; only the optional composer reaches a model, and only
+after single-skill retrieval fails. A skill is demoted when it RAN and failed, never
+for a critic's "task incomplete" - that would retire correct-but-partial skills.
 """
 
 from __future__ import annotations
@@ -180,9 +92,8 @@ FailureStage = Literal[
 ]
 """Where the fast path gave up. The first six happen before anything is performed.
 
-``other_intent`` is the one family reuse added: the request's words line up with a
-stored skill and its VERB does not, which is *remove ... from my cart* meeting a skill
-learned as *add ... to my cart*. See :func:`~skillweaver.skills.family.same_intent`."""
+``other_intent``: the request's words line up with a stored skill but its VERB does
+not - *remove ... from my cart* meeting a skill learned as *add ... to my cart*."""
 
 _PERFORMED_NOTHING = frozenset(
     {
@@ -199,45 +110,20 @@ _PERFORMED_NOTHING = frozenset(
 MIN_ACCOUNTED_FOR = 0.75
 """How much of the request a single skill must have an account of to be run.
 
-Retrieval ranks, and a ranking always has a winner. This is the planner's own
-question, and it is a different one: *does the winner have any account of the whole
-errand?* :func:`~skillweaver.skills.retrieve.accounted_for` answers it without a
-model - every word of the task must appear either in the skill's own text or in the
-arguments it is about to be handed - and a candidate below this line is passed over
-instead of performed.
-
-Calibrated 2026-09-19 against the ordering suite's own library, over all twelve tasks
-in both binding shapes. Only candidates that BIND are measured, because the others
-never reach this check. The number sits in a gap rather than on top of the one case
-that prompted it:
-
-    the right skill, where the library had one     0.90 to 1.00 (0.90 exactly once,
-                                                   on `place_an_order`, whose skill
-                                                   really does leave "place" undone)
-    the best WRONG skill that also bound           0.60 at its worst, and 0.42 on
-                                                   `order_appears_in_history`, 0.24
-                                                   on `order_with_address_and_tip`
-
-Both failing cases are the same trivial navigation skill, which binds because its one
-parameter has a default, and therefore falls out as the first usable candidate
-whenever nothing better binds. 0.75 leaves 0.15 of margin on each side. The table is
-pinned by ``test_the_calibration_gap_this_line_sits_in`` in
-``tests/agent/test_planner.py``.
-
-Which way to be wrong is not symmetric. A skill declined here falls through to the
-composer and then to exploration, and the task still gets done a little slower; a
-skill wrongly run reports a fast, free success that was not one, and every efficiency
-figure in the project improves because of it."""
+Retrieval ranks, and a ranking always has a winner; this asks whether the winner has
+any account of the whole errand. Calibrated 2026-09-19 over an ordering library,
+binding candidates only: the right skill scored 0.90-1.00, the best WRONG skill that
+also bound 0.60 at worst, so 0.75 leaves 0.15 of margin either side. A skill declined
+here falls through to the composer and exploration; a skill wrongly run reports a fast,
+free success that was not one."""
 
 
 @dataclass(frozen=True, slots=True)
 class Rejection:
     """One retrieved skill the planner looked at and turned down.
 
-    A warm run that explores is only diagnosable if the offer that was NOT taken is
-    recorded: ``score`` says how well retrieval thought the skill fit, and ``stage``
-    names the rule that discarded it. Without these two together, "the library was
-    not used" cannot be told apart from "the library had nothing".
+    ``score`` and ``stage`` together are what tell "the library was not used" apart
+    from "the library had nothing".
     """
 
     skill: str
@@ -253,12 +139,8 @@ class Rejection:
 class PlanFailure:
     """Why the fast path declined, in a form an explorer can use.
 
-    ``stage`` says how far it got, ``reason`` is one human-readable line, ``skill``
-    names the skill involved when there was one, ``demoted`` records whether that
-    skill was retired, ``trace`` carries the failed skill's trace - the most valuable
-    thing an explorer can be handed, since it is a play-by-play of what the library
-    *thought* would work - and ``rejected`` holds every candidate that was offered
-    and discarded before anything ran.
+    ``trace`` carries the failed skill's play-by-play; ``rejected`` holds every
+    candidate offered and discarded before anything ran.
     """
 
     stage: FailureStage
@@ -282,11 +164,9 @@ class PlanFailure:
 class _Reuse:
     """How the single skill of the current plan came to be chosen.
 
-    ``how`` is ``"params"`` (the caller supplied the arguments), ``"diff"`` or
-    ``"template"`` (the two strict sentence readers), ``"slot"`` (read through a
-    proven sentence) or ``"family"`` (bound through a relative on another site). It
-    decides two things after the run: what a FAILURE is evidence against
-    (:data:`_WIDENED`), and whether a SUCCESS is worth writing down as a precedent.
+    ``how`` is ``"params"``, ``"diff"``, ``"template"``, ``"slot"`` or ``"family"``. It
+    decides what a FAILURE is evidence against (``_WIDENED``) and whether a SUCCESS is
+    worth writing down as a precedent.
     """
 
     skill: str
@@ -298,21 +178,16 @@ class _Reuse:
 _WIDENED = frozenset({"slot", "family"})
 """Bindings a failed run is evidence against, INSTEAD of the skill.
 
-A skill that fails after the strict readers bound it has failed at its own job and is
-demoted, as it always was. A skill that fails after one of these bound it may simply
-have been handed the wrong argument - the reader is newer and looser than the skill -
-so the run is reported as failed, nothing is recorded for it, and the skill keeps its
-place. Wrongly demoting a working skill costs every later run a cold start; wrongly
-sparing a broken one costs one more failed warm attempt, which demotes it the next time
-a strict reader reaches it."""
+These readers are newer and looser than the skill, so a failure after one of them may
+just be a wrong argument: the run is reported failed and the skill keeps its place,
+to be demoted the next time a strict reader reaches it. Wrongly demoting a working
+skill costs every later run a cold start."""
 
 
 @dataclass(frozen=True, slots=True)
 class FamilyFit:
-    """One way a request can be run through a family: ``skill`` is the member filed
-    under the request's own domain and is what will RUN; ``via`` is the relative whose
-    proven sentence the request bound against; ``vouchers`` are the relatives of the
-    same intent whose words counted towards ``share``."""
+    """``skill`` is the member filed under the request's own domain and is what will
+    RUN; ``via`` is the relative whose proven sentence the request bound against."""
 
     skill: Skill
     args: dict[str, Any]
@@ -322,29 +197,16 @@ class FamilyFit:
 
 
 class Planner:
-    """A :class:`~skillweaver.contracts.Planner`: do it from memory, or say you cannot.
+    """A Planner: do it from memory, or say you cannot.
 
     Args:
-        store: The library. The planner reads skills from it and demotes through it.
-        retriever: Finds candidate skills for the task text.
-        graph: The site graph, for routing to a skill's precondition.
-        runner: The sandbox that executes skill code.
-        critic: Judges the run. A programmatic critic keeps a warm run model-free;
-            a model-backed one will charge ``spend`` for its call, which is why the
-            zero-call claim is about the action loop.
-        controller: The hands.
-        perceiver: The eyes.
-        composer: Optional. Enables the composite path - one model call to chain
-            known skills for a task no single skill covers. ``None`` means the
-            planner is strictly model-free and simply declines such tasks.
-        policy: How much routing risk to take (see
-            :class:`~skillweaver.graph.route.RoutingPolicy`). The default uses only
-            proven edges, which is what makes a replayed route trustworthy.
-        budget: Limits for one :meth:`attempt`.
-        top_k: How many candidates to retrieve.
-        max_candidates: How many of them to try to build a plan from, best first.
-            A candidate is skipped when its arguments cannot be bound from the task
-            or when no route to its precondition is known.
+        critic: A programmatic critic keeps a warm run model-free; a model-backed one
+            charges ``spend``, which is why the zero-call claim is about the action loop.
+        composer: Optional. Enables the composite path - one model call to chain known
+            skills for a task no single skill covers. ``None`` declines such tasks.
+        policy: How much routing risk to take. The default uses only proven edges,
+            which is what makes a replayed route trustworthy.
+        max_candidates: How many retrieved candidates to try to build a plan from.
     """
 
     __slots__ = (
@@ -401,19 +263,17 @@ class Planner:
 
     @property
     def last_failure(self) -> PlanFailure | None:
-        """Why the most recent :meth:`plan` or :meth:`attempt` gave up, or ``None``
-        after one that produced a plan. Hand this to the explorer as context."""
+        """Why the most recent plan or attempt gave up, or ``None``. Hand this to the
+        explorer as context."""
         return self._last_failure
 
     # -- the Planner protocol ---------------------------------------------------------
 
     def plan(self, task: TaskSpec, observation: Observation) -> Plan | None:
-        """A plan for ``task`` from the current screen, or ``None``.
+        """A plan for ``task`` from the current screen, or ``None``. Performs nothing.
 
-        Nothing is performed here: this only reads the library and the graph. The
-        single-skill path is entirely model-free. Only when no single stored skill
-        covers the task does a configured :class:`~skillweaver.agent.compose.Composer`
-        spend ONE model call proposing a chain.
+        Model-free unless no single stored skill covers the task, when a configured
+        composer spends ONE model call proposing a chain.
 
         Raises:
             ProviderError: if retrieval's embedder or the composer's model fails.
@@ -426,18 +286,12 @@ class Planner:
     def attempt(self, task: TaskSpec, observation: Observation) -> RunOutcome | None:
         """Plan, perform and verify - or return ``None`` so the caller explores.
 
-        On success the outcome's ``spend.llm_calls`` is the number of model calls
-        this attempt caused: **zero for a warm single-skill hit**, one when the
-        composer was needed, plus whatever a model-backed critic spent.
-
-        On failure :attr:`last_failure` explains what happened and ``None`` comes
-        back, because a half-worked fast path is not an outcome - it is a reason to
-        explore. A skill that ran and failed is demoted first; a clean run the critic
-        merely judges incomplete is not (see the module docstring).
+        A half-worked fast path is not an outcome, it is a reason to explore, so
+        failure leaves :attr:`last_failure` and returns ``None``.
 
         Raises:
-            BudgetExceeded: if ``budget`` runs out mid-run. Deliberately not caught:
-                an exhausted run must stop, not fall through to a slower path.
+            BudgetExceeded: deliberately not caught - an exhausted run must stop, not
+                fall through to a slower path.
             ProviderError: if retrieval or the composer fails.
         """
         spend = Spend(self._budget).start()
@@ -490,8 +344,7 @@ class Planner:
     # -- building a plan ---------------------------------------------------------------
 
     def _build(self, task: TaskSpec, observation: Observation) -> tuple[Plan | None, Usage]:
-        """``(plan, model usage)``. The usage is zero on every warm single-skill hit,
-        which is the whole point of separating this from :meth:`_perform`."""
+        """``(plan, model usage)``. The usage is zero on every warm single-skill hit."""
         self._last_failure = None
         candidates = self._retriever.search(task.text, domain=task.domain, k=self._top_k)
 
@@ -515,8 +368,7 @@ class Planner:
                 continue
             share, vouchers = account_of(task, skill, args, self._library)
             if share < MIN_ACCOUNTED_FOR:
-                # Only now is it worth naming the words: the happy path pays for the
-                # ratio and nothing else.
+                # Only now name the words: the happy path pays for the ratio alone.
                 missing = unaddressed(task.text, skill, args, family=vouchers)
                 stage = "unaccounted"
                 reason = (
@@ -582,13 +434,10 @@ class Planner:
         reasons: list[str],
         looked_at: list[Rejection],
     ) -> Plan | None:
-        """The family path: run THIS site's member of a workflow the request binds
-        against on any site.
+        """Run THIS site's member of a workflow the request binds against on any site.
 
-        Reached only when no skill here could be run on its own words. Still entirely
-        model-free - :func:`fit_through_family` reads the library and nothing else -
-        and everything after it is the ordinary warm path: the member is routed to,
-        run behind its own precondition and verifier, and judged by the same critic.
+        Reached only when no skill here could be run on its own words. Still model-free,
+        and everything after the fit is the ordinary warm path.
         """
         shelf = self._store.list(domain=task.domain)
         for fit in fit_through_family(task, shelf, self._library()):
@@ -621,16 +470,9 @@ class Planner:
     def _report_miss(
         self, task: TaskSpec, candidates: Sequence[Candidate], looked_at: Sequence[Rejection]
     ) -> None:
-        """One log line naming everything needed to explain a model-free path that
-        found nothing. It fires whenever no single stored skill was usable, whether
-        the composer then rescues the task for one model call or the run explores.
-
-        Four of six warm runs on the live Wikipedia suite reported ``skill_used=None``
-        and left no record of WHY, so the first question - was the skill never
-        offered, or offered and discarded? - could not be answered from a report. It
-        can now: this names what the library held for the domain, what every candidate
-        scored, and the rule that turned each one down.
-        """
+        """One log line explaining a model-free path that found nothing: what the
+        library held for the domain, what every candidate scored, and the rule that
+        turned each one down."""
         shelf = [s.name for s in self._store.list(domain=task.domain)]
         log.info(
             "planner.miss",
@@ -652,10 +494,9 @@ class Planner:
     ) -> tuple[Plan | None, Usage]:
         """The composite path: one model call, then the same model-free execution.
 
-        Only the leading route - from where the agent is now to the FIRST skill's
-        start screen - can be computed here. Where a skill leaves the agent is not
-        something the library records, so the routes between later steps are resolved
-        against the live screen in :meth:`_perform`.
+        Only the leading route can be computed here - where a skill leaves the agent is
+        not recorded - so later routes are resolved against the live screen in
+        :meth:`_perform`.
         """
         if self._composer is None:
             self._last_failure = PlanFailure(
@@ -721,11 +562,9 @@ class Planner:
     ) -> tuple[list[str], PlanFailure | None]:
         """Walk the plan. ``(skills that ran, failure or None)``.
 
-        Every skill call re-reads the screen and routes to that skill's precondition
-        from where the agent actually is. For the first skill that route is normally
-        empty - the plan's leading actions just walked it - which makes the check
-        free and makes a plan that drifted fail cleanly instead of running a skill on
-        the wrong screen.
+        Every skill call re-reads the screen and routes from where the agent actually
+        is, so a plan that drifted fails cleanly instead of running a skill on the
+        wrong screen.
         """
         used: list[str] = []
         current: Observation | None = observation
@@ -807,11 +646,9 @@ class Planner:
     def _reject(self, task: TaskSpec, used: list[str], verdict: Verdict) -> PlanFailure:
         """Report a critic that says the task is not done.
 
-        Nothing is demoted here. Every skill in ``used`` ran cleanly - each one that
-        carries a ``verifier_code`` also passed it - so the evidence says the plan was
-        incomplete or the screen is somewhere unexpected, not that any of these skills
-        is broken. The explorer is told what ran and what the critic said, and finishes
-        the job from wherever the plan left off.
+        Nothing is demoted: every skill in ``used`` ran cleanly and passed its own
+        verifier, so the evidence says the plan was incomplete, not that a skill is
+        broken.
         """
         reason = verdict.reason or "the critic rejected the result"
         log.info(
@@ -824,17 +661,12 @@ class Planner:
         return PlanFailure("rejected", reason, skill=" + ".join(used) or None)
 
     def _remember(self, task: TaskSpec, used: Sequence[str]) -> None:
-        """Write a proven request down as a :class:`~skillweaver.contracts.Precedent`.
+        """Write a proven request down as a Precedent.
 
-        Reached only after the skill ran, its OWN verifier passed and the critic said
-        the task is done - and the first of those is checked again here rather than
-        assumed, because a skill with no verifier has had nothing proved about it and
-        a precedent is a template every later request is bound against. A verdict the
-        critic could not reach comes back ``ok=False`` and never gets this far.
-
-        Only a single-skill run whose argument was read out of the TEXT is recorded:
-        a caller who supplied ``params`` taught the binder nothing about wording, and
-        a composed chain is the composer's reading, not a sentence this skill served.
+        Only a single-skill run whose argument was read out of the TEXT and whose skill
+        carries a verifier: supplied ``params`` teach the binder nothing about wording,
+        a composed chain is the composer's reading, and a skill with no verifier has
+        had nothing proved about it.
         """
         reuse = self._reuse
         if reuse is None or reuse.how == "params" or list(used) != [reuse.skill]:
@@ -862,11 +694,8 @@ class Planner:
     def _trajectory(self, task: TaskSpec, started: Any, ok: bool, note: str) -> Trajectory:
         """The record of a warm run.
 
-        It has no steps, and that is the finding rather than an omission: the fast
-        path does not observe between actions, which is most of why it is fast. The
-        run is fully described by the plan, the verdict and the spend, and there is
-        nothing here for a synthesizer to learn - the skill it would write already
-        exists.
+        It has no steps by design: the fast path does not observe between actions, and
+        there is nothing here for a synthesizer to learn.
         """
         return Trajectory(
             run_id=f"warm-{uuid.uuid4().hex[:12]}",
@@ -882,11 +711,8 @@ class Planner:
     # -- small helpers -------------------------------------------------------------------
 
     def _route_to(self, src: Fingerprint, precondition: Fingerprint | None) -> Route | None:
-        """The route to a skill's start screen, or ``None`` when none is known.
-
-        A skill with no precondition can start anywhere, so it gets the empty route
-        rather than a search.
-        """
+        """The route to a skill's start screen, or ``None`` when none is known. A skill
+        with no precondition can start anywhere, so it gets the empty route."""
         if precondition is None:
             return Route((), 0.0, ())
         return find_route(src, precondition, self._outgoing, self._policy)
@@ -928,12 +754,9 @@ def _vouchers(
 ) -> tuple[Skill, ...]:
     """The relatives of ``skill`` allowed to speak for ``task`` in their own words.
 
-    Shape AND intent, both: :func:`~skillweaver.skills.family.relatives` answers the
-    first from the action signatures, and
-    :func:`~skillweaver.skills.family.same_intent` the second, against each relative's
-    own learned sentence and against ``skill``'s. A skill with no earned signature has
-    no relatives, so for every library stored before families existed this is ``()``
-    and the gate is exactly what it was.
+    Shape AND intent both. A skill with no earned signature has no relatives, so for
+    every library stored before families existed this is ``()`` and the gate is
+    exactly what it was.
     """
     if not earned(skill):
         return ()
@@ -952,27 +775,15 @@ def _vouchers(
 def asks_for(task: TaskSpec, skill: Skill, args: Mapping[str, Any], how: str | None = None) -> bool:
     """Whether ``task`` asks for the errand ``skill`` performs, HOWEVER it was bound.
 
-    The gate every single-skill candidate passes, and it is here rather than inside
-    one binder because of what a real synthesized skill looks like. Measured on
-    2026-09-20 against ``search_and_add_product_to_cart`` as the admission gate
-    stored it on live splitkb.com: the synthesizer had given ``product`` a DEFAULT, so
-    :func:`_bind_args` bound ``{}`` without reading the sentence at all, and *Remove
-    the "MBK Choc Glow Legended Keycaps" from the cart* then accounted for 0.86 of
-    itself on the add skill's own words and was cleared to RUN. A check that lived in
-    the text binder never saw it. A hand-built skill with a required parameter had
-    been refused correctly an hour earlier, which is the whole argument for proving
-    things against what the gate actually stores.
+    Here rather than inside one binder because of what a synthesized skill looks like:
+    measured 2026-09-20, ``product`` carried a DEFAULT, so binding produced ``{}``
+    without reading the sentence at all, and *Remove the "..." from the cart* then
+    accounted for 0.86 of itself on the ADD skill and was cleared to RUN.
 
-    The arguments' own text is cut out first, so a product called *Clear Glass Set*
-    is a value and not the verb *clear*.
-
-    How hard it looks depends on ``how`` the candidate was bound (``None`` works it
-    out). A binding the looser readers made (:data:`_WIDENED`) must lead with the
-    learned verb or one of its class; anything else - the caller's own ``params``, a
-    declared default, the two strict sentence readers - is refused only on a KNOWN
-    conflict, which is what *remove* against *add* is. See
-    :func:`~skillweaver.skills.family.same_intent` for the warm path the single strict
-    setting broke.
+    The arguments' own text is cut out first, so a product called *Clear Glass Set* is
+    a value and not the verb *clear*. A binding the looser readers made (``_WIDENED``)
+    must lead with the learned verb or one of its class; anything else is refused only
+    on a KNOWN conflict, which is what *remove* against *add* is.
     """
     outside = task.text
     for value in args.values():
@@ -1000,12 +811,10 @@ def account_of(
 ) -> tuple[float, tuple[Skill, ...]]:
     """``(how much of task is accounted for, the relatives that had to vouch)``.
 
-    The skill's own words are asked first and, when they clear
-    :data:`MIN_ACCOUNTED_FOR`, nobody else is consulted and ``library`` is never
-    called - so every run that was warm before families existed reads exactly the
-    libraries it read then. Only a candidate that falls short on its own is given its
-    family's words (:func:`_vouchers`), and the line it then has to clear is the same
-    one. WHAT COUNTS as an account was widened; how much of one is needed was not.
+    The skill's own words are asked first, and ``library`` is never called when they
+    clear the line, so every run that was warm before families existed reads exactly
+    the libraries it read then. WHAT COUNTS as an account was widened; how much of one
+    is needed was not.
     """
     share = accounted_for(task.text, skill, args)
     if share >= MIN_ACCOUNTED_FOR:
@@ -1019,34 +828,19 @@ def account_of(
 def fit_through_family(
     task: TaskSpec, shelf: Sequence[Skill], library: Sequence[Skill]
 ) -> list[FamilyFit]:
-    """Every way ``task`` can be run by a member of ``shelf`` through its family.
+    """Every way ``task`` can be run by a member of ``shelf`` through its family, best
+    accounted-for first.
 
-    This is the captain's case: *adding to a cart is almost the same workflow
-    everywhere, so those runs should aid each other*. A request that does not line up
-    with the sentence THIS site's skill was learned from may line up with the sentence
-    another site's skill was learned from; when the two skills perform the same
-    workflow, the argument read through one is what the other needs.
+    A request that does not line up with the sentence THIS site's skill was learned from
+    may line up with another site's; when the two perform the same workflow, the argument
+    read through one is what the other needs. A fit needs all of: one family by SHAPE; a
+    text binding against the relative's proven sentence; exactly one open parameter per
+    side, so which value goes where is not a guess; the same INTENT as the member's own
+    learned sentence; and ``MIN_ACCOUNTED_FOR`` over all of it.
 
-    A fit needs all of:
-
-    * the member and the relative are one family by SHAPE
-      (:func:`~skillweaver.skills.family.relatives`, which also requires that both
-      earned a signature from a verifier-passed run and still carry the verifier);
-    * the request binds against the relative's proven sentence, from its TEXT - the
-      whole of :func:`_bind_from_text`, guards and intent check included;
-    * each side has exactly one parameter for the text to fill, so which value goes
-      where is not a guess, and the value can be the member's declared type;
-    * the request is the same INTENT as the member's own learned sentence too;
-    * member, relatives and arguments together account for the request to the same
-      :data:`MIN_ACCOUNTED_FOR` as any other candidate.
-
-    Public and pure - it reads two lists - because
-    :func:`~skillweaver.orchestrator.resolve_domain` asks the same question before a
-    browser is open, and two implementations of "would the planner run this?" is the
-    defect that function's docstring is about.
-
-    Returns:
-        Fits, best accounted-for first; empty when there is none.
+    Public and pure because ``orchestrator.resolve_domain`` asks the same question before
+    a browser is open, and two implementations of "would the planner run this?" is the
+    defect that function exists to avoid.
     """
     fits: list[FamilyFit] = []
     for member in shelf:
@@ -1080,19 +874,10 @@ def fit_through_family(
 def bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     """The arguments ``skill`` would be called with for ``task``, or ``None`` to decline.
 
-    The model-free half of the warm path, in one name: the values the caller supplied
-    (:func:`_bind_args`), and failing that the one value the task's own wording
-    differs from the sentence the skill was learned in (:func:`_bind_from_text`).
-
-    Public because binding is half of "would the planner run this skill for this
-    task?", and that whole question is asked in a second place - resolving which
-    DOMAIN a bare ``run`` means, in
-    :func:`~skillweaver.orchestrator.resolve_domain`. Asking it there with a
-    reimplemented binder would be asking a different question in the same words: a
-    parameterized repeat binds its argument from the task's wording, and
-    :func:`~skillweaver.skills.retrieve.accounted_for` only clears
-    :data:`MIN_ACCOUNTED_FOR` once that argument is in hand. One definition, so the
-    two callers cannot drift apart.
+    The model-free half of the warm path: the values the caller supplied, and failing
+    that the one value the task's wording differs from the sentence the skill was
+    learned in. Public because ``orchestrator.resolve_domain`` asks the same question,
+    and a reimplemented binder there would be a different question in the same words.
     """
     args = _bind_args(skill, task)
     if args is None:
@@ -1103,23 +888,12 @@ def bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
 def _with_defaults(skill: Skill, task: TaskSpec, args: dict[str, Any]) -> dict[str, Any]:
     """``args`` with every defaulted parameter the caller left out given a VALUE.
 
-    Two defects of "a declared default may simply be omitted", both measured on the
-    skill named in :func:`asks_for`:
-
-    * the default lives in the SCHEMA, and ``run(ctx, product)`` has none, so omitting
-      it was ``TypeError: run() missing 1 required positional argument`` - and because
-      a skill that raises on the warm path is demoted, one bare repeat retired a
-      skill that had just passed admission;
-    * when the sentence NAMES a value, the default is the wrong one. *Buy the "Kailh
-      Choc Transparent Keycaps"* bound ``{}`` and would have been run for the MBK set
-      it was learned on, with a verifier that checks the cart against its own return
-      value and so says yes.
-
-    So the text is asked first, through the same guarded readers as a required
-    parameter (one candidate parameter only - several is a guess), and the declared
-    default is what is used when the text names nothing - passed explicitly only
-    when ``run`` has no default of its own for it (:func:`_required_by_code`), so a
-    skill whose code already declares one is called exactly as before.
+    Two defects of "a declared default may simply be omitted", both measured: the
+    default lives in the SCHEMA and ``run(ctx, product)`` has none, so omitting it was
+    a ``TypeError`` that demoted a skill which had just passed admission; and when the
+    sentence NAMES a value the default is the wrong one. So the text is asked first,
+    through the same guarded readers, and the declared default is passed explicitly
+    only when ``run`` has no default of its own (``_required_by_code``).
     """
     open_slots = [
         name for name, schema in skill.params.items() if name not in args and _has_default(schema)
@@ -1145,9 +919,9 @@ def _with_defaults(skill: Skill, task: TaskSpec, args: dict[str, Any]) -> dict[s
 
 
 def _required_by_code(skill: Skill) -> frozenset[str]:
-    """The parameters ``run`` itself cannot be called without, whatever the schema
-    says. A default the CODE also declares is left to the code, as it always was; one
-    that exists only in the schema has to be passed, or the call is a ``TypeError``."""
+    """The parameters ``run`` itself cannot be called without, whatever the schema says.
+    A default the CODE also declares is left to the code; one that exists only in the
+    schema has to be passed, or the call is a ``TypeError``."""
     try:
         tree = ast.parse(skill.code)
     except SyntaxError:
@@ -1169,19 +943,10 @@ def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     """The skill's arguments taken from ``task.params``, or ``None`` if it cannot be
     called from them.
 
-    This is the model-free half of "what do I pass?". A ``TaskSpec`` carries the
-    concrete values for the errand (``{"company": "Acme Corp"}``) and a stored skill
-    declares the names it wants; when they line up there is nothing to reason about.
-    A required parameter the task has no value for means the task did not supply its
-    arguments; :func:`_bind_from_text` gets a chance to read them out of the task's
-    wording before the candidate is given up on.
-
-    Names that line up EXACTLY are taken first, and only then is what is left over
-    matched by :func:`_alias_for` - because the caller names a parameter and the
-    model that wrote the skill names it again, independently, and they routinely
-    disagree about one word. Measured on the live Wikipedia suite: the caller passes
-    ``link`` where ``open_linked_article`` declares ``link_title``, which cost that
-    task its whole warm path.
+    Names that line up EXACTLY are taken first, and only what is left over is matched
+    by ``_alias_for``: caller and synthesizer name parameters independently and
+    routinely disagree about one word - the live Wikipedia suite passes ``link`` where
+    ``open_linked_article`` declares ``link_title``.
     """
     args: dict[str, Any] = {}
     spare = {k: v for k, v in task.params.items() if k not in skill.params}
@@ -1201,12 +966,9 @@ def _bind_args(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
 def _alias_for(name: str, spare: Mapping[str, Any], declared: Mapping[str, Any]) -> str | None:
     """The one key of ``spare`` that plainly means the parameter ``name``, or ``None``.
 
-    Two names mean the same thing here when, split on underscores, one's words are a
-    subset of the other's: ``link`` and ``link_title``, ``query`` and ``search_query``.
-    Nothing is bound unless the reading is unambiguous in BOTH directions - exactly
-    one spare key fits this parameter, and that key fits no other declared parameter -
-    so a skill taking ``section`` and ``parent_section`` is never fed a ``section``
-    value twice, and a task carrying ``link`` and ``link_text`` is not guessed at.
+    Two names mean the same thing when, split on underscores, one's words are a subset
+    of the other's. Unambiguous in BOTH directions, so a skill taking ``section`` and
+    ``parent_section`` is never fed a ``section`` value twice.
     """
     wanted = _name_words(name)
     fits = [key for key in spare if _shares_words(_name_words(key), wanted)]
@@ -1219,9 +981,9 @@ def _alias_for(name: str, spare: Mapping[str, Any], declared: Mapping[str, Any])
 
 
 def _shares_words(left: frozenset[str], right: frozenset[str]) -> bool:
-    """Whether two parameter names plainly mean the same thing: one's words contain
-    the other's, and there is at least one word to contain. An empty name matches
-    nothing, so a parameter called ``_`` is never fed somebody else's value."""
+    """Whether two parameter names plainly mean the same thing: one's words contain the
+    other's, and there is at least one word to contain. An empty name matches nothing,
+    so a parameter called ``_`` is never fed somebody else's value."""
     return bool(left & right) and (left <= right or right <= left)
 
 
@@ -1243,13 +1005,10 @@ FRAME_WORDS = frozenset(
 )
 """Words a value may sit next to without the alignment being in doubt.
 
-A parameter's value is only read out of a sentence when the words that FRAME it are
-words like these - or punctuation, or the edge of the sentence. The rule exists
-because a maximal common prefix happily eats a word that belongs to the value:
-``"search for computer vision"`` against ``"search for computer graphics"`` agrees on
-``"search for computer"``, and the span that is left is ``"graphics"`` - which is not
-the argument. ``"computer"`` is not a framing word, so that alignment is refused and
-the composer, which can actually read the sentence, gets the job instead.
+A maximal common prefix happily eats a word that belongs to the value: *search for
+computer vision* against *search for computer graphics* agrees on *computer*, leaving
+*graphics*, which is not the argument. *computer* is not a framing word, so that
+alignment is refused and the composer gets the job instead.
 """
 
 _TOKEN = re.compile(r"\w+|[^\w\s]")
@@ -1287,43 +1046,22 @@ def _tokens(text: str) -> list[_Token]:
 def _bind_from_text(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
     """The skill's arguments read out of the task TEXT, or ``None`` to decline.
 
-    This is what makes a plain-English repeat of a known task cost nothing. A stored
-    skill remembers the exact sentence the run it was synthesized from was solving
-    (:attr:`~skillweaver.contracts.Provenance.task_text`). When the new task is the
-    same sentence with one thing changed, that change IS the argument::
+    When the new task is the learned sentence with one thing changed, that change IS the
+    argument, so a plain-English repeat of a known task costs nothing::
 
         learned: "Search Wikipedia for computer vision"
-        asked:   "Search Wikipedia for machine learning"
-                                      ^^^^^^^^^^^^^^^^  -> query="machine learning"
+        asked:   "Search Wikipedia for machine learning"  -> query="machine learning"
 
-    Without this the candidate is rejected as ``unbindable_args`` and the planner
-    falls through to the composer, which spends one model call to read a sentence it
-    has already seen the shape of.
+    It declines far more often than it binds, deliberately: a wrong argument runs real
+    actions behind the same preconditions and verifier as a correct one. It refuses
+    unless exactly ONE required parameter is missing; the sentences agree except one
+    contiguous span, both sides non-empty; at least two tokens are shared and the span is
+    framed on both sides; the two spans share no word (which catches two differences
+    pretending to be one); and the new span is not much longer than the learned one and
+    can be the parameter's declared type.
 
-    When the diff says nothing, :func:`_from_template` gets a turn. The diff is blind
-    in exactly the two cases the live Wikipedia suite is full of: the sentence is
-    repeated WORD FOR WORD (no difference at all to attribute), or it changed in two
-    places and only one of them is the argument. See that function for how a slot is
-    located in the learned sentence instead.
-
-    It declines far more often than it binds, deliberately: a wrong argument is much
-    worse than a model call, because it runs real actions on a real screen behind the
-    same preconditions and verifier as a correct one. It refuses unless
-
-    * exactly ONE required parameter is missing (several missing means several spans
-      to attribute, which is a guess). A parameter with a declared default is never
-      bound here - omitting it already works;
-    * the two sentences agree everywhere except one contiguous span, both sides of
-      which are non-empty - so a sentence that merely ADDS words is not an argument;
-    * at least two tokens are shared, and the span is framed by :data:`FRAME_WORDS`,
-      punctuation or the sentence edge on both sides;
-    * the two spans share no word, which is how two separate differences pretending
-      to be one are caught (``"cats on Monday"`` vs ``"dogs on Tuesday"``);
-    * the new span is not much longer than the learned one, and can actually be the
-      parameter's declared type.
-
-    Returns:
-        The full argument dict, or ``None`` to leave the candidate unbindable.
+    ``_from_template`` gets a turn when the diff says nothing - a word-for-word repeat, or
+    two changes of which only one is the argument.
     """
     missing = [
         name
@@ -1373,10 +1111,9 @@ def _bind_from_text(skill: Skill, task: TaskSpec) -> dict[str, Any] | None:
 def _span_for(skill: Skill, name: str, asked: str) -> tuple[str, str] | None:
     """``(the text of asked that is name's value, how it was found)``, or ``None``.
 
-    Three readers, strictest first, and the first to answer wins: the one-span diff
-    (:func:`_differing_span`), the quoted template (:func:`_from_template`) and the
-    slot (:func:`_through_slot`). ``how`` is ``"diff"``, ``"template"`` or ``"slot"``
-    and travels into the log and into what a failed run is allowed to demote.
+    Three readers, strictest first, first to answer wins: the one-span diff, the quoted
+    template and the slot. ``how`` travels into the log and into what a failed run is
+    allowed to demote.
     """
     learned = skill.provenance.task_text or ""
     span = _differing_span(learned, asked)
@@ -1408,13 +1145,11 @@ def _text_bound(skill: Skill, task: TaskSpec) -> str | None:
 
 
 def _why_unbound(skill: Skill, task: TaskSpec) -> tuple[FailureStage, str]:
-    """The stage and the sentence for a candidate :func:`bind_args` turned down.
+    """The stage and the sentence for a candidate ``bind_args`` turned down.
 
     Asked only after the fact, so the happy path pays nothing for it. It separates the
-    two refusals a reader must never confuse: the sentence did not line up at all
-    (``unbindable_args``), and the sentence lined up but asks for a DIFFERENT errand
-    (``other_intent``) - *remove X from my cart* against a skill learned as *add X to
-    my cart*. The second is the one a family-widened library has to be seen to make.
+    sentence not lining up at all (``unbindable_args``) from its lining up but asking
+    for a DIFFERENT errand (``other_intent``).
     """
     name = _text_bound(skill, task)
     found = _span_for(skill, name, task.text) if name is not None else None
@@ -1431,8 +1166,7 @@ def _why_unbound(skill: Skill, task: TaskSpec) -> tuple[FailureStage, str]:
     asked, known = head_verb(task.text), head_verb(skill.provenance.task_text)
     mine, theirs = intent_of(known or ""), intent_of(asked or "")
     if mine is not None and theirs is not None and mine != theirs:
-        # Refused on alignment first - *from my cart* is not *to my cart* - but the
-        # sentence to show a reader is the one about the verb.
+        # Refused on alignment first, but the sentence to show a reader is the verb.
         return (
             "other_intent",
             f"{skill.name}: the request leads with {asked!r} ({theirs}) and the skill was "
@@ -1449,10 +1183,9 @@ def _why_unbound(skill: Skill, task: TaskSpec) -> tuple[FailureStage, str]:
 def _differing_span(learned: str, asked: str) -> str | None:
     """The one span of ``asked`` that ``learned`` does not have, or ``None``.
 
-    The two sentences are aligned from both ends; what is left in the middle is the
-    difference. Every guard described in :func:`_bind_from_text` is applied here, and
-    the returned text is sliced out of ``asked`` verbatim, so the value keeps its own
-    capitalisation, spacing and internal punctuation.
+    Aligned from both ends; every guard described in ``_bind_from_text`` is applied
+    here, and the text is sliced out of ``asked`` verbatim so the value keeps its own
+    capitalisation and spacing.
     """
     lhs, rhs = _tokens(learned), _tokens(asked)
     if not lhs or not rhs:
@@ -1479,9 +1212,8 @@ def _differing_span(learned: str, asked: str) -> str | None:
     if len(_words(asked_mid)) > max(3, len(_words(learned_mid)) + 2):
         return None  # the new span grew into something bigger than an argument
     if (_words(asked_mid) & _CLAUSE_WORDS) - _words(learned_mid):
-        # *add a box of Tide and then check out* is one span against *add a box of
-        # Folgers ... to my cart*, framed and short enough - and it bound, as a product
-        # called "Tide and then check out", accounted for at 1.00 by its own argument.
+        # *add a box of Tide and then check out* bound as a product called "Tide and
+        # then check out", accounted for at 1.00 by its own argument.
         return None
 
     value = asked[asked_mid[0].start : asked_mid[-1].end]
@@ -1519,27 +1251,13 @@ class _Slot:
 def _from_template(skill: Skill, name: str, learned: str, asked: str) -> str | None:
     """``asked``'s value for ``name``, read through the learned sentence as a template.
 
-    :func:`_differing_span` asks "what changed?", which has no answer in the two
-    cases that dominated the live Wikipedia misses of 2026-09-19::
-
-        learned: 'Search Wikipedia for "Ada Lovelace" and open her article.'
-        asked:   'Search Wikipedia for "Ada Lovelace" and open her article.'
-          -> nothing changed, so nothing is the argument, so the skill is not used
-
-        learned: 'Search Wikipedia for "Ada Lovelace" and open her article.'
-        asked:   'Search Wikipedia for "Photosynthesis" and open the article.'
-          -> TWO things changed ("her" -> "the"), so neither is trusted
-
-    This asks the other question: where in the learned sentence did the value sit?
-    :func:`_learned_slot` answers it from evidence already in the skill, and then
-
-    * a word-for-word repeat replays the learned value. It is not a guess: this skill
-      exists BECAUSE a run of this exact sentence succeeded with that value;
-    * a sentence whose value is quoted takes the asked sentence's one quoted span,
-      but only when the words anchoring the slot still line up (:func:`_anchored`).
-
-    Anything else returns ``None`` and the composer, which can read a sentence, is
-    left to do it.
+    ``_differing_span`` asks "what changed?", which has no answer for a word-for-word
+    repeat (nothing changed, so nothing is the argument) or for a sentence that changed
+    in two places (neither is trusted) - the two cases that dominated the live
+    Wikipedia misses of 2026-09-19. This asks where the value SAT instead: a
+    word-for-word repeat replays the learned value, which is not a guess because the
+    skill exists BECAUSE that exact sentence succeeded with it; and a quoted slot takes
+    the asked sentence's one quoted span when the anchoring words still line up.
     """
     slot = _learned_slot(skill, name, learned)
     if slot is None:
@@ -1557,20 +1275,11 @@ def _from_template(skill: Skill, name: str, learned: str, asked: str) -> str | N
 def _learned_slot(skill: Skill, name: str, learned: str) -> _Slot | None:
     """Where ``name``'s value sat in ``learned``, or ``None`` when it cannot be shown.
 
-    Two independent sources, and they check each other:
-
-    *The one quoted span in the learned sentence.* A person quoting exactly one thing
-    in a one-parameter errand is quoting the parameter.
-
-    *A quoted example in the parameter's own schema description* - the synthesizer
-    writes ``e.g. 'Ada Lovelace'`` from the run it just watched - accepted only when
-    that example occurs exactly once in the learned sentence. That occurrence is the
-    proof: an example the sentence does not contain says nothing about where the
-    value was, and is ignored rather than trusted.
-
-    When both exist they must agree, so a skill learned from *Open the "Settings" page
-    and search for widgets* does not hand ``"Settings"`` to a ``query`` parameter whose
-    description says ``e.g. 'widgets'``.
+    Two sources that check each other: the one quoted span in the learned sentence, and
+    a quoted example in the parameter's own schema description - the latter only when
+    that example occurs exactly once in the learned sentence, because an example the
+    sentence does not contain says nothing about where the value was. When both exist
+    they must agree.
     """
     quoted = _quoted_spans(learned)
     examples = _quoted_spans(_description(skill.params.get(name)))
@@ -1621,11 +1330,9 @@ def _same_sentence(learned: str, asked: str) -> bool:
 def _anchored(learned: str, slot: _Slot, asked: str, found: _Slot) -> bool:
     """Whether ``found`` sits where ``slot`` sat, judged by the words around it.
 
-    The tokens immediately BEFORE the value must be the same on both sides - that is
-    what makes this the same sentence shape rather than a different errand that also
-    quotes something - and the sentence must not have grown a new clause after the
-    value, which is how *search for "Alan Turing", open his article, and from there
-    open Bletchley Park* is refused: it is two errands, and the composer's job.
+    The tokens immediately BEFORE the value must match on both sides, and the sentence
+    must not have grown a new clause after it - *search for "Alan Turing", open his
+    article, and from there open Bletchley Park* is two errands, the composer's job.
     """
     head_l, head_a = _tokens(learned[: slot.start]), _tokens(asked[: found.start])
     tail_l, tail_a = _tokens(learned[slot.end :]), _tokens(asked[found.end :])
@@ -1652,17 +1359,15 @@ MEASURE_WORDS = frozenset(
 )
 """Words that say HOW MUCH of a thing is wanted and nothing about which errand it is.
 
-*A box of* and *a bag of* frame the same slot in the same sentence, so they may differ
-between the learned wording and the asked one. A closed list, like
-:data:`FRAME_WORDS`: what is not on it is a content word, and a content word that
-changed outside the slot is a different request. They are neutral only for LINING THE
-SENTENCES UP - :func:`~skillweaver.skills.retrieve.accounted_for` still counts a
-measure word nobody has an account of against the candidate."""
+*A box of* and *a bag of* frame the same slot, so they may differ between the learned
+and the asked wording. A closed list, like ``FRAME_WORDS``. Neutral only for LINING THE
+SENTENCES UP - ``accounted_for`` still counts a measure word nobody has an account of
+against the candidate."""
 
 _CLAUSE_BREAKS = _CLAUSE_WORDS | frozenset({",", ";", ":", "."})
 """Tokens an UNQUOTED value may not contain when it is read through a slot. A value
-that runs over one of these has swallowed a second clause - *Tide and then check out* -
-and a second clause is a bigger errand, which is the composer's job."""
+that runs over one has swallowed a second clause - *Tide and then check out* - which is
+a bigger errand, and the composer's job."""
 
 _NEUTRAL = (
     FRAME_WORDS
@@ -1688,35 +1393,28 @@ def _content(tokens: Sequence[_Token]) -> list[str]:
 def _same_head(learned: Sequence[_Token], asked: Sequence[_Token]) -> bool:
     """Whether two sentence heads - everything before the value - ask for one thing.
 
-    Every content word must agree, in order, with one licence: the FIRST, which is
-    the verb in the imperative sentences tasks are written in, may differ. Whether the
-    two verbs mean the same errand is NOT decided here -
-    :func:`~skillweaver.skills.family.same_intent` decides it, over the whole request,
-    for every text binding - and keeping the two questions apart is what lets a
-    refusal say which one it was: *buy me a box of* lines up and is the same errand,
-    *remove a box of* lines up and is not (``other_intent``), and *add a review of*
-    does not line up at all.
+    Every content word must agree, in order, with one licence: the FIRST, the verb.
+    Whether two verbs mean the same errand is ``same_intent``'s question, and keeping
+    the two apart is what lets a refusal say which one it was - *buy me a box of* lines
+    up and is the same errand, *remove a box of* lines up and is not.
     """
     mine, theirs = _content(learned), _content(asked)
     return len(mine) == len(theirs) and mine[1:] == theirs[1:]
 
 
 _DIRECTIONS = frozenset({"to", "into", "onto", "from", "off", "out", "in", "on"})
-"""Framing words that carry the DIRECTION of an errand, so :func:`_tail_fits` compares
-them where every other comparison skips them. *To my cart* and *from my cart* differ in
+"""Framing words that carry the DIRECTION of an errand, so ``_tail_fits`` compares them
+where every other comparison skips them. *To my cart* and *from my cart* differ in
 nothing else."""
 
 
 def _tail_fits(learned: Sequence[_Token], asked: Sequence[_Token]) -> bool:
-    """Whether what FOLLOWS the value is the learned sentence's own tail, or the start
-    of it, or nothing.
+    """Whether what FOLLOWS the value is the learned tail, the start of it, or nothing.
 
-    A request may stop early - *add a box of Tide* for a skill learned as *add a box
-    of ... to my cart* - because the verb already says the rest. It may never go on
-    LONGER or go somewhere else: *from my cart* is not a prefix of *to my cart* (the
-    direction of the errand lives in exactly that word, and ``from``/``to`` are
-    compared here although they are framing everywhere else), and a new clause is a
-    bigger errand.
+    A request may stop early - *add a box of Tide* for a skill learned as *add a box of
+    ... to my cart* - because the verb already says the rest. It may never run longer
+    or go elsewhere: the direction of the errand lives in exactly one word, so
+    ``from``/``to`` are compared here although they are framing everywhere else.
     """
     mine = [t.key for t in learned if t.word and t.key not in (_NEUTRAL - _DIRECTIONS)]
     theirs = [t.key for t in asked if t.word and t.key not in (_NEUTRAL - _DIRECTIONS)]
@@ -1724,14 +1422,13 @@ def _tail_fits(learned: Sequence[_Token], asked: Sequence[_Token]) -> bool:
 
 
 def _templates(skill: Skill, name: str) -> list[tuple[str, _Slot]]:
-    """Every sentence ``skill`` is proven to have served, with where ``name`` sat in it.
+    """Every sentence ``skill`` is proven to have served, with where ``name`` sat in it,
+    newest first.
 
-    A :class:`~skillweaver.contracts.Precedent` records the sentence AND the arguments
-    of a verifier-passed run, so the slot is not inferred: it is wherever that run's
-    own value occurs, exactly once, in that run's own sentence. Newest first, because
-    the most recent wording is the likeliest to be repeated. A skill admitted before
-    precedents existed falls back to :func:`_learned_slot`, which reads the slot out
-    of a quotation or the parameter's described example.
+    A Precedent records the sentence AND the arguments of a verifier-passed run, so the
+    slot is not inferred: it is wherever that run's own value occurs, exactly once, in
+    that run's own sentence. A skill admitted before precedents existed falls back to
+    ``_learned_slot``.
     """
     found: list[tuple[str, _Slot]] = []
     for precedent in reversed(skill.precedents):
@@ -1752,28 +1449,18 @@ def _templates(skill: Skill, name: str) -> list[tuple[str, _Slot]]:
 def _through_slot(skill: Skill, name: str, asked: str) -> str | None:
     """``asked``'s value for ``name``, read through a sentence that is KNOWN to work.
 
-    The two readers before this one compare whole sentences, so they answer only when
-    the request is the learned sentence with one framed span changed. Measured on
-    2026-09-19 against a skill learned from *add a box of Folgers classic roast ground
-    coffee to my cart*::
+    The readers before this compare whole sentences, so they answer only when one framed
+    span changed. Measured 2026-09-19 against a skill learned from *add a box of Folgers
+    classic roast ground coffee to my cart*, none of *add a box of Starbucks classic roast
+    ground coffee*, *add a bag of Starbucks Pike Place coffee to my cart* or *buy me a box
+    of Tide laundry detergent* bound - the diff reader cannot know the value runs on past
+    *classic*, which is not a framing word. But the proving run RECORDED the value, so
+    where it sat is a fact, and the request is read as head + value + tail.
 
-        add a box of Starbucks classic roast ground coffee    does not bind
-        add a bag of Starbucks Pike Place coffee to my cart   does not bind
-        buy me a box of Tide laundry detergent                does not bind
-
-    The first fails because the diff is *Folgers* -> *Starbucks* and the word after it,
-    *classic*, is not a framing word - the reader cannot know the value runs on for
-    four more words. But the SKILL knows: the run that proved it recorded the value it
-    was given (:func:`_templates`), so where the value sat is a fact. With the slot in
-    hand a request is read as ``head + value + tail``, and it binds when the head asks
-    for the same thing (:func:`_same_head`) and the tail is the learned one or stops
-    short of it (:func:`_tail_fits`).
-
-    It still declines more than it binds. A value that is not quoted has to end
-    somewhere, and the only places it may end are where the learned tail begins or at
-    the end of the request - and then only if it swallowed no clause break and none of
-    the learned tail's own words, so *add a box of Tide to the basket* is not read as
-    a product called *Tide to the basket*.
+    An unquoted value may only end where the learned tail begins or at the end of the
+    request, and then only if it swallowed no clause break and none of the tail's own
+    words, so *add a box of Tide to the basket* is not a product called *Tide to the
+    basket*.
     """
     rhs = _tokens(asked)
     quoted = _quoted_spans(asked)
@@ -1808,7 +1495,7 @@ def _unquoted_value(
         return None  # a sentence that OPENS with its value has no head to line up
     anchor = head_words[-1].key
     # The value starts after the token that framed it in the learned sentence - or,
-    # when that token was the verb itself, after the asked sentence's own verb.
+    # when that was the verb itself, after the asked sentence's own verb.
     starts = [i + 1 for i, t in enumerate(rhs) if t.key == anchor]
     if not starts and anchor == head_verb(" ".join(t.key for t in head_words)):
         verb = head_verb(asked)
@@ -1863,12 +1550,11 @@ _NUMBER = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
 
 
 def _as_declared(span: str, schema: Any) -> Any:
-    """``span`` as the parameter's declared type, or :data:`_REFUSED`.
+    """``span`` as the parameter's declared type, or ``_REFUSED``.
 
-    A span of prose is a string and nothing else unless it plainly reads as the
-    declared type. Anything with structure - an array, an object, a boolean - is
-    refused rather than parsed out of English, because there is no reading of a
-    phrase as ``True`` that is safer than asking the model.
+    Anything with structure - an array, an object, a boolean - is refused rather than
+    parsed out of English, because there is no reading of a phrase as ``True`` that is
+    safer than asking the model.
     """
     text = span.strip()
     if not text:

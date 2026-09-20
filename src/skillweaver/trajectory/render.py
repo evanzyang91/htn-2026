@@ -1,60 +1,29 @@
 """``describe_trajectory``: a recorded run as the text a model writes a skill from.
 
-This is the only door a recording reaches the synthesizer through, so whatever it
-leaves out, the skill is written without - and whatever it *implies*, the skill
-reproduces. It has to render a MESSY run honestly, because a messy run is the normal
-one: the agent tries something, the critic rejects it, it backs out and tries again.
+The only door a recording reaches the synthesizer through, so whatever it leaves out the
+skill is written without, and it has to render a MESSY run honestly - a messy run is the
+normal one.
 
-Two things this rendering used to get wrong, and both of them read as "the run
-deliberately did all of this".
+A move is one DECISION, but one trajectory step is one ACTION, and the explorer writes the
+move's thought and the critic's verdict onto its LAST step. Read step by step that says
+the agent decided to press Enter because it wanted to search, and left the click before it
+unexplained - so :func:`moves_of` regroups steps into moves, closing a group at every step
+carrying a verdict, which is exactly where the explorer ends one.
 
-**A rejected move looked exactly like an accepted one.** The recording carries the
-critic's verdict per move (:attr:`~skillweaver.contracts.TrajectoryStep.verdict`) and
-nothing was rendering it, so a scroll the critic threw out - it changed nothing - was
-shown to the model as one more step of the procedure. The plausible skill to write
-from that is one that faithfully reproduces the fumbling, including scrolling the
-task never needed: slower on every future run and more fragile, for a recovery that
-was never required.
+A rejected move is one that fell short of what it CLAIMED (the critic judges against
+``move.expect``), not one whose actions were wasted: measured on the fake app with a live
+vision critic, a move that typed the search query and said it would open the invoice was
+correctly rejected and its action was still required. So a rejection is MARKED as suspect
+and never dropped.
 
-**A move's stated reason was attached to its last action.** One move becomes one
-trajectory step per action it performed, and the explorer writes the move's thought
-onto the LAST of them - that is the step the critic looked at, and the verdict has to
-go there (``Explorer._write_down``). But the thought explains the move BEFORE it ran:
-"I'll click the search box, type the query and press Enter" belongs over the click,
-not over the final wait. Read as written, it says the agent decided to press Enter
-because it wanted to search, and the click before it was unexplained.
+Does the marking change the skills? Not on the runs tried: 2026-09-19, 26 live generations
+over three recordings, half rendered each way, produced the same procedure every time - the
+model was already ignoring the fumbling. The rendering is fixed because it was WRONG about
+what the recording says; no quality improvement was observed and none should be reported.
+What the measurement does establish is that the marking costs nothing.
 
-So this module groups steps back into the moves they came from and renders each move
-as a unit: reason first, verdict named, actions under it. The grouping needs no
-string-sniffing of notes - :func:`moves_of` closes a group at every step that carries
-a verdict, which is exactly where the explorer ends one.
-
-**What a rejection means, and what it does not.** The critic judges a move against
-what the agent SAID it expected (``Explorer._make_move`` passes ``move.expect``), so a
-rejected move is one that fell short of its own claim - not necessarily one whose
-actions were wasted. Measured, on the fake app with a live vision critic: a move that
-typed the search query and said it would open the invoice was rejected, correctly, and
-its action was still required to solve the task. So the mark this module writes says
-the critic said no and asks for suspicion; it does not order the action deleted.
-Telling the model to drop a rejected move's actions outright would have damaged that
-skill.
-
-**Does the correction change the skills? Not on the runs it has been tried on.**
-2026-09-19, 26 live generations from claude-opus-5 over three recordings - a real
-Wikipedia search run from ``data/trajectories``, a fumbling run of the fake app
-(7 actions, 5 moves, 1 rejected) and a second fumbling run judged by a live vision
-critic (5 actions, 4 moves, 2 rejected, one of them a move whose action was needed) -
-half rendered the old way and half the new. Every pair produced the same procedure:
-the model was already ignoring the fumbling, and no sample reproduced the useless
-clicks under either rendering. The rendering is fixed because it was WRONG about what
-the recording says, and that is the whole of the claim: no quality improvement was
-observed, and none should be reported. What the measurement does establish is that the
-marking costs nothing - the necessary action inside a rejected move survived all
-three samples.
-
-The rendering is deterministic for a given trajectory - no timestamps, no ordering by
-dict - so the same run produces the same request, which is what makes an LLM cassette
-replay and a repair prompt diffable.
+Deterministic for a given trajectory - no timestamps, no dict ordering - which is what
+makes a cassette replay and a repair prompt diffable.
 """
 
 from __future__ import annotations
@@ -81,13 +50,9 @@ MAX_TEXT = 80
 """Longest element text quoted, in characters; longer is truncated with an ellipsis."""
 
 MAX_REASON = 220
-"""Longest critic reason quoted per move.
-
-A vision critic's reason carries its whole account of the screen - the live runs in
-``data/trajectories`` end on verdicts of 400 to 600 characters - and the model is
-being told WHETHER the move worked, not being asked to re-read the screen through
-somebody else's eyes. It already has the screen.
-"""
+"""Longest critic reason quoted per move. A vision critic's reason carries its whole
+account of the screen - live verdicts run 400 to 600 characters - and the model is being
+told WHETHER the move worked, not asked to re-read a screen it already has."""
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -114,17 +79,13 @@ def _describe_screen(observation: Observation, label: str) -> str:
 def _describe_target(observation: Observation, action: Action) -> str | None:
     """Which element the action landed on, named the way a skill can name it again.
 
-    The recording says ``click (236, 121)`` and the skill may not write that down -
-    rule 6 of the prompt, and rightly, because a coordinate is a screenshot. But
-    without this line the model is left guessing WHICH element that coordinate was,
-    and a wrong guess is admitted or rejected by luck.
-
-    It was rejected. In a live run the model wanted a row "from Dana Whitfield",
-    searched for that text, found none - OCR never reads the sender names on this
-    page - and archived a different message instead. So the element is named twice
-    over: by its text where there is any, and always by its kind and its place in
-    reading order, which is a handle a skill CAN reproduce from pixels when text
-    fails. ``None`` for an action with no point (typing, a key press).
+    The recording says ``click (236, 121)`` and a skill may not write a coordinate down, so
+    without this the model guesses WHICH element that was. It guessed wrong in a live run:
+    it wanted a row "from Dana Whitfield", searched for that text, found none - OCR never
+    reads the sender names on that page - and archived a different message. So the element
+    is named twice over: by its text where there is any, and always by its kind and place
+    in reading order, which a skill CAN reproduce from pixels when text fails. ``None`` for
+    an action with no point.
     """
     point = getattr(action, "point", None)
     if point is None:
@@ -147,18 +108,11 @@ def _describe_target(observation: Observation, action: Action) -> str | None:
 class Move:
     """The steps of one move, with the verdict and the reason that belong to it.
 
-    A move is what the agent decided to do once: a primitive action, or a code block
-    that performed several. The explorer records one trajectory step per action and
-    puts the critic's verdict - and the move's stated reason - on the LAST of them.
-    This regroups them so a reader gets the reason before the actions it explains.
-
     Attributes:
         index: Position of this move in the run, counting from ``1``.
         steps: Its steps, in order. Never empty.
         reason: What the agent said it was doing, from the deciding step's note.
         asides: Notes carried by the move's other steps, deduplicated and in order.
-            The explorer writes ``part of: <summary>`` there, and a controller
-            refusal is appended to whichever note it happened to.
     """
 
     __slots__ = ("asides", "index", "reason", "steps")
@@ -195,15 +149,13 @@ class Move:
 def moves_of(trajectory: Trajectory) -> tuple[Move, ...]:
     """Regroup a run's steps into the moves they were performed as.
 
-    A step carrying a verdict is the last step of its move, because that is where
-    ``Explorer._write_down`` puts the judgment - so no note has to be parsed to find
-    the boundary. Steps after the last verdict form a final unjudged move: a run cut
-    off by its budget mid-move still recorded what it did.
+    A step carrying a verdict is the LAST step of its move, so no note has to be parsed to
+    find the boundary. Steps after the last verdict form a final unjudged move: a run cut
+    off mid-move still recorded what it did.
 
-    A recording with NO verdicts anywhere - an older file, a hand-built trajectory, a
-    test double - has no boundaries to read, so every step is its own move. That is
-    the shape this rendering had before moves existed in it, which is the safe thing
-    to fall back to rather than declaring one twelve-action move nobody performed.
+    A recording with NO verdicts anywhere - an older file, a hand-built one - has no
+    boundaries to read, so every step is its own move, which is the shape this rendering
+    had before moves existed in it.
     """
     steps = trajectory.steps
     if not any(step.verdict is not None for step in steps):

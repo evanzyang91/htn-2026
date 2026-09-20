@@ -1,27 +1,16 @@
 """Per-domain JSON persistence for site graphs.
 
-One file per domain under a root directory, named after a sanitized domain so
-``app.example.com`` and ``../etc/passwd`` both land somewhere harmless and
-predictable. Every file carries :data:`SCHEMA_VERSION`; a file written by a newer
-build is refused with a clear message rather than being half-read into a graph
-that then routes an agent somewhere wrong.
+One file per domain under a root directory, named after a SANITIZED domain so
+``app.example.com`` and ``../etc/passwd`` both land somewhere harmless. Every file carries
+:data:`SCHEMA_VERSION`; one written by a newer build is refused rather than half-read into
+a graph that then routes an agent somewhere wrong.
 
-Why merging, not overwriting
-----------------------------
-
-Several runs - and, in this project, several workers - write the same domain at
-the same time. Two runs that each learn a screen and then each call ``save`` would,
-under last-write-wins, leave only whichever finished second: the other run's
-observations vanish with no error anywhere. So :meth:`JSONGraphStore.save_merged`
-re-reads the file, folds the new snapshot into it with :func:`merge` and writes the
-combination. Statistics sum, states union, and nothing silently disappears.
-
-That still leaves the read-modify-write window itself. :func:`atomic_write` makes
-every writer's file appear whole via ``os.replace``, so a reader never sees a torn
-file and a crash mid-write leaves the previous version intact. A writer that loses
-the race loses only the observations it merged in that instant, not the file - and
-the next ``save`` merges them back in. That is the right trade for a cache of
-learned shortcuts, which is what a site graph is.
+:meth:`JSONGraphStore.save_merged` MERGES rather than overwrites, because several runs
+write one domain at once and last-write-wins would silently drop the other run's
+observations. :func:`atomic_write` makes every writer's file appear whole, so a reader
+never sees a torn one; a writer that loses the read-modify-write race loses only the
+observations it merged in that instant, which the next ``save`` merges back in. That is
+the right trade for a cache of learned shortcuts.
 """
 
 from __future__ import annotations
@@ -55,16 +44,12 @@ _RUNS = re.compile(r"_{2,}")
 
 
 def domain_filename(domain: str) -> str:
-    """The file name for ``domain``. An ordinary hostname keeps its own name.
+    """The file name for ``domain``; an ordinary hostname keeps its own name.
 
-    Anything that is not a hostname is sanitized: unsafe characters and ``..``
-    become ``_``, so the result never holds a path separator or a parent-directory
-    hop and a hostile or empty domain cannot escape the store's root.
-
-    A sanitized name also carries a hash of the original domain. Without it
-    ``a/b`` and ``a_b`` would share one file and silently merge two sites' graphs
-    into each other - a corruption that nothing downstream could detect, since a
-    merged graph is a perfectly well-formed graph.
+    Anything else is sanitized - unsafe characters and ``..`` become ``_`` - so a hostile
+    or empty domain cannot escape the root, and a hash of the original is appended.
+    Without that hash ``a/b`` and ``a_b`` would share one file and silently merge two
+    sites' graphs, a corruption nothing downstream could detect.
     """
     safe = _UNSAFE.sub("_", domain).replace("..", "_")
     safe = _RUNS.sub("_", safe).strip("._-")
@@ -77,12 +62,11 @@ def domain_filename(domain: str) -> str:
 def atomic_write(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` so readers see either the old file or the new one.
 
-    Writes a temporary file in the same directory, flushes it to disk, then renames
-    it over ``path``. ``os.replace`` is atomic within a filesystem, which the same
-    directory guarantees.
+    Temp file in the SAME directory, fsync, then ``os.replace``, which is atomic within a
+    filesystem - which sharing the directory guarantees.
 
     Raises:
-        SkillWeaverError: if the directory or file cannot be written.
+        SkillWeaverError: the directory or file cannot be written.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,11 +86,10 @@ def atomic_write(path: Path, text: str) -> None:
 
 
 class JSONGraphStore:
-    """A :class:`~skillweaver.graph.model.GraphPersistence` over a directory of JSON files.
+    """A ``GraphPersistence`` over a directory of JSON files, one per domain.
 
     Args:
-        root: The directory holding one file per domain, created on first write.
-            ``Settings.graphs_dir`` is the project's conventional location.
+        root: Created on first write; ``Settings.graphs_dir`` is the usual location.
     """
 
     def __init__(self, root: Path | str) -> None:
@@ -117,11 +100,11 @@ class JSONGraphStore:
         return self.root / domain_filename(domain)
 
     def load(self, domain: str) -> GraphSnapshot:
-        """Read ``domain``, or an empty snapshot when nothing is stored for it.
+        """Read ``domain``, or an empty snapshot when nothing is stored.
 
         Raises:
-            SkillWeaverError: if the file exists but is unreadable, is not valid
-                JSON, or carries an unsupported schema version.
+            SkillWeaverError: the file exists but is unreadable, is not valid JSON, or
+                carries an unsupported schema version.
         """
         path = self.path_for(domain)
         try:
@@ -139,13 +122,9 @@ class JSONGraphStore:
         return snapshot_from_dict(data, where=str(path))
 
     def save(self, snapshot: GraphSnapshot) -> Path:
-        """Write ``snapshot`` over whatever is stored for its domain, and return the path.
+        """Write ``snapshot`` over whatever is stored for its domain.
 
-        Overwrites. Prefer :meth:`save_merged` unless you truly mean to discard the
-        stored observations.
-
-        Raises:
-            SkillWeaverError: if the file cannot be written.
+        OVERWRITES; prefer :meth:`save_merged` unless you mean to discard what is stored.
         """
         path = self.path_for(snapshot.domain)
         atomic_write(path, json.dumps(snapshot_to_dict(snapshot), indent=2, sort_keys=False))
@@ -154,23 +133,17 @@ class JSONGraphStore:
     def save_merged(self, snapshot: GraphSnapshot) -> GraphSnapshot:
         """Fold ``snapshot`` into what is stored, write the result, and return it.
 
-        The safe way to persist: another run's observations of the same domain
-        survive. See the module docstring for the concurrency this does and does
-        not protect against.
-
-        Raises:
-            SkillWeaverError: if the stored file cannot be read or written, or
-                carries an unsupported schema version.
+        The safe way to persist: another run's observations survive. See the module
+        docstring for the concurrency this does and does not protect against.
         """
         combined = merge(self.load(snapshot.domain), snapshot)
         self.save(combined)
         return combined
 
     def domains(self) -> list[str]:
-        """Every domain with a stored file, by file name, alphabetically.
+        """Every domain with a stored file, alphabetically.
 
-        Reads each file's recorded ``domain`` rather than trusting the sanitized
-        file name. An empty or unreadable root yields an empty list.
+        Reads each file's recorded ``domain`` rather than trusting the sanitized name.
         """
         if not self.root.is_dir():
             return []
@@ -188,20 +161,14 @@ class JSONGraphStore:
 def merge(left: GraphSnapshot, right: GraphSnapshot) -> GraphSnapshot:
     """Combine two snapshots of the same domain, summing every statistic.
 
-    A state in both keeps its earliest ``first_seen`` and prefers ``left``'s
-    non-empty label, URL pattern and thumbnail. An edge in both - same source,
-    destination and actions - has its attempts and successes added and its
-    ``mean_ms`` recombined by :func:`~skillweaver.graph.model.merge_transitions`.
-    A state or edge in only one side is carried over untouched, so nothing is lost
-    from either.
-
-    Ordering is deterministic: ``left``'s items keep their positions and ``right``'s
-    new ones follow. Matching is exact on ``Fingerprint.value`` - consolidating
-    near-matching screens is node-identity work and belongs to
-    ``InMemorySiteGraph.absorb(..., resolve=True)``, which can see the whole graph.
+    Anything in only one side is carried over untouched. Ordering is deterministic:
+    ``left``'s items keep their positions and ``right``'s new ones follow. Matching is
+    EXACT on ``Fingerprint.value`` - consolidating near-matching screens is node-identity
+    work and belongs to ``InMemorySiteGraph.absorb(..., resolve=True)``, which can see the
+    whole graph.
 
     Raises:
-        ValueError: if the two snapshots are for different domains.
+        ValueError: the two snapshots are for different domains.
     """
     if left.domain != right.domain:
         raise ValueError(
@@ -225,15 +192,9 @@ def merge(left: GraphSnapshot, right: GraphSnapshot) -> GraphSnapshot:
     )
 
 
-# -- serialization -----------------------------------------------------------------
-
-
 def snapshot_to_dict(snapshot: GraphSnapshot) -> dict[str, Any]:
-    """Render a snapshot as the JSON-safe object stored on disk.
-
-    The inverse is :func:`snapshot_from_dict`; together they round-trip every field,
-    including statistics, ``parts`` sub-hashes and thumbnails.
-    """
+    """A snapshot as the JSON-safe object stored on disk; :func:`snapshot_from_dict`
+    inverts it, round-tripping statistics, ``parts`` sub-hashes and thumbnails."""
     return {
         "schema_version": SCHEMA_VERSION,
         "domain": snapshot.domain,
@@ -247,11 +208,11 @@ def snapshot_from_dict(data: Mapping[str, Any], where: str = "<memory>") -> Grap
 
     Args:
         data: The stored object.
-        where: A path or label naming the source, used in error messages.
+        where: A path or label naming the source, for error messages.
 
     Raises:
-        SkillWeaverError: if the schema version is missing, is not an integer, or
-            is not :data:`SCHEMA_VERSION`, or if any record is malformed.
+        SkillWeaverError: the schema version is missing, not an integer or not
+            :data:`SCHEMA_VERSION`, or a record is malformed.
     """
     version = data.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool):
@@ -335,6 +296,6 @@ def _transition_from_dict(data: Mapping[str, Any]) -> Transition:
 
 
 def _time_from_iso(text: str) -> datetime:
-    """Parse an ISO timestamp, forcing the result to be timezone-aware UTC."""
+    """An ISO timestamp, forced to timezone-aware UTC."""
     parsed = datetime.fromisoformat(text)
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)

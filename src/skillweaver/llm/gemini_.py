@@ -1,36 +1,19 @@
 """The Gemini backend: the same ``contracts.LLMClient`` over ``google-genai``.
 
-Built alongside the Claude adapter so a run can be repeated on a second model
-without anything above this module changing. The two adapters are
-interchangeable through :class:`~skillweaver.contracts.LLMClient` and share
-:mod:`skillweaver.llm.usage` and :mod:`skillweaver.llm.cassette`.
+Interchangeable with the Claude adapter, sharing :mod:`skillweaver.llm.usage` and
+:mod:`skillweaver.llm.cassette`, so a run can be repeated on a second model.
 
-Where Gemini's surface differs from Claude's, and what this adapter does about it:
+Three differences from Claude's surface. Gemini has ``"user"`` and ``"model"`` and no
+tool role, so a ``"tool"`` message becomes a ``function_response`` part inside a user
+turn. A function response is keyed by NAME, not only by id, and ``LLMMessage`` carries no
+function name - which is why the whole conversation is walked in order to resolve it. And
+sampling is real here: a non-``None`` ``temperature`` is forwarded rather than dropped.
 
-**Roles.** Gemini has ``"user"`` and ``"model"``; there is no tool role. A
-``"tool"`` message becomes a ``function_response`` part inside a user turn.
-
-**A function response is keyed by name, not only by id.** The contract's
-``LLMMessage`` for a tool result carries ``tool_call_id`` but no function name, so
-this adapter resolves the name from the tool calls earlier in the same
-conversation - which is why the whole conversation, not just the last turn, is
-walked in order.
-
-**Sampling is real here.** Unlike Claude, Gemini accepts ``temperature``, so a
-non-``None`` value is forwarded rather than dropped.
-
-.. warning::
-   **Verification status: cassette-only. This adapter has NEVER made a real
-   call.** No ``GEMINI_API_KEY`` has been supplied, so every path here is
-   exercised against the real ``google-genai`` types and replayed from
-   ``tests/fixtures/cassettes/gemini_basics.json``, but that cassette holds
-   INVENTED replies, not recorded ones. The request shapes below - the
-   computer-use tool, the screenshot-carrying function response, the
-   finish-reason mapping - follow the current docs and are unconfirmed by any
-   live round trip. The sibling Claude adapter IS live-proven; do not read its
-   status as covering this one. Run
-   ``python tests/llm/record_fixtures.py --live --only gemini`` once a key
-   exists.
+**Verification status: this adapter has NEVER made a real call.** No ``GEMINI_API_KEY``
+has been supplied, so the computer-use tool, the screenshot-carrying function response
+and the finish-reason mapping follow the current docs and are unconfirmed by any live
+round trip. The sibling Claude adapter IS live-proven; do not read its status as covering
+this one.
 """
 
 from __future__ import annotations
@@ -60,11 +43,8 @@ ENVIRONMENTS: Final[Mapping[str, genai_types.Environment]] = MappingProxyType(
         "mobile": genai_types.Environment.ENVIRONMENT_MOBILE,
     }
 )
-"""skillweaver target name -> the Gemini computer-use environment it maps to.
-
-The keys match ``Settings.default_target`` so a caller can pass the configured
-target straight through.
-"""
+"""skillweaver target name -> the Gemini computer-use environment. The keys match
+``Settings.default_target``, so a caller can pass the configured target straight through."""
 
 _STOP_REASONS: Final[Mapping[str, str]] = MappingProxyType(
     {
@@ -138,11 +118,11 @@ class GeminiClient:
         api_key: An explicit key; ``None`` uses ``settings().gemini_api_key`` and
             then the SDK's own resolution (``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``).
         client: A ready-made ``genai.Client``, or any object exposing
-            ``models.generate_content(**kwargs)``. Tests pass a stub here.
+            ``models.generate_content(**kwargs)``.
         extra_tools: Provider-level tools appended to every request - notably
             :func:`computer_use_tool`.
         max_attempts / base_delay / max_delay: Retry with exponential backoff.
-        sleep / jitter: Injected for tests.
+        sleep / jitter: Injectable, so a retry need not cost wall time.
     """
 
     def __init__(
@@ -309,9 +289,8 @@ class GeminiClient:
 def _stop_reason(candidate: Any, has_tool_calls: bool) -> str:
     """Normalize Gemini's ``finish_reason``.
 
-    Gemini reports ``STOP`` for a turn that asked for a function call, where the
-    contract wants ``"tool_use"``; every safety, recitation or malformed-call
-    reason lands on ``"other"``.
+    Gemini reports ``STOP`` for a turn that asked for a function call, where the contract
+    wants ``"tool_use"``; safety, recitation and malformed-call reasons land on ``"other"``.
     """
     raw = getattr(candidate, "finish_reason", None)
     name = getattr(raw, "value", raw)
@@ -324,12 +303,12 @@ def _stop_reason(candidate: Any, has_tool_calls: bool) -> str:
 def build_contents(messages: Sequence[LLMMessage]) -> list[genai_types.Content]:
     """Translate the conversation into Gemini ``Content`` turns.
 
-    Consecutive ``"tool"`` messages collapse into one user turn, mirroring the
-    Claude adapter so both backends see the same conversation shape.
+    Consecutive ``"tool"`` messages collapse into one user turn, mirroring the Claude
+    adapter so both backends see the same conversation shape.
 
     Raises:
-        ProviderError: when a tool result cannot be matched to the call it answers,
-            which would otherwise be sent under the wrong function name.
+        ProviderError: a tool result cannot be matched to the call it answers, which
+            would otherwise be sent under the wrong function name.
     """
     names_by_id: dict[str, str] = {}
     pending_call_names: list[str] = []

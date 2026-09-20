@@ -1,27 +1,13 @@
 """Construction, validation and serialization for :class:`~skillweaver.contracts.Skill`.
 
-A skill is code that a model wrote and that a later run will execute, so the only
-thing standing between a bad generation and a broken library is this module. Every
-check here is structural - "could this ever work?" - and cheap enough to run on every
-synthesis. Whether the skill *does* work is the admission harness's job.
+A skill is code a model wrote and a later run will execute, so this module is the only
+thing between a bad generation and a broken library. Every check is structural - "could
+this ever work?" - and cheap enough to run on every synthesis; whether the skill DOES
+work is the admission harness's job.
 
-::
-
-    skill = make_skill(
-        name="search_invoice",
-        domain="example.com",
-        summary="Search the invoice list for a company.",
-        docstring="Types the company name into the search box and waits for rows.",
-        params={"company": {"type": "string"}},
-        code="def run(ctx, company):\\n    ctx.ctl.type_text(company)\\n",
-        provenance=Provenance("run-1", "pay an invoice", "claude", utcnow()),
-    )
-    signature(skill)                      # 'search_invoice(company: str)'
-    from_dict(to_dict(skill)) == skill    # True
-
-Every failure raises a :class:`SkillInvalid` subclass naming exactly what was wrong.
-They all derive from :class:`~skillweaver.errors.AdmissionRejected`, so a synthesizer
-that already catches "this skill may not enter the library" catches these too.
+Every failure raises a :class:`SkillInvalid` subclass naming exactly what was wrong. They
+all derive from AdmissionRejected, so a synthesizer that already catches "this skill may
+not enter the library" catches these too.
 """
 
 from __future__ import annotations
@@ -131,14 +117,11 @@ _BAD_PATH_CHARS = frozenset({"/", "\\", "\x00"})
 
 
 def validate_name(name: str, *, what: str = "name") -> None:
-    """Check a skill name: a lower-case Python identifier that is not a keyword and
-    does not start with an underscore.
-
-    The name is both a callable name in prompts and a directory component on disk, so
-    an identifier is exactly the right shape for it.
+    """Check a skill name: a lower-case Python identifier, not a keyword, and safe as a
+    directory name.
 
     Raises:
-        InvalidSkillName: with the reason in the message.
+        InvalidName: with what was wrong and what is allowed.
     """
     if not isinstance(name, str) or not name:
         raise InvalidSkillName(f"{what} must be a non-empty string, got {name!r}")
@@ -173,12 +156,10 @@ def validate_domain(domain: str) -> None:
 
 def validate_identity(skill: Skill) -> None:
     """Check only ``name`` and ``domain`` - the part that decides where the skill is
-    stored. :meth:`~skillweaver.contracts.SkillStore.put` runs this so a malformed
-    key can never reach the filesystem.
+    stored.
 
     Raises:
-        InvalidSkillName, InvalidSkillDomain: per :func:`validate_name` /
-            :func:`validate_domain`.
+        InvalidName, InvalidDomain: naming what was wrong.
     """
     validate_name(skill.name)
     validate_domain(skill.domain)
@@ -240,14 +221,8 @@ def _validate_one_schema(name: str, schema: Any, *, where: str) -> None:
 def validate_params(params: Mapping[str, Any]) -> None:
     """Check that ``params`` is a coherent JSON schema per parameter.
 
-    Each key must be a legal Python identifier (it becomes a keyword argument) and
-    each value a JSON-schema object with a known ``type``. ``description``, ``enum``,
-    ``default``, ``items``, ``properties`` and ``required`` are checked for shape when
-    present, and a ``default`` must match its declared ``type``. The whole mapping
-    must be JSON-serializable, because it is stored as JSON.
-
     Raises:
-        InvalidSkillParams: with the offending parameter in the message.
+        InvalidParams: naming the parameter and what is wrong with it.
     """
     if not isinstance(params, Mapping):
         raise InvalidSkillParams(f"params must be a mapping, got {type(params).__name__}")
@@ -283,17 +258,11 @@ def _signature_of(fn: ast.FunctionDef) -> tuple[list[str], list[str], bool]:
 
 
 def validate_code(code: str, params: Mapping[str, Any] | None = None) -> None:
-    """Check that ``code`` parses and defines a module-level ``def run(ctx, ...)``
-    whose parameters agree with ``params``.
-
-    Agreement means: ``run`` accepts every declared param (directly or via
-    ``**kwargs``), and every parameter ``run`` requires is declared - so
-    ``run(ctx, **skill.params_filled_in)`` can never raise ``TypeError``.
+    """Check that ``code`` parses and defines a module-level ``def run(ctx, ...)`` whose
+    parameters agree with ``params``.
 
     Raises:
-        InvalidSkillCode: if the source does not parse, or ``run`` is missing,
-            asynchronous, takes no ``ctx`` first, or rejects a declared param.
-        InvalidSkillParams: if ``run`` requires a parameter ``params`` never declared.
+        InvalidCode: naming what is missing or mismatched.
     """
     if not isinstance(code, str) or not code.strip():
         raise InvalidSkillCode("code must be a non-empty string of Python source")
@@ -341,10 +310,10 @@ def _validate_verifier(verifier_code: str) -> None:
 
 def validate_requires(requires: Sequence[str], own_name: str = "") -> None:
     """Check that every name in ``requires`` is a well-formed skill name, that none
-    repeats, and that the skill does not require itself.
+    repeats and that none is the skill itself.
 
     Raises:
-        InvalidSkillRequires: with the offending name in the message.
+        InvalidRequires: naming the offending entry.
     """
     if isinstance(requires, str) or not isinstance(requires, Sequence):
         raise InvalidSkillRequires(f"requires must be a sequence of names, got {requires!r}")
@@ -364,11 +333,8 @@ def validate_requires(requires: Sequence[str], own_name: str = "") -> None:
 def validate_skill(skill: Skill) -> Skill:
     """Run every structural check on ``skill`` and return it unchanged.
 
-    Checks, in the order they are reported: name, domain, summary and docstring,
-    params, code against params, verifier code, requires, and the stats invariants.
-
     Raises:
-        SkillInvalid: a subclass naming the first thing that was wrong.
+        SkillInvalid: the first check to fail, as its specific subclass.
     """
     validate_name(skill.name)
     validate_domain(skill.domain)
@@ -423,15 +389,8 @@ def make_skill(
 ) -> Skill:
     """Build a validated :class:`~skillweaver.contracts.Skill`.
 
-    Normalizes the shapes a generator is likely to get slightly wrong - ``params`` as
-    a plain dict, ``requires`` as a list - and validates the result.
-
-    Args:
-        validate: ``False`` to skip :func:`validate_skill`; only for tests that need
-            a deliberately broken skill.
-
     Raises:
-        SkillInvalid: a subclass naming what was wrong.
+        SkillInvalid: if anything is structurally wrong.
     """
     skill = Skill(
         name=name,
@@ -452,12 +411,8 @@ def make_skill(
 
 
 def signature(skill: Skill) -> str:
-    """Render ``skill`` as the call a planner would write.
-
-    ``search_invoice(company: str, limit: int = 10)``. Parameters keep their declared
-    order except that optional ones move after required ones, so the result is always
-    a legal Python signature. ``ctx`` is left out: the runner supplies it.
-    """
+    """Render ``skill`` as the call a planner would write, e.g.
+    ``search_invoice(company: str)``."""
     required: list[str] = []
     optional: list[str] = []
     for name, schema in skill.params.items():
@@ -492,12 +447,8 @@ def _parse_time(raw: Any, field: str) -> datetime:
 
 
 def to_dict(skill: Skill, *, include_code: bool = True) -> dict[str, Any]:
-    """Serialize ``skill`` to JSON-ready primitives.
-
-    Args:
-        include_code: ``False`` omits ``code`` and ``verifier_code``, for a store
-            that keeps the source in its own file next to the metadata.
-    """
+    """Serialize ``skill`` to JSON-ready primitives. Round-trips through
+    :func:`from_dict`."""
     data: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "name": skill.name,
@@ -543,18 +494,8 @@ def from_dict(
 ) -> Skill:
     """Rebuild a :class:`~skillweaver.contracts.Skill` from :func:`to_dict` output.
 
-    Args:
-        code: the source, when ``data`` was written with ``include_code=False``.
-            It wins over any ``code`` in ``data``.
-        verifier_code: likewise for the verifier.
-        validate: ``True`` to re-run :func:`validate_skill` on the result. Off by
-            default so a store can always read back what it once wrote, even after
-            the rules tightened.
-
     Raises:
-        SkillWeaverError: on a missing field, a bad timestamp or an unknown
-            ``schema_version``.
-        SkillInvalid: when ``validate`` is on and the rebuilt skill is malformed.
+        SkillInvalid: if the payload is malformed or the skill does not validate.
     """
     found = data.get("schema_version", SCHEMA_VERSION)
     if found != SCHEMA_VERSION:

@@ -1,55 +1,18 @@
 """``SkillContext``: the entire world a stored skill can reach.
 
-A skill is Python source a model wrote. When it runs it gets exactly one object -
-``ctx`` - and this module is that object. If something is not on ``ctx`` it does not
-exist as far as skill code is concerned::
+A skill is Python source a model wrote. When it runs it gets exactly one object - ``ctx``
+- and this module is that object; if something is not on ``ctx`` it does not exist as far
+as skill code is concerned. ``sandbox.py`` compiles and executes the code.
 
-    def run(ctx, company):
-        ctx.ctl.type_text(company)                       # hands
-        rows = ctx.see.find_text(company, ElementKind.row)  # eyes, re-observed
-        ctx.expect(bool(rows), f"no row for {company}")  # a clean failure
-        ctx.ctl.click(rows[0])
-        ctx.expect(bool(ctx.wait_for_text("Invoice")), "the invoice never opened")
-        ctx.log(f"opened {company}")
-        return ctx.call("confirm_payment")               # composition
-
-Five deliberate omissions, each of which a model would otherwise reach for:
-
-*The raw controller.* ``ctx.ctl`` is an :class:`ActionView` - eight ways to act and
-nothing else. No ``capture``, no ``close``, no ``viewport``: a skill that wants to
-know what is on screen asks ``ctx.see``, which is a fresh observation, not a frame a
-skill has to decode itself.
-
-*Ground truth.* :class:`~skillweaver.contracts.GroundTruthSource` reads the DOM and
-is an offline teacher for labelling and scoring only. It is not merely absent from
-this surface, it is unreachable from it: nothing here holds a reference to one, so
-no amount of attribute walking finds it. An agent that works from pixels has to
-actually work from pixels.
-
-*Graph writing.* ``ctx.graph`` is wrapped in a :class:`ReadOnlyGraph`, so a skill can
-route but cannot teach the graph things it has not verified.
-
-``ctx.wait_for_text`` is ``ctx.see.find_text`` allowed to look again while the page
-answers - the one wait this surface offers, and it waits for a THING rather than for a
-TIME. See :data:`AWAIT_BUDGET_MS` for the control that makes it necessary.
-
-*Unbounded work.* Every action goes through the :class:`RunLedger`, which charges a
-step and checks the clock, so a skill cannot outrun its budget between two
-observations. The ledger is shared by a whole composition, so a skill that calls
-three skills is still held to one step budget. The clock it checks is the skill's
-OWN: time spent blocked in the controller or the detector is not charged, because a
-dense real page whose OCR takes four seconds is a slow world, not a runaway skill.
-That forgiveness is not a licence for the world to take forever: this clock cannot
-bound a call that is executing no Python at all, so the controller and the perceiver
-each bound their own - see :class:`~skillweaver.perception.ocr.OcrWorker` - and a
-failure of theirs arrives here as an exception, recorded by
-:meth:`RunLedger.note_perception_failure` so the skill is not blamed for it.
-
-*Silence.* ``ctx.log`` and every action land in the ledger's trace, which becomes
-``SkillResult.trace`` - the thing skill synthesis feeds back to a model when a skill
-needs repairing.
-
-``sandbox.py`` compiles and executes the code; this module is what that code sees.
+Five deliberate omissions. *The raw controller*: ``ctx.ctl`` is an :class:`ActionView`,
+eight ways to act and nothing else. *Ground truth* is not merely absent but unreachable -
+nothing here holds a reference to one, so no attribute walking finds it; an agent that
+works from pixels has to actually work from pixels. *Graph writing*: ``ctx.graph`` is a
+:class:`ReadOnlyGraph`. *Sleeping*: ``ctx.wait_for_text`` is the one wait offered, and it
+waits for a THING rather than a TIME (:data:`AWAIT_BUDGET_MS`). *Unbounded work*: every
+action goes through the :class:`RunLedger`, whose clock is the skill's OWN - time blocked
+in the controller or the detector is not charged, because a dense page whose OCR takes
+four seconds is a slow world, not a runaway skill.
 """
 
 from __future__ import annotations
@@ -124,36 +87,24 @@ TRUNCATED = "... trace truncated"
 AWAIT_BUDGET_MS = 4000.0
 """How long :meth:`SkillAPI.wait_for_text` will keep looking, by default.
 
-**Not a sleep, and not the reflex wait that was removed from skills.** The difference
-fits in one sentence: ``ctx.ctl.wait(ms)`` spends a fixed duration whatever the page
-does, while this returns the instant the text is on screen and therefore costs NOTHING
-on a page that already answered - its first look is the very observation the skill was
-about to make anyway. That is why one is stripped by
-:func:`~skillweaver.skills.refactor.strip_reflex_waits` and this one is written in by
-:meth:`~skillweaver.skills.refactor._Hardener.await_expected_reads`.
+**Not a sleep, and not the reflex wait that was removed from skills.** ``ctx.ctl.wait``
+spends a fixed duration whatever the page does; this returns the instant the text is
+there and costs NOTHING on a page that already answered.
 
 It exists because a control the page answers WITHOUT navigating is invisible to
 ``BrowserController._settle``, which waits for the load event. Measured on live
-splitkb.com on 2026-09-19: the click on "Add to cart" returned in 130ms with the
-document complete and the OLD url still showing, and the cart it redirects to did not
-commit until 1170ms. A skill recorded at model speed never sees that gap - a model was
-being asked what to do next between every pair of actions - and the same skill replayed
-at code speed reads the page it is still standing on and concludes, correctly for the
-screen in front of it, that the cart is empty.
-
-Four seconds is the same number :data:`~skillweaver.reset_actions.SETTLE_BUDGET_MS`
-carries and for the same reason: it only has to outlast one slow request, and a wait
-that will never be answered still says so within one budget rather than hanging.
-"""
+splitkb.com 2026-09-19: the "Add to cart" click returned in 130ms with the document
+complete and the OLD url showing, and the cart did not commit until 1170ms. A skill
+recorded at model speed never sees that gap; replayed at code speed it reads the page it
+is still standing on. Four seconds is ``SETTLE_BUDGET_MS`` for the same reason: it only
+has to outlast one slow request."""
 
 AWAIT_POLL_MS = 120.0
 """How long :meth:`SkillAPI.wait_for_text` pauses between looks.
 
-Each look is a real observation - detection and OCR - so this is not the thing that
-paces the loop; it is there so a perceiver that answers instantly is not spun flat out.
-An unchanged page is cheap to re-read by design: ``CachingTextReader`` is keyed on the
-exact pixels, so the second look at a page that has not moved pays no OCR at all.
-"""
+Each look is a real observation, so this does not pace the loop; it is there so a
+perceiver that answers instantly is not spun flat out. An unchanged page is cheap to
+re-read: ``CachingTextReader`` is keyed on the exact pixels."""
 
 
 # --------------------------------------------------------------------------------------
@@ -164,12 +115,10 @@ exact pixels, so the second look at a page that has not moved pays no OCR at all
 class LimitExceeded(SkillWeaverError):
     """A skill ran past one of the sandbox's hard limits.
 
-    Distinct from :class:`~skillweaver.errors.SandboxViolation` (the skill reached
-    for something it may not touch) and from
-    :class:`~skillweaver.errors.ExpectationFailed` (the screen was not what the skill
-    expected). Synthesis treats the three differently: a violation needs the code
-    rewritten, a limit needs it made shorter, a failed expectation may just mean the
-    skill was run in the wrong place.
+    Distinct from SandboxViolation (reached for something it may not touch) and
+    ExpectationFailed (the screen was not what it expected). Synthesis treats the three
+    differently: a violation needs the code rewritten, a limit needs it made shorter, a
+    failed expectation may just mean the skill was run in the wrong place.
     """
 
 
@@ -189,12 +138,9 @@ def default_max_seconds() -> float:
     """The configured skill time limit: ``SKILLWEAVER_SKILL_MAX_SECONDS``, else
     :data:`~skillweaver.config.DEFAULT_SKILL_MAX_SECONDS`.
 
-    Read at construction rather than at import, so a process that sets the variable
-    - the command line does, for ``--skill-max-seconds`` - gets the limit it asked
-    for without every caller of :class:`SkillLimits` having to thread it through. An
-    unreadable environment falls back to the default instead of refusing to run a
-    skill: a misspelt variable is a configuration complaint the command line already
-    makes, and it is not a reason for the sandbox to have no limit at all.
+    Read at construction rather than at import, so a process that sets the variable gets
+    the limit it asked for. An unreadable environment falls back to the default rather
+    than refusing to run a skill.
     """
     try:
         return settings().skill_max_seconds
@@ -206,22 +152,16 @@ def default_max_seconds() -> float:
 class SkillLimits:
     """Hard limits for one top-level skill execution, nested calls included.
 
-    These are the sandbox's own limits and are unrelated to
-    :class:`~skillweaver.contracts.Budget`, which governs a whole agent run. A skill
-    is meant to be a short, known procedure: if it needs more than this it is not a
-    skill yet.
+    The sandbox's own limits, unrelated to :class:`~skillweaver.contracts.Budget`, which
+    governs a whole agent run. A skill needing more than this is not a skill yet.
 
     Attributes:
-        max_steps: Controller actions the whole composition may perform.
         max_seconds: Seconds of the composition's OWN running time - see
-            :meth:`RunLedger.elapsed_seconds`, which does not count time spent
-            blocked in the controller or the perceiver. ``0`` disables the limit
-            entirely, which only a test has any business doing. Defaults to
-            :func:`default_max_seconds`, so the environment and the command line can
-            raise it for a slow site without this class being edited.
+            :meth:`RunLedger.elapsed_seconds`, which does not count time blocked in the
+            controller or the perceiver. ``0`` disables the limit entirely.
         max_depth: How deep ``ctx.call`` may nest; ``1`` forbids composition.
-        max_trace_lines: Trace lines kept before truncating, so a spinning skill
-            cannot exhaust memory through ``ctx.log``.
+        max_trace_lines: Trace lines kept before truncating, so a spinning skill cannot
+            exhaust memory through ``ctx.log``.
     """
 
     max_steps: int = 40
@@ -239,30 +179,16 @@ class SkillLimits:
 class RunLedger:
     """Mutable bookkeeping for ONE top-level execution, shared by every nested skill.
 
-    One ledger per ``SkillRunner.run`` at depth ``0``; ``ctx.call`` reuses it, which
-    is what makes the limits apply to a composition rather than to each skill in it.
-    Not thread-safe, like everything else on the action path.
+    One ledger per ``SkillRunner.run`` at depth ``0``; ``ctx.call`` reuses it, which makes
+    the limits apply to a composition rather than to each skill in it. Not thread-safe.
 
-    Inspect ``steps``, ``depth``, ``stack`` and ``trace`` after a run; the runner
-    turns them into a :class:`~skillweaver.contracts.SkillResult`.
-
-    What the clock does and does not count
-    --------------------------------------
-
-    The time limit exists to interrupt a runaway loop in code a model wrote. It is
-    NOT a budget for how long the world may take to answer, and the two used to be
-    conflated: a Wikipedia article is dense enough that one screenshot plus OCR takes
-    seconds, so a three-observation skill that did its job perfectly could spend its
-    whole allowance sitting still and be killed for it. That is what
-    :meth:`blocked` fixes. Time inside the controller or the perceiver is banked in
-    ``blocked_seconds`` and subtracted, so :attr:`elapsed_seconds` is the time the
-    skill's own Python was running.
-
-    Nothing is lost by this. A skill that spins is spinning in its own code and the
-    tracer in ``sandbox.py`` still catches it within microseconds; a skill that acts
-    forever is stopped by ``max_steps``; and a skill that sleeps on purpose through
-    ``ctx.ctl.wait`` IS charged, because a deliberate sleep is the skill spending its
-    own time rather than the page being slow.
+    The time limit exists to interrupt a runaway loop in code a model wrote, NOT to budget
+    how long the world may take to answer. The two were conflated: a Wikipedia article is
+    dense enough that one screenshot plus OCR takes seconds, so a three-observation skill
+    could spend its whole allowance sitting still. Time inside the controller or the
+    perceiver is banked by :meth:`blocked` and subtracted. Nothing is lost - a spinning
+    skill is caught by the sandbox tracer, one that acts forever by ``max_steps``, and
+    ``ctx.ctl.wait`` IS charged because a deliberate sleep is the skill's own time.
     """
 
     limits: SkillLimits = field(default_factory=SkillLimits)
@@ -288,25 +214,19 @@ class RunLedger:
 
     @property
     def elapsed_seconds(self) -> float:
-        """Seconds the skill's OWN code has been running: wall-clock since the ledger
-        was created, less :attr:`blocked_seconds`.
-
-        Never negative and never decreasing while no wait is open, so the message a
-        :class:`TimeLimitExceeded` carries is a number a reader can act on.
-        """
+        """Seconds the skill's OWN code has been running: wall-clock since the ledger was
+        created, less :attr:`blocked_seconds`. Never negative and never decreasing while
+        no wait is open."""
         return max(time.monotonic() - self.started - self.blocked_seconds, 0.0)
 
     @contextmanager
     def blocked(self) -> Iterator[None]:
         """Hold the clock for the duration of a wait on the world.
 
-        Re-entrant, and it stops the clock from the moment it is entered rather than
-        banking the time on the way out: the deadline tracer fires while a screenshot
-        is still being taken, so a limit that only learned about the wait afterwards
-        would trip during exactly the wait it was meant to forgive.
-
-        Never swallows the exception a failing controller or perceiver raises; the
-        time is banked on the way out either way.
+        Re-entrant, and it stops the clock on ENTRY rather than banking on the way out:
+        the deadline tracer fires while a screenshot is still being taken, so a limit
+        that only learned about the wait afterwards would trip during exactly the wait it
+        was meant to forgive. Never swallows the exception; the time is banked either way.
         """
         if self._blocked_depth == 0:
             self._blocked_since = time.monotonic()
@@ -322,28 +242,22 @@ class RunLedger:
     def note_perception_failure(self, why: str) -> None:
         """Record that an OBSERVATION failed during this run, and say so in the trace.
 
-        Kept separately from the trace because it changes a verdict, not just a
-        report. A skill whose eyes stopped working has not failed its task - nothing
-        at all has been learned about it - and ``sandbox.py`` reads this list to
-        decide not to hold the run against it. See :meth:`SkillAPI.observe`, which is
-        the only place that calls this.
+        Kept separately because it changes a verdict, not just a report: a skill whose
+        eyes stopped working has not failed its task, and ``sandbox.py`` reads this list
+        to decide not to hold the run against it.
         """
         self.perception_failures.append(why)
         self.note(f"perception FAILED: {why}")
 
     def check_time(self) -> None:
-        """Raise :class:`TimeLimitExceeded` once the limit is reached.
+        """Raise :class:`TimeLimitExceeded` once the limit is reached. ``max_seconds`` of
+        ``0`` means no limit.
 
-        ``max_seconds`` of ``0`` means no limit; see :class:`SkillLimits`.
-
-        This is a PYTHON-level check and it can only fire while Python is running.
-        It is reached from :meth:`charge_step`, from the runner, and from a trace hook
-        that fires every few frames - all three of which a call that has wedged inside
-        a native library executes none of. Bounding such a call is the job of whoever
-        makes it; :class:`~skillweaver.perception.ocr.OcrWorker` is where perception
-        does it, and it is the reason this ledger sees a
-        :class:`~skillweaver.errors.PerceptionError` rather than never being reached
-        again.
+        A PYTHON-level check that can only fire while Python is running - reached from
+        :meth:`charge_step`, from the runner and from a trace hook, none of which a call
+        wedged inside a native library executes. Bounding such a call is the job of
+        whoever makes it; :class:`~skillweaver.perception.ocr.OcrWorker` is where
+        perception does it.
         """
         limit = self.limits.max_seconds
         if limit > 0:
@@ -357,12 +271,11 @@ class RunLedger:
     # -- steps --------------------------------------------------------------------------
 
     def charge_step(self, description: str) -> None:
-        """Charge one controller action, after checking both the clock and the step
-        budget.
+        """Charge one controller action, after checking both the clock and the step budget.
 
         Raises:
-            TimeLimitExceeded, StepLimitExceeded: when no budget remains. The action
-                is NOT performed, because the check happens first.
+            TimeLimitExceeded, StepLimitExceeded: when no budget remains. The action is
+                NOT performed, because the check happens first.
         """
         self.check_time()
         limit = self.limits.max_steps
@@ -378,9 +291,8 @@ class RunLedger:
         """Enter one skill, holding the composition depth for its duration.
 
         Raises:
-            DepthLimitExceeded: naming the call chain, when entering would nest past
-                ``SkillLimits.max_depth``. Mutual recursion between two skills stops
-                here rather than in the interpreter.
+            DepthLimitExceeded: naming the call chain. Mutual recursion between two
+                skills stops here rather than in the interpreter.
         """
         limit = self.limits.max_depth
         if self.depth >= limit:
@@ -456,20 +368,16 @@ def _point_of(target: Point | Box | Element) -> Point:
 
 
 class ActionView:
-    """A :class:`~skillweaver.contracts.ActionSurface`: a controller narrowed to the
-    eight things a skill is allowed to do to the screen.
+    """A controller narrowed to the eight things a skill may do to the screen.
 
     Every action is charged to the ledger BEFORE it is performed and invalidates the
-    cached observation afterwards, whether or not it worked - a refused click can
-    still have moved the UI. Unlike ``Controller.perform``, a failure raises
-    :class:`~skillweaver.errors.ControllerError` so straight-line skill code does not
-    have to check a result it would only ignore.
+    cached observation afterwards, whether or not it worked - a refused click can still
+    have moved the UI. Unlike ``Controller.perform``, a failure raises ControllerError so
+    straight-line skill code need not check a result it would only ignore.
 
-    The time an action spends inside the controller is not charged to the skill's
-    clock - a browser that takes a second to settle after a click is a slow browser,
-    not a runaway skill - with one exception: a :class:`~skillweaver.contracts.Wait`
-    IS charged, because a skill asking to sleep is spending its own time and is
-    exactly the shape a "just wait longer" repair takes.
+    Controller time is not charged to the skill's clock, with one exception: a ``Wait``
+    IS, because a skill asking to sleep is spending its own time and is exactly the shape
+    a "just wait longer" repair takes.
 
     The wrapped controller is held in a private slot and is not reachable from skill
     code: the sandbox rejects ``_``-prefixed attribute access at compile time.
@@ -545,11 +453,10 @@ class ActionView:
 
 
 class ReadOnlyGraph:
-    """The three query methods of a :class:`~skillweaver.contracts.GraphView`, over a
-    graph that may well be a writable :class:`~skillweaver.contracts.SiteGraph`.
+    """The three query methods of a GraphView, over a graph that may well be writable.
 
-    Wrapping rather than passing the graph through is the point: skill code can route
-    but cannot record a transition it never verified, or save one over the real graph.
+    Wrapping rather than passing the graph through is the point: skill code can route but
+    cannot record a transition it never verified.
     """
 
     __slots__ = ("_graph",)
@@ -574,12 +481,10 @@ class ReadOnlyGraph:
 
 
 class NullGraph:
-    """A :class:`~skillweaver.contracts.GraphView` that knows nothing.
+    """A GraphView that knows nothing.
 
-    ``ctx.graph`` is always present, so a skill written against it does not have to
-    guard for the graph being missing; with no graph configured it simply finds no
-    routes. "Nothing is known" and "there is no graph" look the same from inside a
-    skill, which is the honest answer to both.
+    ``ctx.graph`` is always present, so a skill written against it need not guard for the
+    graph being missing; with none configured it simply finds no routes.
     """
 
     __slots__ = ()
@@ -606,15 +511,15 @@ anything about compiling or executing one."""
 
 
 class SkillAPI:
-    """The :class:`~skillweaver.contracts.SkillContext` handed to ``run(ctx, ...)``.
+    """The SkillContext handed to ``run(ctx, ...)``.
 
-    Build one with ``SkillRunner.context(...)`` rather than directly: the runner has
-    to wire ``invoke`` to itself for ``ctx.call`` to work, and has to share the
-    ledger for the limits to cover a whole composition.
+    Build one with ``SkillRunner.context(...)``: the runner has to wire ``invoke`` to
+    itself for ``ctx.call`` to work, and has to share the ledger for the limits to cover
+    a whole composition.
 
-    ``ledger`` is public because the runner reads it to build a ``SkillResult``.
-    Skill code cannot reach it: it is not a documented member of ``SkillContext``,
-    and any attempt is one more name the sandbox's static check rejects.
+    ``ledger`` is public because the runner reads it to build a ``SkillResult``. Skill
+    code cannot reach it: it is not a documented member of ``SkillContext``, and any
+    attempt is one more name the sandbox's static check rejects.
     """
 
     __slots__ = (
@@ -661,13 +566,10 @@ class SkillAPI:
     def see(self) -> ElementIndex:
         """Eyes: an index of the screen AS IT IS NOW.
 
-        The observation is cached until the next action through ``ctl``, so reading
-        ``ctx.see`` twice in a row costs one capture, and reading it after acting
-        costs a fresh one. Never hold on to it across an action.
+        Cached until the next action through ``ctl``, so reading ``ctx.see`` twice in a
+        row costs one capture. Never hold on to it across an action.
 
-        Observing costs no time against the skill's limit, however slow the page: a
-        capture and an OCR pass on a dense article can take seconds, and charging
-        them would kill honest skills for reading a real web page.
+        Observing costs no time against the skill's limit, however slow the page.
 
         Raises:
             PerceptionError: if observing fails.
@@ -683,9 +585,8 @@ class SkillAPI:
     def call(self, name: str, **kwargs: Any) -> Any:
         """Run another skill of this skill's domain and return its value.
 
-        The callee shares this context: the same controller, the same ledger and the
-        same trace, so its actions count against the caller's budget and its log
-        lines appear in the caller's trace.
+        The callee shares this context - the same controller, ledger and trace - so its
+        actions count against the caller's budget.
 
         Raises:
             SkillNotFound: if no such skill exists, or no store is configured.
@@ -700,18 +601,17 @@ class SkillAPI:
     def expect(self, condition: bool, why: str) -> None:
         """Assert something about the screen.
 
-        This is how a skill fails HONESTLY: a false ``condition`` means the world was
-        not as the skill requires, which is a clean failure and not a bug in the
-        code. The sandbox reports it as such, so synthesis does not try to repair
-        code that was right.
+        How a skill fails HONESTLY: a false ``condition`` means the world was not as the
+        skill requires, which the sandbox reports as such, so synthesis does not try to
+        repair code that was right.
 
         Raises:
             ExpectationFailed: with ``why`` as its message, when ``condition`` is false.
         """
         if condition:
-            # ``why`` describes the FAILURE, so "ruled out: ..." is the only phrasing
-            # that does not read, in a trace a model will later be asked to repair
-            # from, as an assertion that the bad thing happened.
+            # ``why`` describes the FAILURE, so "ruled out: ..." is the only phrasing that
+            # does not read, in a trace a model will be asked to repair from, as an
+            # assertion that the bad thing happened.
             self.ledger.note(f"ruled out: {why}")
             return
         self.ledger.note(f"expect FAILED: {why}")
@@ -733,42 +633,22 @@ class SkillAPI:
     ) -> list[Element]:
         """``ctx.see.find_text`` that is allowed to look again while the page answers.
 
-        Returns the matching elements, best first, exactly as ``find_text`` does - and
-        an empty list when the budget ran out without them ever appearing, so a caller
-        checks the result rather than catching something. Pair it with ``ctx.expect``,
-        which is what turns "it never arrived" into an honest failure::
+        Returns the matching elements best first, exactly as ``find_text`` does, and an
+        empty list when the budget ran out; pair it with ``ctx.expect``, which turns "it
+        never arrived" into an honest failure.
 
-            ctx.ctl.click(add_to_cart[0])
-            cart = ctx.wait_for_text("Subtotal")
-            ctx.expect(bool(cart), "the cart never appeared after Add to cart")
+        **Wait for a THING, not for a TIME** - the whole difference from ``ctx.ctl.wait``,
+        which ``strip_reflex_waits`` removes on sight. On a page that already answered,
+        the first look IS the observation the skill was about to make, so the fast path
+        pays nothing.
 
-        **Wait for a THING, not for a TIME.** That one line is the whole difference
-        between this and ``ctx.ctl.wait(ms)``, which
-        :func:`~skillweaver.skills.refactor.strip_reflex_waits` removes on sight: a
-        duration is spent whether or not it was needed, and this returns the moment the
-        text is there. On a page that has already answered the first look IS the
-        observation the skill was about to make, so the fast path pays nothing - which
-        is the property that let this ship beside a measured 2x speedup rather than
-        against it. See :data:`AWAIT_BUDGET_MS` for the measurement that makes it
-        necessary at all.
+        Matching is ``fuzzy=False``, and that is not a detail: a wait decides which SCREEN
+        the rest of the skill acts on, and a near match answers on the screen it was meant
+        to wait out - asked fuzzily for "Your cart" on splitkb's product page, the "Add to
+        cart" button answers. Name text only the ANSWERED screen says.
 
-        Matching is ``fuzzy=False`` - equality or containment, case-insensitive - and
-        that is not a detail. A wait decides which SCREEN the rest of the skill acts
-        on, and a near match answers on the screen it was supposed to wait out: asked
-        fuzzily for "Your cart" while still standing on the product page, the "Add to
-        cart" button answers. This is the same choice, for the same reason, that
-        ``_says`` makes in :mod:`skillweaver.reset_actions`. Name text that only the
-        ANSWERED screen says.
-
-        The time spent looking is banked as blocked, not charged: a page taking a
-        second to commit is a slow world, not a runaway skill, and charging it would
-        make the skill that waits correctly look more expensive than the one that reads
-        too early and fails. The budget is what bounds it.
-
-        Args:
-            text: What the answered screen says. Not what the current one says.
-            kind: Restrict to one element kind, as ``find_text`` does.
-            budget_ms: How long to keep looking. Default :data:`AWAIT_BUDGET_MS`.
+        Time spent looking is banked as blocked, not charged: charging it would make the
+        skill that waits correctly look more expensive than the one that reads too early.
 
         Raises:
             PerceptionError: if observing fails, as ``ctx.see`` does.
@@ -800,19 +680,17 @@ class SkillAPI:
         return self.ledger.current_domain or self._domain
 
     def observe(self) -> Observation:
-        """The current (possibly cached) observation. ``ctx.see`` is its index; a
-        planner or the runner may want the screenshot, url or fingerprint too.
+        """The current (possibly cached) observation. ``ctx.see`` is its index; a planner
+        or the runner may want the screenshot, url or fingerprint too.
 
-        The time the perceiver takes is banked as blocked, not charged - see
-        :meth:`RunLedger.blocked`.
+        Perceiver time is banked as blocked, not charged.
 
         Raises:
-            PerceptionError: whatever the perceiver raises, recorded on the ledger
-                first through :meth:`RunLedger.note_perception_failure`. The record is
-                what keeps the blame straight: a read that was abandoned because the
-                OCR engine wedged is not this skill failing, and the run must not be
-                counted against it - including in the case where skill code catches
-                the exception and then fails for its own reasons.
+            PerceptionError: whatever the perceiver raises, recorded on the ledger first
+                through :meth:`RunLedger.note_perception_failure`. That record keeps the
+                blame straight: a read abandoned because the OCR engine wedged is not this
+                skill failing, including when skill code catches it and then fails for its
+                own reasons.
             TimeLimitExceeded: if the limit is already spent.
         """
         if self._observation is None:

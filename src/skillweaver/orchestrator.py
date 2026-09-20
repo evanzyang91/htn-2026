@@ -1,7 +1,4 @@
-"""The cold-versus-warm decision, and the wiring that makes it runnable.
-
-Eighteen modules in this project each do one thing well. This one decides which of
-them gets to answer a task, and that decision is the product::
+"""The cold-versus-warm decision, and the wiring that makes it runnable::
 
     retrieve  ->  WARM: plan from stored skills and run it
                     |
@@ -11,47 +8,15 @@ them gets to answer a task, and that decision is the product::
                     |
                     +-- succeeded -> synthesize, gate, store -> next time is WARM
 
-Why the fall-through is reported rather than hidden
----------------------------------------------------
+A fall-through is REPORTED, never hidden: ``RunReport`` carries an ``AttemptRecord`` per
+path tried, and ``rescued`` / ``warm_missed`` keep a warm miss out of the headline
+"SOLVED by the cold path", which is the sentence that has hidden a defect for months.
 
-The tempting shape for this module is "try the fast thing, and if it does not work,
-quietly do the slow thing" - a caller then only ever sees success, and the library
-looks flawless while it silently rots. So every :class:`RunReport` carries an
-:class:`AttemptRecord` **per path attempted**, including the warm attempt that failed,
-what stage it failed at, and whether a skill was demoted for it. A warm run that was
-rescued by exploration reports ``rescued`` and both records; it is the most
-informative thing that can happen to this system and it is never flattened into a
-plain success. :meth:`RunReport.explain` is the paragraph a human reads.
-
-What "zero model calls" needs from this module
------------------------------------------------
-
-The warm path is model-free in its action loop only if the critic that judges it is
-too, and :class:`~skillweaver.agent.critic.TieredCritic` is programmatic only when it
-has something free to run. What this module supplies is :func:`recall_end_state`: the
-screen the recorded run that TAUGHT the skill ended on, read back from the trajectory
-store. A warm run that lands there is a decisive, free yes. It is handed over as
-*corroboration* and not as evidence, because a mismatch means "this replay was given
-a different argument" at least as often as it means "this replay failed" - see
-:func:`recall_end_state`. When it does not match, or cannot be recalled at all, the
-critic escalates to a model and pays for one call.
-
-And a cost that is not counted is a cost that gets claimed as a saving, so
-:class:`Agent` charges each attempt every model call made while it ran - read from
-the client's own ``total_usage`` across the attempt - rather than only the calls that
-survived into a returned outcome. A composer call spent on a plan that was then
-thrown away at routing used to vanish from the report, and a warm path that is
-cheaper on paper than in the bill is the one bug this project cannot ship.
-
-Budgets
--------
-
-:class:`~skillweaver.contracts.Budget` bounds a run four ways. The planner
-deliberately lets ``BudgetExceeded`` escape so an exhausted run stops rather than
-falling through to a slower path; :class:`Agent` honours that by recording the
-exhaustion as the warm attempt's failure and **not** exploring afterwards. Falling
-back to the expensive path after running out of money is the one fallback that is
-always wrong.
+Two costs are counted here for the same reason. ``Agent._charge_model`` reads each
+attempt's spend from the client's own ``total_usage`` across it, so a composer call
+whose plan was discarded is not lost; and a ``BudgetExceeded`` from the planner is
+recorded as the warm failure and NOT explored after - falling back to the expensive path
+having run out of money is the one fallback that is always wrong.
 """
 
 from __future__ import annotations
@@ -75,7 +40,7 @@ from skillweaver.agent.planner import (
     bind_args,
     fit_through_family,
 )
-from skillweaver.config import Settings, settings
+from skillweaver.config import Settings, browser_backend, settings
 from skillweaver.contracts import (
     Budget,
     Candidate,
@@ -177,48 +142,24 @@ log = get_logger(__name__)
 Path_ = Literal["warm", "cold"]
 
 SynthesisFactory = Callable[[Trajectory], Synthesizer]
-"""Builds the synthesizer for one trajectory.
-
-A factory rather than an instance because the admission gate's critic wants to know
-where the recorded run ENDED, and that is only knowable once the run has happened.
-"""
+"""A factory and not an instance because the gate's critic wants to know where the
+recorded run ENDED, which is only knowable once it has happened."""
 
 EnvironmentFor = Callable[[Trajectory], EnvironmentFactory | None]
-"""Builds the admission gate's replay environment for one trajectory, or declines.
-
-The gate re-runs a candidate skill from the screen the recording STARTED on, and where
-that is depends on the run: an exploration that rescued a failed warm attempt began
-wherever the warm attempt left the screen, not at the task's start URL. So the reset is
-resolved per trajectory rather than per task.
-
-``None`` means this world cannot be put back there - a desktop that cannot navigate, a
-run whose first screen has no URL - and the caller then admits nothing and says why.
-"""
+"""The gate's replay world for one trajectory, or ``None`` when this world cannot be put
+back there. Per trajectory and not per task: an exploration that rescued a failed warm
+attempt began wherever that attempt left the screen, not at the task's start URL."""
 
 WorldReset = Callable[[], None]
-"""Put the world back the way it was before the run: "how do I undo this?".
+""""How do I undo this?" - re-opening a screen is NOT it. A task worth learning changes
+something, so without a way back the gate can never stand a candidate where the recording
+stood and no such skill is ever admitted.
 
-Re-opening a screen is not this. Most tasks worth learning CHANGE something - a
-message is archived, an invoice is paid, a row is deleted - and the screen the run
-started on no longer exists once they have. Without a way back, the admission gate
-can never stand a candidate where the recording stood, so no skill for such a task
-can ever be admitted. That is not a corner case; it is most of the product.
-
-What counts as one is whatever that world actually offers: a seed-restoring endpoint
-(:func:`world_reset_from_url`), a database snapshot rolled back, a container
-replaced, a fresh profile. skillweaver does not care which - it only needs the call.
-
-Raises (by contract): anything, and the caller treats a failure as "not restored"
-rather than as a crash; a gate that cannot reset still has a report to write.
-:class:`ResetRefused` is the one distinguished failure - "this endpoint is not a reset
-hook and never will be" as opposed to "it did not work this time" - and
-:class:`ResetReport` is how the difference reaches a human.
+Whatever that world offers counts: a seed endpoint (``world_reset_from_url``), a snapshot,
+a fresh profile, steps performed on the screen (``reset_actions``). It may raise anything
+and the caller reads that as "not restored"; ``ResetRefused`` is the one distinguished
+failure, meaning "this is not a reset hook and never will be".
 """
-
-
-# --------------------------------------------------------------------------------------
-# What a run reports about itself
-# --------------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,39 +167,23 @@ class AttemptRecord:
     """One path the agent tried, and what came of it.
 
     Attributes:
-        path: ``"warm"`` (compose stored skills) or ``"cold"`` (explore).
-        ok: Whether this attempt achieved the task.
-        reason: One human-readable line. On a warm failure this is the planner's
-            :class:`~skillweaver.agent.planner.PlanFailure` reason; on a cold failure
-            it is the explorer's rendered diagnosis.
-        stage: Where it stopped. For warm, a
-            :data:`~skillweaver.agent.planner.FailureStage` or ``"empty_library"`` /
-            ``"budget"``; for cold, the diagnosis' ``stopped_by``. Empty on success.
-        skills_used: The stored skills this attempt ran, in order.
-        steps: Controller actions performed.
-        llm_calls: Model calls this attempt was charged for. **Zero is the claim the
-            warm path exists to make**, which is exactly why it is read from the
-            model client across the attempt rather than from the plan the attempt
-            happened to return: a call spent on a plan that was discarded is still a
-            call, and leaving it out flatters every efficiency figure downstream.
-        usd: Model spend charged to this attempt, counted the same way.
-        seconds: Wall-clock seconds the attempt was charged.
-        perception: What the eyes did during this attempt - observations, captures,
-            detections and, above all, OCR reads against cache hits. It sits beside
-            ``llm_calls`` and ``usd`` because it is the same kind of fact: the cost
-            of the attempt, stated as a count so it means the same thing on a busy
-            machine as on an idle one.
-        cross_mode: When this attempt lost the screen and the library was recorded in
-            the OTHER render mode, the sentence saying so; ``None`` otherwise. Its own
-            field rather than a ``stage``, because ``stage`` must keep saying where the
-            attempt actually stopped - ``no_route`` - while this says what most likely
-            put it there. See :mod:`skillweaver.render_mode`.
-        demoted: The skill retired because it ran and failed, or ``None``.
-        performed_nothing: Whether the screen is untouched, so the next path may
-            start from it as it stands.
-        run_id: The trajectory this attempt recorded, when it recorded one.
-        trace: The failed skill's sandbox trace - a play-by-play of what the library
-            thought would work, and the most useful thing a failed warm run leaves.
+        reason: The planner's ``PlanFailure`` reason (warm) or the explorer's rendered
+            diagnosis (cold).
+        stage: A ``FailureStage``, ``"empty_library"`` or ``"budget"`` for warm; the
+            diagnosis' ``stopped_by`` for cold. Empty on success.
+        llm_calls: ZERO is the claim the warm path exists to make, which is why this is
+            read from the model client across the attempt and not from the plan it
+            returned - a call spent on a discarded plan is still a call.
+        usd: Model spend, counted the same way.
+        perception: What the eyes did, as COUNTS, so it means the same on a busy machine
+            as on an idle one.
+        cross_mode: The render-mode crossing that most likely lost the screen. Its own
+            field, not a ``stage``, because ``stage`` must keep saying where the attempt
+            stopped (``no_route``) while this says what put it there.
+        demoted: The skill retired because it ran and failed.
+        performed_nothing: Whether the screen is untouched, so the next path may start
+            from it as it stands.
+        trace: The failed skill's sandbox trace - the most useful thing a warm miss leaves.
     """
 
     path: Path_
@@ -290,24 +215,11 @@ class AttemptRecord:
 
 @dataclass(frozen=True, slots=True)
 class RunReport:
-    """Everything one :meth:`Agent.run` did, and why it did it that way.
+    """Everything one ``Agent.run`` did, so "which path ran?" is never a guess.
 
-    This type exists so that "which path ran?" is never a guess. ``decision`` names
-    the path that produced the answer; ``attempts`` holds every path that was tried,
-    failures included, in the order they were tried.
-
-    Attributes:
-        ok: Whether the task was achieved by any path.
-        task: What was asked.
-        decision: The path that produced the result, or ``"none"`` when none did.
-        attempts: One :class:`AttemptRecord` per path tried, in order.
-        candidates: The skills retrieval offered before anything was attempted.
-        outcome: The winning path's :class:`~skillweaver.contracts.RunOutcome`, or
-            the last failed one when nothing worked. ``None`` if nothing ran.
-        admission: The admission gate's verdict, when a cold success was fed to it.
-        learned: The skill that entered the library because of this run, or ``None``.
-        learning_note: Why nothing was learned, when ``learned`` is ``None`` and the
-            run succeeded cold.
+    ``decision`` names the path that produced the answer and ``attempts`` holds every path
+    tried, failures included, in order. ``outcome`` is the winner's, or the last failure
+    when nothing worked; ``learning_note`` says why nothing was learned.
     """
 
     ok: bool
@@ -322,7 +234,7 @@ class RunReport:
 
     @property
     def warm(self) -> AttemptRecord | None:
-        """The warm attempt, or ``None`` when the warm path was not tried."""
+        """The warm attempt, or ``None`` when it was not tried."""
         return next((a for a in self.attempts if a.path == "warm"), None)
 
     @property
@@ -332,16 +244,9 @@ class RunReport:
 
     @property
     def rescued(self) -> bool:
-        """Whether the library RAN something, it did not work, and exploration saved it.
-
-        The single most important thing this report can say: the library believed it
-        knew this task, acted on that belief, and was wrong. Treating that as a plain
-        success is how a skill library quietly stops being true.
-
-        A warm path that declined before touching the screen - an empty library, no
-        candidate, no route - is not a rescue. It is an ordinary cold start, and
-        calling it a rescue would cry wolf on every first run.
-        """
+        """The library RAN something, it did not work, and exploration saved it - the most
+        important thing this report can say. A warm path that declined before touching the
+        screen is an ordinary cold start, not a rescue; see ``warm_missed``."""
         warm, cold = self.warm, self.cold
         return (
             warm is not None
@@ -353,22 +258,13 @@ class RunReport:
 
     @property
     def warm_missed(self) -> bool:
-        """Whether the library was consulted, could not plan the task, and exploring paid.
+        """The library was consulted, declined before touching the screen, and exploring
+        paid full price.
 
-        :attr:`rescued` is the louder cousin of this: there the library RAN something
-        and was wrong. Here it declined before touching the screen - an empty
-        namespace, no candidate, no route - and the run then explored.
-
-        That is a legitimate cold start on a task nobody has taught yet, and it is
-        also exactly what a lookup in the WRONG namespace looks like. The two are
-        indistinguishable from the outside, which is the whole problem: ``run``
-        without a ``--url`` used to resolve its domain to the literal string
-        ``"browser"``, miss a library it was standing next to, explore from a blank
-        page and print ``SOLVED by the cold path``. True, and useless. So every
-        fall-through says that the library was consulted and what it said, and the
-        verdict line says the answer cost full price - see :meth:`explain`. A cold
-        path that is reported as a plain success is how a defect like that survives
-        for months.
+        A legitimate cold start looks EXACTLY like a lookup in the wrong namespace - ``run``
+        without a ``--url`` once resolved its domain to the literal ``"browser"``, missed a
+        library it was standing next to, and printed ``SOLVED by the cold path``. So every
+        fall-through says so in the headline.
         """
         warm, cold = self.warm, self.cold
         return (
@@ -381,23 +277,18 @@ class RunReport:
 
     @property
     def llm_calls(self) -> int:
-        """Model calls across every attempt of this run."""
+        """Model calls across every attempt."""
         return sum(a.llm_calls for a in self.attempts)
 
     @property
     def steps(self) -> int:
-        """Controller actions performed across every attempt of this run."""
+        """Controller actions across every attempt."""
         return sum(a.steps for a in self.attempts)
 
     @property
     def perception(self) -> PerceptionCounts:
-        """What the eyes did across every attempt of this run.
-
-        The headline this whole optimization is judged by is
-        ``report.perception.ocr_reads``: a task that used to need one OCR read per
-        observation and now needs one per CHANGED screen says so here, in a number that
-        does not move when the machine is loaded.
-        """
+        """What the eyes did across every attempt; ``ocr_reads`` is the number the OCR
+        cache is judged by, and it does not move with machine load."""
         total = PerceptionCounts()
         for attempt in self.attempts:
             total = total + attempt.perception
@@ -448,10 +339,8 @@ class RunReport:
                 f"({eyes.hit_rate:.0%}), {eyes.detections} detection(s)"
             )
         verdict = "SOLVED" if self.ok else "NOT SOLVED"
-        # "SOLVED by the cold path" on its own reads as a plain success, and after a
-        # warm attempt that was tried and missed it is the single most misleading
-        # sentence this report can end on: the fast path did not apply, and the
-        # headline is where that has to be said.
+        # "SOLVED by the cold path" alone reads as a plain success, and after a warm miss
+        # it is the most misleading sentence this report can end on.
         after = " AFTER A WARM MISS" if (self.rescued or self.warm_missed) else ""
         lines.append(
             f"{verdict} by the {self.decision} path{after} "
@@ -460,38 +349,18 @@ class RunReport:
         return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------------------
-# The decision
-# --------------------------------------------------------------------------------------
-
-
 class Agent:
     """Runs one task by deciding between the warm and the cold path.
 
     Args:
-        controller: The hands, already open and pointed at the right world.
-        perceiver: The eyes.
-        store: The skill library. Read for the warm path, written by admission.
-        retriever: Finds candidates. Consulted once here for the report, and again
-            inside the planner - both are lexical-and-embedding lookups outside the
-            action loop, and the duplicate buys a report that names what was offered.
-        planner: The warm path.
-        explorer: The cold path.
-        graph: The site graph. Saved after a run so what was learned survives.
-        trajectories: Where a cold run's trajectory is persisted.
-        synthesis: Builds the synthesizer for a finished trajectory. ``None``
-            disables learning, and the report says so rather than pretending.
-        environment: Builds the admission gate's world for a finished trajectory,
-            reset to the screen that run STARTED on. ``None`` - or a call that
-            returns ``None`` - disables learning for this run, because a skill that
-            has not been re-run has not proved anything.
-        llm: The model client the planner, the explorer and the critics were wired
-            with. Never called here: it is read, through ``total_usage``, to charge
-            each attempt every call made while it ran. ``None`` falls back to what
-            each attempt reports about itself, which undercounts a plan that was
-            discarded after the composer had already paid for it.
-        budget: Limits for one :meth:`run`.
-        top_k: How many candidates to retrieve for the report.
+        retriever: Consulted here for the report and again inside the planner; both are
+            outside the action loop, and the duplicate buys a report naming what was offered.
+        synthesis: ``None`` disables learning, and the report says so rather than pretending.
+        environment: The gate's world, reset to the screen the run STARTED on. ``None``, or a
+            call returning ``None``, disables learning: an un-re-run skill has proved nothing.
+        llm: Never called here - only READ, through ``total_usage``, to charge each attempt
+            every call made while it ran. ``None`` falls back to what each attempt says about
+            itself, which undercounts a plan discarded after the composer paid for it.
     """
 
     __slots__ = (
@@ -546,8 +415,8 @@ class Agent:
 
     @property
     def controller(self) -> Controller:
-        """The open world. Exposed so a command can replay a recorded run against the
-        same browser this session opened, rather than opening a second one."""
+        """The open world, exposed so a command can replay against the browser this session
+        opened rather than a second one."""
         return self._controller
 
     @property
@@ -557,30 +426,17 @@ class Agent:
 
     @property
     def budget(self) -> Budget:
-        """The limits this agent will run one task under."""
+        """The limits one task runs under."""
         return self._budget
-
-    # -- the decision ------------------------------------------------------------------
 
     def run(
         self, task: TaskSpec, *, learn: bool = True, warm: bool = True, cold: bool = True
     ) -> RunReport:
-        """Do ``task`` and report which path did it.
+        """Do ``task`` and report which path did it; a failure is a report, not an exception.
 
-        Args:
-            task: What to do.
-            learn: Whether a cold success should be offered to the admission gate.
-            warm: Whether the warm path may be tried at all. ``False`` forces
-                exploration, which is what ``learn`` on the command line wants.
-            cold: Whether exploration may be tried. ``False`` makes this a
-                library-only run that reports honestly when the library falls short.
-
-        Returns:
-            A :class:`RunReport`. A failure is a report, not an exception.
-
-        Raises:
-            ControllerError: if the controller breaks mid-run.
-            ProviderError: if a model call fails outright.
+        ``warm=False`` forces exploration, which is what the ``learn`` command wants;
+        ``cold=False`` makes this library-only and reports honestly when the library falls
+        short.
         """
         candidates = self._retrieve(task)
         attempts: list[AttemptRecord] = []
@@ -602,9 +458,8 @@ class Agent:
                     learning_note="the skill was already in the library",
                 )
             if record.stage == "budget":
-                # The planner lets BudgetExceeded escape so an exhausted run STOPS.
-                # Exploring now would spend money the run has already been told it
-                # does not have.
+                # The planner lets BudgetExceeded escape so an exhausted run STOPS:
+                # exploring now spends money the run was told it does not have.
                 self._persist()
                 return RunReport(
                     ok=False,
@@ -642,36 +497,23 @@ class Agent:
         )
 
     def _charge_eyes(self, record: AttemptRecord, mark: PerceptionCounts) -> AttemptRecord:
-        """Attribute the perception work done since ``mark`` to ``record``.
-
-        Counted here rather than inside each attempt because the perceiver is shared by
-        the planner, the explorer and every skill they run, so the only honest boundary
-        for "what this attempt made the eyes do" is the attempt itself.
-        """
+        # Counted here, not inside each attempt: the perceiver is shared by the planner,
+        # the explorer and every skill they run, so the attempt is the only honest boundary.
         return replace(record, perception=perception_counts(self._perceiver) - mark)
 
     def _charge_model(self, record: AttemptRecord, mark: Usage) -> AttemptRecord:
-        """Charge ``record`` every model call made since ``mark``.
-
-        The attempt's own number is kept when it is the larger one, so a path that
-        counts a call this meter cannot see - a second client, a model reached
-        through something other than ``llm`` - is never talked DOWN by this. The
-        meter's job is the opposite direction: a call that was made and then lost,
-        because the plan it bought was discarded at routing and its outcome thrown
-        away with it, is found again here. Undercounting is the only failure mode
-        that makes this project look better than it is.
-        """
+        """Charge ``record`` every model call since ``mark``, keeping the attempt's own
+        number when it is larger - a path counting a call this meter cannot see is never
+        talked DOWN. This meter only ever finds calls that were LOST, such as a plan
+        discarded at routing after the composer paid for it."""
         spent = self._usage()
         calls = max(record.llm_calls, spent.calls - mark.calls)
         usd = max(record.usd, spent.cost_usd - mark.cost_usd)
         return replace(record, llm_calls=calls, usd=usd)
 
     def _usage(self) -> Usage:
-        """What the model client has been asked for so far, or an empty tally.
-
-        :class:`~skillweaver.contracts.LLMClient` does promise ``total_usage``, but a
-        stub wired in by a test need not, and a report is not worth an exception.
-        """
+        """The client's spend so far, or an empty tally: a stub need not implement
+        ``total_usage``, and a report is not worth an exception."""
         total = getattr(self._llm, "total_usage", None)
         if total is None:
             return Usage()
@@ -682,14 +524,9 @@ class Agent:
             return Usage()
         return result if isinstance(result, Usage) else Usage()
 
-    # -- the warm path -----------------------------------------------------------------
-
     def _try_warm(self, task: TaskSpec) -> tuple[AttemptRecord, RunOutcome | None]:
-        """Plan from the library and run the plan, or say why not.
-
-        Nothing is performed when the library holds nothing for the domain, so that
-        case is answered without even reading the screen.
-        """
+        """Plan from the library and run it, or say why not. An empty domain is answered
+        without even reading the screen."""
         stored = self._store.list(domain=task.domain)
         if not stored:
             return (
@@ -743,14 +580,9 @@ class Agent:
         return self._explained(self._warm_failure(task, failure), stored, task.domain), None
 
     def _held_elsewhere(self, domain: str) -> str:
-        """What the library holds under OTHER domains, as a clause to append.
-
-        "The library holds no skill for domain 'browser'" is true and stops one
-        question short of the answer. Naming the namespaces that DO hold something is
-        what turns it into a diagnosis: a reader who sees ``'browser'`` empty while
-        ``en.wikipedia.org`` holds four skills has been handed the bug rather than a
-        shrug. Empty is worth saying too - it is the ordinary first run.
-        """
+        """What the library holds under OTHER domains, as a clause to append: an empty
+        ``'browser'`` beside four skills under ``en.wikipedia.org`` hands the reader the
+        bug rather than a shrug."""
         try:
             others = sorted({s.domain for s in self._store.list() if s.domain != domain})
         except SkillWeaverError:  # a report is not worth failing a run for
@@ -783,32 +615,20 @@ class Agent:
         )
 
     _LOST_THE_SCREEN = frozenset({"no_route"})
-    """Warm failure stages a render-mode crossing can explain.
-
-    Only one, and deliberately. ``no_route`` is the planner saying it cannot get from
-    the screen in front of it to the screen a skill remembers, which is precisely the
-    question two renderers disagree about; ``find_route`` settles "am I already there?"
-    by similarity, so a cross-mode observation lands here. Every other stage is about
-    something else - ``unaccounted`` and ``no_candidates`` are judgments about words,
-    ``vanished`` is about the library, ``route_failed`` is a broken controller, and
-    ``skill_failed`` means the screens matched well enough to run. Offering the mode as
-    an explanation for those would be a confident falsehood in the one place a user is
-    already confused.
-    """
+    """The only warm stage a render-mode crossing can explain, deliberately: every other
+    is about something else (words, the library, a broken controller, or screens that
+    matched well enough to run), and offering the mode there would be a confident
+    falsehood where the user is already confused."""
 
     def _explained(
         self, record: AttemptRecord, stored: Sequence[Skill], domain: str
     ) -> AttemptRecord:
-        """``record`` with the render-mode crossing attached, when one explains it.
+        """``record`` with a render-mode crossing attached, when one explains it - never
+        refused, only explained, since the gap is not a constant.
 
-        Unchanged unless the attempt lost the screen AND every skill the library offers
-        for ``domain`` recorded its own starting screen in the other mode. That second
-        condition is deliberately strict: one skill recorded in this mode, or one that
-        never said which mode it was recorded in, means the library is not uniformly
-        unreadable and the crossing is not the explanation.
-
-        Nothing is refused here, only explained, because the gap is not a constant - see
-        :mod:`skillweaver.render_mode` for the page that survived it.
+        Requires that EVERY skill for ``domain`` recorded its start screen in the other
+        mode: one skill in this mode, or one that never said, means the library is not
+        uniformly unreadable and the crossing is not the explanation.
         """
         if record.stage not in self._LOST_THE_SCREEN:
             return record
@@ -828,15 +648,9 @@ class Agent:
         log.info("agent.warm.cross_mode", domain=domain, stage=record.stage, why=sentence)
         return replace(record, cross_mode=sentence)
 
-    # -- the cold path -----------------------------------------------------------------
-
     def _try_cold(self, task: TaskSpec) -> tuple[AttemptRecord, RunOutcome]:
-        """Explore, and persist whatever the run recorded - success or not.
-
-        A failed exploration is saved too: its trajectory names the screen the agent
-        was stuck on and everything it had tried there, which is the raw material for
-        the next attempt and for the dashboard.
-        """
+        """Explore, and persist whatever the run recorded. A failed exploration is saved
+        too: its trajectory names the screen the agent was stuck on and what it tried."""
         outcome = self._explorer.explore(task, self._controller, self._budget)
         self._save(outcome.trajectory)
         log.info(
@@ -846,8 +660,8 @@ class Agent:
             steps=outcome.spend.steps,
             llm_calls=outcome.spend.llm_calls,
         )
-        # ``diagnosis`` belongs to ExplorationOutcome, not to the Explorer Protocol,
-        # so an explorer that only promises the Protocol still reports a stage.
+        # ``diagnosis`` belongs to ExplorationOutcome, not the Explorer Protocol, so an
+        # explorer promising only the Protocol still reports a stage.
         diagnosis = getattr(outcome, "diagnosis", None)
         stage = "" if outcome.ok else (getattr(diagnosis, "stopped_by", "") or "gave-up")
         return (
@@ -866,16 +680,11 @@ class Agent:
             outcome,
         )
 
-    # -- learning ----------------------------------------------------------------------
-
     def _learn(
         self, task: TaskSpec, outcome: RunOutcome, *, enabled: bool
     ) -> tuple[Skill | None, Admission | None, str]:
-        """Offer a successful cold run to the admission gate.
-
-        Returns ``(stored skill, admission, note)``. The note says why nothing was
-        learned; an empty note with no skill means learning was not attempted.
-        """
+        """Offer a successful cold run to the admission gate, as ``(skill, admission, note)``.
+        An empty note with no skill means learning was not attempted."""
         if not outcome.ok:
             return None, None, "the run did not succeed, so there is nothing to learn from"
         if not enabled:
@@ -902,24 +711,17 @@ class Agent:
         return None, admission, self._with_reset_cause(admission.reason)
 
     def _with_reset_cause(self, reason: str) -> str:
-        """Name what the reset actually did, when the environment kept a record.
-
-        The gate is handed one bool and so can only say "restored" or "not restored".
-        A reader chasing a failed learning step needs the other half: an endpoint that
-        refused the job is a wrong flag, a hook that timed out is a world having a bad
-        day, and nothing configured at all is a mutating task nobody gave a way back.
-        Those have three different fixes and the bool spells them the same way.
-        """
+        """Name what the reset actually did. The gate has one bool and spells three
+        different fixes the same way: a refusing endpoint is a wrong flag, a timeout is a
+        bad day, and nothing configured is a mutating task with no way back."""
         report = getattr(self._environment, "last_reset", None)
         if not isinstance(report, ResetReport) or report.restored:
             return reason
         return f"{reason} [{report}]" if reason else str(report)
 
-    # -- bookkeeping -------------------------------------------------------------------
-
     def _retrieve(self, task: TaskSpec) -> tuple[Candidate, ...]:
-        """What the library offers for this task. A retrieval failure is not a run
-        failure: it means the warm path starts blind, not that the task is impossible."""
+        """What the library offers. A retrieval failure starts the warm path blind; it does
+        not fail the run."""
         try:
             return tuple(self._retriever.search(task.text, domain=task.domain, k=self._top_k))
         except SkillWeaverError as exc:
@@ -936,8 +738,7 @@ class Agent:
             log.warning("agent.trajectory.save_failed", run_id=trajectory.run_id, error=str(exc))
 
     def _persist(self) -> None:
-        """Write the site graph out. What a run learned about the map is worth
-        keeping even when the run itself failed."""
+        """Write the site graph out - worth keeping even when the run failed."""
         if self._graph is None:
             return
         try:
@@ -946,26 +747,14 @@ class Agent:
             log.warning("agent.graph.save_failed", error=str(exc))
 
 
-# --------------------------------------------------------------------------------------
-# Recalling where a task ends
-# --------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class Recollection:
     """Where this task ended last time, and which stored skill remembered it.
 
-    The second half is what decides how much authority the first half gets. A skill
-    that carries a ``verifier_code`` has already answered "did I do my job?" in the
-    sandbox, before the critic is asked anything; its recalled end screen is a
-    shortcut to a free yes and nothing more. A skill with no verifier has answered
-    nothing, and then the recalled screen is the only evidence there is - so it keeps
-    its veto, and a stored skill that runs cleanly while finishing half the errand is
-    still caught for free.
-
-    Attributes:
-        state: The fingerprint of the screen the recorded run ended on.
-        source: The stored skill whose trajectory it was read back from.
+    The second half decides the first half's authority (``_warm_critic``): a skill with a
+    ``verifier_code`` already answered "did I do my job?" in the sandbox, so its recalled
+    screen is a shortcut to a free yes and nothing more. One without a verifier has
+    answered nothing, so the recalled screen is the only evidence there is and keeps its veto.
     """
 
     state: Fingerprint | None = None
@@ -983,11 +772,8 @@ def recall(
     task: TaskSpec,
     candidates: Sequence[Candidate] = (),
 ) -> Recollection:
-    """:func:`recall_end_state`, with the skill it came from kept.
-
-    Read that one first; this exists because the answer is only half useful without
-    knowing who remembered it. See :class:`Recollection`.
-    """
+    """``recall_end_state``, keeping the skill it came from - the answer is only half
+    useful without knowing who remembered it."""
     if trajectories is None:
         return Recollection()
     skills = [c.skill for c in candidates] or store.list(domain=task.domain)
@@ -1010,113 +796,52 @@ def recall_end_state(
     task: TaskSpec,
     candidates: Sequence[Candidate] = (),
 ) -> Fingerprint | None:
-    """The screen a successful run of this task ended on, or ``None``.
+    """The screen a successful run of this task ended on, or ``None`` - what lets the warm
+    path be judged for free, as a ``TieredCritic``'s ``corroborating_state``.
 
-    This is what lets the warm path be judged for free. A stored skill records the
-    trajectory it was synthesized from; that trajectory's last screen is where the
-    task finished when it demonstrably worked. Handing it to a
-    :class:`~skillweaver.agent.critic.TieredCritic` as ``corroborating_state`` turns
-    "did the task get done?" into a fingerprint comparison - and a match is decisive,
-    and costs nothing.
+    A match is decisive; a MISMATCH is not, and that is the whole point. This is where ONE
+    run ended with the arguments IT was given: a skill learned on "computer vision" and
+    correctly replayed for "machine learning" ends elsewhere, and passing this as
+    ``expected_state`` failed that correct replay at 0.120 similarity, twice, on live
+    Wikipedia. So it can only ever say yes.
 
-    A MISMATCH is not decisive, and that distinction is the whole of it. This screen
-    is where ONE run of this task ended, with the arguments that run was given. A
-    skill learned from "Search Wikipedia for computer vision" and replayed for
-    "machine learning" correctly ends on a different article; handing this fingerprint
-    over as ``expected_state`` made that correct replay a failure, at similarity
-    0.120, twice, measured on live Wikipedia. So it is offered as corroboration: a
-    shortcut to a free yes with no power to say no.
-
-    Without it the critic has no evidence to run and escalates to a model, so a warm
-    run would still work but would no longer be model-free. That is a real cost and
-    it is reported in ``spend`` rather than hidden - see :class:`Agent`, which charges
-    an attempt every model call made while it ran, not only the ones a plan survived
-    to report.
-
-    Args:
-        store: The library, searched when ``candidates`` is empty.
-        trajectories: Where recorded runs live. ``None`` gives ``None``.
-        task: The task being run; only its domain is used.
-        candidates: Retrieval's offer, best first. The first one whose trajectory
-            can still be read wins.
-
-    Returns:
-        The recalled fingerprint, or ``None`` when nothing could be read back.
+    ``candidates`` is retrieval's offer, best first, and the first whose trajectory still
+    reads wins; the library is searched when it is empty.
     """
     return recall(store, trajectories, task, candidates).state
 
 
 def _load_light(trajectories: TrajectoryStore, run_id: str) -> Trajectory:
-    """Load a trajectory without its screenshots when the store can do that.
-
-    ``TrajectoryStore`` does not promise the keyword - the file-backed store offers
-    it and the in-memory one does not - and reading a run's pixels to look at one
-    fingerprint is pure waste, so it is asked for and not insisted on.
-    """
+    """Ask for a trajectory without screenshots; ``TrajectoryStore`` does not promise the
+    keyword, and reading a run's pixels for one fingerprint is pure waste."""
     try:
         return trajectories.load(run_id, screenshots=False)  # type: ignore[call-arg]
     except TypeError:
         return trajectories.load(run_id)
 
 
-# --------------------------------------------------------------------------------------
-# Eyes
-# --------------------------------------------------------------------------------------
-
-
 class ComposedPerceiver:
-    """A :class:`~skillweaver.contracts.Perceiver` over a detector, a reader and a
-    fingerprinter.
+    """A ``Perceiver`` over a detector, a reader and a fingerprinter: capture once, detect
+    and read that frame, fuse, index and fingerprint. Boxes are LOGICAL throughout.
 
-    Capture once, detect and read that one frame, fuse the two element lists, index
-    them and fingerprint the result. Boxes are LOGICAL pixels throughout, because
-    both producers are required to convert before they return.
-
-    Reading is 84% to 97% of that, measured on every live page tried, so the reader is
-    wrapped in a :class:`~skillweaver.perception.ocr.CachingTextReader` by default: an
-    observation of a screen nothing has touched costs a capture and a detection, and no
-    OCR at all. Everything the perceiver does is charged to :attr:`counters`, which is
-    what a run reports so the saving can be stated as a count rather than as seconds
-    measured on whatever else the machine happened to be doing.
+    Reading is 84-97% of that on every live page tried, so the reader is wrapped in a
+    ``CachingTextReader`` by default and an observation of an untouched screen costs no OCR
+    at all. Everything is charged to ``counters``, so the saving is a COUNT and not seconds
+    measured against whatever else the machine was doing.
 
     Args:
-        detector: Finds controls. Required.
-        reader: Reads text. ``None`` runs detection alone, which is what a machine
-            without the OCR models can still do.
-        fingerprinter: Identifies the screen. Defaults to
-            :class:`~skillweaver.perception.fingerprint.StateFingerprinter`.
-        cache_size: Frames the text cache remembers. ``0`` reads every frame afresh,
-            which is how a caller turns the optimization off to measure against it.
-        counters: The tally to charge work to. A fresh one is made when not given.
+        reader: ``None`` runs detection alone, which a machine without the OCR models can
+            still do.
+        cache_size: ``0`` reads every frame afresh, which is how the optimization is
+            turned off to measure against it.
 
-    Why the text is not read LAZILY
-    -------------------------------
-
-    The obvious next step is to defer the read until something actually asks for text,
-    so the steps that never touch it never pay. It is implementable -
-    :class:`~skillweaver.contracts.Observation` is a frozen slots dataclass, and a
-    subclass whose ``elements``, ``index`` and ``fingerprint`` are properties over one
-    memoized thunk passes ``isinstance``, equality and ``repr`` untouched - and it is
-    worth nothing, because of a dependency that is easy to miss:
-
-        ``fingerprint`` is computed FROM ``elements``, and ``elements`` includes the OCR
-        ones. :class:`~skillweaver.perception.fingerprint.StateFingerprinter`'s
-        structural hash bins every element by kind and position, text elements included,
-        so asking a screen what state it is in already requires the read.
-
-    Since every consumer in this project compares fingerprints - the explorer to
-    remember a state, the critic to judge a move, the planner to check a precondition -
-    a lazy field would materialize almost immediately. Measured rather than assumed: on
-    two live Wikipedia exploration runs, **12 of 12 and 9 of 9 observations had their
-    elements and fingerprint read**, so the laziness would have saved exactly zero reads
-    in both. The saving is real only for a fingerprinter that does not consume OCR
-    elements, and changing what ``StateFingerprinter`` hashes changes every stored graph
-    node id and every stored skill precondition - a coordination decision, not a local
-    one.
-
-    This lives here rather than in :mod:`skillweaver.perception` only because that
-    package has not grown a composing perceiver yet; it is wiring, and wiring is this
-    module's job until it has a better home.
+    The text is NOT read lazily, and that is measured, not an omission: ``fingerprint`` is
+    computed FROM ``elements``, which include the OCR ones, so asking a screen what state
+    it is in already requires the read - and every consumer here compares fingerprints. On
+    two live Wikipedia runs, 12 of 12 and 9 of 9 observations read both, so laziness would
+    have saved zero. It would pay only for a fingerprinter that does not consume OCR
+    elements, and changing what ``StateFingerprinter`` hashes invalidates every stored
+    graph node id and skill precondition.
     """
 
     __slots__ = ("_counters", "_detector", "_fingerprinter", "_reader")
@@ -1133,10 +858,8 @@ class ComposedPerceiver:
         self._detector = detector
         self._reader: CachingTextReader | None
         if isinstance(reader, CachingTextReader):
-            # A reader that already caches is reused rather than wrapped again, so two
-            # perceivers sharing one warm cache share its tally instead of each counting
-            # half the frames. It charges its reads where it was told to at construction,
-            # and a tally that only some of the work reaches is worse than none.
+            # Reused rather than wrapped again, so two perceivers over one warm cache share
+            # its tally instead of each counting half the frames.
             if counters is not None and counters is not reader.counters:
                 raise ValueError(
                     "this reader already charges its reads to another PerceptionCounters; "
@@ -1170,12 +893,8 @@ class ComposedPerceiver:
         return self._reader
 
     def observe(self, controller: Controller) -> Observation:
-        """One frame, fully understood.
-
-        Raises:
-            ControllerError: if the capture fails.
-            PerceptionError: if detection, reading or fingerprinting fails.
-        """
+        """One frame, fully understood. CAPTURES FIRST and reads after, so a post-click
+        read judges the frame taken while the click was being answered."""
         shot: Screenshot = controller.capture()
         self._counters.captures += 1
         found: list[Element] = self._detector.detect(shot)
@@ -1196,12 +915,8 @@ class ComposedPerceiver:
 
 
 def perception_counts(perceiver: Perceiver | None) -> PerceptionCounts:
-    """What ``perceiver`` has done so far, or an empty tally when it does not count.
-
-    :class:`~skillweaver.contracts.Perceiver` says nothing about counters - a fake in a
-    test, or a perceiver another worker writes, is under no obligation to keep them - so
-    a report asks politely and reports nothing rather than failing when the answer is no.
-    """
+    """What ``perceiver`` has done, or an empty tally: ``Perceiver`` says nothing about
+    counters, so this asks politely rather than failing when the answer is no."""
     counters = getattr(perceiver, "counters", None)
     snapshot = getattr(counters, "snapshot", None)
     if snapshot is None:
@@ -1210,39 +925,17 @@ def perception_counts(perceiver: Perceiver | None) -> PerceptionCounts:
     return result if isinstance(result, PerceptionCounts) else PerceptionCounts()
 
 
-# --------------------------------------------------------------------------------------
-# Wiring
-# --------------------------------------------------------------------------------------
-
-
 RESET_URL_PARAM = "reset_url"
-"""The task parameter holding a :data:`WorldReset` endpoint.
-
-It rides in ``TaskSpec.params`` beside ``start_url`` rather than in a new argument
-to the session factory, so a caller that already builds a workbench - the evaluation
-harness, a test - keeps working unchanged and gains the hook by naming it.
-
-One GET is the whole undo, which is the shape a demo app with a seed-restoring
-endpoint has and almost nothing else does. The other shape - an undo PERFORMED on the
-screen, "go to the cart and remove every line until it is empty" - is
-:data:`~skillweaver.reset_actions.RESET_ACTIONS_PARAM`. They coexist and compose: a
-task naming both gets the endpoint first and the steps afterwards.
-"""
+"""The ``TaskSpec.params`` key holding a ``WorldReset`` endpoint: one GET is the whole
+undo, which is a demo app's shape and almost nothing else's. ``RESET_ACTIONS_PARAM`` is
+the other shape, and a task naming both gets the endpoint first."""
 
 
 READ_ONLY_PARAM = "read_only"
-"""The task parameter declaring that this task changes nothing.
-
-It rides in ``TaskSpec.params`` beside ``start_url`` for the same reason
-:data:`RESET_URL_PARAM` does, and because that makes it reachable from the command
-line that already exists: ``-p read_only=true``.
-
-A task that only reads and navigates needs no way back - re-opening the page IS the
-way back - and saying so is what stops the admission gate reporting a precondition it
-missed for some other reason as a world it could not restore. Live sites are the
-whole case: Wikipedia has no reset endpoint, and pointing ``--reset-url`` at one
-answers ``403``.
-"""
+"""``-p read_only=true``: this task changes nothing, so re-opening the page IS the way
+back. Saying so stops the gate reporting a precondition it missed for another reason as a
+world it could not restore - and a live site (Wikipedia answers ``403``) has no endpoint
+to point ``--reset-url`` at."""
 
 
 def task_spec(
@@ -1256,25 +949,12 @@ def task_spec(
     read_only: bool = False,
     params: dict[str, Any] | None = None,
 ) -> TaskSpec:
-    """Build a :class:`~skillweaver.contracts.TaskSpec` the way the command line does.
+    """Build a ``TaskSpec`` the way the command line does; ``domain`` defaults to the host
+    of ``url`` for a browser task, else the target's name.
 
-    The domain defaults to the host of ``url`` for a browser task, so
-    ``--url https://example.com/invoices`` files its skills under ``example.com``
-    without anyone having to say so twice. A desktop task with no domain gets
-    ``"desktop"``.
-
-    ``reset_url`` is how this world is put back before the admission gate re-runs a
-    candidate; see :data:`WorldReset` for why a task that changes anything cannot be
-    learned without one. ``reset_steps`` is the same job done with hands instead of an
-    endpoint, for the sites that have no such endpoint and never will - anything
-    :func:`~skillweaver.reset_actions.reset_steps_from` accepts, normalized here so a
-    malformed list is rejected while it is still a command-line argument rather than
-    halfway through a paid run. ``read_only`` is the other answer to the same question
-    - this task changes nothing, so there is nothing to put back - and see
-    :data:`READ_ONLY_PARAM` for when that is the true one.
-
-    Raises:
-        ValueError: if ``reset_steps`` does not parse.
+    ``reset_url``, ``reset_steps`` and ``read_only`` are the three answers to "how is this
+    world put back?" - see ``WorldReset``. ``reset_steps`` is normalized HERE so a malformed
+    list is rejected while still a command-line argument, not halfway through a paid run.
     """
     merged: dict[str, Any] = dict(params or {})
     if url:
@@ -1304,25 +984,16 @@ def _host(url: str | None) -> str | None:
     return parsed.hostname or None
 
 
-# --------------------------------------------------------------------------------------
-# Which namespace a task means
-# --------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class DomainChoice:
     """Which library namespace a task belongs to, and on whose authority.
 
     Attributes:
-        domain: The namespace to file under and to look in.
-        start_url: Where to open the world, when something knows. For a looked-up
-            domain this is the page the winning skill's start screen was last seen
-            at, which is what makes a bare repeat runnable at all.
-        source: Who decided. ``"named"`` a ``--domain``; ``"url"`` the host of a
-            ``--url``; ``"library"`` a stored skill that answered for this task;
-            ``"target"`` nothing did, and the target's own name is the fallback.
-        skill: The skill that answered, for ``"library"``. Empty otherwise.
-        score: That skill's retrieval score.
+        start_url: Where to open the world. For a looked-up domain this is where the
+            winning skill's start screen was last seen, which is what makes a bare
+            repeat runnable at all.
+        source: ``"named"`` a ``--domain``, ``"url"`` the host of a ``--url``,
+            ``"library"`` a stored skill that answered, ``"target"`` nothing did.
         why: One line for a human: what was consulted and what it said.
     """
 
@@ -1359,79 +1030,35 @@ def resolve_domain(
 ) -> DomainChoice:
     """Which library namespace ``text`` means, when the caller did not say.
 
-    A skill is filed under a domain, and a lookup happens in one. ``learn`` is given
-    a ``--url``, so what it stores is filed under that host. A repeat has no reason to
-    pass one - the whole point is that the agent already knows how - and resolving
-    that silence to the literal target (``"browser"``) files the lookup in a namespace
-    nothing is ever stored in. The miss is then guaranteed, and the run explores from
-    a blank page and reports a plain success at full cold-path price. That is not a
-    corner case: it is the two commands this project's own README tells a new user to
-    type, and it made the project's entire claim untestable from the command line.
+    ``learn`` is given a ``--url`` and files under that host; a repeat has no reason to
+    pass one, and resolving that silence to the literal target (``"browser"``) looks up a
+    namespace nothing is stored in - a guaranteed miss reported as a plain success at full
+    cold price. So the silence is resolved by ASKING THE LIBRARY: every domain is searched,
+    and the best candidate the planner would actually run names its own.
 
-    So the silence is resolved by ASKING THE LIBRARY instead of guessing: every
-    domain is searched, and the best candidate that the planner would actually run
-    names its own domain. Where the caller did say - a ``--domain``, or a ``--url``
-    to take the host of - nothing is looked up and what they said stands.
+    Ranking cannot be the authority, since a library with one skill ranks it first for
+    every sentence in the world. A candidate must pass the planner's OWN question - does
+    it account for the whole request (``MIN_ACCOUNTED_FOR``) - run with the same code.
+    Arguments count towards that as they do there, taken from ``bind_args`` when it binds
+    them free and from ``-p`` otherwise; the composer is deliberately unreachable, since
+    binding a sentence the cheap binder cannot costs a model call, which a question about
+    NAMESPACES may not pay. So the strict direction wins.
 
-    Ranking is not the authority here, and cannot be
-    ------------------------------------------------
-
-    Retrieval RANKS, so it has a winner whenever the library is non-empty, and a
-    library with one skill in it ranks that skill first for every sentence in the
-    world. Letting the top of a cross-domain ranking name the domain would therefore
-    send a Wikipedia task to a grocery site for no better reason than that the
-    grocery site was the only thing stored - the same mistake, in a new place, that
-    :data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR` was calibrated to stop
-    (short generic names rank perfectly and account for nothing; see
-    :mod:`skillweaver.skills.retrieve`).
-
-    So a candidate only gets to name the domain when it passes the planner's own
-    admission question: does it account for the whole request
-    (:func:`~skillweaver.skills.retrieve.accounted_for` against
-    :data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR`)? That is the same test, run
-    with the same code, that decides whether a skill is worth performing at all. When
-    nothing passes it, nothing is resolved and ``source`` is ``"target"``, which the
-    report then states rather than dressing up as a cold start that was always going
-    to be cold.
-
-    Arguments count towards that account exactly as they do in the planner, and for
-    the same reason - a skill learned on *Ada Lovelace* has no text about
-    *photosynthesis*, and ordering it to search for one is what it is FOR. They are
-    taken from :func:`~skillweaver.agent.planner.bind_args` when it binds them for
-    free, and from the caller's own ``-p`` values otherwise. What is deliberately NOT
-    reachable from here is the composer: it binds a sentence the cheap binder cannot,
-    and it costs a model call to do it, which is not a price a question about
-    NAMESPACES may pay. So a candidate the composer would have rescued is judged on
-    its bare text here, which is the strict direction.
-
-    Measured against the live Wikipedia library on 2026-09-19, for *Search Wikipedia
-    for computer vision and open the article*: the skill learned from that exact
-    sentence accounts for 1.000 of it, the one learned from *Ada Lovelace* for 0.667
-    and a link-following skill for 0.500, while a grocery errand scores 0.000 against
-    all three. The cut sits in the gap rather than on top of a case.
+    Measured on the live Wikipedia library, 2026-09-19, for *Search Wikipedia for computer
+    vision and open the article*: 1.000 for the skill learned from that sentence, 0.667 for
+    the *Ada Lovelace* one, 0.500 for a link-follower, 0.000 for a grocery errand. The cut
+    sits in the gap, not on top of a case.
 
     Args:
-        text: The task, in the words it was asked in.
-        target: Which world it drives.
-        url: ``--url``, if given. Its host wins when there is one.
-        domain: ``--domain``, if given. Always wins.
-        params: The values the caller supplied (``-p``), which count towards a
-            candidate's account of the request exactly as they do in the planner.
-        retriever: Retrieval over the whole library. ``None`` disables the lookup,
-            which leaves the old fallback and is what a caller with no library wants.
-        graph: The site graph, consulted only to find where the winning skill's start
-            screen lives. ``None`` means the caller gets a domain and no URL.
-        path: Which perception path this run will use. Every namespace this returns
-            belongs to it, and a cross-domain search considers only candidates filed
-            under it - see :mod:`skillweaver.perception_mode` for why a DOM run must
-            never be handed a skill a pixel run stored, and why the fingerprint will
-            not catch that on its own.
-        k: How many candidates to consider.
+        domain: ``--domain``. Always wins; ``url``'s host wins next.
+        retriever: ``None`` disables the lookup and leaves the old fallback.
+        graph: Consulted only for where the winning skill's start screen lives; ``None``
+            gives a domain and no URL.
+        path: The perception path; every namespace returned belongs to it, and only
+            candidates filed under it are considered - the fingerprint will NOT catch a
+            crossing, see ``perception_mode``.
 
-    Returns:
-        A :class:`DomainChoice`. Never raises: a retrieval or graph failure leaves the
-        domain unresolved, because failing to look something up is not a reason to
-        refuse to run.
+    Never raises: failing to look something up is not a reason to refuse to run.
     """
     if domain:
         return DomainChoice(
@@ -1471,15 +1098,12 @@ def resolve_domain(
     passed_over: list[str] = []
     for candidate in candidates:
         skill = candidate.skill
-        # A skill from the OTHER perception path is not a weaker answer, it is a wrong
-        # one: its code was written against element text a different reader produced.
-        # It is skipped before it is scored, so it can never name the domain.
+        # A skill from the OTHER path is WRONG, not weaker: its code was written against
+        # element text a different reader produced. Skipped before it is scored.
         if path_of(skill.domain) != path:
             continue
-        # The planner's own question, never asked more loosely than the planner asks
-        # it: the arguments when they bind for free, and the skill's bare text when
-        # they do not - because what binds them there is the composer, which costs a
-        # model call and cannot run before the browser is even open.
+        # The planner's own question, never asked more loosely: bound arguments when they
+        # come free, the bare text otherwise - what binds them there is the composer.
         args = bind_args(skill, probe) or probe.params
         if not asks_for(probe, skill, args):
             passed_over.append(f"{skill.name}@{skill.domain} (a different errand: other intent)")
@@ -1509,10 +1133,9 @@ def resolve_domain(
             ),
         )
 
-    # Nothing answers in its own words. A request may still bind against a RELATIVE's
-    # proven sentence - the same workflow learned on another site - and the member of
-    # that family filed under this perception path then names the domain. It is the
-    # planner's own function, so this cannot say yes to something the planner declines.
+    # Nothing answers in its own words, but a request may still bind against a RELATIVE's
+    # proven sentence - the same workflow learned on another site. The planner's own
+    # function, so this cannot say yes to something the planner declines.
     everything = _whole_library(retriever)()
     shelf = [skill for skill in everything if path_of(skill.domain) == path]
     for fit in fit_through_family(probe, shelf, everything):
@@ -1555,12 +1178,8 @@ def resolve_domain(
 
 
 def _whole_library(retriever: SkillRetriever) -> Callable[[], list[Skill]]:
-    """Every healthy skill behind ``retriever``, read only if somebody asks.
-
-    Relatives are looked for across every site, and a retriever is handed here
-    rather than a store. One that does not expose its store has no families to offer,
-    which is the honest answer for a test double.
-    """
+    """Every healthy skill behind ``retriever``, read only if somebody asks. A retriever
+    that does not expose its store has no families to offer."""
 
     def read() -> list[Skill]:
         store = getattr(retriever, "store", None)
@@ -1582,16 +1201,9 @@ def _or_nothing(passed_over: Sequence[str]) -> str:
 def _where_it_starts(graph: SiteGraph | None, skill: Skill) -> str | None:
     """The URL ``skill``'s start screen was last seen at, or ``None``.
 
-    Resolving the domain is only half of a bare repeat: the browser still has to open
-    somewhere, and a warm attempt against ``about:blank`` fails at ``no_route`` having
-    consulted the right library. The site graph already records where each screen was
-    seen (:attr:`~skillweaver.contracts.UIState.url_pattern`), and the skill declares
-    which screen it starts on, so the two together answer it without a new memory and
-    without a guess.
-
-    A graph that has never seen that screen answers ``None`` and the caller keeps
-    whatever URL it had, which is the honest outcome: the domain is still right, and
-    the warm attempt will report what it could not route to.
+    The other half of a bare repeat: a warm attempt against ``about:blank`` fails at
+    ``no_route`` having consulted the right library. The graph's ``url_pattern`` and the
+    skill's own precondition answer it together, with no new memory and no guess.
     """
     if graph is None or skill.precondition is None:
         return None
@@ -1610,46 +1222,32 @@ def _where_it_starts(graph: SiteGraph | None, skill: Skill) -> str | None:
 class ResetRefused(OSError):
     """The endpoint answered, and its answer was "I am not a reset hook".
 
-    An ``OSError`` so that every existing caller of a :data:`WorldReset` - the
-    evaluation harness translates one into its own error, the admission gate treats
-    one as "not restored" - keeps working unchanged, and a subclass so that the one
-    caller who wants to tell the two apart can.
-
-    The distinction is not academic. Live Wikipedia answers ``403`` to the URL a
-    ``--reset-url`` pointed at it, and reporting that as "the world was not restored"
-    sent a day of debugging after a mutating task that did not exist. ``403`` means
-    the flag was wrong; a timeout means the endpoint was down.
+    An ``OSError`` so every existing ``WorldReset`` caller keeps working, and a subclass so
+    the one that cares can tell the two apart: a ``403`` (live Wikipedia's answer) means
+    the flag was wrong, while a timeout means the endpoint was down.
     """
 
 
 _REFUSALS = frozenset({401, 403, 404, 405, 410, 451, 501})
-"""HTTP statuses that mean this URL will never act as a reset hook.
-
-Authentication, absence and method refusals are all permanent for a GET that asks an
-application to restore itself: retrying cannot change any of them, and neither can
-running the task again. Everything else - a timeout, a connection refused, a ``5xx`` -
-is the endpoint having a bad day and is reported as a plain failure.
-"""
+"""Statuses no retry and no re-run can change, for a GET asking an app to restore itself.
+Everything else - a timeout, a refused connection, a ``5xx`` - is a bad day, not a refusal."""
 
 
 class ResetOutcome(enum.StrEnum):
-    """What became of the attempt to put the world back.
-
-    ``restored`` and ``unnecessary`` both mean the world is fit to judge a candidate
-    in; the other three mean it is not, and they differ in whose problem that is.
-    """
+    """``restored`` and ``unnecessary`` both mean the world is fit to judge a candidate in;
+    the other three mean it is not, and differ in whose problem that is."""
 
     restored = "restored"
     """Something actually put the world back."""
 
     unnecessary = "unnecessary"
-    """Nothing needed putting back: the task only reads and navigates."""
+    """The task only reads and navigates."""
 
     absent = "absent"
     """No way back was configured, and the task did not say it needs none."""
 
     refused = "refused"
-    """The endpoint answered and refused the job - it is not a reset hook."""
+    """The endpoint answered and refused: it is not a reset hook."""
 
     failed = "failed"
     """A real way back was tried and did not work this time."""
@@ -1657,14 +1255,9 @@ class ResetOutcome(enum.StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ResetReport:
-    """The outcome of one reset attempt, and the sentence a human should read.
-
-    :attr:`restored` is what :class:`~skillweaver.skills.synthesize.ReplayEnvironment`
-    takes, a bool because that is what it takes; :attr:`outcome` is what a report
-    should quote, because "this endpoint refuses to be a reset hook" and "this task
-    changed something nothing can undo" are opposite problems that the bool spells
-    the same way.
-    """
+    """The outcome of one reset attempt. ``restored`` is the bool ``ReplayEnvironment``
+    takes; a REPORT should quote ``outcome``, since the bool spells two opposite problems
+    the same way."""
 
     outcome: ResetOutcome
     detail: str = ""
@@ -1683,23 +1276,9 @@ class ResetReport:
 
 
 def world_reset_from_url(url: str, *, timeout: float = 10.0) -> WorldReset:
-    """A :data:`WorldReset` that restores the world by asking it to.
-
-    One GET to ``url``, and the application puts itself back to its seed state. The
-    sandbox site's ``/__reset`` is the instance this project ships, and any
-    application with a "restore the demo data" endpoint fits the same shape - which
-    is the point of taking a URL rather than knowing about the sandbox.
-
-    Args:
-        url: The endpoint to call. Its response body is read and discarded.
-        timeout: Seconds to wait before giving up.
-
-    Returns:
-        The callable. It raises ``OSError`` (``URLError`` and ``HTTPError`` are both
-        that) when the endpoint cannot be reached, which the caller reads as "the
-        world was not restored" - except for the statuses in :data:`_REFUSALS`, which
-        raise :class:`ResetRefused` and mean "there is no reset here to fail".
-    """
+    """A ``WorldReset`` that restores the world with one GET - a demo app's "restore seed
+    data" endpoint, and almost nothing else. The callable raises ``OSError`` when the
+    endpoint cannot be reached, and ``ResetRefused`` for a ``_REFUSALS`` status."""
 
     def reset() -> None:
         import urllib.error
@@ -1723,16 +1302,12 @@ def world_reset_from_url(url: str, *, timeout: float = 10.0) -> WorldReset:
 
 
 def reset_world(restore: WorldReset | None, *, read_only: bool = False) -> ResetReport:
-    """Call ``restore`` if there is one, and say honestly what happened.
+    """Call ``restore`` if there is one and say honestly what happened. Never raises: the
+    run this precedes already succeeded, and a traceback out of a reset hook would throw
+    away the expensive half.
 
-    Never raises: the run whose learning this precedes has already succeeded, and
-    losing it to a traceback out of a reset hook would throw away the expensive half
-    of the work.
-
-    ``read_only`` is the task saying it changed nothing, which makes the answer
-    ``unnecessary`` whatever the hook did - re-opening a page you only read IS the
-    way back, and reporting that as a failed reset is how a read-only navigation task
-    gets blamed for a mutation it never made.
+    ``read_only`` makes the answer ``unnecessary`` whatever the hook did, so a task that
+    only read is never blamed for a mutation it never made.
     """
     detail = ""
     if restore is not None:
@@ -1776,45 +1351,27 @@ def reset_world(restore: WorldReset | None, *, read_only: bool = False) -> Reset
 class NavigatingEnvironment:
     """Put the world back, then open the screen the recorded run started on.
 
-    An :data:`EnvironmentFor` - it is called with a trajectory and hands back a
-    factory, exactly as the plain function it replaced did - that additionally
-    remembers what the last reset attempt came to, in :attr:`last_reset`. The gate
-    only gets a bool, and a bool cannot tell "this endpoint is not a reset hook"
-    from "this task changed something nothing can undo"; those are opposite problems
-    with opposite fixes, and a run that reports the wrong one sends whoever reads it
-    after the wrong cause. That happened, on live Wikipedia, and it is the reason
-    this is a class.
+    An ``EnvironmentFor`` that also remembers what the last reset came to, in
+    ``last_reset``: the gate gets only a bool, which spells "this endpoint is not a reset
+    hook" and "nothing can undo this task" the same way. That sent a day of debugging after
+    the wrong cause on live Wikipedia, and is why this is a class.
 
-    Two separate jobs, and only the second one is navigation. ``restore`` undoes what
-    the run CHANGED; navigating then returns to where it started. A browser can
-    always do the second and can never do the first, which is why a mutating task -
-    archive this message, pay this invoice - was unlearnable until ``restore`` was
-    passed: the gate arrived at a screen that no longer held what the recording held,
-    failed its precondition, and did so forever.
+    Two jobs, and only the second is navigation: ``restore`` undoes what the run CHANGED,
+    then navigating returns to where it started. A browser can always do the second and
+    never the first, which is why a mutating task was unlearnable before ``restore``.
 
-    The trajectory's own first screen is the navigation target, not the task's start
-    URL. They differ exactly when it matters: a run that rescued a failed warm attempt
-    began part-way through the site, and sending the gate back to the front page would
-    have it judge the candidate on the wrong screen.
+    The navigation target is the TRAJECTORY's first screen, not the task's start URL: a run
+    that rescued a failed warm attempt began part-way through the site.
 
-    A ``restore`` that raises is reported, not propagated: the environment comes back
-    with ``restored=False`` and the gate says the world could not be put back, which
-    is a truer answer than a traceback out of a learning step.
-
-    The call declines - ``None`` - for a controller that cannot navigate (every
-    desktop one) or a run whose first screen had no URL. Nothing is then admitted,
-    and the report says so.
+    Declines with ``None`` for a controller that cannot navigate or a run whose first screen
+    had no URL; a ``restore`` that raises comes back ``restored=False`` rather than
+    propagating out of a learning step.
 
     Args:
-        controller / perceiver: The world the candidate is re-run in.
-        graph: The site graph the candidate may read.
-        restore: How to put this world back. ``None`` means nothing can, and a
-            mutating task will be reported as unproved rather than as rejected.
-        read_only: The task saying it changes nothing, so re-opening the screen it
-            started on IS the way back. The gate then judges the candidate instead of
-            reporting a reset that was never needed - which is what a search-and-read
-            task on a live site needs, since no such site has a reset endpoint and
-            pointing ``--reset-url`` at one only earns a ``403``.
+        restore: ``None`` means nothing can, and a mutating task is reported unproved
+            rather than rejected.
+        read_only: Re-opening the start screen IS the way back, so the gate judges the
+            candidate instead of reporting a reset that was never needed.
     """
 
     __slots__ = ("_controller", "_graph", "_last_reset", "_perceiver", "_read_only", "_restore")
@@ -1841,8 +1398,7 @@ class NavigatingEnvironment:
 
     @property
     def last_reset(self) -> ResetReport | None:
-        """What the most recent attempt to put the world back came to, or ``None``
-        when no candidate has been stood up yet."""
+        """What the most recent reset came to, or ``None`` before any candidate stood up."""
         return self._last_reset
 
     def __call__(self, trajectory: Trajectory) -> EnvironmentFactory | None:
@@ -1871,7 +1427,7 @@ def navigating_environment(
     restore: WorldReset | None = None,
     read_only: bool = False,
 ) -> NavigatingEnvironment:
-    """Build a :class:`NavigatingEnvironment`. See it for what the arguments mean."""
+    """Build a ``NavigatingEnvironment``; see it for what the arguments mean."""
     return NavigatingEnvironment(
         controller, perceiver, graph=graph, restore=restore, read_only=read_only
     )
@@ -1896,54 +1452,30 @@ def build_agent(
     max_repairs: int = 2,
     top_k: int = 5,
 ) -> Agent:
-    """Assemble the planner, the explorer and the admission gate around one task.
+    """Assemble the planner, the explorer and the admission gate around one task - the ONE
+    place the real agent is wired. The three critics differ on purpose:
 
-    This is the ONE place the real agent is wired, so a test that injects fakes at
-    the leaves exercises the same wiring the command line runs. The two critics
-    differ on purpose:
-
-    * The **warm** critic gets :func:`recall` - the recorded end screen AND the skill
-      that remembered it - and :func:`_warm_critic` decides from the second how much
-      the first is allowed to say. Either way a warm run that lands where the recorded
-      run landed is judged programmatically and the action loop stays model-free.
-    * The **cold** critic is a plain :class:`~skillweaver.agent.critic.TieredCritic`
-      over ``llm``: exploration has no recorded end state to compare against, and
-      paying for a verdict is the cheapest part of a run that is already paying for
-      every move.
-    * The **admission** critic, built per trajectory, demands as decisive evidence
-      that the replayed candidate reach the same screen the recording reached. That
-      is right HERE and wrong on the warm path, and the difference is the arguments:
-      the gate re-runs the recorded run with the recorded values, so one end screen
-      is the only correct answer. Also free.
+    * **warm**: gets ``recall`` - the recorded end screen AND the skill that remembered it
+      - and ``_warm_critic`` decides from the second how much the first may say. Either
+      way a warm run landing where the recording landed is judged free.
+    * **cold**: a plain ``TieredCritic``; exploration has no recorded end state, and a
+      verdict is the cheapest part of a run already paying for every move.
+    * **admission**: per trajectory, and DEMANDS the recorded end screen. Right here and
+      wrong on the warm path, and the difference is the arguments: the gate re-runs the
+      recording with the recorded values, so one end screen is the only correct answer.
 
     Args:
-        task: What the agent will be asked to do; used to recall the end state.
-        controller / perceiver: The world.
-        llm: The model. Used by exploration, synthesis, composition and by any
-            critic that has to escalate - never by a warm action loop.
-        store: The library.
-        retriever: Defaults to a :class:`~skillweaver.skills.retrieve.SkillRetriever`
-            over ``store``.
-        graph: The site graph. Defaults to a fresh in-memory one.
-        trajectories: Where runs are saved and end states are recalled from.
-        recorder: Where exploration writes. ``None`` lets the explorer choose, which
-            means the configured data directory.
-        environment: Resets the world for the admission gate, per trajectory.
-            ``None`` means this agent cannot learn, and it reports that rather than
+        llm: Used by exploration, synthesis, composition and any critic that escalates -
+            never by a warm action loop.
+        recorder: ``None`` lets the explorer choose the configured data directory.
+        environment: ``None`` means this agent cannot learn, and it says so rather than
             skipping quietly.
-        policy: Who decides each exploratory move. ``None`` - the DEFAULT - is ``llm``
-            through the acting prompt. See
-            :class:`~skillweaver.agent.explorer.ActingPolicy`: a policy replaces that
-            one step, and the planner, the critics, the gate and the store are the
-            same objects either way, which is the whole reason the skills layer needs
-            no changes to sit on top of a new acting path.
-        budget: Limits for one run.
-        compose: Whether the planner may spend one model call chaining known skills
-            for a task no single skill covers. ``False`` keeps it strictly
-            model-free.
-        learn: Whether to build a synthesizer at all.
+        policy: ``None`` (the default) is ``llm`` through the acting prompt. A policy
+            replaces that ONE step; the planner, critics, gate and store are the same
+            objects either way.
+        compose: Whether the planner may spend one model call chaining known skills for a
+            task no single skill covers. ``False`` keeps it strictly model-free.
         max_repairs: How many times the gate may ask for the code to be rewritten.
-        top_k: Retrieval breadth.
     """
     retriever = retriever if retriever is not None else build_retriever(store)
     graph = graph if graph is not None else InMemorySiteGraph()
@@ -2016,28 +1548,18 @@ def build_agent(
 
 
 def _warm_critic(llm: LLMClient, recalled: Recollection) -> TieredCritic:
-    """The critic that judges a warm replay, and how much the recalled screen may say.
+    """How much authority the recalled end screen gets - the difference between a library
+    that improves and one that eats itself.
 
-    One decision, and it is the difference between a library that improves and one
-    that eats itself.
+    A skill WITH a verifier already proved it did its own job in the sandbox, so the
+    recalled screen is CORROBORATION: a free yes, silent on a miss. It must be, because it
+    is where one run ended with ONE set of arguments - holding a correct "machine learning"
+    replay of a "computer vision" skill to it rejected it at 0.120 similarity, twice, on
+    live Wikipedia. A skill WITHOUT one has proved nothing, so that screen is the only free
+    evidence there is and keeps its veto.
 
-    * A skill that **carries a verifier** has already proved it did its own job before
-      the critic is consulted: the sandbox ran that verifier and a failure there would
-      have failed the run. The recalled screen is then :data:`corroboration` - a free
-      yes when it matches, and silent when it does not. It has to be, because it is
-      the screen ONE run ended on with ONE set of arguments: a skill learned from
-      "Search Wikipedia for computer vision" and replayed for "machine learning"
-      correctly ends somewhere else, and holding it to the recorded screen rejected
-      that correct replay at similarity 0.120, twice, on live Wikipedia.
-    * A skill with **no verifier** has proved nothing, and the recalled screen is the
-      only free evidence there is, so it keeps its veto. That is what catches the
-      stored skill which runs without error and finishes half the errand.
-
-    What can still fail a warm run either way: any veto -
-    :func:`~skillweaver.agent.checks.state_changed` on a replay that did nothing and
-    :func:`~skillweaver.agent.checks.no_error_state` on one that ended on an error
-    page - and, when the corroboration misses, the model that is then asked and paid
-    for. A skill's own say-so is never enough on its own.
+    Either way the vetoes still run (``state_changed``, ``no_error_state``) and a missed
+    corroboration escalates to a paid model call. A skill's own say-so is never enough.
     """
     if recalled.self_checking:
         return TieredCritic(llm, corroborating_state=recalled.state)
@@ -2045,24 +1567,13 @@ def _warm_critic(llm: LLMClient, recalled: Recollection) -> TieredCritic:
 
 
 def build_retriever(store: SkillStore, config: Settings | None = None) -> SkillRetriever:
-    """The retriever every shipped command ranks with: token overlap, plus the local
-    embedding model when this machine has its weights.
+    """The retriever every shipped command ranks with, and the one place an ``Embedder`` is
+    constructed, so ``learn``, ``run`` and ``eval run`` rank alike.
 
-    The one place an :class:`~skillweaver.contracts.Embedder` is constructed, so
-    ``learn``, ``run`` and ``eval run`` all get the same ranking and a test that
-    injects its own retriever still bypasses it. :func:`~skillweaver.skills.embed.
-    load_embedder` answers in two ``exists`` calls and loads no model, so a command
-    that never searches pays nothing for this.
-
-    When there is no embedder the REASON travels with the retriever into every
-    candidate's ``why``, and a backend that breaks mid-run is dropped rather than
-    taking the library down with it - see ``degrade_on_error`` in
-    :class:`~skillweaver.skills.retrieve.SkillRetriever`.
-
-    Args:
-        store: the library to rank.
-        config: settings to read the embedder's state from. ``None`` - what every
-            shipped command passes - uses the process-wide ones, resolved once.
+    ``load_embedder`` answers in two ``exists`` calls and loads no model, so a command that
+    never searches pays nothing. When there is none the REASON travels into every
+    candidate's ``why``, and a backend breaking mid-run is dropped rather than taking the
+    library down (``degrade_on_error``).
     """
     embedder, reason = load_embedder() if config is None else embedder_for(config)
     if reason:
@@ -2077,29 +1588,11 @@ def _safe_search(retriever: SkillRetriever, task: TaskSpec, top_k: int) -> tuple
         return ()
 
 
-# --------------------------------------------------------------------------------------
-# What the command line holds
-# --------------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class Workbench:
-    """Everything a command needs, built once per invocation.
-
-    The cheap memories - the skill library, the site graph, the trajectory store -
-    are built eagerly because half the subcommands need nothing else. Anything
-    expensive (a browser, a model) is behind :attr:`session`, so ``skills ls`` never
-    launches Chromium.
-
-    Attributes:
-        settings: Resolved configuration. The only source of paths and defaults.
-        store: The skill library.
-        retriever: Retrieval over ``store``.
-        graph: The site graph, backed by the configured graph directory.
-        trajectories: Recorded runs.
-        session: Opens a live agent for one task, and closes the world afterwards.
-            Tests replace this with one wired to fakes.
-    """
+    """Everything a command needs, built once per invocation. The cheap memories are eager
+    because half the subcommands need nothing else; anything expensive (a browser, a model)
+    is behind ``session``, so ``skills ls`` never launches Chromium."""
 
     settings: Settings
     store: SkillStore
@@ -2115,19 +1608,13 @@ class Workbench:
 
 
 def build_workbench(config: Settings | None = None) -> Workbench:
-    """The real workbench: file-backed memories and a live browser session.
-
-    Nothing here touches a browser, a model or a network; the session factory does
-    that, and only when a command opens one.
-
-    Args:
-        config: Resolved settings. ``None`` uses :func:`skillweaver.config.settings`.
-    """
+    """The real workbench: file-backed memories and a live browser session. Nothing here
+    touches a browser, a model or a network - the session factory does, and only when a
+    command opens one."""
     resolved = config if config is not None else settings()
-    # The mode is stamped on everything this workbench STORES, because a stored screen
-    # outlives the window that rendered it: see skillweaver.render_mode. A command that
-    # never opens a world (`skills ls`) writes no skill either, so claiming the
-    # configured mode here cannot put a mode on something that was not rendered in it.
+    # The mode is stamped on everything this workbench STORES: a stored screen outlives
+    # the window that rendered it (see render_mode). A command that never opens a world
+    # writes no skill either, so this cannot mislabel one.
     store = FileSkillStore(resolved.skills_dir, render_mode=mode_name(resolved.headless))
     graph = InMemorySiteGraph(store=JSONGraphStore(resolved.graphs_dir))
     trajectories = TrajectoryFileStore(resolved.trajectories_dir)
@@ -2172,19 +1659,9 @@ def build_workbench(config: Settings | None = None) -> Workbench:
 
 
 def _reset_for(task: TaskSpec, controller: Controller, perceiver: Perceiver) -> WorldReset | None:
-    """How to put this task's world back, if the task said.
-
-    Two kinds, and a task may name both: an endpoint that restores the application
-    (:data:`RESET_URL_PARAM`) and a sequence of actions performed on the screen
-    (:data:`~skillweaver.reset_actions.RESET_ACTIONS_PARAM`). Both because they answer
-    different worlds - the sandbox has a real ``/__reset`` and should keep using it,
-    while a live cart has nothing of the kind and can only be emptied by emptying it -
-    and in that order because the coarse restore should land before the fine tidying
-    reads the screen it left.
-
-    ``None`` is a real answer and not a failure: the gate then reports that a
-    mutating task could not be proved, which is what is true.
-    """
+    """How to put this task's world back, if it said. A task may name both an endpoint and
+    on-screen steps, and gets them in that order so the coarse restore lands before the fine
+    tidying reads the screen it left. ``None`` is a real answer, not a failure."""
     url = task.params.get(RESET_URL_PARAM)
     steps = reset_steps_from(task.params.get(RESET_ACTIONS_PARAM) or ())
     return chain_resets(
@@ -2198,47 +1675,32 @@ def _reset_for(task: TaskSpec, controller: Controller, perceiver: Perceiver) -> 
 
 
 def _dom_of(controller: Controller) -> Any:
-    """A DOM reader for a reset step that asks for one, or ``None``.
+    """A DOM reader for a reset step that asks for one, or ``None`` on a desktop.
 
-    :class:`~skillweaver.controllers.browser.BrowserGroundTruth` is documented as an
-    offline teacher the AGENT must never see, and this respects that: it is handed to
-    a world reset, which is scaffolding rather than the agent - the peer of the HTTP
-    GET behind ``--reset-url`` - and it reaches nothing else from here. It is built at
-    this one call site precisely so the dependency is visible, which is what that
-    Protocol asks of code that legitimately needs it.
-
-    It exists because a real site names its controls where no camera can read them:
-    DoorDash's quick-add and its header cart are icon-only buttons whose only name is
-    an ``aria-label``, and a search of that page's visible text finds nothing at all.
-    A reset that must work EVERY time cannot be aimed by guessing at an unlabelled
-    glyph. ``None`` for a desktop controller, which has no DOM; a step that asked for
-    one then fails saying so.
+    ``BrowserGroundTruth`` is an offline teacher the AGENT must never see; a world reset is
+    scaffolding, the peer of the GET behind ``--reset-url``, and this ONE call site is where
+    the dependency is made visible. It exists because a real site names controls where no
+    camera can read them - DoorDash's quick-add and header cart are icon-only, with only an
+    ``aria-label``, and a search of that page's visible text finds nothing.
     """
-    from skillweaver.controllers.browser import BrowserController, BrowserGroundTruth
+    from skillweaver.controllers.browser import BrowserGroundTruth
 
-    return BrowserGroundTruth(controller) if isinstance(controller, BrowserController) else None
+    reads_pages = callable(getattr(controller, "evaluate", None))
+    return BrowserGroundTruth(controller) if reads_pages else None
 
 
 def _is_read_only(task: TaskSpec) -> bool:
-    """Whether the task declared that it changes nothing. See :data:`READ_ONLY_PARAM`.
-
-    Anything truthy counts, and ``-p read_only=false`` parses to the JSON ``False``
-    the command line intends, so the flag reads the way it is written.
-    """
+    """Whether the task declared it changes nothing; ``-p read_only=false`` parses to JSON
+    ``False``, so the flag reads the way it is written."""
     return bool(task.params.get(READ_ONLY_PARAM, False))
 
 
 def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver]:
-    """Open the controller the task asks for, and the eyes it was configured with.
+    """Open the controller the task asks for and the eyes it was configured with.
 
-    Imported here rather than at module scope: Playwright, ultralytics and RapidOCR
-    are all slow to import, and ``skillweaver skills ls`` has no business paying for
-    any of them. The DOM path skips the last two entirely, which is most of why it is
-    quick to start as well as quick to run.
-
-    Raises:
-        ConfigError: if ``--perception dom`` is asked for on a desktop target. A
-            desktop has no DOM, and failing here is failing before anything opens.
+    Imported here, not at module scope: Playwright, ultralytics and RapidOCR are all slow,
+    and ``skills ls`` must not pay for them. ``--perception dom`` on a desktop target raises
+    ``ConfigError`` here, before anything opens.
     """
     controller: Controller
     if task.target == "desktop":
@@ -2250,6 +1712,10 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
                 "Use --perception pixels, which is the default."
             )
         controller = DesktopController()
+    elif browser_backend(config) == "harness":
+        from skillweaver.controllers.harness import HarnessBrowserController
+
+        controller = HarnessBrowserController(start_url=task.params.get("start_url"))
     else:
         from skillweaver.controllers.browser import BrowserController
 
@@ -2263,8 +1729,8 @@ def _open_world(config: Settings, task: TaskSpec) -> tuple[Controller, Perceiver
 
 
 def _open_eyes(config: Settings) -> Perceiver:
-    """The perceiver this invocation was configured with. See
-    :mod:`skillweaver.perception_mode` for why the two keep separate libraries."""
+    """The configured perceiver; see ``perception_mode`` for why the two keep separate
+    libraries."""
     if config.perception == DOM:
         from skillweaver.perception.dom import DomPerceiver
 
@@ -2272,20 +1738,16 @@ def _open_eyes(config: Settings) -> Perceiver:
     from skillweaver.perception.detect_yolo import DEFAULT_WEIGHTS_NAME, YoloDetector
     from skillweaver.perception.ocr import RapidOcrReader
 
-    # Not ``default_weights_path()``: that reads the process-wide settings, which a
+    # Not ``default_weights_path()``: it reads the process-wide settings, which a
     # --data-dir on this invocation has already overridden.
     detector = YoloDetector(config.models_dir / DEFAULT_WEIGHTS_NAME)
     return ComposedPerceiver(detector, RapidOcrReader())
 
 
 def _open_model(config: Settings) -> LLMClient:
-    """The computer-use model. Claude is primary; Gemini is the alternative.
-
-    This stays Claude whichever acting policy is selected, because a policy replaces
-    only the MOVE decision: the critic that judges each move, the synthesizer that
-    compiles a trajectory into a skill, the composer and the Jev path's own text
-    helper are all this client. See :func:`_open_policy`.
-    """
+    """The computer-use model, whichever acting policy is selected: a policy replaces only
+    the MOVE decision, while the critic, synthesizer, composer and the Jev path's own text
+    helper are all this client."""
     from skillweaver.llm.anthropic_ import AnthropicClient
 
     return AnthropicClient(model=config.claude_model, computer_use=True)
@@ -2294,14 +1756,9 @@ def _open_model(config: Settings) -> LLMClient:
 def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any | None:
     """The acting policy, or ``None`` for the default - Claude through the prompt.
 
-    Raises:
-        ConfigError: if ``--policy jev`` was asked for without ``--perception dom``.
-            Jev answers with an index into a table of named controls, and the pixel
-            path does not produce one: OCR gives a detected box some text was near,
-            not a control with a role and a value. Pairing them would mean inventing
-            the table, and a policy aimed at an invented target is a policy aimed at
-            nothing.
-        ProviderError: if the Jev credential is missing - before a browser opens.
+    ``--policy jev`` without ``--perception dom`` raises: Jev answers with an index into a
+    table of named controls, and OCR gives a box some text was near, not a control with a
+    role and a value. A missing Jev credential also raises, before a browser opens.
     """
     if config.policy != "jev":
         return None
@@ -2325,11 +1782,8 @@ def budget_from(
     max_usd: float | None = None,
     max_llm_calls: int | None = None,
 ) -> Budget:
-    """The configured budget with any explicitly given flag overriding it.
-
-    Configuration is the floor, flags are the override, and a flag that was not
-    given never silently resets a configured limit to a default.
-    """
+    """The configured budget with any explicitly given flag overriding it; a flag NOT given
+    never silently resets a configured limit to a default."""
     base = config.default_budget
     return Budget(
         max_steps=base.max_steps if max_steps is None else max_steps,

@@ -1,70 +1,26 @@
 """``DesktopController``: real screen capture and a real cursor on this machine.
 
-This is what makes "general computer use" more than a claim about browsers. It
-captures with `mss <https://github.com/BoboTiG/python-mss>`_ and acts with
-`pyautogui <https://pyautogui.readthedocs.io>`_, and every coordinate it exchanges
-with the rest of skillweaver is a LOGICAL pixel relative to the top-left of
-:meth:`DesktopController.viewport`.
+Captures with ``mss`` and acts with ``pyautogui``. Every coordinate exchanged with the
+rest of skillweaver is a LOGICAL pixel relative to the top-left of :meth:`viewport`.
 
-Why the scale factor is the whole story
----------------------------------------
+:meth:`capture` never assumes the scale factor: a Retina Mac grabs 3024x1964 for a
+display the pointer APIs address as 1512x982, so it measures the bitmap against the
+display bounds and reports the ratio as ``Screenshot.scale``. Report a capture at its
+bitmap size instead and every click lands in the wrong half of the screen.
 
-A Retina Mac has two physical bitmap pixels per logical pixel in each direction, so
-a 1512x982 display grabs as a 3024x1964 image while the pointer APIs still address
-it as 1512x982. A capture reported at its *bitmap* size makes every detection come
-back at twice its true offset, every click lands in the wrong half of the screen,
-and the whole thing reads as a model that cannot aim - which is why this lives in
-its own module with :mod:`skillweaver.controllers.scaling` next to it.
+Two macOS permissions fail SILENTLY and are checked here. Screen Recording withheld: the
+capture succeeds and returns one flat colour, so :meth:`capture` raises a
+``PerceptionError`` naming the permission rather than handing perception a black
+rectangle. Accessibility withheld: pointer events post and do nothing, so
+:meth:`perform` reads the cursor back and fails the action. Neither grants anything, and
+importing this module never raises a permission prompt. ``SKILLWEAVER_LIVE_DESKTOP=1``
+opts into exercising the real screen.
 
-So :meth:`capture` never assumes. It grabs the display, compares the bitmap size it
-got against the display's logical bounds, and reports the measured ratio as
-``Screenshot.scale`` with ``width``/``height`` in logical pixels. A machine that
-turns out to be 1x, an external monitor that really is 1x, or a backend configured
-for nominal resolution all come out right without a special case.
-
-macOS permissions, which fail silently
---------------------------------------
-
-Screen capture and synthetic input are both gated behind permissions a human grants
-by hand, and neither raises when it is missing:
-
-* **Screen Recording** withheld: the capture succeeds and returns a uniform image
-  (black, or just the desktop picture). :meth:`capture` detects a single-colour
-  frame and raises :class:`~skillweaver.errors.PerceptionError` naming the
-  permission and where to grant it, rather than handing perception a black rectangle
-  to hallucinate over.
-* **Accessibility** withheld: the pointer events post and simply do nothing.
-  :meth:`perform` reads the cursor back after moving it and reports
-  ``ActionResult(ok=False, error=...)`` naming that permission when it did not land.
-
-Neither check tries to grant anything, and nothing in the default test run touches a
-real screen, so importing or unit-testing this module never raises a permission
-prompt. Set ``SKILLWEAVER_LIVE_DESKTOP=1`` to opt into the live tests.
-
-Multiple displays
------------------
-
-``DesktopController(display=N)`` drives one display, numbered as ``mss`` numbers
-them: ``1`` is the primary, ``2`` and up are the others, and ``0`` is the union of
-them all. :meth:`viewport` reports that display's bounds in global logical pixels -
-a display to the left of the primary has a negative ``x`` - while the coordinates of
-an action stay relative to the viewport's top-left, as
-``contracts.Controller.viewport`` requires. :func:`scaling.to_global` does the
-translation in one place.
-
-One backing scale factor is measured per capture and applies to the whole captured
-region. That is exact for a single display, which is all the demo needs. Capturing
-``display=0`` across a Retina laptop screen and a 1x external monitor would give a
-bitmap the OS has already normalised to one resolution, so the single ratio is
-still self-consistent, but element boxes on the lower-density display would be
-about as accurate as its own pixels allow and no better. Drive each display with
-its own controller when that matters.
-
-Example::
-
-    with DesktopController() as ctl:
-        shot = ctl.capture()                       # logical size, measured scale
-        ctl.perform(Click(Point(40, 12)))          # logical, viewport-relative
+``display=N`` is ``mss``-numbered (``1`` primary, ``0`` the union). :meth:`viewport`
+reports GLOBAL logical bounds - a display left of the primary has a negative ``x`` -
+while action coordinates stay viewport-relative; :func:`scaling.to_global` translates.
+One scale is measured per capture, which is exact for a single display. Drive each
+display with its own controller when mixing densities.
 """
 
 from __future__ import annotations
@@ -113,22 +69,14 @@ LIVE_ENV_VAR = "SKILLWEAVER_LIVE_DESKTOP"
 """Set this to ``1`` to enable the tests that touch the real screen and cursor."""
 
 _UNSUPPORTED_ACTIONS: frozenset[str] = frozenset({"navigate", "back"})
-"""The action kinds a desktop cannot perform, named rather than inferred.
-
-Both are session history: there is no address bar to load a URL from and no stack to
-pop. Naming them is what makes a NEW action kind land here as unsupported-until-taught
-rather than as silently supported, which is how a controller comes to claim a move it
-would then have to fake.
-"""
+"""The action kinds a desktop cannot perform: both are session history, and there is no
+address bar and no stack. NAMED rather than inferred, so a new action kind lands here as
+unsupported-until-taught instead of as silently supported."""
 
 SCROLL_PIXELS_PER_CLICK = 40
-"""Logical pixels of content movement one wheel 'click' is taken to be.
-
-``Scroll`` speaks pixels because that is what a browser and a vision model speak,
-but the macOS wheel event speaks lines, and how far a line scrolls is up to the
-application receiving it. Forty is a typical line height and makes the conversion
-predictable; a scroll is a nudge in a direction, not a measured displacement.
-"""
+"""Logical pixels one wheel click is taken to be. ``Scroll`` speaks pixels because a
+browser and a vision model do, but the macOS wheel event speaks lines and how far a line
+scrolls is up to the receiving application; 40 is a typical line height."""
 
 SCREEN_RECORDING_HINT = (
     "screen capture returned a single flat colour, which on macOS almost always means "
@@ -175,29 +123,18 @@ KEY_ALIASES: dict[str, str] = {
     "option": "option",
     "capslock": "capslock",
 }
-"""Maps a lowercased contract key name to its pyautogui name.
-
-Anything not listed falls through as-is once lowercased, which covers single
-characters (``"a"``) and the function keys (``"F5"`` -> ``"f5"``). A name pyautogui
-does not know is refused by :meth:`DesktopController.perform` rather than silently
-dropped.
-"""
-
-
-# --------------------------------------------------------------------------------------
-# Backends
-# --------------------------------------------------------------------------------------
+"""Lowercased contract key name to its pyautogui name. Anything unlisted falls through
+lowercased, covering single characters and function keys; a name pyautogui does not know
+is refused by :meth:`DesktopController.perform` rather than silently dropped."""
 
 
 @contextlib.contextmanager
 def _native_image_options(enabled: bool) -> Iterator[None]:
-    """Temporarily ask the macOS capture backend for the display's real pixel density.
+    """Temporarily ask the macOS backend for the display's real pixel density.
 
-    ``mss`` defaults to ``kCGWindowImageNominalResolution``, which hands back a
-    logical-sized bitmap - correct, but soft, and the detector and OCR downstream
-    both want the full Retina detail. The flag is a module global that ``mss`` reads
-    at grab time and documents as the supported way to turn scaling on, so this sets
-    it for the duration of one grab and always puts it back. A no-op off macOS.
+    ``mss`` defaults to ``kCGWindowImageNominalResolution``, a logical-sized bitmap that
+    is correct but soft. The flag is a module global read at grab time and documented as
+    the supported way to turn scaling on. A no-op off macOS.
     """
     import sys
 
@@ -219,8 +156,8 @@ def _native_image_options(enabled: bool) -> Iterator[None]:
 class RawCapture:
     """One grabbed bitmap, straight from the screen backend.
 
-    ``rgb`` is ``width * height * 3`` bytes of 8-bit RGB. ``width`` and ``height``
-    are PHYSICAL pixels, which is what makes this type worth having: nothing else in
+    ``rgb`` is ``width * height * 3`` bytes of 8-bit RGB, and ``width``/``height`` are
+    PHYSICAL pixels - which is what makes this type worth having, since nothing else in
     the project is allowed to be.
     """
 
@@ -231,25 +168,14 @@ class RawCapture:
 
 @runtime_checkable
 class ScreenGrabber(Protocol):
-    """The screen-capture half of the controller, injectable so tests never grab a
-    real screen."""
+    """The screen-capture half, injectable so a caller need not grab a real screen."""
 
     def displays(self) -> list[Box]:
-        """Every display's bounds in global LOGICAL pixels, ``mss``-ordered: index
-        ``0`` is the union of them all and ``1`` is the primary.
-
-        Raises:
-            ControllerError: if the displays cannot be enumerated.
-        """
+        """Every display's bounds in global LOGICAL pixels, ``mss``-ordered."""
         ...
 
     def grab(self, bounds: Box) -> RawCapture:
-        """Capture the region ``bounds`` (global LOGICAL pixels) at whatever
-        resolution the backend natively provides.
-
-        Raises:
-            ControllerError: if the capture fails.
-        """
+        """Capture ``bounds`` (global LOGICAL pixels) at the backend's native resolution."""
         ...
 
     def close(self) -> None:
@@ -259,8 +185,8 @@ class ScreenGrabber(Protocol):
 
 @runtime_checkable
 class Pointer(Protocol):
-    """The input half of the controller, injectable so tests never move a real
-    cursor. All coordinates are global LOGICAL pixels."""
+    """The input half, injectable so a caller need not move a real cursor. All coordinates
+    are global LOGICAL pixels."""
 
     def position(self) -> tuple[int, int]: ...
 
@@ -277,14 +203,12 @@ class Pointer(Protocol):
     def key_up(self, key: str) -> None: ...
 
     def scroll(self, x: int, y: int, *, horizontal: int, vertical: int) -> None:
-        """Scroll by wheel clicks at ``(x, y)``. Positive ``vertical`` scrolls the
-        view UP and positive ``horizontal`` scrolls it LEFT, matching the underlying
-        wheel-event convention rather than the ``Scroll`` action's."""
+        """Scroll by wheel clicks at ``(x, y)``. Positive ``vertical`` scrolls the view UP
+        and positive ``horizontal`` LEFT - the wheel-event convention, not ``Scroll``'s."""
         ...
 
     def is_typable(self, text: str) -> str:
-        """The characters of ``text`` this backend would silently drop, as a string;
-        empty when it can type all of them."""
+        """The characters of ``text`` this backend would silently drop; empty when none."""
         ...
 
     def knows_key(self, key: str) -> bool:
@@ -295,11 +219,9 @@ class Pointer(Protocol):
 class MssGrabber:
     """:class:`ScreenGrabber` backed by ``mss``.
 
-    ``native_resolution=True`` (the default) asks the macOS backend for the full
-    Retina bitmap instead of the nominal-resolution one it prefers, because the
-    detector and the OCR downstream both want the sharper image. Either way
-    :meth:`DesktopController.capture` measures the scale from what it actually got,
-    so this is a quality knob and never a correctness one.
+    ``native_resolution=True`` asks the macOS backend for the full Retina bitmap, which
+    the detector and OCR both want. :meth:`DesktopController.capture` measures the scale
+    from what it got either way, so this is a quality knob, never a correctness one.
     """
 
     def __init__(self, *, native_resolution: bool = True) -> None:
@@ -345,11 +267,9 @@ class MssGrabber:
 class PyAutoGuiPointer:
     """:class:`Pointer` backed by ``pyautogui``, with its failsafe left on.
 
-    Moving the real cursor into a screen corner raises pyautogui's
-    ``FailSafeException`` and aborts whatever the agent was doing - the last-resort
-    way for a human to take the machine back. :class:`DesktopController` turns that
-    into ``ActionResult(ok=False, ...)`` rather than letting it escape, so the run
-    stops cleanly instead of crashing.
+    Moving the real cursor into a screen corner raises ``FailSafeException`` and aborts
+    whatever the agent was doing - the last-resort way for a human to take the machine
+    back. :class:`DesktopController` turns it into a failed action, not a crash.
     """
 
     def __init__(self, *, failsafe: bool = True, move_duration_s: float = 0.0) -> None:
@@ -373,8 +293,8 @@ class PyAutoGuiPointer:
         self._gui.moveTo(start_x, start_y, duration=self._move_duration_s)
         self._gui.mouseDown(button="left")
         try:
-            # A drag with no duration is often dropped: the OS sees a teleport rather
-            # than a gesture, so give it a moment of travel to follow.
+            # A drag with no duration is often dropped: the OS sees a teleport, not a
+            # gesture.
             self._gui.moveTo(end_x, end_y, duration=max(self._move_duration_s, 0.2))
         finally:
             self._gui.mouseUp(button="left")
@@ -402,33 +322,20 @@ class PyAutoGuiPointer:
         return key in self._gui.KEYBOARD_KEYS
 
 
-# --------------------------------------------------------------------------------------
-# The controller
-# --------------------------------------------------------------------------------------
-
-
 class DesktopController:
     """A ``contracts.Controller`` over one real display of this machine.
 
     Args:
-        display: Which display to drive, ``mss``-numbered (``1`` is the primary,
-            ``0`` is every display unioned).
-        settle_ms: How long to wait after an action for the UI to catch up. Applied
-            to every action except :class:`~skillweaver.contracts.Wait`, which is
-            already a wait.
-        detect_blank: Whether :meth:`capture` should treat a single-colour frame as
-            a missing Screen Recording permission. Turn it off only when the screen
-            legitimately is one colour.
-        verify_pointer: Whether :meth:`perform` should read the cursor back after
-            moving it and fail the action when it did not land, which is how a
-            missing Accessibility permission shows itself.
+        display: Which display to drive, ``mss``-numbered.
+        settle_ms: Wait after an action for the UI to catch up; not applied to ``Wait``.
+        detect_blank: Treat a single-colour frame as a missing Screen Recording
+            permission. Off only when the screen legitimately is one colour.
+        verify_pointer: Read the cursor back after moving it, which is how a missing
+            Accessibility permission shows itself.
         native_resolution: Ask the capture backend for the full-density bitmap.
-        failsafe: Leave pyautogui's corner failsafe on. Defaults to ``True`` and
-            there is no good reason to change it.
-        move_duration_s: Seconds a pointer move takes. ``0.0`` teleports, which is
-            fastest and fine for most UIs.
-        grabber / pointer: Backend overrides. Both default to the real ones; tests
-            pass doubles so the suite never touches the screen.
+        failsafe: Leave pyautogui's corner failsafe on.
+        move_duration_s: Seconds a pointer move takes; ``0.0`` teleports.
+            grabber / pointer: Backend overrides, so a caller can drive this without a screen.
 
     Raises:
         ControllerError: if the display cannot be found or the backends cannot start.
@@ -477,10 +384,9 @@ class DesktopController:
         """Grab the display, reported at its LOGICAL size with the measured scale.
 
         Raises:
-            ControllerError: if the controller is closed or the grab fails.
-            PerceptionError: if the frame is a single flat colour, which means the
-                Screen Recording permission is almost certainly missing. The message
-                names the permission and where to grant it.
+            ControllerError: the controller is closed or the grab failed.
+            PerceptionError: the frame is one flat colour - almost always a missing
+                Screen Recording permission, which the message names.
         """
         self._ensure_open()
         bounds = self._bounds
@@ -510,11 +416,8 @@ class DesktopController:
     def perform(self, action: Action) -> ActionResult:
         """Execute one action, then wait ``settle_ms`` for the UI to catch up.
 
-        Every way an individual action can fail - an unsupported kind, a point
-        outside the display, a key this backend cannot press, the failsafe firing -
-        comes back as ``ActionResult(ok=False, error=...)``. Nothing is raised except
-        when the controller itself is unusable, exactly as the ``Controller``
-        docstring requires, so an exploring agent can try the next thing.
+        Every way an individual action can fail comes back as ``ActionResult(ok=False)``
+        so an exploring agent can try the next thing.
 
         Raises:
             ControllerError: only if the controller is closed.
@@ -546,21 +449,12 @@ class DesktopController:
         return done(True)
 
     def viewport(self) -> Box:
-        """The driven display's bounds in global LOGICAL pixels.
-
-        ``x``/``y`` are its origin on the desktop - non-zero for a secondary display
-        - while action coordinates remain relative to this box's top-left.
-        """
+        """The driven display's bounds in global LOGICAL pixels; ``x``/``y`` are its origin
+        on the desktop, while action coordinates stay relative to this box's top-left."""
         return self._bounds
 
     def supports(self, action_kind: ActionKind) -> bool:
-        """Every action kind but the two that need a session history.
-
-        A desktop has no address bar to ``navigate`` with and no history stack to go
-        ``back`` through. Both are named rather than the set being "everything except
-        navigate", so a controller that cannot do a thing says so instead of a new
-        action kind arriving here as supported by default.
-        """
+        """Every action kind but the two that need a session history."""
         return action_kind not in _UNSUPPORTED_ACTIONS
 
     def url(self) -> str | None:
@@ -594,21 +488,19 @@ class DesktopController:
     # -- extras beyond the protocol ----------------------------------------------------
 
     def displays(self) -> list[Box]:
-        """Every display's bounds in global LOGICAL pixels, ``mss``-ordered.
-
-        Index ``0`` is the union of them all; ``1`` is the primary. Use it to pick
-        the ``display`` argument for another controller.
+        """Every display's bounds in global LOGICAL pixels, ``mss``-ordered, for picking
+        another controller's ``display``.
 
         Raises:
-            ControllerError: if the controller is closed or enumeration fails.
+            ControllerError: the controller is closed or enumeration failed.
         """
         self._ensure_open()
         return self._grabber.displays()
 
     @property
     def scale(self) -> float | None:
-        """The backing scale factor measured by the most recent :meth:`capture`, or
-        ``None`` before the first one. Never assumed, always measured."""
+        """The scale measured by the most recent :meth:`capture`, or ``None`` before the
+        first. Never assumed."""
         return self._scale
 
     # -- internals ---------------------------------------------------------------------
@@ -618,17 +510,14 @@ class DesktopController:
             raise ControllerError("desktop controller is closed")
 
     def _local_bounds(self) -> Box:
-        """The viewport with its origin moved to ``(0, 0)``: what an action's
-        coordinates are measured against."""
+        """The viewport at origin ``(0, 0)``: what action coordinates are measured against."""
         return Box(0, 0, self._bounds.w, self._bounds.h)
 
     def _out_of_bounds(self, action: Action) -> str | None:
-        """The abort guard: refuse any action whose target is off the display.
+        """Refuse any action whose target is off the display.
 
-        Half of a mis-scaled coordinate's damage is that it still lands *somewhere* -
-        on another window, on a menu bar, on a Delete button. Refusing beats clicking
-        a place nobody asked for, and the refusal is reported, not raised, so the
-        agent learns from it.
+        Half of a mis-scaled coordinate's damage is that it still lands somewhere - on
+        another window, on a Delete button. Reported, not raised, so the agent learns.
         """
         bounds = self._local_bounds()
         for label, point in _targets(action):
@@ -688,12 +577,8 @@ class DesktopController:
         return f"unhandled action kind {action.kind!r}"  # pragma: no cover
 
     def _press(self, keys: tuple[str, ...]) -> str | None:
-        """Hold ``keys`` together in order, then release them in reverse.
-
-        Reverse release is what makes a chord a chord: Cmd goes down, A goes down, A
-        comes up, Cmd comes up. Releasing in order would lift the modifier first and
-        turn Cmd+A into a bare 'a'.
-        """
+        """Hold ``keys`` in order, then release in reverse: releasing in order would lift
+        the modifier first and turn Cmd+A into a bare 'a'."""
         if not keys:
             return "no keys to press"
         translated: list[str] = []
@@ -715,10 +600,9 @@ class DesktopController:
     def _check_landed(self, target: Point) -> str | None:
         """Confirm the cursor actually reached ``target``.
 
-        On macOS a process without the Accessibility permission posts input events
-        that are accepted and then ignored - no exception, no effect. Reading the
-        position back is the only way to notice. A couple of pixels of slack absorbs
-        pointer acceleration and a human nudging the mouse at the same moment.
+        Without the Accessibility permission macOS accepts input events and then ignores
+        them - no exception, no effect - so reading the position back is the only notice.
+        Two pixels of slack absorb acceleration and a human nudging the mouse.
         """
         if not self._verify_pointer:
             return None
@@ -736,8 +620,7 @@ class DesktopController:
     def _encode_png(self, raw: RawCapture) -> bytes:
         """Encode the raw RGB bitmap as PNG, refusing a frame that is one flat colour.
 
-        ``getextrema`` is a C-speed min/max per channel, so the blank check costs
-        nothing next to the grab itself.
+        ``getextrema`` is a C-speed min/max per channel, so the check costs nothing.
         """
         from PIL import Image
 
@@ -766,12 +649,8 @@ def _targets(action: Action) -> tuple[tuple[str, Point], ...]:
 
 
 def _wheel_clicks(pixels: int) -> int:
-    """Logical pixels of scrolling as whole wheel clicks, never rounding to nothing.
-
-    The backend truncates to an integer, so a small scroll asked for in pixels would
-    otherwise turn into no scroll at all and look like the page refusing to move.
-    Any non-zero request becomes at least one click in the right direction.
-    """
+    """Logical pixels of scrolling as whole wheel clicks, never rounding to nothing: the
+    backend truncates, so a small scroll would otherwise look like a page refusing to move."""
     if pixels == 0:
         return 0
     magnitude = max(1, round(abs(pixels) / SCROLL_PIXELS_PER_CLICK))

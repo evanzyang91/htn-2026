@@ -1,50 +1,18 @@
 """Programmatic checks: the free half of the critic.
 
-Every check here is deterministic, runs on two :class:`~skillweaver.contracts.Observation`
-values that have already been captured, and never calls a model, a network or a browser.
-Running the whole set costs microseconds; asking a vision model the same question costs
-cents and seconds. That difference is where this project's efficiency claim comes from,
-so the checks are written to be *decisive as often as honestly possible* - and to admit
-it loudly when they are not.
+Deterministic, over two already-captured Observations, never calling a model, a network
+or a browser - microseconds where a vision model costs cents and seconds. So they are
+written to be decisive as often as honestly possible, and to admit it loudly when
+they are not.
 
-Three outcomes, not two
------------------------
-
-A check returns a :class:`CheckVerdict`, which IS a
-:class:`~skillweaver.contracts.Verdict` (``source="programmatic"``, human-readable
-``reason``) carrying one extra field: :class:`Outcome`.
-
-===========  ==========  ============  ===========================================
-outcome      ``ok``      confidence    meaning
-===========  ==========  ============  ===========================================
-``passed``   ``True``    > 0           the evidence says yes
-``failed``   ``False``   > 0           the evidence says no
-``unknown``  ``False``   ``0.0``       there is no evidence either way
-===========  ==========  ============  ===========================================
-
-``unknown`` is the point of this module. ``Verdict.ok`` is a bool, so an unknown check
-has to report ``ok=False`` - but it pairs that with ``confidence == 0.0`` and
-``outcome is Outcome.unknown``, so nothing downstream can mistake "I did not see it" for
-"it did not happen". :class:`~skillweaver.agent.critic.TieredCritic` escalates to a model
-on exactly that distinction: collapse it and the critic becomes either expensive (asking
-the model about everything) or wrong (reporting failure whenever perception was thin).
-
-Every check names its own ignorance explicitly. An element check is ``unknown`` when the
-element index is empty, because "the detector found nothing at all" is not evidence of
-absence. A text check is ``unknown`` when no element on screen carries any text. A
-fingerprint check is ``unknown`` inside an ambiguity band around
-:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` (see
-:data:`AMBIGUITY_MARGIN`), and when two fingerprints share no comparable parts.
-
-Composition
------------
-
-:func:`all_of`, :func:`any_of` and :func:`not_` combine checks with three-valued (Kleene)
-logic, so ignorance propagates instead of being rounded to a "no":
-
-* ``all_of``: ``failed`` if any fails, else ``unknown`` if any is unknown, else ``passed``.
-* ``any_of``: ``passed`` if any passes, else ``unknown`` if any is unknown, else ``failed``.
-* ``not_``: swaps ``passed`` and ``failed``, leaves ``unknown`` alone.
+**Three outcomes, not two.** ``Verdict.ok`` is a bool, so an unknown check reports
+``ok=False`` - but pairs it with ``confidence == 0.0`` and ``outcome is
+Outcome.unknown``, so nothing downstream can mistake "I did not see it" for "it did not
+happen". :class:`~skillweaver.agent.critic.TieredCritic` escalates on exactly that
+distinction: collapse it and the critic becomes either expensive or wrong. Every check
+names its own ignorance - an empty element index, a screen with no text, a fingerprint
+score inside :data:`AMBIGUITY_MARGIN`. :func:`all_of`, :func:`any_of` and :func:`not_`
+combine them with three-valued logic so ignorance propagates.
 """
 
 from __future__ import annotations
@@ -87,14 +55,11 @@ class Outcome(enum.StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CheckVerdict(Verdict):
-    """A :class:`~skillweaver.contracts.Verdict` that can also say "I do not know".
+    """A Verdict that can also say "I do not know".
 
-    Attributes:
-        name: The check that produced it, such as ``"state_changed"``. Used to build
-            the critic's readable trail.
-        outcome: :class:`Outcome`. ``ok`` is ``True`` exactly when it is
-            ``Outcome.passed``, and an ``Outcome.unknown`` verdict always carries
-            ``confidence == 0.0``.
+    ``ok`` is ``True`` exactly when ``outcome`` is ``Outcome.passed``, and an
+    ``Outcome.unknown`` verdict always carries ``confidence == 0.0``. ``name`` is the
+    check that produced it, for the critic's readable trail.
     """
 
     name: str = ""
@@ -129,11 +94,9 @@ def _clamp(value: float) -> float:
 
 @runtime_checkable
 class Check(Protocol):
-    """A deterministic judgment on a before/after pair.
-
-    Implementations are cheap, side-effect free and safe to run in any order. ``name``
-    is stable and appears in the critic's trail.
-    """
+    """A deterministic judgment on a before/after pair. Implementations are cheap, side
+    effect free and safe to run in any order; ``name`` is stable and appears in the
+    critic's trail."""
 
     name: str
 
@@ -149,35 +112,19 @@ class Check(Protocol):
 AMBIGUITY_MARGIN = 0.023
 """Half-width of the "I do not know" band around the same-state threshold.
 
-Derived from the separation :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`
-was fitted to, and it has to be re-derived whenever that is. Same-state scores bottom out
-at ``0.305`` and different-state scores top out at ``0.213``, so the cut at ``0.26`` has
-``0.047`` of clearance below it and ``0.045`` above. This margin is **half the gap**:
-the band is ``0.237`` to ``0.283``, and every measured pair keeps half its clearance
-rather than being swallowed. Only a score in the middle half of the gap - where the
-calibration genuinely cannot say - refuses to commit, which is the case the model exists
-for.
-
-Getting this wrong is expensive in a way that does not announce itself. A margin WIDER
-than the gap makes every check abstain at both extremes, each abstention escalates to
-the vision model, and each escalation is a model call - so an over-wide band raises the
-cost of every run while looking like caution. It was ``0.06`` against a threshold of
-``0.62``, whose corpus separated ``0.500`` from ``0.750``; carried onto the present cut
-unchanged it would span ``0.20`` to ``0.32`` and swallow the whole measured separation.
-
-Even ``0.04`` is too wide here: it clears the measured extremes by ``0.005`` and
-``0.007``, which is finer than the thing being measured. Half the gap is the widest
-band that leaves both ends decisive by a margin worth having.
-"""
+Derived from the separation ``SAME_STATE_THRESHOLD`` was fitted to, and it has to be
+re-derived whenever that is. Same-state scores bottom out at ``0.305`` and
+different-state scores top out at ``0.213``, so the ``0.26`` cut has ``0.047`` of
+clearance below and ``0.045`` above; this is HALF that gap, leaving every measured pair
+half its clearance. A band WIDER than the gap makes every check abstain at both extremes
+and every abstention is a model call - even ``0.04`` clears the extremes by ``0.005``,
+finer than the thing being measured."""
 
 
 def _similarity_confidence(distance: float) -> float:
-    """Confidence for a fingerprint decision made ``distance`` beyond the band edge.
-
-    ``0.8`` right at the edge, rising to ``1.0`` once the score is a further ``0.1``
-    away. Deliberately never below ``0.8``: inside the band we return ``unknown``
-    instead, so anything that gets here already cleared the measured separation.
-    """
+    """Confidence for a fingerprint decision made ``distance`` beyond the band edge:
+    ``0.8`` at the edge, rising to ``1.0`` a further ``0.1`` away. Never below ``0.8``,
+    because inside the band we return ``unknown``."""
     return _clamp(0.8 + 2.0 * max(distance - AMBIGUITY_MARGIN, 0.0))
 
 
@@ -190,9 +137,8 @@ def _comparable(a: Fingerprint, b: Fingerprint) -> bool:
 class _SameState:
     """Shared machinery: is ``left`` the same UI state as ``right``?
 
-    Returns ``(outcome, similarity, confidence, detail)`` where ``outcome`` is
-    ``passed`` for "same state", ``failed`` for "different state", ``unknown`` inside the
-    band or when the two fingerprints carry no comparable parts.
+    ``(outcome, similarity, confidence, detail)``, ``unknown`` inside the band or when
+    the two fingerprints carry no comparable parts.
     """
 
     threshold: float = SAME_STATE_THRESHOLD
@@ -228,11 +174,9 @@ class _SameState:
 
 @dataclass(frozen=True, slots=True)
 class state_changed:  # noqa: N801 - a check reads as a verb at the call site
-    """Passes when ``after`` is a different UI state from ``before``.
-
-    The workhorse negative: a step that left the screen exactly as it found it did not
-    do anything, whatever the model would like to say about it.
-    """
+    """Passes when ``after`` is a different UI state from ``before``. The workhorse
+    negative: a step that left the screen exactly as it found it did not do anything,
+    whatever the model would like to say about it."""
 
     threshold: float = SAME_STATE_THRESHOLD
     margin: float = AMBIGUITY_MARGIN
@@ -251,11 +195,8 @@ class state_changed:  # noqa: N801 - a check reads as a verb at the call site
 
 @dataclass(frozen=True, slots=True)
 class state_unchanged:  # noqa: N801
-    """Passes when ``after`` is the same UI state as ``before``.
-
-    The mirror of :class:`state_changed`, for a step whose whole point is that nothing
-    moved - dismissing a tooltip, or a no-op guard.
-    """
+    """Passes when ``after`` is the same UI state as ``before`` - the mirror of
+    :class:`state_changed`, for a step whose whole point is that nothing moved."""
 
     threshold: float = SAME_STATE_THRESHOLD
     margin: float = AMBIGUITY_MARGIN
@@ -274,11 +215,9 @@ class state_unchanged:  # noqa: N801
 
 @dataclass(frozen=True, slots=True)
 class matches_state:  # noqa: N801
-    """Passes when ``after`` is the UI state identified by ``expected``.
-
-    This is the cheapest decisive *positive* there is, and the reason a learned skill is
-    worth recording with the fingerprint of the screen it ends on.
-    """
+    """Passes when ``after`` is the UI state identified by ``expected``. The cheapest
+    decisive POSITIVE there is, and the reason a learned skill is worth recording with
+    the fingerprint of the screen it ends on."""
 
     expected: Fingerprint
     threshold: float = SAME_STATE_THRESHOLD
@@ -311,12 +250,10 @@ class matches_state:  # noqa: N801
 # --------------------------------------------------------------------------------------
 
 FUZZY_ONLY_CONFIDENCE = 0.75
-"""Confidence for a hit that only a fuzzy text match found.
-
-An exact or substring match is the element; a fuzzy match is a guess about what OCR
-meant, so it is worth less - and for :class:`element_absent` it is worth nothing at all,
-because a near-miss is precisely the case where "it is not there" cannot be trusted.
-"""
+"""Confidence for a hit that only a fuzzy text match found. An exact or substring match
+is the element; a fuzzy match is a guess about what OCR meant - and for
+:class:`element_absent` it is worth nothing, because a near-miss is precisely where "it
+is not there" cannot be trusted."""
 
 
 def _locate(
@@ -347,12 +284,9 @@ class element_present:  # noqa: N801
     """Passes when ``after`` shows an element matching ``text`` and/or ``kind``.
 
     At least one of ``text`` and ``kind`` must be given. Matching goes through
-    :class:`~skillweaver.contracts.ElementIndex`, so it is case-insensitive and tolerant
-    of OCR noise; a hit that only the fuzzy pass found is reported at
-    :data:`FUZZY_ONLY_CONFIDENCE` rather than as certainty.
-
-    Unknown when ``after`` has no elements at all: an empty index means perception
-    produced nothing, which is not evidence about this element.
+    ElementIndex, so it is case-insensitive and tolerant of OCR noise; a fuzzy-only hit
+    is reported at :data:`FUZZY_ONLY_CONFIDENCE`. Unknown when ``after`` has no elements
+    at all: an empty index is not evidence about this element.
     """
 
     text: str | None = None
@@ -392,9 +326,8 @@ class element_absent:  # noqa: N801
     """Passes when ``after`` shows NO element matching ``text`` and/or ``kind``.
 
     Stricter about its own ignorance than :class:`element_present`, because absence is
-    the weaker claim. Unknown when the index is empty, and unknown when only a *fuzzy*
-    match was found: a near-miss is the one case where neither "it is there" nor "it is
-    gone" can be said honestly.
+    the weaker claim: unknown on an empty index, and unknown when only a FUZZY match was
+    found, since a near-miss is the one case where neither answer can be said honestly.
     """
 
     text: str | None = None
@@ -446,16 +379,11 @@ def _screen_text(observation: Observation) -> str:
 class text_appeared:  # noqa: N801
     """Passes when ``text`` is legible on ``after``.
 
-    Matching is case- and whitespace-insensitive over the concatenated element text,
-    falling back to the index's fuzzy search so OCR noise does not turn a real hit into
-    a false negative.
-
+    Case- and whitespace-insensitive over the concatenated element text, falling back to
+    the index's fuzzy search so OCR noise does not turn a real hit into a false negative.
     With ``require_new=True`` the text must additionally NOT have been on ``before``,
-    which is what you want when judging a step: a confirmation banner that was already
-    there proves nothing about the step just taken.
-
-    Unknown when nothing on ``after`` carries any text, because then the screen was
-    never read, rather than read and found wanting.
+    which is what judging a step wants: a confirmation banner that was already there
+    proves nothing. Unknown when nothing on ``after`` carries any text.
     """
 
     text: str
@@ -529,53 +457,24 @@ ERROR_PHRASES: tuple[str, ...] = (
 )
 """Word-boundary patterns that mark a dialog, alert or validation message.
 
-Deliberately a *phrase* list rather than single alarming words: ``"required"`` alone
-fires on the label "Required fields are marked", while ``"is required"`` and
-``"required field"`` only fire on the message.
+Deliberately a PHRASE list rather than single alarming words: ``"required"`` alone fires
+on the label "Required fields are marked". **A call to action is not a failure**, and
+this list once could not tell them apart - it carried ``please (?:enter|select|...)``,
+and Wikipedia's fundraising appeal says "Please select an amount (CAD)", so a run that
+had just finished correctly was told its end screen was an error state.
 
-**A call to action is not a failure, and this list once could not tell the two apart.**
-It carried ``please (?:enter|select|provide|correct|fix|choose)``, which is form copy
-at least as often as it is validation copy: Wikipedia's own fundraising appeal says
-"Please select an amount (CAD)", so a run that had just finished correctly was told its
-end screen was an error state and went off to fight a banner. The appeal is blocked at
-the controller now (``SOMETIMES_ONLY_OVERLAYS`` in :mod:`skillweaver.controllers.browser`)
-but the pattern would still fire on any page with a form call to action, so the verbs
-that only ASK - enter, select, provide, choose - are gone and only the two that follow a
-failure are kept.
+Measured 2026-09-19 over 47 captured frames read by the shipped OCR, 42 with no error
+and 5 with one: the original patterns fired on 3 of 42 ordinary frames and caught 1 of 5
+errors; narrowing the ``please`` verbs dropped that to 1 of 42; adding ``not found`` and
+``not available`` caught a second error frame while still firing on 1 of 42. Those two
+are the only candidates of two dozen tried that caught a real error and fired on NO
+ordinary frame. The one false positive left is a forum thread whose TITLE quotes an
+error: a page discussing an error reads exactly like a page showing one.
 
-Measured on 2026-09-19 over 47 captured frames, each one a real screen read by the
-shipped OCR: 11 distinct observations from the runs in ``data/trajectories``, the 7
-committed detector fixtures, 27 pages opened headless (Wikipedia article, main page,
-login, create-account, search, upload wizard, donate; python.org home and login;
-github.com login; sqlite.org home and forum; 8 sandbox screens), and two forced
-fundraising appeals - the copy this defect came from, which only renders with the
-controller's blocking turned off. 42 of them carry no error; 5 do (python.org and
-sqlite.org 404s, a GitHub 404, Wikipedia's permission-denied edit page and its
-missing-article page).
-
-===========================  =========================  ====================
-pattern set                  ordinary frames that fire  error frames caught
-===========================  =========================  ====================
-before                       3 of 42 (7.1%)             1 of 5
-``please`` verbs narrowed    1 of 42 (2.4%)             1 of 5
-plus ``not found``/``not
-available``                  1 of 42 (2.4%)             2 of 5
-===========================  =========================  ====================
-
-The two additions are the only candidates of two dozen tried that caught a real error
-frame and fired on NO ordinary one; everything else that sounded like failure text
-(``sorry``, ``no permission``, ``does not exist``) is left out because the corpus gave
-no evidence for it. The one false positive left is an sqlite.org forum thread whose
-TITLE quotes ``"runtime error : unique constraint failed"``: a page discussing an error
-reads exactly like a page showing one, and no word list separates them.
-
-**Recall is low here for a reason that is not vocabulary.** Three of the four missed
-error frames are missed because OCR runs words together - Wikipedia's permission page
-reads ``donothavepermissionto edit thispage``, so ``\\bpermission\\b`` never matches.
-Matching against the text with all spacing removed recovers that frame and costs one
-more false positive (a Wikipedia search-results page), which is not a trade this corpus
-justifies taking; it is written down here so the next attempt starts from the
-measurement rather than from the word list.
+**Recall is low for a reason that is not vocabulary.** Three of the four missed error
+frames are missed because OCR runs words together - Wikipedia's permission page reads
+``donothavepermissionto edit thispage``. Matching with all spacing removed recovers that
+frame and costs one more false positive, which this corpus does not justify.
 """
 
 _ERROR_RE = re.compile(r"\b(?:" + "|".join(ERROR_PHRASES) + r")\b", re.IGNORECASE)
@@ -585,14 +484,10 @@ _ERROR_RE = re.compile(r"\b(?:" + "|".join(ERROR_PHRASES) + r")\b", re.IGNORECAS
 class no_error_state:  # noqa: N801
     """Passes when ``after`` shows no error dialog, alert or validation message.
 
-    Detection is by text, because nothing upstream labels an element as a dialog: the
-    element kinds in :class:`~skillweaver.contracts.ElementKind` do not include one, so a
-    silent modal with no words in it is invisible to this check. State that limit when
-    reading a ``passed`` here - it means "no error text", not "no error".
-
-    With ``ignore_preexisting=True`` (the default) an error phrase that was ALREADY on
-    ``before`` does not fail the step: a validation message the step never touched is
-    not the step's fault. Unknown when ``after`` carries no text at all.
+    Detection is by TEXT, because nothing upstream labels an element as a dialog, so a
+    silent modal with no words in it is invisible here. A ``passed`` means "no error
+    text", not "no error". With ``ignore_preexisting=True`` (the default) a phrase
+    already on ``before`` does not fail the step. Unknown when ``after`` carries no text.
     """
 
     ignore_preexisting: bool = True
@@ -641,10 +536,8 @@ def _combine(name: str, results: Sequence[CheckVerdict], outcome: Outcome) -> Ch
 @dataclass(frozen=True, slots=True)
 class all_of:  # noqa: N801
     """Kleene conjunction: fails if any part fails, unknown if any part is unknown.
-
-    Ignorance propagates rather than being rounded down to a "no", so a set of checks
-    that is merely incomplete escalates to the model instead of failing the step.
-    """
+    Ignorance propagates rather than being rounded down to a "no", so a merely incomplete
+    set of checks escalates to the model instead of failing the step."""
 
     checks: tuple[Check, ...]
     name: str = field(default="all_of", init=False)
@@ -688,10 +581,8 @@ class any_of:  # noqa: N801
 
 @dataclass(frozen=True, slots=True)
 class not_:  # noqa: N801
-    """Kleene negation: swaps passed and failed, and leaves unknown untouched.
-
-    Negating ignorance into a decision is the one thing this must never do.
-    """
+    """Kleene negation: swaps passed and failed, and leaves unknown untouched. Negating
+    ignorance into a decision is the one thing this must never do."""
 
     check: Check
     name: str = field(default="not_", init=False)

@@ -1,65 +1,32 @@
 """The DOM perceiver: ask the page what is on it, instead of looking at a picture of it.
 
-A :class:`~skillweaver.contracts.Perceiver` that reads the browser's own accessibility
-information - roles, accessible names, values, checked/expanded state and
-``getBoundingClientRect()`` - and emits ordinary :class:`~skillweaver.contracts.Element`
-values with ``source=dom``. It runs NO detector and NO OCR.
+A ``Perceiver`` that reads the browser's own accessibility information and emits ordinary
+``Element`` values with ``source=dom``. It runs NO detector and NO OCR.
 
-Read ``AGENTS.md`` first. This project's acting loop was pixels-only by design, and
-:class:`~skillweaver.controllers.browser.BrowserGroundTruth` is documented as an offline
-teacher the agent may not reach. This module is a DELIBERATE, authorized relaxation of
-that rule for BROWSER USE ONLY, and it is a separate class from ``BrowserGroundTruth``
-precisely so the relaxation stays visible: nothing here is reachable unless a run was
-started with ``--perception dom``. The pixel path remains the default.
+Read ``AGENTS.md`` first: the acting loop is pixels-only by design, and this is a
+DELIBERATE, authorized relaxation for BROWSER USE ONLY, unreachable without
+``--perception dom``. It is a separate class from ``BrowserGroundTruth`` so the
+relaxation stays visible.
 
-What this buys, and what it costs
----------------------------------
+It buys the whole OCR bill - reading is 84-97% of a pixel observation - and costs
+everything the page declines to say: text in an image, a canvas, a cross-origin iframe or
+a closed shadow root. The two paths see genuinely different screens, which is why they
+keep separate skill libraries; see :mod:`skillweaver.perception_mode`, and measure the
+two paths with ``PerceptionCounts`` rather than claiming a speedup.
 
-**It buys the whole OCR bill.** Reading is 84-97% of a pixel observation on every live
-page tried (see :mod:`skillweaver.perception.ocr`), and this path does not read. It
-still CAPTURES - :attr:`~skillweaver.contracts.Observation.screenshot` is part of the
-contract, the fingerprinter hashes it, and the capture is the cheap part - but a frame
-costs one screenshot and one ``page.evaluate`` instead of a screenshot, a YOLO forward
-pass and an ONNX recognition batch per text line. Do not take that as a speed claim
-without a number beside it; measure the two paths on the same page and quote the
-counts, which is what :class:`~skillweaver.orchestrator.PerceptionCounts` is for.
+:meth:`DomPerceiver.observe` emits CONTROLS (actionable, carrying a :class:`DomControl` in
+:attr:`DomPerceiver.last` for the policy's target table) and then visible TEXT, both in
+reading order. The policy ignores the text; ``ctx.see.find_text`` in stored skills and
+``structural_hash`` do not.
 
-**It costs everything the page declines to say.** Text baked into an image, a canvas, a
-cross-origin iframe and a closed shadow root are all invisible here and all perfectly
-visible to OCR. The two paths therefore see genuinely different screens, which is why
-they keep separate skill libraries - see :mod:`skillweaver.perception_mode` for how, and
-for the measurement that says a fingerprint will NOT catch the crossing on its own.
+Geometry is LOGICAL pixels: ``getBoundingClientRect`` already reports CSS pixels, so the
+conversion is at scale 1.0 through :mod:`skillweaver.controllers._coords`, and only the
+rounding has to agree with everything else.
 
-Two element populations, one list
----------------------------------
-
-:meth:`DomPerceiver.observe` emits controls first and then visible text, both in reading
-order, because both are needed by different consumers:
-
-* **Controls** - anything actionable, from the same selector Jev uses. These carry a
-  :class:`DomControl` in :attr:`DomPerceiver.last`, which is what a policy needs to
-  build an indexed target table.
-* **Text** - visible text nodes, as :attr:`~skillweaver.contracts.ElementKind.text`
-  elements. The policy ignores these; ``ctx.see.find_text`` in stored skill code does
-  not, and neither does
-  :func:`~skillweaver.perception.fingerprint.structural_hash`, so dropping them would
-  make a DOM screen an unusable thing to write a skill against.
-
-Geometry is LOGICAL pixels throughout, as the contract requires: ``getBoundingClientRect``
-already reports CSS pixels, so the conversion is at scale 1.0 and only the rounding has
-to agree with everything else - which is why it goes through
-:mod:`skillweaver.controllers._coords` like every other producer.
-
-Off-screen is dropped on purpose
---------------------------------
-
-A control whose centre is outside the viewport is not reported, exactly as in Jev's
-``snapshot.js``. This path's actions are POINT-based - a click is delivered at the
-element's box centre through the unchanged
-:class:`~skillweaver.controllers.browser.BrowserController` - so an element the camera
-could not see is an element the mouse cannot reach. Reporting it would offer a policy a
-target that silently misses. Scrolling is how the rest of the page is reached, which is
-why ``SCROLL_UP``/``SCROLL_DOWN`` are in the action space at all.
+A control whose centre is outside the viewport is dropped, as in Jev's ``snapshot.js``:
+actions here are POINT-based, so an element the camera could not see is one the mouse
+cannot reach, and offering it would offer a target that silently misses. Scrolling is how
+the rest of the page is reached.
 """
 
 from __future__ import annotations
@@ -103,41 +70,27 @@ __all__ = [
 ]
 
 MAX_CONTROLS = 250
-"""Controls reported from one frame, matching Jev's own cap.
-
-A page with more actionable things than this in ONE viewport is a page whose extra
-targets are decoration; the cap bounds the policy's target table, which is the thing
-that grows the request. :attr:`DomSnapshot.omitted_controls` says when it bit, so a cap
-that ever truncates a real page is findable rather than silent.
-"""
+"""Controls reported from one frame, matching Jev's own cap: it bounds the policy's
+target table, which is what grows the request. :attr:`DomSnapshot.omitted_controls` says
+when it bit, so a cap that truncates a real page is findable rather than silent."""
 
 MAX_TEXT_NODES = 400
-"""Visible text elements reported from one frame.
-
-Higher than the control cap because text is what a stored skill reads, and a dense
-article legitimately has hundreds of lines. It is still a cap: the element list feeds
-:class:`~skillweaver.contracts.ElementIndex`, whose ``best`` and ``find_text`` scan it
-per query.
-"""
+"""Visible text elements per frame. Higher than the control cap because text is what a
+stored skill reads and a dense article legitimately has hundreds of lines; still a cap,
+because ``ElementIndex.best`` and ``find_text`` scan the list per query."""
 
 SNAPSHOT_ATTEMPTS = 4
-"""How many times :meth:`DomPerceiver._read` asks a document that answers ``null``.
-
-See the loop for what that answer means and why the controller's own retry does not
-cover it. Four, with :data:`SNAPSHOT_RETRY_MS` between, because a page that has
-committed a navigation gets a body within a frame or two and one that never does is a
-broken page worth reporting rather than waiting on.
-"""
+"""Asks of a document that answers ``null`` (see :meth:`DomPerceiver._read`). Four,
+because a page that has committed a navigation gets a body within a frame or two and one
+that never does is broken and worth reporting rather than waiting on."""
 
 SNAPSHOT_RETRY_MS = 150.0
 """How long to wait between those attempts."""
 
 MAX_PAGE_TEXT = 6000
-"""Characters of visible page text carried on the snapshot, as in Jev's ``snapshot.js``.
-
-This is the blob a policy is shown as page context, NOT the element list. It is capped
-because it goes into a request body on every step.
-"""
+"""Characters of visible page text on the snapshot, as in Jev's ``snapshot.js``. The blob
+a policy is shown as context, NOT the element list, and capped because it goes into a
+request body on every step."""
 
 ROLE_KINDS: dict[str, ElementKind] = {
     "button": ElementKind.button,
@@ -155,14 +108,10 @@ ROLE_KINDS: dict[str, ElementKind] = {
     "spinbutton": ElementKind.text_field,
     "gridcell": ElementKind.row,
 }
-"""ARIA role to :class:`~skillweaver.contracts.ElementKind`.
-
-The mapping is deliberately lossy in one direction: several roles collapse onto
-``menu`` and ``text_field`` because :class:`~skillweaver.contracts.ElementKind` is the
-vocabulary a PIXEL detector can support, and a kind the detector cannot emit would be a
-kind stored skill code could only ever find on one path. An editable ``combobox`` is
-re-mapped to ``text_field`` in :func:`_kind_of`, where its editability is known.
-"""
+"""ARIA role to ``ElementKind``. Deliberately lossy in one direction - several roles
+collapse onto ``menu`` and ``text_field`` - because ``ElementKind`` is the vocabulary a
+PIXEL detector can support, and a kind it cannot emit is one stored skill code could only
+find on one path. An editable ``combobox`` is re-mapped in :func:`_kind_of`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,32 +126,27 @@ class DomOption:
 class DomControl:
     """One actionable thing on the page, as the page describes it.
 
-    This is the richness :class:`~skillweaver.contracts.Element` deliberately does not
-    carry - ``Element`` is the source-agnostic type every consumer in this project is
-    written against, and widening it would be a change to the shared surface. A policy
-    that needs to know a checkbox is already ticked reads it from here instead, via
-    :attr:`DomPerceiver.last`.
+    The richness ``Element`` deliberately does not carry: ``Element`` is source-agnostic
+    and widening it would change the shared surface, so a policy that needs to know a
+    checkbox is already ticked reads it from here, via :attr:`DomPerceiver.last`.
 
     Attributes:
-        index: 1-based position in :attr:`DomSnapshot.controls`, which is the number an
-            indexed target table quotes.
-        element_id: The id this control's :class:`~skillweaver.contracts.Element` will
-            carry as ``stable_id``, and therefore the id an
-            :class:`~skillweaver.agent.explorer.ElementCatalog` files it under. This is
-            the ONE join between a policy's choice and the grounding the explorer does,
-            so it is computed once, here.
+        index: 1-based position in :attr:`DomSnapshot.controls`, the number an indexed
+            target table quotes.
+        element_id: The id this control's ``Element`` carries as ``stable_id``, and so
+            the id ``ElementCatalog`` files it under - the ONE join between a policy's
+            choice and the explorer's grounding, computed once, here.
         role: The ARIA role, as ``snapshot.js`` resolves it.
-        name: The accessible name - ``aria-labelledby``, then ``aria-label``, then a
-            ``<label>``, then own text, then ``title`` or ``placeholder``.
+        name: The accessible name.
         kind: ``role`` mapped onto :data:`ROLE_KINDS`.
         box: Bounding rectangle in LOGICAL pixels, clipped to the viewport.
-        value: The field's current value, ``""`` when it has none.
+        value: The field's current value.
         editable: Whether text can be typed into it.
-        checked / selected / expanded: The matching ARIA state, or ``None`` when the
-            page does not say. ``None`` means unknown and must not be read as ``False``.
+        checked / selected / expanded: The matching ARIA state. ``None`` means the page
+            did not say, and must not be read as ``False``.
         options: The selectable values, for a ``<select>`` only.
-        scope_text: Text of the nearest enclosing row, list item, card or form, capped.
-            What tells a policy that this ``Add`` button belongs to THAT product.
+        scope_text: Text of the nearest enclosing row, card or form - what tells a policy
+            that this ``Add`` button belongs to THAT product.
     """
 
     index: int
@@ -221,8 +165,8 @@ class DomControl:
 
     @property
     def label(self) -> str:
-        """The name, falling back to the role - never empty, so a target table always
-        has something to quote for an icon-only control."""
+        """The name, or the role - never empty, so a target table can quote an icon-only
+        control."""
         return self.name or self.role
 
 
@@ -233,23 +177,18 @@ class DomSnapshot:
     Attributes:
         url / title: The document's own.
         text: Visible page text, capped at :data:`MAX_PAGE_TEXT`.
-        controls: Actionable elements in reading order, 1-based via
-            :attr:`DomControl.index`.
-        texts: Visible text runs as ready-made ``text`` elements. Not part of the
-            policy's target table; see the module docstring on the two populations.
+        controls: Actionable elements in reading order, 1-based via ``DomControl.index``.
+        texts: Visible text runs as ready-made ``text`` elements, not in the policy's
+            target table.
         viewport: The visible area in logical pixels.
-        scroll_y / page_height: Where the page is scrolled to and how tall it is,
-            which is what decides whether scrolling up or down is even offered.
-        omitted_controls: How many controls :data:`MAX_CONTROLS` cut. See that constant.
-        can_go_back: Whether this tab has a previous session-history entry, which is
-            what decides whether going back is offered at all. The page's own answer,
-            from the Navigation API; see the script for why ``history.length`` is not
-            that answer. It counts only entries contiguous and SAME-ORIGIN with this
-            one, so the ``about:blank`` a run starts from does not make it true and a
-            back is never offered as a way off the site being explored.
-        by_element_id: The controls again, keyed by
-            :attr:`DomControl.element_id`. This is the lookup a policy does to turn the
-            id it chose back into what it knows about that control.
+        scroll_y / page_height: What decides whether scrolling is offered.
+        omitted_controls: How many controls :data:`MAX_CONTROLS` cut.
+        can_go_back: Whether this tab has a previous session-history entry - the page's
+            own answer from the Navigation API, not ``history.length``. It counts only
+            entries contiguous and SAME-ORIGIN with this one, so the ``about:blank`` a run
+            starts from does not make it true and a back never leaves the site.
+        by_element_id: The controls keyed by ``element_id``, which is how a policy turns
+            the id it chose back into what it knows about that control.
     """
 
     url: str
@@ -276,21 +215,16 @@ class DomSnapshot:
 
 
 class DomPerceiver:
-    """A :class:`~skillweaver.contracts.Perceiver` over the page's own control list.
+    """A ``Perceiver`` over the page's own control list.
 
-    Fills :class:`~skillweaver.contracts.Observation` exactly as
-    :class:`~skillweaver.orchestrator.ComposedPerceiver` does - same screenshot, same
-    reading-order elements, same :class:`~skillweaver.contracts.ElementIndex`, same
-    fingerprinter - so everything above ``Element`` is unaffected by which path
-    produced it.
+    Fills ``Observation`` exactly as ``ComposedPerceiver`` does, so everything above
+    ``Element`` is unaffected by which path produced it.
 
     Args:
-        fingerprinter: Identifies the screen. Defaults to
-            :class:`~skillweaver.perception.fingerprint.StateFingerprinter`, which is
-            what every stored precondition was hashed with.
-        counters: The tally to charge work to, shared with whatever else counts. A
-            fresh one is made when not given. ``ocr_reads`` stays at zero on this path
-            and that is the measurement, not an omission.
+        fingerprinter: Defaults to ``StateFingerprinter``, which every stored
+            precondition was hashed with.
+        counters: The tally to charge work to. ``ocr_reads`` staying at zero on this path
+            is the measurement, not an omission.
 
     Not thread-safe: :attr:`last` is one slot, so one perceiver drives one browser.
     """
@@ -317,12 +251,10 @@ class DomPerceiver:
 
     @property
     def last(self) -> DomSnapshot | None:
-        """The snapshot behind the most recent :meth:`observe`, or ``None`` before one.
+        """The snapshot behind the most recent :meth:`observe`, or ``None``.
 
-        A policy reads this to get the roles, values and states that
-        :class:`~skillweaver.contracts.Element` does not carry. It belongs to the LAST
-        observation only; anything holding an older ``Observation`` must not assume
-        this still describes it.
+        It belongs to the LAST observation only; anything holding an older
+        ``Observation`` must not assume this still describes it.
         """
         return self._last
 
@@ -355,15 +287,12 @@ class DomPerceiver:
     def _read(self, controller: Controller, shot: Screenshot) -> DomSnapshot:
         """Run :data:`_SNAPSHOT_JS` on the controller's page and parse the result.
 
-        The page script is handed to the controller through a narrow duck-typed hook
-        (``evaluate``) rather than by importing
-        :class:`~skillweaver.controllers.browser.BrowserController`, so a controller
-        that can run page script simply has one and this module stays out of the
-        controllers package.
+        Handed to the controller through a duck-typed ``evaluate`` rather than by
+        importing ``BrowserController``, so this module stays out of that package.
 
         Raises:
-            ControllerError: if the controller cannot run page script at all.
-            PerceptionError: if the script returns something unusable.
+            ControllerError: the controller cannot run page script at all.
+            PerceptionError: the script returned something unusable.
         """
         evaluate = getattr(controller, "evaluate", None)
         if not callable(evaluate):
@@ -377,12 +306,10 @@ class DomPerceiver:
             raw = evaluate(_SNAPSHOT_JS)
             if isinstance(raw, dict):
                 return _snapshot_from(raw, shot)
-            # ``null``, not an exception: the script's own first line answers a document
-            # with no ``body`` yet, which is a commit that has landed and not finished.
-            # The controller's retry cannot see this - it catches a DESTROYED execution
-            # context, and this context is alive and nearly empty - so the wait is here.
-            # Measured on live splitkb.com: a click that navigates hit it once in a run
-            # and, before this loop existed, ended the run with a PerceptionError.
+            # ``null``, not an exception: the script answers a document with no ``body``
+            # yet - a commit that landed and did not finish. The controller's retry
+            # cannot see it, catching a DESTROYED context while this one is alive and
+            # nearly empty. Measured on live splitkb.com: once per run, and fatal before.
             if attempt + 1 < SNAPSHOT_ATTEMPTS:
                 log.info("dom.snapshot.retry", attempt=attempt + 1, url=controller.url())
                 time.sleep(SNAPSHOT_RETRY_MS / 1000.0)
@@ -392,20 +319,14 @@ class DomPerceiver:
         )
 
 
-# --------------------------------------------------------------------------------------
-# Parsing the page's answer
-# --------------------------------------------------------------------------------------
-
-
 def _snapshot_from(raw: dict[str, Any], shot: Screenshot) -> DomSnapshot:
     """Build a :class:`DomSnapshot` from the script's raw result.
 
-    Every field is read defensively: this is data crossing back out of a web page, and a
-    page that returns nonsense should give a perception failure naming the field rather
-    than a ``TypeError`` halfway up the explorer.
+    Read defensively: this is data crossing out of a web page, and nonsense should give a
+    perception failure naming the field rather than a ``TypeError`` up in the explorer.
 
     Raises:
-        PerceptionError: if the result cannot be read as a snapshot.
+        PerceptionError: the result cannot be read as a snapshot.
     """
     try:
         viewport = Box(0, 0, int(raw.get("w") or shot.width), int(raw.get("h") or shot.height))
@@ -477,9 +398,8 @@ def _control_from(
 def _texts_from(entries: Any, viewport: Box, seen: dict[str, int]) -> tuple[Element, ...]:
     """The visible text runs as ``text`` elements, sharing the control id counter.
 
-    Sharing ``seen`` is what guarantees an id is unique across BOTH populations, so the
-    catalogue never falls back to a positional id for a control because a text run
-    happened to hash the same way.
+    Sharing ``seen`` keeps ids unique across BOTH populations, so the catalogue never
+    falls back to a positional id because a text run hashed like a control.
     """
     elements: list[Element] = []
     for entry in entries:
@@ -509,11 +429,10 @@ def _texts_from(entries: Any, viewport: Box, seen: dict[str, int]) -> tuple[Elem
 
 
 def _kind_of(role: str, editable: bool) -> ElementKind:
-    """``role`` as an :class:`~skillweaver.contracts.ElementKind`. See :data:`ROLE_KINDS`.
+    """``role`` as an ``ElementKind``; see :data:`ROLE_KINDS`.
 
-    An editable ``combobox`` - the shape every site search box with autocomplete takes -
-    is a ``text_field`` rather than a ``menu``, because that is what stored skill code
-    asking ``ctx.see.by_kind(ElementKind.text_field)`` means by it.
+    An editable ``combobox`` - every site search box with autocomplete - is a
+    ``text_field``, because that is what ``by_kind(ElementKind.text_field)`` means by it.
     """
     if role == "combobox" and editable:
         return ElementKind.text_field
@@ -523,9 +442,8 @@ def _kind_of(role: str, editable: bool) -> ElementKind:
 def _elements_of(snapshot: DomSnapshot) -> tuple[Element, ...]:
     """The snapshot's controls and text as one reading-order element tuple.
 
-    Controls keep the ``element_id`` they were given, so the id a policy chooses is the
-    id the catalogue files it under. Text elements get their own hashed id from the same
-    function, which cannot collide with a control's because the role is part of the seed.
+    Controls keep their ``element_id``, so the id a policy chooses is the id the
+    catalogue files it under; a text element cannot collide because the role is in the seed.
     """
     elements = [
         Element(
@@ -546,16 +464,11 @@ def _elements_of(snapshot: DomSnapshot) -> tuple[Element, ...]:
 def _element_id(role: str, text: str, box: Box, seen: dict[str, int]) -> str:
     """A per-screen identity for one element, unique within the snapshot.
 
-    Seeded exactly like :func:`skillweaver.controllers.browser._stable_id` - kind, text
-    and a 16-pixel position grid - so the same control keeps its name across observations
-    of one screen while a label that shifts a pixel does not get a new one.
-
-    Uniqueness matters more here than on the pixel path, because
-    :class:`~skillweaver.agent.explorer.ElementCatalog` falls back to a POSITIONAL id
-    whenever a ``stable_id`` is duplicated, and a positional id would break the join
-    between the policy's choice and the catalogue. A duplicate therefore gets a counter
-    suffix rather than being allowed to collide - two ``Add`` buttons 16 pixels apart in
-    a product grid is an ordinary page, not a corner case.
+    Seeded exactly like ``browser._stable_id`` - kind, text and a 16-pixel position grid -
+    so a label that shifts a pixel keeps its name. A duplicate gets a counter suffix
+    rather than colliding, because ``ElementCatalog`` falls back to a POSITIONAL id on a
+    duplicated ``stable_id`` and that would break the join with the policy's choice; two
+    ``Add`` buttons 16 pixels apart in a product grid is an ordinary page.
     """
     seed = f"{role}|{text}|{box.x // 16}|{box.y // 16}"
     base = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
@@ -572,12 +485,8 @@ def _clean(value: Any) -> str:
 
 
 def _tri(value: Any) -> bool | None:
-    """An ARIA tri-state: ``True``, ``False``, or ``None`` for "the page did not say".
-
-    ``None`` is never coerced to ``False``. "This checkbox is not ticked" and "this
-    element has no checked state" are different facts, and a policy told the first when
-    the second is true will happily tick something that was never a checkbox.
-    """
+    """An ARIA tri-state; ``None`` means "the page did not say" and is never coerced to
+    ``False``: a policy told a non-checkbox is unticked will happily tick it."""
     if isinstance(value, bool):
         return value
     if value in ("true", "True"):
@@ -586,10 +495,6 @@ def _tri(value: Any) -> bool | None:
         return False
     return None
 
-
-# --------------------------------------------------------------------------------------
-# The page script
-# --------------------------------------------------------------------------------------
 
 _SNAPSHOT_JS = (
     """
@@ -738,18 +643,8 @@ _SNAPSHOT_JS = (
 )
 """The one page script this perceiver runs, adapted from ``jev-ultrafast/snapshot.js``.
 
-Differences from Jev's, and why:
-
-* **No node-identity cache and no freshness guards.** Jev keeps a ``WeakMap`` of DOM
-  nodes so it can dispatch input at a node id and verify the node did not move between
-  the decision and the click. This path acts by POINT through the unchanged
-  :class:`~skillweaver.controllers.browser.BrowserController`, and the explorer
-  re-observes after every single action
-  (:class:`~skillweaver.agent.explorer._TapedController`), so the guard has nothing to
-  protect: a stale target shows up as the next observation disagreeing, which the
-  critic already judges.
-* **Text nodes are returned with their rectangles.** Jev only needs a text blob for the
-  model. This path needs ``Element``s, per the module docstring.
-* **Select options are carried but no select action exists.** See
-  :mod:`skillweaver.llm.jev_` on why ``SELECT`` is not offered on this branch.
-"""
+Three differences from Jev's. No node-identity ``WeakMap`` or freshness guard: this path
+acts by POINT and the explorer re-observes after every action, so a stale target shows up
+as the next observation disagreeing. Text nodes come back WITH their rectangles, because
+this path needs ``Element``s. And select options are carried although no select action
+exists - see :mod:`skillweaver.llm.jev_`."""

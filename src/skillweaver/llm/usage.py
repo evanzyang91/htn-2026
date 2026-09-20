@@ -1,13 +1,10 @@
 """Token and money accounting for LLM calls.
 
-Every adapter builds its per-call :class:`~skillweaver.contracts.Usage` here, so
-there is exactly one pricing table and exactly one rule for an unknown model:
-**report zero cost and warn, never guess.** A wrong price is worse than a missing
-one because it silently corrupts the budget a run is checked against
-(``Spend.check``), and a zero that logged a warning is at least findable.
+One pricing table and one rule for an unknown model: report ZERO cost and warn, never
+guess. A wrong price silently corrupts the budget a run is checked against
+(``Spend.check``); a zero that logged a warning is at least findable.
 
-Accumulation lives in :class:`UsageMeter`, which every adapter uses to answer
-``LLMClient.total_usage()``.
+:class:`UsageMeter` is what every adapter answers ``total_usage()`` from.
 """
 
 from __future__ import annotations
@@ -131,7 +128,7 @@ def _warn_once(model: str) -> None:
 
 
 def reset_unknown_model_warnings() -> None:
-    """Forget which models have been warned about. For tests only."""
+    """Forget which models have been warned about."""
     with _warn_lock:
         _warned.clear()
 

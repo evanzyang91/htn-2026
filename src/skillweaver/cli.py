@@ -1,46 +1,19 @@
-"""``skillweaver``: the command line, and the only part of this project a judge sees.
+"""``skillweaver``: the command line, a thin shell over ``orchestrator``.
 
-Everything here is a thin shell over :mod:`skillweaver.orchestrator`. No decision is
-made in this file - it parses arguments, opens a :class:`~skillweaver.orchestrator.Workbench`,
-calls one function, and prints what came back. That split is what lets the whole
-command line be tested end to end with fakes: a test invokes the real commands with a
-workbench wired to the doubles in ``tests/fakes`` and nothing reaches a browser, a
-model or a network.
+No decision is made here - it parses arguments, opens a ``Workbench``, calls one
+function and prints what came back.
 
-::
+Exit codes: ``0`` it did what it said; ``1`` it ran and the answer was no (task not
+solved, no such skill, unknown run id); ``2`` it could not run at all (bad
+configuration, a subcommand whose module has not landed).
 
-    skillweaver learn "Confirm payment of the Acme invoice" --url https://acme.test/inv
-    skillweaver run   "Confirm payment of the Acme invoice"     # now warm, no model
-    skillweaver skills ls
-    skillweaver graph show acme.test --svg --out graph.svg
-    skillweaver replay 4f2a91c07b3d
-    skillweaver dashboard build
+Configuration comes from ``config`` - the environment and ``.env`` - and flags override
+it per invocation; there is no second mechanism, and a flag that was not given never
+resets a configured limit. ``--data-dir``, ``--log-level``, ``--headless`` and
+``--chrome-profile`` are properties of the WHOLE invocation, so they go BEFORE the
+subcommand and one of them covers ``learn``, ``run`` and ``eval run`` alike::
 
-Exit codes
-----------
-
-``0`` the command did what it said. ``1`` it ran and the answer was no - the task was
-not solved, the skill does not exist, the run id is unknown. ``2`` the command could
-not run at all: bad configuration, or a subcommand whose module has not been built
-yet. A caller can tell "it failed" from "it could not even try".
-
-Configuration comes from :mod:`skillweaver.config` - the environment and ``.env`` -
-and flags override it per invocation. There is no second configuration mechanism and
-no flag silently resets a configured limit to a default.
-
-``--data-dir``, ``--log-level``, ``--headless`` and ``--chrome-profile`` are properties
-of the WHOLE invocation rather than of one subcommand - which memories, how loud, which
-browser and whose profile -
-so they are written before the subcommand, and one of them therefore covers ``learn``,
-``run`` and ``eval run`` alike::
-
-    skillweaver --headless eval run --suite eval/order.yaml
-
-Headed is the default, and ``--headless`` is measurement's flag; see
-:data:`skillweaver.config.DEFAULT_HEADLESS` for why that way round and
-:mod:`skillweaver.render_mode` for what happens to a skill learned in one mode and
-replayed in the other. ``--chrome-profile`` is what a site that refuses an automated
-browser needs; see ``REAL_CHROME_CHANNEL`` in :mod:`skillweaver.controllers.browser`.
+    skillweaver --headless eval run --suite eval/wikipedia.yaml
 """
 
 from __future__ import annotations
@@ -54,7 +27,7 @@ from typing import Annotated, Any
 
 import typer
 
-from skillweaver.config import POLICIES, Settings, check_settings, load_settings, settings
+from skillweaver.config import BROWSERS, POLICIES, Settings, check_settings, load_settings, settings
 from skillweaver.contracts import Skill, Transition, UIState, action_to_dict
 from skillweaver.errors import ConfigError, SkillNotFound, SkillWeaverError
 from skillweaver.orchestrator import (
@@ -73,10 +46,6 @@ __all__ = ["app", "main"]
 OK, NO, CANNOT = 0, 1, 2
 """Exit codes: it worked; it ran and the answer was no; it could not run at all."""
 
-
-# --------------------------------------------------------------------------------------
-# The app
-# --------------------------------------------------------------------------------------
 
 app = typer.Typer(
     name="skillweaver",
@@ -204,12 +173,23 @@ def root(
             show_default=False,
         ),
     ] = None,
+    browser: Annotated[
+        str | None,
+        typer.Option(
+            "--browser",
+            help="Which browser a run drives: 'harness' (the DEFAULT - the Chrome you "
+            "already have open, through Browser Harness and raw DevTools-protocol calls, "
+            "with no automation framework; the run works in a background tab of its own "
+            "and closes it) or 'playwright' (a browser this project starts, which most "
+            "real shops refuse). 'harness' IS YOUR REAL, LOGGED-IN BROWSER: a task "
+            "addressed to it can act on your accounts. Chrome asks once to allow remote "
+            "debugging. --headless and --chrome-profile describe a browser this project "
+            "starts, so either one selects 'playwright'. Overrides SKILLWEAVER_BROWSER.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
-    """Open the memories every subcommand reads from.
-
-    Nothing expensive happens here: no browser is launched and no model is contacted
-    until a command actually needs one.
-    """
+    """Open the memories every subcommand reads from. Nothing expensive happens here."""
     if ctx.obj is not None:  # a caller (a test, an embedder) supplied its own
         return
     try:
@@ -222,6 +202,7 @@ def root(
                 chrome_attach,
                 perception,
                 policy,
+                browser,
             )
         )
     except ConfigError as exc:
@@ -236,18 +217,12 @@ def _settings(
     chrome_attach: bool | None = None,
     perception: str | None = None,
     policy: str | None = None,
+    browser: str | None = None,
 ) -> Settings:
-    """Configuration, with the global flags applied on top.
-
-    Every one of them is tri-state on purpose: ``None`` means the flag was not written,
-    and the configured value stands. ``--headless/--headed`` is the interesting case -
-    a plain ``bool`` defaulting to ``False`` would make every invocation that says
-    nothing an invocation that says ``--headed``, quietly overriding a
-    ``SKILLWEAVER_HEADLESS=1`` that a CI file had set on purpose.
-
-    Raises:
-        ConfigError: if the environment or a flag holds an invalid value.
-    """
+    """Configuration with the global flags on top. Every flag is TRI-STATE: ``None`` means
+    it was not written and the configured value stands. A plain ``bool`` for
+    ``--headless/--headed`` would make every silent invocation say ``--headed`` and
+    override a ``SKILLWEAVER_HEADLESS=1`` set on purpose."""
     resolved = load_settings()
     changes: dict[str, Any] = {}
     if data_dir is not None:
@@ -273,9 +248,14 @@ def _settings(
         if chosen not in POLICIES:
             raise ConfigError(f"--policy {policy!r} must be one of {POLICIES}")
         changes["policy"] = chosen
+    if browser is not None:
+        chosen = browser.lower()
+        if chosen not in BROWSERS:
+            raise ConfigError(f"--browser {browser!r} must be one of {BROWSERS}")
+        changes["browser"] = chosen
     if not changes:
         return resolved
-    # Checked again after the flags land: --chrome-attach and the directory it needs can
+    # Re-checked after the flags land: --chrome-attach and the directory it needs can
     # arrive from opposite sides, one in the environment and one on the command line.
     return check_settings(dataclasses.replace(resolved, **changes))
 
@@ -411,22 +391,17 @@ def learn_command(
 ) -> None:
     """Learn a task by trial and error, and keep what worked as a reusable skill.
 
-    This is the slow, expensive path: a computer-use model proposes each move, the
-    agent performs it and judges the result, and the whole run is recorded. When the
-    run succeeds, the recording is handed to the admission gate - which rewrites it
-    as a Python skill, RE-RUNS that skill from the starting screen, and stores it only
-    if it works a second time. Nothing enters the library on the strength of one
-    lucky run.
+    The slow path: a model proposes each move, the agent performs and judges it, and the
+    whole run is recorded. On success the admission gate rewrites the recording as a Python
+    skill, RE-RUNS it from the starting screen, and stores it only if it works a second
+    time - nothing enters the library on one lucky run.
 
-    Re-running it needs the starting screen back. If the task CHANGES anything - and
-    most worth learning do - say how to undo it, or the gate will report that it
-    could not prove the skill and store nothing. `--reset-url` is one GET that
-    restores the application, which a demo app has; `--reset-steps` is the undo
-    PERFORMED on the screen, which is the only kind a real site offers - "open the
-    cart, and remove lines until none are left". A task that only reads and
-    navigates needs neither and should say so with `-p read_only=true`.
+    That re-run needs the starting screen back, so a task that CHANGES anything must say
+    how to undo it or nothing is stored. `--reset-url` is one GET that restores the
+    application; `--reset-steps` is the undo performed ON the screen, which is the only
+    kind a real site offers. A task that only reads should say `-p read_only=true`.
 
-    Afterwards, `skillweaver run` on the same task takes the warm path instead.
+    Afterwards, `skillweaver run` on the same task takes the warm path.
 
         skillweaver learn "Confirm payment of the Acme Corp invoice" \\
             --url https://acme.test/invoices --reset-url https://acme.test/__reset \\
@@ -488,20 +463,18 @@ def run_command(
 ) -> None:
     """Do a task the fastest way the agent knows.
 
-    The warm path runs first: retrieve a stored skill, walk the known route to the
-    screen it starts on, run its Python, verify. A warm hit consults NO model in the
-    action loop, and the printed report says so with a call count.
+    The warm path runs first: retrieve a stored skill, route to the screen it starts on,
+    run its Python, verify. A warm hit consults NO model in the action loop, and the report
+    says so with a call count.
 
-    `--url` is not needed for a task that has been learned. With no `--url` and no
-    `--domain` the library is searched across every domain, and a stored skill that
-    accounts for this request names both the domain to look in and the page to open;
-    the run says which skill answered. Without that, a repeat would look for the
-    skill under the literal name of the target and never find it.
+    `--url` is not needed for a task already learned. With neither `--url` nor `--domain`
+    the library is searched across every domain, and a skill that accounts for this request
+    names both the domain and the page to open; without that a repeat would look under the
+    literal name of the target and never find it.
 
-    If the library cannot plan the task - or plans it, runs it, and the result does
-    not pass verification - the run falls through to exploration. That fall-through is
-    always reported: a warm attempt that failed and was rescued is the most important
-    thing this system can tell you, and it is never printed as a plain success.
+    A library that cannot plan the task - or plans it, runs it, and fails verification -
+    falls through to exploration, and that is ALWAYS reported rather than printed as a
+    plain success.
     """
     _do(
         ctx,
@@ -573,9 +546,8 @@ def _do(
             params=params,
         )
     except ValueError as exc:
-        # Before a browser opens and before a model is paid: a malformed undo is a
-        # typo in an argument, and finding out at the admission gate would cost the
-        # whole run to learn it.
+        # Before a browser opens and before a model is paid: finding a typo in the undo
+        # at the admission gate would cost the whole run.
         _die(f"--reset-steps: {exc}")
     try:
         with bench.session(spec, budget) as agent:
@@ -592,12 +564,8 @@ def _do(
 
 
 def _say_where(where: DomainChoice) -> None:
-    """Announce a domain the caller did not name and the library did.
-
-    A run that resolves its own namespace has made a decision on the caller's behalf,
-    and a decision nobody can see is one nobody can correct. Printed only when the
-    library answered, because a ``--domain`` or a ``--url`` repeated back is noise.
-    """
+    """Announce a domain the caller did not name and the library did - a decision made on
+    their behalf that nobody could otherwise correct."""
     typer.echo(
         f"resolved: {where.domain} - {where.why}"
         + (f"\n          starting at {where.start_url}" if where.start_url else "")
@@ -605,16 +573,9 @@ def _say_where(where: DomainChoice) -> None:
 
 
 def _apply_skill_seconds(seconds: float | None) -> None:
-    """Make ``--skill-max-seconds`` the configured skill time limit for this process.
-
-    The limit is read by :func:`skillweaver.skills.api.default_max_seconds` at the
-    moment a ``SkillLimits`` is built, which happens inside the session this command
-    is about to open - in ``build_agent``, several layers below any argument this
-    file could pass down. Setting the variable the setting is already named after is
-    what keeps the promise at the top of this module: one configuration mechanism,
-    which flags override per invocation, rather than a second path that only the
-    command line knows about.
-    """
+    """Set the env var rather than pass an argument: the limit is read by
+    ``skills.api.default_max_seconds`` when a ``SkillLimits`` is built, several layers below
+    anything this file could pass down, and one configuration mechanism is the promise."""
     if seconds is None:
         return
     if seconds <= 0:
@@ -624,14 +585,9 @@ def _apply_skill_seconds(seconds: float | None) -> None:
 
 
 def _hint_at_cross_mode(report: RunReport) -> None:
-    """Repeat the render-mode crossing on its own line, where a hint is looked for.
-
-    The attempt line already carries it in brackets, but that line is a dense one -
-    stage, chain, model calls, perception counts - and this is the rare finding a
-    reader must not scan past: the library is INTACT, and the run that just paid a
-    model for a task it already knew needs one word on the command line rather than a
-    relearn. It sits beside the ``--reset-url`` hint for the same reason.
-    """
+    """Repeat the render-mode crossing on its own line. The attempt line already carries it
+    in brackets, but that line is dense and this is the rare finding a reader must not scan
+    past: the library is INTACT and one flag fixes the run."""
     warm = report.warm
     if warm is None or warm.cross_mode is None:
         return
@@ -639,14 +595,8 @@ def _hint_at_cross_mode(report: RunReport) -> None:
 
 
 def _hint_at_reset(report: RunReport, undo: str | None) -> None:
-    """Say what to do when the task was done but could not be learned.
-
-    A run that solved the task and stored nothing looks like a failure of the model.
-    Usually it is not: the task changed something, nothing could change it back, and
-    the gate refused to pretend it had proved a skill it never ran. That is one flag
-    away from working, and the run that just paid for a cold exploration is exactly
-    the moment to say so.
-    """
+    """Say what to do when the task was DONE but could not be learned - usually the task
+    changed something nothing could change back, which is one flag away from working."""
     admission = report.admission
     if admission is None or not admission.unproved or undo:
         return
@@ -662,14 +612,8 @@ def _hint_at_reset(report: RunReport, undo: str | None) -> None:
 
 
 def _reset_steps(given: str | None) -> Any:
-    """``--reset-steps`` as something :func:`task_spec` can parse: JSON, or a file.
-
-    A step list long enough to be interesting is long enough to be unpleasant to
-    quote on one command line, and it is the kind of thing that belongs beside a
-    task rather than retyped per invocation - so a value naming a readable file is
-    read from it. Anything else is passed through as written and parsed there, which
-    keeps ONE place deciding what a reset step is.
-    """
+    """``--reset-steps`` as JSON ``task_spec`` can parse; a value naming a readable file is
+    read from it, and anything else passes through so ONE place decides what a step is."""
     if given is None:
         return None
     text = given.strip()
@@ -686,11 +630,8 @@ def _reset_steps(given: str | None) -> Any:
 
 
 def _params(pairs: Sequence[str] | None) -> dict[str, Any]:
-    """``KEY=VALUE`` strings as a mapping, with JSON values parsed when they parse.
-
-    ``-p count=3`` gives an int and ``-p company="Acme Corp"`` gives the string, so a
-    skill declaring a numeric parameter binds without a second flag to say so.
-    """
+    """``KEY=VALUE`` as a mapping, parsing JSON values when they parse: ``-p count=3`` gives
+    an int, so a skill with a numeric parameter binds without a second flag."""
     out: dict[str, Any] = {}
     for pair in pairs or ():
         key, sep, value = pair.partition("=")
@@ -704,12 +645,8 @@ def _params(pairs: Sequence[str] | None) -> dict[str, Any]:
 
 
 def _recorded_in(bench: Workbench, skill: Skill) -> str:
-    """``" (recorded headless)"`` when the library knows, else the empty string.
-
-    Printed against "starts on" rather than on a line of its own because it qualifies
-    exactly that screen: the identity is only comparable to a screen the same renderer
-    drew. A skill stored before the mode was recorded says nothing, which is the truth.
-    """
+    """``" (recorded headless)"`` when the library knows, else ``""``. Printed against
+    "starts on" because it qualifies THAT screen, which only the same renderer can match."""
     recorded = getattr(bench.store, "recorded_render_mode", None)
     if recorded is None:
         return ""
@@ -718,15 +655,8 @@ def _recorded_in(bench: Workbench, skill: Skill) -> str:
 
 
 def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[str, Any]:
-    """The report as data: the same facts ``explain`` prints, for a harness to read.
-
-    ``perception`` sits beside ``llm_calls`` for the reason it sits beside it in the
-    prose: it is the same kind of fact - what the run COST - and it is the one kind
-    that does not move when the machine is busy. Seconds saved by not reading the same
-    pixels twice shrink on a loaded box and grow on an idle one; ``ocr_reads`` does
-    neither. The field names are :class:`~skillweaver.perception.ocr.PerceptionCounts`'
-    own, so this and ``explain()`` can never quote different numbers for one run.
-    """
+    """The report as data, for a harness to read. The field names are ``PerceptionCounts``'
+    own, so this and ``explain()`` can never quote different numbers for one run."""
     eyes = report.perception
     return {
         "ok": report.ok,
@@ -775,11 +705,6 @@ def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[s
     }
 
 
-# --------------------------------------------------------------------------------------
-# skills
-# --------------------------------------------------------------------------------------
-
-
 @skills_app.command("ls")
 def skills_ls(
     ctx: typer.Context,
@@ -798,9 +723,9 @@ def skills_ls(
 ) -> None:
     """List what the agent has learned to do.
 
-    One row per skill, latest version only, with how often it has run and how well.
-    A retired skill is hidden unless you pass --all; retirement is what happens when
-    a skill ran on the warm path and did not work.
+    One row per skill, latest version only, with how often it has run and how well. A
+    retired skill is hidden unless you pass --all; retirement is what happens when a skill
+    ran on the warm path and did not work.
     """
     bench = _bench(ctx)
     found = bench.store.list(domain=domain, include_demoted=include_demoted)
@@ -852,8 +777,7 @@ def skills_show(
 ) -> None:
     """Show one skill: what it does, where it starts, and what it has cost.
 
-    With --code, print the Python the agent wrote for itself. That source is the
-    whole point of this project, so it is worth reading.
+    With --code, print the Python the agent wrote for itself.
     """
     bench = _bench(ctx)
     skill = _find(bench, name, domain, version)
@@ -900,10 +824,8 @@ def skills_rm(
 ) -> None:
     """Retire a skill so retrieval stops offering it.
 
-    Nothing is deleted: every stored version stays on disk, and a later `learn` of
-    the same task stores a fresh version that is healthy again. What changes is that
-    the warm path will no longer reach for this one, so the next `run` of its task
-    explores instead.
+    Nothing is deleted: every stored version stays on disk, and a later `learn` of the same
+    task stores a fresh, healthy version. The next `run` of its task explores instead.
     """
     bench = _bench(ctx)
     skill = _find(bench, name, domain, None)
@@ -959,11 +881,6 @@ def _skill_json(skill: Skill, *, code: bool = False) -> dict[str, Any]:
     return out
 
 
-# --------------------------------------------------------------------------------------
-# graph
-# --------------------------------------------------------------------------------------
-
-
 @graph_app.command("show")
 def graph_show(
     ctx: typer.Context,
@@ -986,19 +903,15 @@ def graph_show(
 ) -> None:
     """Show the screens the agent knows for a site, and how to get between them.
 
-    Each node is one recognizable screen, identified by its fingerprint. Each edge is
-    a sequence of actions that was observed to lead from one screen to another, with
-    how often it worked. The warm path routes over exactly these edges, and only over
-    those with at least one success - so an edge listed here at 0/3 is one the agent
-    will not trust.
+    Each node is one recognizable screen; each edge is an action sequence observed to lead
+    between two, with how often it worked. The warm path routes only over edges with at
+    least one success, so an edge listed at 0/3 is one the agent will not trust.
 
         skillweaver graph show acme.test --svg --out acme.svg
     """
     bench = _bench(ctx)
-    # Load only what is not already in memory. A fresh process starts empty and
-    # reads the domain off disk; a graph a session has already filled must not be
-    # reloaded, because an in-memory graph with no store answers `load` by forgetting
-    # the domain - which would wipe exactly what we were asked to show.
+    # Only what is not already in memory: an in-memory graph with no store answers
+    # `load` by FORGETTING the domain, wiping exactly what we were asked to show.
     if not bench.graph.states(domain):
         try:
             bench.graph.load(domain)
@@ -1077,11 +990,8 @@ def graph_show(
 
 
 def _edges_of(bench: Workbench, states: Sequence[UIState]) -> list[Transition]:
-    """Every outgoing edge of every known screen, de-duplicated and ordered.
-
-    Uses ``neighbors``, which is on the ``GraphView`` Protocol, rather than any
-    concrete graph's richer listing - so this command works against any site graph.
-    """
+    """Every outgoing edge of every known screen, de-duplicated. Uses ``neighbors`` from the
+    ``GraphView`` Protocol, not a concrete graph's richer listing, so any graph works."""
     seen: dict[tuple[str, str, tuple[Any, ...]], Transition] = {}
     for state in states:
         for edge in bench.graph.neighbors(state.fingerprint):
@@ -1090,8 +1000,7 @@ def _edges_of(bench: Workbench, states: Sequence[UIState]) -> list[Transition]:
 
 
 def _actions(actions: Sequence[Any]) -> str:
-    """A short human summary of an action sequence, borrowed from the dashboard so
-    the two views of the same edge read the same way."""
+    """Borrowed from the dashboard so the two views of one edge read the same way."""
     from skillweaver.dashboard.build import actions_summary
 
     return actions_summary(actions)
@@ -1112,13 +1021,9 @@ runs back over the boxes it sits between.
 
 
 def _svg(domain: str, states: Sequence[UIState], edges: Sequence[Transition]) -> str:
-    """The graph as a standalone SVG: layered left to right, reachability first.
-
-    Screens are laid out in breadth-first layers from the oldest known state, which
-    is almost always where runs begin, so the drawing reads in the direction the
-    agent actually moves. It is plain SVG with no script and no external reference,
-    so it opens in a browser, drops into a slide, and survives being emailed.
-    """
+    """The graph as a standalone SVG, in breadth-first layers from the oldest known state -
+    almost always where runs begin - so it reads in the direction the agent moves. No script
+    and no external reference, so it survives being emailed."""
     if not states:
         return _empty_svg(domain)
     layers = _layers(states, edges)
@@ -1227,11 +1132,6 @@ def _fit(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-# --------------------------------------------------------------------------------------
-# replay
-# --------------------------------------------------------------------------------------
-
-
 @app.command("replay")
 def replay_command(
     ctx: typer.Context,
@@ -1245,12 +1145,9 @@ def replay_command(
 ) -> None:
     """Show exactly what happened on one recorded run, action by action.
 
-    Every run this agent makes - warm or cold, successful or not - is recorded with
-    the screen before and after each action. This prints that recording back: what
-    was done, what the critic made of it, and where the screen went. It is how you
-    find out why a run failed, and it is where a stored skill came from.
-
-    With no run id, lists the runs on record, newest last.
+    Every run - warm or cold, successful or not - is recorded with the screen before and
+    after each action. This prints that back: what was done, what the critic made of it,
+    and where the screen went. With no run id, lists the runs on record, newest last.
     """
     bench = _bench(ctx)
     if run_id is None:
@@ -1339,11 +1236,6 @@ def _list_runs(bench: Workbench, as_json: bool) -> None:
         typer.echo(f"  {run_id}")
 
 
-# --------------------------------------------------------------------------------------
-# dashboard
-# --------------------------------------------------------------------------------------
-
-
 @dashboard_app.command("build")
 def dashboard_build(
     ctx: typer.Context,
@@ -1361,10 +1253,9 @@ def dashboard_build(
 ) -> None:
     """Build the one-page review of everything the agent has learned.
 
-    Reads the skill library, the site graphs, the recorded runs and any evaluation
-    results, and writes a single self-contained HTML file - no server, no network,
-    no sibling files. Missing data is never an error: the page explains what is not
-    there yet, so it is worth building before the first run as well as after.
+    Reads the skill library, the site graphs, the recorded runs and any evaluation results,
+    and writes one self-contained HTML file - no server, no network, no sibling files.
+    Missing data is never an error: the page explains what is not there yet.
     """
     bench = _bench(ctx)
     from skillweaver.dashboard.build import build_dashboard
@@ -1381,9 +1272,53 @@ def dashboard_build(
         webbrowser.open(written.resolve().as_uri())
 
 
-# --------------------------------------------------------------------------------------
-# eval
-# --------------------------------------------------------------------------------------
+@app.command("inspect")
+def inspect_command(
+    ctx: typer.Context,
+    port: Annotated[
+        int | None,
+        typer.Option(
+            "--port",
+            help="Loopback port to serve on. 0 asks the OS for a free one. "
+            "Default: the inspector's own.",
+            show_default=False,
+        ),
+    ] = None,
+    open_it: Annotated[
+        bool, typer.Option("--open", help="Open the page in the default browser.")
+    ] = False,
+) -> None:
+    """Drive a live browser session by hand, one move at a time.
+
+    Not `dashboard build`, which writes a report of what already happened. This serves
+    a page on 127.0.0.1 with a prompt bar, the browser's screen with the controls the
+    agent found drawn over it, buttons to CHOOSE a move without making it, EXECUTE the
+    one shown, or do both, a running log of every decision and verdict, resets for the
+    run, the browser and the site, and a live view of the skill library that updates
+    while a `learn` in another terminal adds to it.
+
+    It drives the same agent `learn` does, so the global flags mean what they always
+    mean and are written before the subcommand:
+
+        skillweaver --perception dom --policy jev inspect --open
+        skillweaver --chrome-profile ~/.sw-chrome --chrome-attach inspect
+
+    The server listens on the loopback only and every request must carry a token minted
+    at startup, because the browser it drives may be carrying your own logged-in profile.
+    """
+    bench = _bench(ctx)
+    from skillweaver.inspector import DEFAULT_PORT, serve
+
+    try:
+        serve(
+            bench.settings,
+            port=DEFAULT_PORT if port is None else port,
+            open_browser=open_it,
+        )
+    except OSError as exc:
+        _die(f"the inspector could not listen on that port: {exc}")
+    except SkillWeaverError as exc:
+        _die(f"the inspector could not start: {exc}")
 
 
 @eval_app.command("run")
@@ -1421,18 +1356,15 @@ def eval_run(
 ) -> None:
     """Run the evaluation suite and write a cold-versus-warm report.
 
-    Measures the project's actual claim: the same tasks done once by exploration and
-    then again from the library, with the time and the model calls of each recorded
-    side by side. `skillweaver dashboard build` renders the result.
+    Measures the project's actual claim: the same tasks done once by exploration and again
+    from the library, with each one's time and model calls side by side. `skillweaver
+    dashboard build` renders the result.
 
-    The suite says what it is run against and how it is judged, including which
-    referee reads ground truth - an application that reports its own state, or the
-    live page itself. Nothing about that is a flag here, so one suite cannot be
-    scored two ways.
+    The suite file says what it runs against and how it is judged, including which referee
+    reads ground truth. None of that is a flag here, so one suite cannot be scored two ways.
 
-    `--only` bounds a run to named tasks. A suite that hits a real website costs real
-    time and somebody else's bandwidth, and one task is usually enough to see that
-    the loop works there.
+    `--only` bounds a run to named tasks - a suite that hits a real website costs real time
+    and somebody else's bandwidth.
     """
     bench = _bench(ctx)
     entry = _eval_entry()
@@ -1458,18 +1390,13 @@ def eval_run(
             only=list(only) if only else None,
         )
     except SkillWeaverError as exc:
-        # A suite that is missing or malformed is a command that could not run,
-        # not a crash - the same answer `run` gives, through the same door.
+        # A missing or malformed suite is a command that could not run, not a crash.
         _die(f"the evaluation could not run: {exc}")
 
 
 def _eval_entry() -> Any:
-    """The evaluation harness's entry point, or ``None`` when it has not landed.
-
-    Two names are tried because the harness is another worker's piece and has not
-    chosen one yet. Anything else - an ``ImportError`` from inside a harness that
-    does exist, say - is a real error and is not swallowed here.
-    """
+    """The evaluation harness's entry point, or ``None`` when it has not landed. Two names
+    are tried; an ``ImportError`` from INSIDE a harness that does exist is not swallowed."""
     import importlib
 
     for module_name, attr in (
@@ -1484,11 +1411,6 @@ def _eval_entry() -> Any:
         if callable(entry):
             return entry
     return None
-
-
-# --------------------------------------------------------------------------------------
-# Small shared helpers
-# --------------------------------------------------------------------------------------
 
 
 def _bench(ctx: typer.Context) -> Workbench:
@@ -1521,11 +1443,7 @@ def _ms(value: float) -> str:
 
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
-    """Print aligned columns.
-
-    Deliberately not a rich table: this output gets piped into grep and awk during a
-    demo, and a box-drawing character in the middle of a skill name helps nobody.
-    """
+    """Aligned columns, deliberately not a rich table: this gets piped into grep and awk."""
     columns = list(zip(*([headers, *rows]), strict=True)) if rows else [(h,) for h in headers]
     widths = [max(len(str(cell)) for cell in column) for column in columns]
     typer.echo("  ".join(h.upper().ljust(w) for h, w in zip(headers, widths, strict=True)))
@@ -1534,19 +1452,15 @@ def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point. Returns the exit code rather than exiting, so it is callable.
-
-    ``python -m skillweaver.cli --help`` works today; a ``skillweaver`` console
-    script needs a ``[project.scripts]`` entry in ``pyproject.toml``, which is
-    shared surface and not this module's to change.
-    """
+    """Entry point, returning the exit code rather than exiting. ``python -m skillweaver.cli``
+    is how it is invoked: a ``skillweaver`` console script needs a ``[project.scripts]`` in
+    ``pyproject.toml``, which is shared surface."""
     try:
         app(args=list(argv) if argv is not None else None)
     except SystemExit as exc:
-        # Typer's own dispatch turns typer.Exit and every usage error into a
-        # SystemExit carrying the code. `standalone_mode=False` does NOT: it lets a
-        # UsageError escape instead, which is how every command here once reported
-        # success while printing a failure.
+        # `standalone_mode=False` does NOT turn a UsageError into SystemExit the way
+        # Typer's own dispatch does; unhandled, it reported success while printing a
+        # failure.
         code = exc.code
         if code is None:
             return OK

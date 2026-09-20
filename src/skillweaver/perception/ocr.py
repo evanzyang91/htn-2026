@@ -1,176 +1,8 @@
-"""OCR: reading the text on a screenshot with RapidOCR (PP-OCRv4, ONNX Runtime, local).
+"""OCR through RapidOCR (PP-OCRv4, ONNX Runtime, local: no network, no API key).
 
-:class:`RapidOcrReader` is the project's :class:`skillweaver.contracts.TextReader`. It
-runs the bundled ONNX models on the CPU, with no network and no API key, which is why
-it can be the default: perception must work in a test, in an eval loop and on a plane.
-
-Two decisions worth knowing about before using it:
-
-**The model loads on the first :meth:`RapidOcrReader.read`, not on import.**
-    Importing this module costs nothing, so a CLI that lists skills does not pay for
-    ONNX Runtime. Construct the reader wherever you like; the 1-2 second load happens
-    when text is first actually needed, and only once per reader.
-
-**Failure is loud.** If the engine cannot be imported or built, or inference raises,
-    :meth:`read` raises :class:`~skillweaver.errors.PerceptionError`. It never returns
-    an empty list to mean "OCR is broken", because an agent cannot tell that apart from
-    "this screen has no text" and would go on to click blindly. An empty list means the
-    engine ran and found nothing.
-
-OCR runs on the PHYSICAL-resolution image (sharper - it is what the model wants) and the
-boxes are divided by ``Screenshot.scale`` on the way out, so everything this module
-returns is in LOGICAL pixels like the rest of the system.
-
-Not reading the same pixels twice
----------------------------------
-
-Reading is the expensive half of perception by an enormous margin. Profiled against live
-pages at 1280x800, a full-page read costs 0.44s to over 7s while capture costs 0.02-0.05s
-and detection 0.06s - **84% to 97% of all perception time**, on every real page measured.
-Two ways of making the read itself cheaper were measured and both lost: cropping to the
-detector's boxes took 53.8s against 7.4s for one full-page read of the same frame (the
-engine's per-call overhead dwarfs the pixel saving), and downscaling showed no reliable
-win. So one saving is to not read at all.
-
-:class:`CachingTextReader` is that saving, and :class:`PerceptionCounters` is how you know
-it worked. Counts, unlike seconds, do not move when the machine is busy, so "this task
-went from 14 reads to 3" is a claim that survives being measured on a loaded laptop.
-It only ever fires on a frame nothing has touched, though, and a replay changes the
-screen at every step, so the other saving had to be inside one read. That one is
-:data:`DEFAULT_REC_BATCH`.
-
-Recognition is the read
------------------------
-
-"OCR is expensive" is too coarse to optimize against, because RapidOCR is three models
-and they are not close to equal. Timed by the engine's own per-stage clock on live
-Wikipedia at 1280x800, medians of five, at RapidOCR's shipped ``rec_batch_num=6``::
-
-    frame            lines     det      cls      rec    total
-    Ada Lovelace        70    77 ms    28 ms   840 ms    966 ms
-    Photosynthesis      75    76 ms    29 ms   776 ms    901 ms
-    dense table         58    76 ms    25 ms   881 ms    999 ms
-
-**Recognition is ~87% of a read; detection is ~8% and the angle classifier ~3%.**
-Three consequences, each of which kills a plausible idea:
-
-*Resolution cannot help.* Every crop is resized to height 48 before recognition, so
-what sets rec's cost is each line's ASPECT RATIO, and halving the capture's pixel
-density leaves every ratio exactly where it was. Downscaling can only touch det's 8% -
-which is why the measurement above records no reliable win rather than a small one.
-Browser captures are ``scale=1.0`` anyway (``BrowserController``'s default), so there
-is no Retina factor to give back.
-
-*Reading only where the detector looked is what already happens.* RapidOCR IS detect,
-crop, recognize; rec never sees a pixel outside a detected line. Substituting the YOLO
-detector's boxes would not read less, it would only pay the engine's per-call overhead
-once per box - the 53.8s above.
-
-*Skipping the classifier is not worth its 3%*, and it changes one or two lines' text
-per page, so it buys the smallest win on offer at the price of a correctness argument.
-
-What is worth it is how many lines go into one ONNX Runtime call. RapidOCR sorts the
-crops by aspect ratio, batches ``rec_batch_num`` of them, and pads each batch to its
-widest member. Six is its default; one is ~1.5x faster, and almost all of the
-difference is recognition - the same three frames at ``rec_batch_num=1`` read in
-648/633/616 ms with rec down to 518/502/494 ms while det and cls do not move.
-
-The headline number is measured as MATCHED ADJACENT PAIRS: each pair runs both arms
-back to back with the order coin-flipped, so the ratio comes from two runs that saw the
-same machine. Pooled over two sets of six pairs on three frames, **36 of 36 paired
-comparisons favour one line per call**, median 1.51x and 1.53x, per frame 1.44-1.62x.
-The set-1 pairs held that ratio while the machine's load average climbed from 3.9 to
-6.4 under them, which is the evidence that this is not a load artifact; the absolute
-times drifted by 5% over the same span, which is the evidence that pooling unpaired
-timings here would have been worthless.
-
-An unpaired sweep of the other sizes, so the shape is on record even though its window
-straddled a load change::
-
-    rec_batch_num      1       2       4       6      12
-    ada             1.54x   0.82x   1.15x   1.00x   1.06x
-    photosynthesis  1.41x   0.79x   1.07x   1.00x   1.03x
-    dense table     1.64x   0.86x   1.11x   1.00x   0.96x
-
-**The ordering is not monotone**, which is what rules out the padding arithmetic:
-sorted crops waste only ~14% on a batch of six, nowhere near 1.5x, and padding grows
-with the batch so it cannot make 2 the worst of the five and 4 better again. That dip
-reproduced in three independent runs. What fits is memory - a batch of six lines of
-Wikipedia body text is a 3x48x~1900 input per line and the intermediate feature maps
-are far larger again, so batch 1 stays in cache where batch 6 streams - but the
-mechanism is inference and the measurement is not, so treat the number as the fact and
-that paragraph as the guess. :data:`DEFAULT_REC_BATCH` is 1 because of the number.
-
-It is worth ~0.7s of a warm replay and no more, which is the honest size of it. **A
-1.5x read is not a 1.5x replay, and nothing here should be read as claiming it is.**
-Reading is ~88% of an OBSERVATION, and a warm replay barely observes: on the live
-Wikipedia suite it makes four observations and only TWO text reads (the frame cache
-serves the other two), against a run whose remaining seconds are page loads, interpreter
-start and model loads that this change does not touch. So the saving end to end is two
-reads' worth:
-measured over ten matched pairs at a stable load, 12.05s -> 11.31s, median +0.73s, all
-ten pairs positive - against the +0.70s that two reads at 1.00s and 0.65s predict. Four
-earlier pairs taken while load swung 2.9-4.5 gave +0.27s and two negative pairs, which
-is what this effect looks like when the sample is too small for the run's own variance:
-~2s of OCR inside ~12s of interpreter start, model loads and two live page fetches.
-
-It costs no accuracy. Checked on eight live frames, including three scrolled ones:
-every text element the batch-6 read found is still found by ``find_text`` at the same
-place - 0 lost of 548, matched by box overlap and not just by string - and recall
-against the DOM's own labels goes from 338/385 to 340/385, because a batch padded less
-loses fewer of the spaces between words.
-
-A cheaper read is not the same as a cached one, and the cache cannot be pushed down to
-the line to make up the difference. Keyed on a line's exact pixels, a per-line cache
-saves 3-4% of recognition across a NAVIGATION and 12-13% across a scroll (one pixel of
-difference in a detected box is a different key, so it misses even where the content is
-plainly unchanged); on a re-observation of one screen it would save everything, which is
-the case :class:`CachingTextReader` already serves for free.
-
-Ending a read that has gone wrong
----------------------------------
-
-A read that never returns used to be unstoppable. A 12-task evaluation stopped
-producing output after 49 runs and sat at 98.8% CPU for over 36 minutes with every
-thread parked in ONNX Runtime's own ``WorkerLoop``, spinning - no log line, no error,
-no timeout. Nothing caught it because the skill clock is enforced from Python: the
-sandbox's trace hook fires on Python frames, and a native call executes none, so the
-one place a bound is most needed is the one place it could not reach.
-
-Two deliberate settings fix that here, where the native call is actually made.
-
-**The read runs in a child process** (:class:`OcrWorker`), so abandoning it is a
-``SIGKILL`` rather than a request the spinning threads are never going to read.
-Nothing else can end such a call: a signal handler runs at a Python bytecode
-boundary and there is no such boundary inside ONNX Runtime; a watchdog thread can
-stop *waiting* but leaves the pool spinning at full CPU, which is the very symptom.
-Killing the process is the only mechanism that both frees the caller and gives the
-cores back, and ONNX Runtime itself offers no wall-clock cap on a ``Run``.
-:data:`DEFAULT_READ_TIMEOUT_S` is the budget; exceeding it is a
-:class:`PerceptionTimeout`, which is a :class:`~skillweaver.errors.PerceptionError`
-- the eyes failed, and whatever asked for the read did not.
-
-**The engine's thread pool is sized explicitly** (:data:`DEFAULT_OCR_THREADS`), not
-inherited from the core count. ONNX Runtime sizes its intra-op pool from
-``os.cpu_count()`` and then SPINS while waiting for work, which on a machine already
-running several agents is all cost. Measured on this project's ``invoices@2x``
-fixture, a 14-core machine, seconds per read and CPU-seconds burned per wall second::
-
-    threads   idle wall   idle cpu/wall   6 readers at once   cpu-s per read
-    default   0.245 s     6.11            1.80 s              3.6
-    6         0.342 s     5.19            1.62 s              3.4
-    4         0.293 s     3.81            1.38 s              2.3
-    2         0.443 s     1.97            0.78 s              1.3
-    1         0.811 s     1.01            0.97 s              1.0
-
-The default pool is the FASTEST choice on an idle machine and the SLOWEST under the
-contention that produced the hang - 14 spinning threads per reader, six readers, one
-14-core machine. Four is the knee: 20% off the idle read, 1.3x faster than the
-default under six-way load, and 1.6x less CPU burned to get there. Set
-``SKILLWEAVER_OCR_THREADS=2`` for a fleet run, where it is 2.3x faster still.
-
-Constraining the pool is a mitigation and not the bound: it makes the pathological
-case far less likely and cannot make it impossible, which is why the kill exists.
+Runs on the PHYSICAL-resolution image and divides boxes by ``Screenshot.scale`` on the
+way out, so everything here is in logical pixels. Failure raises rather than returning
+an empty list, which an agent cannot tell apart from "this screen has no text".
 """
 
 from __future__ import annotations
@@ -216,38 +48,26 @@ __all__ = [
     "rec_batch",
 ]
 
-#: Recognitions below this score are dropped: at that level RapidOCR is reporting
-#: shapes it could not read, and a wrong label is worse for an agent than no label.
+#: Below this RapidOCR reports shapes it could not read, and a wrong label is worse
+#: for an agent than no label.
 DEFAULT_MIN_CONFIDENCE = 0.5
 
 DEFAULT_READ_TIMEOUT_S = 60.0
-"""Seconds one text read may take before it is abandoned and the engine killed.
-
-Generous on purpose: this is a dead-man's switch, not a performance target. The
-slowest honest read this project has measured is 7.4s on a dense live article, and
-the same read under six-way contention is a few times that; 60s is comfortably above
-anything real and four orders of magnitude below the 36 minutes the hang it exists
-for actually ran. Override with ``SKILLWEAVER_OCR_TIMEOUT_S``; ``0`` disables the
-bound, which only a test has any business doing.
-"""
+"""Seconds one read may take. A dead-man's switch, not a target: the slowest honest read
+measured is 7.4s and the hang it exists for ran 36 minutes. ``SKILLWEAVER_OCR_TIMEOUT_S``
+overrides; ``0`` disables the bound."""
 
 DEFAULT_OCR_THREADS = 4
-"""Intra- and inter-op threads the ONNX Runtime sessions are given.
-
-Explicit rather than inherited: left alone ONNX Runtime sizes its pool from
-``os.cpu_count()`` and spins. See the module docstring for the measured table this
-number comes from, and ``SKILLWEAVER_OCR_THREADS`` to change it.
-"""
+"""ONNX Runtime intra-/inter-op threads. Explicit because left alone it sizes the pool
+from ``os.cpu_count()`` and SPINS: on 14 cores, four is 20% off the idle read, 1.3x
+faster than the default under six concurrent readers and 1.6x less CPU burned.
+``SKILLWEAVER_OCR_THREADS`` changes it (2 for a fleet run, 2.3x faster still)."""
 
 DEFAULT_REC_BATCH = 1
-"""Text lines the recognizer is given per ONNX Runtime call.
-
-One, which reads like a mistake and is the fastest setting measured, by a lot. See
-"Recognition is the read" in the module docstring for the table and for why the
-padding arithmetic does not explain it. ``SKILLWEAVER_OCR_REC_BATCH`` changes it,
-which is how the number gets re-derived on a machine that is not this one rather
-than nudged.
-"""
+"""Text lines per ONNX Runtime recognizer call. One beats RapidOCR's default of six in
+36 of 36 matched adjacent pairs, median 1.51x, and costs no accuracy (0 of 548 text
+elements lost); the 1/2/4/6/12 ordering is not monotone, so batch padding does not
+explain it. Re-derive on another machine with ``SKILLWEAVER_OCR_REC_BATCH``."""
 
 log = get_logger(__name__)
 
@@ -257,23 +77,11 @@ _REC_BATCH_ENV = "SKILLWEAVER_OCR_REC_BATCH"
 
 
 class PerceptionTimeout(PerceptionError):
-    """A text read was abandoned because it did not return within its budget.
-
-    A :class:`~skillweaver.errors.PerceptionError` and not a new top-level kind, so
-    every caller that already treats a broken pair of eyes as "not the skill's fault"
-    treats this the same way. What it must never be mistaken for is a skill failing
-    its task: nothing has been learned about the skill, and recording one would
-    demote a good one.
-    """
+    """A text read was abandoned: the eyes failed, not whatever asked for the read."""
 
 
 def _positive_float(name: str, fallback: float) -> float:
-    """``name`` from the environment as a non-negative float, else ``fallback``.
-
-    A malformed value falls back rather than raising: perception refusing to start
-    because a variable was misspelt would be a worse failure than the one this
-    module is here to prevent.
-    """
+    """``name`` as a non-negative float; a malformed value falls back rather than raising."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return fallback
@@ -285,55 +93,36 @@ def _positive_float(name: str, fallback: float) -> float:
 
 
 def read_timeout_s() -> float:
-    """The configured per-read budget: ``SKILLWEAVER_OCR_TIMEOUT_S``, else
-    :data:`DEFAULT_READ_TIMEOUT_S`. Read per reader rather than at import, so a
-    process that sets the variable gets the bound it asked for."""
+    """The per-read budget, read per reader rather than at import."""
     return _positive_float(_TIMEOUT_ENV, DEFAULT_READ_TIMEOUT_S)
 
 
 def ocr_threads() -> int:
-    """The configured ONNX Runtime pool size: ``SKILLWEAVER_OCR_THREADS``, else
-    :data:`DEFAULT_OCR_THREADS`. Clamped to at least one thread."""
+    """The configured ONNX Runtime pool size, at least one thread."""
     return max(1, int(_positive_float(_THREADS_ENV, DEFAULT_OCR_THREADS)))
 
 
 def rec_batch() -> int:
-    """The configured recognizer batch: ``SKILLWEAVER_OCR_REC_BATCH``, else
-    :data:`DEFAULT_REC_BATCH`. Clamped to at least one line."""
+    """The configured recognizer batch, at least one line."""
     return max(1, int(_positive_float(_REC_BATCH_ENV, DEFAULT_REC_BATCH)))
 
 
 class RapidOcrReader:
-    """A :class:`~skillweaver.contracts.TextReader` backed by RapidOCR.
+    """A ``TextReader`` backed by RapidOCR: one ``text`` element per recognized line.
 
-    One element of kind :attr:`~skillweaver.contracts.ElementKind.text` per recognized
-    line, with ``source=ElementSource.ocr``, a real confidence from the recognizer, a
-    box in LOGICAL pixels and a :func:`~skillweaver.perception.elements.stable_id`
-    already filled in.
-
-    By default the engine runs in a CHILD PROCESS, one per reader, reused across
-    reads: a read that does not come back within ``timeout_s`` is abandoned by killing
-    that process, which is the only thing that ends a call executing no Python. See
-    the module docstring for why nothing lighter works. The child is started on the
-    first read and lives until :meth:`close`, the reader is garbage collected, or the
-    parent exits.
-
-    Instances are safe to share between threads (the engine is built once under a lock,
-    and the worker serves one read at a time) and are cheap to create.
+    Boxes are in logical pixels with a ``stable_id`` filled in. By default the engine
+    runs in a CHILD PROCESS, one per reader and reused across reads, because killing it
+    is the only thing that ends a read executing no Python. Built on the first read;
+    safe to share between threads.
 
     Args:
         min_confidence: Recognitions scoring below this are dropped.
-        engine: An already-built RapidOCR callable, for tests or for reusing one engine
-            across readers. When given, nothing is imported, loaded or spawned, and the
-            read happens IN THIS PROCESS - so it is not bounded, because there is no
-            process of ours to kill.
-        isolate: ``False`` builds the engine in this process instead of a child. The
-            read is then unbounded; only use it to exercise the engine itself.
-        timeout_s: Seconds one read may take. ``0`` disables the bound. Defaults to
-            :func:`read_timeout_s`.
-        threads: ONNX Runtime intra-/inter-op threads. Defaults to :func:`ocr_threads`.
-        worker: A prepared :class:`OcrWorker` to read through, for tests that need to
-            drive the bound itself.
+        engine: An already-built RapidOCR callable. Reads then happen IN THIS PROCESS
+            and are unbounded, because there is no process of ours to kill.
+        isolate: ``False`` builds the engine here rather than in a child; unbounded.
+        timeout_s: Seconds one read may take. ``0`` disables the bound.
+        threads: ONNX Runtime intra-/inter-op threads.
+        worker: A prepared :class:`OcrWorker` to read through, for driving the bound.
     """
 
     __slots__ = (
@@ -372,11 +161,7 @@ class RapidOcrReader:
 
     @property
     def loaded(self) -> bool:
-        """Whether an engine has been built in THIS process yet.
-
-        Always ``False`` for an isolated reader however many times it has read: the
-        engine belongs to the child, and this process never imports ONNX Runtime.
-        """
+        """Whether an engine was built in THIS process; always ``False`` when isolated."""
         return self._engine is not None
 
     @property
@@ -398,13 +183,6 @@ class RapidOcrReader:
             pass
 
     def _ensure_engine(self) -> Any:
-        """Build the engine in THIS process on first use.
-
-        Raises:
-            PerceptionError: if RapidOCR is not installed or its models cannot be
-                loaded. The message names the cause, because "OCR silently found no
-                text" is the single most expensive failure mode in this pipeline.
-        """
         if self._engine is not None:
             return self._engine
         with self._lock:
@@ -413,16 +191,12 @@ class RapidOcrReader:
             return self._engine
 
     def read(self, screenshot: Screenshot) -> list[Element]:
-        """Read the text on ``screenshot``.
-
-        Returns one element per recognized line, in reading order. An empty list means
-        the engine ran and found no text.
+        """The text on ``screenshot``, in reading order. Empty means none was found.
 
         Raises:
-            PerceptionTimeout: if the read did not return within ``timeout_s``. The
-                engine process was killed; the next read starts a fresh one.
-            PerceptionError: if the screenshot cannot be decoded, the engine cannot be
-                loaded, or inference fails.
+            PerceptionTimeout: the read overran ``timeout_s``; the engine process was
+                killed and the next read starts a fresh one.
+            PerceptionError: the screenshot cannot be decoded or inference failed.
         """
         scale = screenshot.scale if screenshot.scale > 0 else 1.0
         raw = self._raw_rows(screenshot)
@@ -454,7 +228,7 @@ class RapidOcrReader:
         if self._isolate:
             return self._worker_rows(screenshot)
         engine = self._ensure_engine()
-        # Decoding is outside the try: an undecodable PNG is its own PerceptionError
+        # Outside the try: an undecodable PNG is its own error, not the engine failing.
         # and must not be reported as the engine having failed.
         image = screenshot.to_array(logical=False)
         try:
@@ -472,8 +246,7 @@ class RapidOcrReader:
             try:
                 return worker.rows(screenshot, self.timeout_s)
             except PerceptionTimeout:
-                # ``rows`` has already killed it. Drop it so the next read - which may
-                # well be of a screen this engine can handle - starts somewhere clean.
+                # ``rows`` already killed it; drop it so the next read starts clean.
                 self._worker = None
                 raise
             except PerceptionError:
@@ -483,10 +256,10 @@ class RapidOcrReader:
 
 
 def _parse_entry(entry: Any) -> tuple[Any, str, float] | None:
-    """Pull ``(polygon, text, confidence)`` out of one RapidOCR result row.
+    """``(polygon, text, confidence)`` from one RapidOCR row.
 
-    RapidOCR returns ``[polygon, text, score]`` rows, but the exact container types have
-    moved between releases, so this stays shape-driven rather than trusting one version.
+    Shape-driven rather than version-specific: the container types have moved between
+    RapidOCR releases.
     """
     try:
         polygon, text, score = entry[0], entry[1], entry[2]
@@ -500,10 +273,10 @@ def _parse_entry(entry: Any) -> tuple[Any, str, float] | None:
 
 
 def _polygon_to_box(polygon: Any, scale: float, width: int, height: int) -> Box | None:
-    """Convert a physical-pixel quadrilateral to a clamped LOGICAL-pixel ``Box``.
+    """A physical-pixel quadrilateral as a clamped LOGICAL-pixel box.
 
-    Dividing by ``scale`` here is the one conversion that keeps OCR honest: skip it on a
-    Retina capture and every click derived from text lands twice as far down the screen.
+    Skip the ``scale`` division on a Retina capture and every click derived from text
+    lands twice as far down the screen.
     """
     import numpy as np
 
@@ -526,30 +299,17 @@ def _polygon_to_box(polygon: Any, scale: float, width: int, height: int) -> Box 
     return box if box.area > 0 else None
 
 
-# --------------------------------------------------------------------------------------
-# The engine, and the process it is kept in
-# --------------------------------------------------------------------------------------
-
-
 def build_engine(threads: int, batch: int | None = None) -> Any:
-    """Import RapidOCR and build it with an EXPLICIT thread pool and batch size.
+    """Build the engine with an explicit thread pool and batch size.
 
-    The one place the engine is constructed, so the parent process (``isolate=False``)
-    and the worker child get identical settings and identical failure messages.
-
-    ``intra_op_num_threads`` is the number that matters for the pool: ONNX Runtime
-    spawns that many workers per session and spins them while they wait. RapidOCR
-    forwards both values from its global config into the detection, classification
-    and recognition sessions, so passing them here sizes all three.
-
-    ``rec_batch_num`` is the number that matters for the clock. It defaults to
-    :func:`rec_batch`, which is ONE line per call; RapidOCR ships six. The module
-    docstring has the measurements.
+    The one construction site, so ``isolate=False`` and the worker child get identical
+    settings and identical failure messages. RapidOCR forwards both thread counts into
+    its three sessions, so passing them here sizes all of them.
 
     Raises:
-        PerceptionError: if RapidOCR is not installed or its models cannot be loaded.
-            The message names the cause, because "OCR silently found no text" is the
-            single most expensive failure mode in this pipeline.
+        PerceptionError: RapidOCR is not installed or its models cannot be loaded. The
+            message names the cause; "OCR silently found no text" is the most expensive
+            failure mode in this pipeline.
     """
     try:
         from rapidocr_onnxruntime import RapidOCR
@@ -569,8 +329,8 @@ def build_engine(threads: int, batch: int | None = None) -> Any:
 
 
 _FRAME = struct.Struct("<I")
-"""Every message on the worker pipe is a 4-byte little-endian length then that many
-bytes. A length prefix rather than a delimiter because one of the messages is a PNG."""
+"""4-byte little-endian length prefix; a prefix rather than a delimiter because one of
+the messages is a PNG."""
 
 _WORKER_BOOTSTRAP = "from skillweaver.perception.ocr import _worker_main; _worker_main()"
 
@@ -594,18 +354,15 @@ def _recv_frame(stream: Any) -> bytes | None:
 
 
 def _worker_argv() -> list[str]:
-    """The command that runs :func:`_worker_main` in a fresh interpreter."""
     return [sys.executable, "-c", _WORKER_BOOTSTRAP]
 
 
 def _worker_env(threads: int) -> dict[str, str]:
-    """The child's environment: this package importable, and every thread pool named.
+    """The child's environment: this package importable, every thread pool named.
 
-    ``SKILLWEAVER_OCR_THREADS`` is what the child actually reads; the three
-    ``*_NUM_THREADS`` variables are set because they are read by OpenMP and the BLAS
-    libraries underneath ONNX Runtime AT IMPORT TIME, which is before the child can
-    pass anything to a session. Setting them in the environment we hand to
-    ``Popen`` is the only moment early enough.
+    The three ``*_NUM_THREADS`` variables are set because OpenMP and the BLAS libraries
+    under ONNX Runtime read them AT IMPORT TIME, before the child can pass anything to a
+    session; the environment handed to ``Popen`` is the only moment early enough.
     """
     env = dict(os.environ)
     package_root = str(Path(__file__).resolve().parents[2])
@@ -619,19 +376,13 @@ def _worker_env(threads: int) -> dict[str, str]:
 
 
 _LIVE: set[subprocess.Popen[bytes]] = set()
-"""Every engine process this interpreter has started and not yet let go of.
-
-Kept so :func:`_kill_live_workers` can be certain. A reader that is simply dropped
-gets its child cleaned up by ``__del__``; a process that exits while a reader is
-still referenced somewhere would otherwise leave a child alive, and this child is
-one that can be burning every core on the machine.
-"""
+"""Engine processes this interpreter started, so :func:`_kill_live_workers` can be
+certain: an abandoned child here can be burning every core on the machine."""
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
-    """SIGKILL and reap. Not ``terminate``: a process wedged in a native spin is not
-    going to run a signal handler, and a polite request that is never read is exactly
-    the failure this module exists to end."""
+    """SIGKILL and reap. Not ``terminate``: a process wedged in a native spin never runs
+    a signal handler."""
     _LIVE.discard(proc)
     try:
         proc.kill()
@@ -647,10 +398,7 @@ def _close_streams(proc: subprocess.Popen[bytes], *, stdin: bool, stdout: bool) 
     """Close each pipe, but ONLY the ones no thread is still inside.
 
     Closing a pipe a thread is blocked reading is a fatal interpreter error
-    (``_enter_buffered_busy``), which a real headless run produced on the first try.
-    Leaking a file descriptor for a process that has already been killed is the
-    cheaper mistake by a wide margin, so an unjoined thread means its pipe is left to
-    the garbage collector.
+    (``_enter_buffered_busy``); leaking an fd of an already-killed process is cheaper.
     """
     for stream, joined in ((proc.stdin, stdin), (proc.stdout, stdout)):
         if stream is not None and joined:
@@ -662,11 +410,9 @@ def _close_streams(proc: subprocess.Popen[bytes], *, stdin: bool, stdout: bool) 
 
 @atexit.register
 def _kill_live_workers() -> None:
-    """Kill every engine process still running, before the interpreter tears down.
+    """Kill every engine process before teardown.
 
-    Registered rather than left to ``__del__`` because ``atexit`` runs while threads
-    and pipes still work, and because the cost of getting this wrong is a child at
-    98.8% CPU that outlives the run that started it.
+    ``atexit`` rather than ``__del__`` because it runs while threads and pipes still work.
     """
     for proc in list(_LIVE):
         _kill(proc)
@@ -675,18 +421,14 @@ def _kill_live_workers() -> None:
 class OcrWorker:
     """A child process holding one OCR engine, whose reads can be abandoned.
 
-    The point of the process is the kill. A read that has wedged inside ONNX Runtime
-    is executing no Python, so nothing inside that interpreter will ever look at a
-    flag, a signal or a trace hook again; ``SIGKILL`` is what ends it, and it is also
-    what gives the spinning cores back. Everything else here is plumbing around that.
-
-    One request is in flight at a time. The child is started lazily on the first
-    :meth:`rows` and restarted automatically after it has been abandoned.
+    The point of the process is the kill: a read wedged inside ONNX Runtime executes no
+    Python, so no flag, signal or trace hook will ever be looked at again, and SIGKILL is
+    also what gives the spinning cores back. One request in flight at a time; the child
+    starts lazily and is restarted after being abandoned.
 
     Args:
         threads: ONNX Runtime pool size to build the engine with.
-        argv: The command to run. Defaults to this module's own worker; a test may
-            point it at a process that deliberately never answers.
+        argv: The command to run. A test may point it at a process that never answers.
         env: Environment for the child. Defaults to :func:`_worker_env`.
     """
 
@@ -721,11 +463,7 @@ class OcrWorker:
         return self._proc is not None and self._proc.poll() is None
 
     def start(self) -> None:
-        """Spawn the child if it is not already running.
-
-        Raises:
-            PerceptionError: if the interpreter could not be started at all.
-        """
+        """Spawn the child if it is not already running."""
         if self._proc is not None and self._proc.poll() is None:
             return
         self._reap()
@@ -754,16 +492,12 @@ class OcrWorker:
         """Read ``screenshot`` in the child and return the recognizer's raw rows.
 
         Args:
-            screenshot: The frame to read. Its PNG bytes and geometry go over the
-                pipe; the child decodes them the same way this process would.
-            timeout_s: Seconds to wait. ``0`` waits forever, which is what this class
-                exists to avoid - only a test should pass it.
+            screenshot: The frame to read; its PNG and geometry go over the pipe.
+            timeout_s: Seconds to wait. ``0`` waits forever - only a test should.
 
         Raises:
-            PerceptionTimeout: the budget was spent. The child has been killed and the
-                message says so, because a caller needs to know the cores came back.
-            PerceptionError: the child died, could not be started, or reported that
-                the engine failed. The message is the child's own.
+            PerceptionTimeout: the budget was spent and the child was killed.
+            PerceptionError: the child died or reported that the engine failed.
         """
         self.start()
         proc = self._proc
@@ -775,11 +509,9 @@ class OcrWorker:
                 "scale": screenshot.scale,
             }
         ).encode()
-        # The request goes out on its own thread. A pipe holds 64 KiB and a screenshot
-        # is bigger, so writing one to a child that has stopped reading BLOCKS - which
-        # would be a second unbounded wait, in the caller, for exactly the reason the
-        # first one exists. Only the reply is waited on here, with a deadline; a send
-        # that never finishes ends when the kill closes the pipe under it.
+        # On its own thread: a pipe holds 64 KiB and a screenshot is bigger, so writing
+        # one to a child that has stopped reading BLOCKS - a second unbounded wait, in
+        # the caller. Only the reply is waited on, and the kill closes the pipe.
         self._join_sender()
         self._sender = threading.Thread(
             target=_send_request,
@@ -809,18 +541,12 @@ class OcrWorker:
         return _decode_reply(reply)
 
     def abandon(self) -> None:
-        """Kill the child now and forget it. Safe to call when none is running.
-
-        ``kill`` and not ``terminate``: a process wedged in a native spin is not going
-        to run a signal handler, and a polite request that is never read is exactly
-        the failure this class exists to end.
-        """
+        """Kill the child now and forget it. Safe to call when none is running."""
         proc, self._proc = self._proc, None
         if proc is None:
             return
-        # Kill BEFORE touching anything. The child dying is what releases a writer
-        # blocked on a full pipe and a reader blocked on an empty one; closing a
-        # stream another thread is mid-call on is the way to turn this into a new bug.
+        # Kill FIRST: the child dying is what releases a writer blocked on a full pipe
+        # and a reader blocked on an empty one.
         _kill(proc)
         if sys.is_finalizing():
             return
@@ -829,18 +555,13 @@ class OcrWorker:
         _close_streams(proc, stdin=sent, stdout=pumped)
 
     def close(self) -> None:
-        """Ask the child to exit, and kill it if it will not.
-
-        Closing its stdin is end-of-stream to the worker loop, which returns. A child
-        that is mid-read cannot notice, so the wait is short and the kill is certain.
-        """
+        """Ask the child to exit - closing stdin ends its loop - and kill it if it will not."""
         proc = self._proc
         if proc is None:
             return
         if sys.is_finalizing():
-            # Interpreter teardown: the threads are about to be frozen wherever they
-            # stand, so joining them cannot finish and closing a pipe one of them is
-            # reading is a fatal error. Kill the child and let the OS do the rest.
+            # Teardown: threads are about to freeze, so joining cannot finish and closing
+            # a pipe one is reading is fatal. Kill and let the OS do the rest.
             self._proc = None
             _kill(proc)
             return
@@ -861,8 +582,7 @@ class OcrWorker:
         _close_streams(proc, stdin=sent, stdout=pumped)
 
     def _join_pump(self) -> bool:
-        """Wait for the reader thread. ``False`` means it is still in the pipe, and
-        that the pipe must therefore be left alone."""
+        """Wait for the reader thread. ``False`` means the pipe must be left alone."""
         pump, self._pump = self._pump, None
         if pump is None or pump is threading.current_thread():
             return True
@@ -870,7 +590,7 @@ class OcrWorker:
         return not pump.is_alive()
 
     def _join_sender(self) -> bool:
-        """Wait for the writer thread, with the same meaning as :meth:`_join_pump`."""
+        """Wait for the writer thread; same meaning as :meth:`_join_pump`."""
         sender, self._sender = self._sender, None
         if sender is None or sender is threading.current_thread():
             return True
@@ -878,7 +598,6 @@ class OcrWorker:
         return not sender.is_alive()
 
     def _reap(self) -> None:
-        """Clear away a child that has already exited."""
         if self._proc is not None:
             try:
                 self._proc.wait(timeout=0)
@@ -893,9 +612,8 @@ class OcrWorker:
 def _send_request(stream: Any, header: bytes, png: bytes) -> None:
     """Write one request to the child, off the caller's thread.
 
-    Failures are swallowed on purpose. A send can only fail because the child is gone
-    or being killed, and both of those reach the caller as the reply that never
-    arrives - reported once, in one place, rather than as two races for the same news.
+    Failures are swallowed: a send can only fail because the child is gone, which
+    reaches the caller as the reply that never arrives.
     """
     try:
         _send_frame(stream, header)
@@ -905,11 +623,9 @@ def _send_request(stream: Any, header: bytes, png: bytes) -> None:
 
 
 def _pump_frames(stream: Any, replies: queue.Queue[bytes | None]) -> None:
-    """Move frames off the child's stdout so a reader can wait on them with a timeout.
+    """Move frames off the child's stdout so a reader can wait with a deadline.
 
-    A queue and a thread rather than a plain blocking read, because a blocking read is
-    precisely what cannot be given a deadline. The thread ends when the pipe closes,
-    which killing the child does.
+    A blocking read is precisely what cannot be given one.
     """
     try:
         while True:
@@ -924,7 +640,7 @@ def _pump_frames(stream: Any, replies: queue.Queue[bytes | None]) -> None:
 
 
 def _decode_reply(reply: bytes) -> Any:
-    """The rows out of one worker reply, or the child's failure raised as ours."""
+    """The rows of one worker reply, or the child's failure raised as ours."""
     try:
         message = json.loads(reply)
     except ValueError as exc:
@@ -933,17 +649,14 @@ def _decode_reply(reply: bytes) -> Any:
         raise PerceptionError("the OCR engine process sent a reply we cannot read")
     if message.get("ok"):
         return message.get("rows") or []
-    # The child raises the same PerceptionError messages this module would, so its
-    # wording is passed through verbatim rather than wrapped in ours.
+    # The child raises this module's own messages, so they pass through verbatim.
     raise PerceptionError(str(message.get("error") or "the OCR engine process failed"))
 
 
 def _jsonable_rows(raw: Any) -> list[list[Any]]:
-    """RapidOCR's rows reduced to ``[[[x, y], ...], text, score]``, JSON-safe.
+    """RapidOCR's rows as JSON-safe ``[[[x, y], ...], text, score]``.
 
-    Parsed in the child so numpy never has to cross the pipe, and so a row the
-    recognizer returned in a shape we do not understand is dropped where it is made
-    rather than travelling as far as the element list.
+    Parsed in the child so numpy never crosses the pipe.
     """
     import numpy as np
 
@@ -966,14 +679,10 @@ def _jsonable_rows(raw: Any) -> list[list[Any]]:
 def _worker_main() -> int:
     """The child: read frames, answer with rows, until stdin ends.
 
-    Started by :class:`OcrWorker`, never by a person. Two things matter here.
-
-    The reply channel is a DUPLICATE of the original stdout and file descriptor 1 is
-    then pointed at stderr, so RapidOCR's logging, a stray ``print`` in a dependency
-    and anything else that writes to stdout cannot corrupt the frames. The engine is
-    built on the first request rather than at startup, so a failure to load is
-    reported down the same channel as any other failure instead of killing a child
-    the parent is still waiting on.
+    The reply channel is a DUPLICATE of stdout and fd 1 is repointed at stderr, so
+    RapidOCR's logging and any stray ``print`` cannot corrupt the frames. The engine is
+    built on the first request so a load failure is reported rather than killing a child
+    the parent is waiting on.
     """
     channel = os.fdopen(os.dup(1), "wb")
     os.dup2(2, 1)
@@ -1013,37 +722,21 @@ def _worker_main() -> int:
 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-"""``Screenshot.captured_at`` for the frame the worker rebuilds. Nothing on the read
-path looks at it, and inventing "now" in the child would make a reply depend on when
-it was answered."""
-
-
-# --------------------------------------------------------------------------------------
-# Counting what perception did
-# --------------------------------------------------------------------------------------
+"""``captured_at`` for the frame the worker rebuilds; nothing reads it, and inventing
+"now" in the child would make a reply depend on when it was answered."""
 
 
 @dataclass(frozen=True, slots=True)
 class PerceptionCounts:
-    """How much work perception did over some window, as COUNTS rather than seconds.
+    """Perception work over some window, as COUNTS rather than seconds.
 
-    Seconds are the number everybody wants and the number nobody can trust: the same
-    frame read on a quiet machine and on one running four other workers differs by more
-    than any optimization in this module could ever buy. Counts do not move, so this is
-    the type a run reports alongside its model calls and its dollars.
+    Seconds move with machine load; counts do not, so this is what a run reports.
 
     Attributes:
-        observations: Completed :meth:`~skillweaver.contracts.Perceiver.observe` calls.
-        captures: Frames taken from the controller.
-        detections: Detector (YOLO) invocations.
-        ocr_reads: Text reads that actually ran the OCR engine. **This is the number
-            an optimization here has to move.**
-        ocr_hits: Text reads answered from cache without touching the engine.
-        ocr_timeouts: Reads abandoned because the engine did not come back. A SUBSET
-            of ``ocr_reads`` - the work was started and charged - and a number that
-            should be zero. One of these is a killed engine process, and a run that
-            reports any has had eyes that stopped working rather than skills that
-            stopped working.
+        ocr_reads: Text reads that ran the engine. An optimization here has to move this.
+        ocr_hits: Text reads answered from cache.
+        ocr_timeouts: Reads abandoned. A SUBSET of ``ocr_reads``, and should be zero:
+            one means eyes that stopped working, not skills that did.
     """
 
     observations: int = 0
@@ -1060,10 +753,7 @@ class PerceptionCounts:
 
     @property
     def hit_rate(self) -> float:
-        """Fraction of text reads the cache answered, in ``0.0..1.0``.
-
-        ``0.0`` when no text read was asked for, rather than a division by zero.
-        """
+        """Fraction of text reads the cache answered; ``0.0`` when none was asked for."""
         asked = self.text_reads
         return self.ocr_hits / asked if asked else 0.0
 
@@ -1078,11 +768,8 @@ class PerceptionCounts:
         )
 
     def __sub__(self, other: PerceptionCounts) -> PerceptionCounts:
-        """The work done SINCE ``other``, which is how a per-attempt figure is taken.
-
-        Counters only ever climb, so every field is clamped at zero rather than
-        reporting a negative amount of work if the two came from different counters.
-        """
+        """The work done SINCE ``other``. Clamped at zero per field: counters only climb,
+        so a negative would mean the two came from different counters."""
         return PerceptionCounts(
             observations=max(self.observations - other.observations, 0),
             captures=max(self.captures - other.captures, 0),
@@ -1093,12 +780,10 @@ class PerceptionCounts:
         )
 
     def __bool__(self) -> bool:
-        """Whether anything at all was counted, so a report can stay silent otherwise."""
+        """Whether anything was counted, so a report can stay silent otherwise."""
         return bool(self.observations or self.captures or self.detections or self.text_reads)
 
     def __str__(self) -> str:
-        # The abandoned clause appears only when there is one, so the ordinary line
-        # stays the line every report and test already reads.
         abandoned = f", {self.ocr_timeouts} ABANDONED" if self.ocr_timeouts else ""
         return (
             f"{self.observations} observation(s), {self.ocr_reads} OCR read(s) "
@@ -1110,12 +795,8 @@ class PerceptionCounts:
 class PerceptionCounters:
     """MUTABLE running tally of perception work, shared by everything that does some.
 
-    Modelled on :class:`~skillweaver.contracts.Spend`: one instance is threaded through
-    a perceiver and its reader, each of them charges its own work to it, and a caller
-    takes :meth:`snapshot` before and after a stretch to get that stretch's
-    :class:`PerceptionCounts`. Not thread-safe, like ``Spend``; the counts are
-    diagnostics, and a lost increment under concurrency is not worth a lock on the
-    hot path.
+    Like ``Spend``: threaded through a perceiver and its reader, snapshotted before and
+    after a stretch. Not thread-safe - a lost increment is not worth a hot-path lock.
     """
 
     observations: int = 0
@@ -1141,7 +822,7 @@ class PerceptionCounters:
         return self.snapshot() - mark
 
     def reset(self) -> None:
-        """Zero every field, for a caller measuring one stretch in isolation."""
+        """Zero every field."""
         self.observations = self.captures = self.detections = 0
         self.ocr_reads = self.ocr_hits = self.ocr_timeouts = 0
 
@@ -1149,79 +830,41 @@ class PerceptionCounters:
         return str(self.snapshot())
 
 
-# --------------------------------------------------------------------------------------
-# Not reading the same pixels twice
-# --------------------------------------------------------------------------------------
-
 DEFAULT_CACHE_SIZE = 32
-"""Frames a :class:`CachingTextReader` remembers.
-
-Small on purpose. The hit this cache exists to catch is the one the agent hands it
-immediately - a check, a critic and the next loop iteration all looking at the screen
-the last action left - and a run that comes back to a frame it last saw thirty frames
-ago has almost certainly re-rendered it in the meantime. Each entry holds a frame's
-text elements, not its pixels, so the bound is on entries rather than bytes.
-"""
+"""Frames a :class:`CachingTextReader` remembers. Small because the hit it exists for is
+immediate - a check, a critic and the next loop iteration on the screen the last action
+left. Entries hold text elements, not pixels, so the bound is on entries."""
 
 
 def content_key(screenshot: Screenshot) -> str:
     """The identity of the pixels a text read would be performed on.
 
-    Two screenshots share a key exactly when reading them is guaranteed to produce the
-    same elements: the same PNG bytes *and* the same declared geometry. The geometry
-    belongs in the key because :attr:`~skillweaver.contracts.Screenshot.scale` is what
-    divides OCR's physical coordinates down to logical ones - the same bytes declared at
-    ``scale=2.0`` yield boxes at half the position of the same bytes at ``scale=1.0``,
-    and serving one for the other is the doubled-coordinate bug this project warns about
-    everywhere else.
-
-    Hashing the whole PNG on every read is affordable by four orders of magnitude: 0.26ms
-    median for a 334 KiB live Wikipedia frame, against the 440ms to 7.4s read it may save.
+    The same PNG bytes *and* the same declared geometry: ``scale`` divides OCR's physical
+    coordinates down, so the same bytes at ``scale=2.0`` yield boxes at half the position
+    of those at ``1.0``. Hashing the whole PNG costs 0.26ms median against a 0.44-7.4s read.
     """
     digest = hashlib.blake2b(screenshot.png, digest_size=16).hexdigest()
     return f"{digest}:{screenshot.width}x{screenshot.height}@{screenshot.scale:g}"
 
 
 class CachingTextReader:
-    """A :class:`~skillweaver.contracts.TextReader` that never reads the same pixels twice.
+    """A ``TextReader`` that never reads the same pixels twice.
 
-    Wraps another reader with a bounded LRU keyed on :func:`content_key`, so an
-    observation of a screen nothing has changed reuses the previous read instead of
-    paying for it again. Measured on live Wikipedia pages, four captures of an untouched
-    page are byte-identical, so this is the common case and not a corner one.
+    A bounded LRU keyed on :func:`content_key`. Four captures of an untouched live page
+    are byte-identical, so this is the common case.
 
-    Why the key is exact, and not "the same state"
-    ----------------------------------------------
-
-    The obvious improvement is to serve a cached read whenever the new frame is the SAME
-    STATE as the cached one, by
-    :meth:`~skillweaver.contracts.Fingerprint.similarity` against
-    :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`. That judgment is
-    the right one for its own question and the wrong one for this one, and the
-    fingerprinter's own measured table says why: ``dense_text_scrolled_slightly`` scores
-    0.750 and ``same_screen_clock_tick`` scores 1.000. Both are correctly the same state;
-    in both the text has MOVED or CHANGED.
-
-    That is not a theoretical worry. Taking the 12 frames one live Wikipedia exploration
-    actually captured, grouping them by perceptual hash and normalized URL - a far
-    STRICTER key than the 0.62 same-state cut, since it demands every pixel row and the
-    URL agree - and reading all 12 for real: three frames would have been served another
-    frame's text. The worst of them differed by twelve strings that were still on screen
-    but at a different box, because the page had been scrolled. Those boxes are precisely
-    what a skill clicks, and a skill cannot tell a stale read from a true one - it just
-    clicks. A slow read costs seconds; a stale one costs a wrong click on a real site, so
-    this cache only ever answers for pixels it has literally seen.
-
-    Nothing is given up for that. The exact key caught every duplicate those 12 frames
-    contained: 12 frames, 9 distinct, 3 reads saved, which is the whole of what was
-    safely available.
+    The key is EXACT and not "the same state": a same-state judgment is right for its own
+    question and wrong here, because ``dense_text_scrolled_slightly`` scores 0.750 and is
+    correctly the same state while every box has moved. Replayed over the 12 frames one
+    live Wikipedia exploration captured, a stricter-than-same-state key (perceptual hash
+    plus normalized URL) would still have served three frames another frame's text, the
+    worst differing by twelve strings at a different box. Boxes are what a skill clicks.
+    The exact key lost nothing for that: 12 frames, 9 distinct, 3 reads saved.
 
     Args:
-        inner: The reader that does the actual work on a miss.
-        capacity: How many frames to remember. ``0`` disables caching while leaving the
-            counting intact.
-        counters: The tally to charge reads and hits to. A fresh one is made when not
-            given; share one to count a whole perceiver's work together.
+        inner: The reader that does the work on a miss.
+        capacity: Frames to remember. ``0`` disables caching, leaving counting intact.
+        counters: The tally to charge reads and hits to.
     """
 
     __slots__ = ("_cache", "_capacity", "_counters", "_inner", "_lock")
@@ -1268,18 +911,14 @@ class CachingTextReader:
     def read(self, screenshot: Screenshot) -> list[Element]:
         """The text on ``screenshot``, read once and remembered.
 
-        The returned list is a fresh one every time, so a caller that sorts or trims it
-        cannot corrupt what the next caller is served.
+        The returned list is fresh every time, so a caller that sorts it cannot corrupt
+        what the next caller is served.
 
         Raises:
-            PerceptionTimeout: if ``inner`` abandoned the read. Counted in
-                ``counters.ocr_timeouts`` on the way past, because this is the one
-                layer every text read in the system goes through, so it is the one
-                place a run's tally of abandoned reads can be complete.
-            PerceptionError: whatever else ``inner`` raises. A failed read is NOT
-                cached: an engine that could not load this time may load next time,
-                and caching the failure would turn a transient fault into a permanent
-                blind spot.
+            PerceptionTimeout: ``inner`` abandoned the read. Counted here because this is
+                the one layer every text read goes through.
+            PerceptionError: whatever else ``inner`` raises. A failed read is NOT cached:
+                that would turn a transient fault into a permanent blind spot.
         """
         if self._capacity == 0:
             self._counters.ocr_reads += 1
@@ -1307,7 +946,7 @@ class CachingTextReader:
 
     @contextmanager
     def _charged(self) -> Iterator[None]:
-        """Count an abandoned read on its way out, and let it keep going."""
+        """Count an abandoned read on its way out."""
         try:
             yield
         except PerceptionTimeout:

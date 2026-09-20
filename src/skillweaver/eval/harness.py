@@ -5,7 +5,7 @@ faster at things it has done before* - into numbers somebody else can check. It 
 a suite of tasks against a real application, scores each run against ground truth the
 agent cannot see, and writes a machine-readable report plus a markdown summary.
 
-    load_suite(eval/tasks.yaml)
+    load_suite(eval/wikipedia.yaml)
             |
             v
     for each task:  reset -> COLD run    -> score   (explore; learn a skill)
@@ -21,36 +21,34 @@ agent cannot see, and writes a machine-readable report plus a markdown summary.
 The reset, and why it is the load-bearing part
 ----------------------------------------------
 
-Every run - including the first - starts by putting the application back to a
-byte-identical state through :meth:`Referee.reset`. This is not tidiness. Nine of the
-fourteen tasks in the shipped suite MUTATE state: they archive a message, rename a
-row, save a setting. A second run that starts on the wreckage of the first is not
-repeating the task, it is doing a different and usually easier one - "archive the
-Billing message" is free when the first run already archived it - and the resulting
-speedup would be a measurement of leftovers. That failure is silent, which is what
-makes it dangerous, so :func:`run_task` resets before every single run and the report
-records ``reset_ok`` per run so a reset that did not happen is visible rather than
-assumed.
+Every run - including the first - starts by putting the world back through
+:meth:`Referee.reset`. This is not tidiness. A run that starts on the wreckage of the
+previous one is not repeating the task, it is doing a different and usually easier one
+- "archive the Billing message" is free when the first run already archived it - and
+the resulting speedup would be a measurement of leftovers. That failure is silent,
+which is what makes it dangerous, so :func:`run_task` resets before every single run
+and the report records ``reset_ok`` per run so a reset that did not happen is visible
+rather than assumed. On a LIVE site the reset is one ordinary page load that restores
+nothing, because such a suite is read-only by construction; see :class:`BrowserReferee`.
 
-:class:`Referee` is a general seam, not a sandbox-specific one: anything that can put
-its world back and describe the result satisfies it, and
-:class:`HttpReferee` is merely the implementation that speaks to
-``apps/sandbox-site``. The admission gate in ``skills/synthesize.py`` needs the same
+:class:`Referee` is a general seam: anything that can put its world back and describe
+the result satisfies it. The admission gate in ``skills/synthesize.py`` needs the same
 "put the world back" capability, and this Protocol is offered as the shared shape for
 it rather than a second competing mechanism.
 
-The second implementation is :class:`BrowserReferee`, which exists because a PUBLIC
-website has no ``/__state`` to ask and never will. It reads the DOM of the page the
-run ended on - offline, after the fact - and a suite says which of the two it needs
-with one ``referee:`` key, so ``skillweaver eval run --suite <a live site>`` is an
-ordinary command rather than a rig somebody has to rebuild by hand.
+The one implementation shipped here is :class:`BrowserReferee`, because the sites this
+project evaluates against are PUBLIC websites, which have no control endpoint to ask
+and never will. It reads the DOM of the page the run ended on - offline, after the
+fact - and a suite names it with one ``referee:`` key, so
+``skillweaver eval run --suite <a live site>`` is an ordinary command rather than a rig
+somebody has to rebuild by hand.
 
 The ground-truth boundary
 -------------------------
 
-:class:`Referee` is an **OFFLINE TEACHER**. It reads the application's authoritative
-state - for the sandbox, the server's own ``GET /__state``, which is exact rather than
-inferred - and the harness uses it to decide whether a run reached the goal. The agent
+:class:`Referee` is an **OFFLINE TEACHER**. It reads what is authoritatively true about
+the application - here, the DOM of the finished screen, read after the fact - and the
+harness uses it to decide whether a run reached the goal. The agent
 must never see it, and in this module it cannot: the referee is a local in
 :func:`run_task`, it is never placed on the :class:`~skillweaver.contracts.TaskSpec`,
 never passed into ``workbench.session``, and never reachable from the ``Agent`` the
@@ -89,8 +87,6 @@ from __future__ import annotations
 
 import json
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -116,7 +112,6 @@ __all__ = [
     "BrowserReferee",
     "Check",
     "EvalTask",
-    "HttpReferee",
     "LiveReferee",
     "REFEREES",
     "Referee",
@@ -156,35 +151,36 @@ Binding = Literal["plain", "bound"]
 path must still read to bind a skill's parameters; ``"bound"`` supplies them, which is
 what makes a warm run cost nothing at all."""
 
-DEFAULT_SUITE = Path("eval/tasks.yaml")
+DEFAULT_SUITE = Path("eval/wikipedia.yaml")
 """The shipped suite, relative to the repository root."""
 
 TAGS = ("single-step", "multi-step", "composite")
 """The shapes a task may be tagged with. A suite is rejected if it uses another, so a
 typo cannot quietly create a fourth category nobody reports on."""
 
-REFEREES = ("http", "dom")
+REFEREES = ("dom",)
 """Where a suite's ground truth comes from, as its ``referee:`` key spells it.
 
-``"http"`` is :class:`HttpReferee` over an application that exposes its own state -
-the sandbox's ``/__state`` - and is the default because it is the better referee
-wherever it exists: the state is the server's own, not something scraped back out of
-a page. ``"dom"`` is :class:`BrowserReferee`, for a site nobody here controls and
-which therefore has no such endpoint. The choice belongs to the SUITE rather than to
-the command line: it is a fact about the application being evaluated, and a flag
-would let one report be produced two ways."""
+``"dom"`` is :class:`BrowserReferee`, which reads the page the run ended on. It is the
+only kind, because every site this project evaluates against is one nobody here
+controls and which therefore exposes no state endpoint to ask. The key is still
+written down rather than assumed: the choice belongs to the SUITE rather than to the
+command line - it is a fact about the application being evaluated, and a flag would
+let one report be produced two ways - and a suite that one day names a second kind
+should be rejected by name rather than silently scored by this one."""
 
-RefereeKind = Literal["http", "dom"]
+RefereeKind = Literal["dom"]
 """One of :data:`REFEREES`."""
 
 OPERATORS = ("equals", "contains", "count", "at_least", "absent")
-"""The check vocabulary. Deliberately tiny - see ``eval/tasks.yaml`` for what each
-means. A check naming no operator, or two, is a broken suite and is rejected at load."""
+"""The check vocabulary. Deliberately tiny - see ``eval/wikipedia.yaml`` for what
+each means. A check naming no operator, or two, is a broken suite and is rejected at
+load."""
 
 _MISSING = object()
-"""Distinguishes "no value at that path" from "the value there is ``None``". The
-sandbox uses ``null`` meaningfully - ``ui.mail.openId`` is null when no message is
-open - so the two cannot be conflated."""
+"""Distinguishes "no value at that path" from "the value there is ``None``". A state
+mapping may use ``null`` meaningfully - "this field exists and is empty" - so the two
+cannot be conflated."""
 
 
 # --------------------------------------------------------------------------------------
@@ -236,14 +232,21 @@ class EvalTask:
 
 @dataclass(frozen=True, slots=True)
 class Suite:
-    """A loaded ``tasks.yaml``: the tasks plus where to run them."""
+    """A loaded suite file: the tasks plus where to run them.
+
+    ``domain`` and ``base_url`` carry no default on purpose. They used to default to
+    the local demo application, which meant a suite that forgot to name its site was
+    silently evaluated against ``http://127.0.0.1:8765`` - a report of zeroes that
+    reads like a bad agent rather than a missing key. :func:`load_suite` now requires
+    both.
+    """
 
     tasks: tuple[EvalTask, ...]
-    name: str = "sandbox-site"
-    domain: str = "sandbox.test"
-    base_url: str = "http://127.0.0.1:8765"
-    reset_path: str = "/__reset"
-    referee: RefereeKind = "http"
+    domain: str
+    base_url: str
+    name: str = "suite"
+    reset_path: str = "/"
+    referee: RefereeKind = "dom"
     warm_runs: int = WARM_RUNS
     bound_runs: int = BOUND_RUNS
     source: str = ""
@@ -301,9 +304,9 @@ def load_suite(path: Path | str | None = None) -> Suite:
     return Suite(
         tasks=tuple(tasks),
         name=str(raw.get("suite") or resolved.stem),
-        domain=str(raw.get("domain") or "sandbox.test"),
-        base_url=str(raw.get("base_url") or "http://127.0.0.1:8765").rstrip("/"),
-        reset_path=str(raw.get("reset_path") or "/__reset"),
+        domain=_required(raw, "domain", resolved),
+        base_url=_required(raw, "base_url", resolved).rstrip("/"),
+        reset_path=str(raw.get("reset_path") or "/"),
         referee=_referee_kind(raw, resolved),
         warm_runs=warm,
         bound_runs=_count(raw, "bound_runs", BOUND_RUNS, resolved),
@@ -311,15 +314,28 @@ def load_suite(path: Path | str | None = None) -> Suite:
     )
 
 
+def _required(raw: Mapping[str, Any], key: str, source: Path) -> str:
+    """A non-empty string setting, or a :class:`ConfigError` naming it.
+
+    ``domain`` and ``base_url`` are required rather than defaulted. They used to fall
+    back to the local demo application, so a suite that named neither was evaluated
+    against a port nothing was listening on and reported a table of zeroes - which
+    reads like an agent that failed every task rather than a suite missing a key.
+    """
+    value = raw.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{source}: '{key}' is required and must be a non-empty string")
+    return value.strip()
+
+
 def _referee_kind(raw: Mapping[str, Any], source: Path) -> RefereeKind:
-    """The suite's ``referee:`` key, validated, defaulting to ``"http"``.
+    """The suite's ``referee:`` key, validated, defaulting to ``"dom"``.
 
     Rejected rather than defaulted when it is anything else, for the reason the whole
-    loader is strict: a suite that named ``dom`` and got ``http`` because of a typo
-    would ask a public website for ``/__state``, fail every reset, and report a table
-    of zeroes as though the agent had done the work badly.
+    loader is strict: a misspelled kind that was quietly accepted would score the
+    suite with a referee nobody asked for and report a table nobody could read back.
     """
-    value = raw.get("referee", "http")
+    value = raw.get("referee", "dom")
     if value not in REFEREES:
         allowed = " or ".join(repr(name) for name in REFEREES)
         raise ConfigError(f"{source}: 'referee' must be {allowed}, not {value!r}")
@@ -442,95 +458,13 @@ class Referee(Protocol):
         ...
 
 
-class HttpReferee:
-    """A :class:`Referee` over ``apps/sandbox-site``'s own control endpoints.
-
-    The reset endpoint rebuilds the server's state from ``seed.json`` and
-    ``GET /__state`` returns it. Both are server-side and exact: the sandbox routes
-    every mutation through ``POST /api/act``, so its state is a precise description of
-    what is on screen rather than something scraped back out of the DOM. That makes it
-    a far better referee than reading pixels, and an absolutely disqualifying thing to
-    let the agent see.
-
-    **The reset is not this class's own invention.** It is
-    :func:`~skillweaver.orchestrator.world_reset_from_url`, the very callable the
-    admission gate uses to put a world back before re-running a candidate skill. One
-    mechanism, used from both ends: if the evaluation can reset this application then
-    so can the gate, and a reset that starts failing fails visibly in both places at
-    once instead of the two drifting apart.
-
-    Args:
-        base_url: Where the sandbox is serving, e.g. ``http://127.0.0.1:8765``.
-        reset_path: The endpoint that restores the seed state.
-        timeout: Seconds to wait on either endpoint.
-    """
-
-    __slots__ = ("_base", "_reset", "_reset_url", "_timeout")
-
-    def __init__(
-        self, base_url: str, *, reset_path: str = "/__reset", timeout: float = 10.0
-    ) -> None:
-        self._base = base_url.rstrip("/")
-        self._reset_url = f"{self._base}{reset_path}"
-        self._reset = world_reset_from_url(self._reset_url, timeout=timeout)
-        self._timeout = timeout
-
-    def __repr__(self) -> str:
-        return f"HttpReferee({self._base!r})"
-
-    @property
-    def reset_url(self) -> str:
-        """The endpoint that restores this world, for handing to a task that must be
-        learned: a state-changing task cannot be admitted without one."""
-        return self._reset_url
-
-    def reset(self) -> None:
-        """Restore the seed state. Raises :class:`SkillWeaverError` if it does not.
-
-        ``world_reset_from_url`` raises ``OSError`` by contract; that is translated
-        here into the project's own error carrying the sentence a stranger can act on.
-        """
-        try:
-            self._reset()
-        except OSError as exc:
-            raise SkillWeaverError(
-                f"the sandbox at {self._base} did not answer the reset at "
-                f"{self._reset_url}: {exc}. "
-                "Start it with: python3 apps/sandbox-site/serve.py --port 8765"
-            ) from exc
-
-    def state(self) -> Mapping[str, Any]:
-        """GET ``/__state``, parsed."""
-        payload = self._call("/__state", method="GET")
-        if not isinstance(payload, Mapping):
-            raise SkillWeaverError(f"{self._base}/__state did not return an object")
-        return payload
-
-    def _call(self, path: str, *, method: str) -> Any:
-        url = f"{self._base}{path}"
-        request = urllib.request.Request(url, method=method, data=b"" if method == "POST" else None)
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                body = response.read().decode("utf-8")
-        except (urllib.error.URLError, OSError) as exc:
-            raise SkillWeaverError(
-                f"the sandbox at {self._base} did not answer {method} {path}: {exc}. "
-                "Start it with: python3 apps/sandbox-site/serve.py --port 8765"
-            ) from exc
-        try:
-            return json.loads(body) if body else {}
-        except json.JSONDecodeError as exc:
-            raise SkillWeaverError(f"{url} did not return JSON: {exc}") from exc
-
-
 @runtime_checkable
 class LiveReferee(Protocol):
     """A :class:`Referee` whose ground truth is the screen the run ended on.
 
-    A referee over an application that reports its own state can be asked at any
-    moment, because the state outlives the browser: the sandbox's ``/__state`` is
-    still there after the window has closed. A referee over a public website has no
-    such luxury. The only record that the agent reached ``/wiki/Charles_Babbage`` is
+    A referee over an application that reports its own state could be asked at any
+    moment, because such a state outlives the browser. A referee over a public website
+    has no such luxury. The only record that the agent reached ``/wiki/Charles_Babbage`` is
     the page it left open, and :meth:`~skillweaver.orchestrator.Workbench.session`
     closes the controller on the way out.
 
@@ -560,11 +494,9 @@ class LiveReferee(Protocol):
 class BrowserReferee:
     """A :class:`Referee` over a LIVE PAGE, for a site with no control endpoints.
 
-    ``eval/tasks.yaml`` runs against an application this repository ships, which is
-    why :class:`HttpReferee` can ask it what is true. The live-site suite runs against
-    somebody else's website, which has no ``/__state`` and never will - and pointing
-    the shipped command at it made the harness ask ``en.wikipedia.org`` for one,
-    which is the bug this class exists to remove.
+    A suite runs against somebody else's website, which has no control endpoint to
+    ask what is true and never will. This is the referee for that, and the only one
+    the harness ships: ground truth is the screen the run ended on.
 
     Ground truth here is the DOM, read by
     :class:`~skillweaver.controllers.browser.BrowserGroundTruth` - **an offline
@@ -671,13 +603,15 @@ class BrowserReferee:
 def build_referee(suite: Suite, *, timeout: float = 10.0) -> Referee:
     """The referee the suite asked for. **The only place that choice is made.**
 
+    One kind exists - ``"dom"``, :class:`BrowserReferee` - and this function stays a
+    function rather than collapsing into its one branch because the choice belongs to
+    the suite: a second kind is added here and nowhere else.
+
     Args:
         suite: The loaded suite, whose ``referee`` key names the kind.
         timeout: Seconds to wait on the reset endpoint.
     """
-    if suite.referee == "dom":
-        return BrowserReferee(suite.base_url, reset_path=suite.reset_path, timeout=timeout)
-    return HttpReferee(suite.base_url, reset_path=suite.reset_path, timeout=timeout)
+    return BrowserReferee(suite.base_url, reset_path=suite.reset_path, timeout=timeout)
 
 
 def resolve_path(state: Any, path: str) -> Any:
@@ -689,8 +623,8 @@ def resolve_path(state: Any, path: str) -> Any:
         mail.messages[id=m03].archived    the first list element whose "id" is "m03"
         mail.sent[0].subject              the element at that position
 
-    The key-match form exists because the interesting facts about the sandbox live in
-    lists of records whose positions shift as the application is used, and a check
+    The key-match form exists because the interesting facts about an application live
+    in lists of records whose positions shift as it is used, and a check
     written against position 2 would start testing a different message the moment a
     task reordered anything.
 
@@ -1618,11 +1552,8 @@ def run(
     this function's frame except into :func:`run_suite`, which likewise hands it to
     nothing the agent can see.
 
-    **Which referee is the suite's decision, not the command's.** A suite naming an
-    application that reports its own state gets :class:`HttpReferee`; one naming a
-    public website gets :class:`BrowserReferee`, which reads the DOM offline. Before
-    this existed the harness built an ``HttpReferee`` unconditionally, so running the
-    live-site suite asked a website for ``/__state`` and could not start at all.
+    **Which referee is the suite's decision, not the command's.** See
+    :func:`build_referee`, which is the only place that choice is made.
 
     ``repeat`` is passed through exactly as given. Note that ``cli.py`` - which this
     harness does not own - defaults that flag to ``1``, while this suite's own default
@@ -1632,7 +1563,7 @@ def run(
 
     Args:
         workbench: The :class:`~skillweaver.orchestrator.Workbench` to run through.
-        suite: Path to the task suite. ``None`` uses ``eval/tasks.yaml``.
+        suite: Path to the task suite. ``None`` uses :data:`DEFAULT_SUITE`.
         out: Where the report is written. ``None`` uses ``<data-dir>/eval``.
         repeat: Warm runs per task, after the cold one.
         budget: Limits per run.
@@ -1652,7 +1583,7 @@ def run(
     """
     loaded = load_suite(suite)
     judge = referee if referee is not None else build_referee(loaded)
-    # Fail before running fourteen tasks against a world that is not there.
+    # Fail before running a whole suite against a world that is not there.
     judge.reset()
     destination = (
         Path(out) if out is not None else Path(getattr(workbench, "data_dir", "data")) / "eval"

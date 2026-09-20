@@ -1,75 +1,27 @@
 """Skill synthesis: turning one successful fumble into a skill the library can trust.
 
-This is the self-growing half of skillweaver, and its whole value rests on one
-property: **nothing enters the library without proving it works**. A model that has
-watched a run will happily write plausible code for it. Plausible code that does not
-run is the known failure mode of this entire approach - a library of it is worse than
-an empty one, because a planner picks from it.
+**Nothing enters the library without proving it works.** ``synthesize`` writes a
+candidate and hands it back; the only ``put`` in this module is inside ``admit``, after
+the gate, and the store is private. There is no third path.
 
-So there are two doors and only one of them opens::
+The gate, in order, for every attempt: **structure** (``validate_skill``); the sandbox's
+**static scan**; the **precondition**, which puts the world back to the recorded start
+screen and requires :data:`MIN_PRECONDITION_SIMILARITY`, not identity, because a live
+page never reproduces itself exactly; **execution**, re-running the skill there with the
+model's own example arguments; **discrimination**, replaying the verifier against the
+START screen, since one that says yes there cannot tell the finished job from the
+unfinished (:data:`_INDISCRIMINATE`); and the **critic**.
 
-    synthesizer = Synthesizer(llm, store, critic)
+When nothing could put the world back the attempt stops at ``"reset"``, not
+``"precondition"``: a skill DISPROVED and a skill that could never be TRIED are
+different outcomes, and reporting the second as the first makes a whole class of task
+silently unlearnable.
 
-    candidate = synthesizer.synthesize(trajectory)     # a draft. NOT stored. Ever.
-    admission = synthesizer.admit(trajectory, environment)
-    admission.ok, admission.skill, admission.attempts  # stored only if ok
-
-:meth:`Synthesizer.synthesize` is the ``Synthesizer`` Protocol: it writes a candidate
-and hands it back. It cannot store, because it does not store - the only ``put`` in
-this module is inside :meth:`Synthesizer.admit`, after the gate, and the store is
-private to the synthesizer. There is no third path.
-
-The gate, in order, for every attempt:
-
-1. **Structure.** :func:`~skillweaver.skills.model.validate_skill` - a name, a
-   one-line summary, a docstring, params that agree with ``run``, a verifier.
-2. **The sandbox's static scan.** An import, an ``open``, a dunder: refused here,
-   before anything executes, and never admitted.
-3. **The precondition.** The environment is put back to the recorded starting screen
-   and must actually be there; a skill proved against the wrong screen proves nothing.
-   "There" is :data:`MIN_PRECONDITION_SIMILARITY` alike, not identical - a live page
-   never reproduces itself exactly, and demanding that it does is how a correct skill
-   gets written and thrown away on every website that is not the demo.
-   When the world could not be put back at all - the run archived a message, and
-   re-opening the page does not un-archive it - the attempt stops at ``"reset"``
-   rather than ``"precondition"``. That distinction is the whole point: a skill that
-   was DISPROVED and a skill that could never be TRIED are different outcomes, and
-   reporting the second as the first is how a whole class of task silently becomes
-   unlearnable.
-4. **Execution.** The skill is RE-RUN through
-   :class:`~skillweaver.skills.sandbox.SkillRunner` against that environment with the
-   model's own example arguments, verifier included.
-5. **Discrimination.** The verifier that just said yes is replayed against the screen
-   the skill STARTED from, held in :class:`_StartScreen`. A verifier that also says
-   yes there cannot tell the finished job from the unfinished one, and is refused:
-   see :data:`_INDISCRIMINATE`.
-6. **The critic.** :class:`~skillweaver.contracts.Critic` judges the screen before
-   against the screen after, for the task the trajectory was solving.
-
-Only then is it stored. A failure at any stage is fed back to the model - the error
-AND the sandbox's trace, which lists every action and log line in order - and the
-skill is rewritten, up to ``max_repairs`` times. Exhausting them is a clean
-``Admission(ok=False)`` with every attempt attached, not an exception: a synthesizer
-that could not write this skill has not broken, it has simply not written it.
-
-A reply that cannot be read at all - prose around the object, a fence, an empty
-turn, a reply cut off by the token cap - is a FORMATTING failure, not a skill
-defect. It is retried (``max_format_retries``, with a larger token cap when the
-reply ran out of room) and does not spend a repair. Repairs are for code that was
-judged and found wanting; burning them on punctuation is how a run ends with
-nothing stored. Assistant prefill would be the tidier fix and is not available:
-``claude-opus-5`` rejects a conversation that ends on an assistant turn outright.
-
-Before any of that the draft goes through :mod:`skillweaver.skills.refactor`, which
-replaces literal coordinates with perception lookups, lifts this run's data into
-parameters, and re-anchors every element the draft reached for BY POSITION onto
-something nameable. That last one is the difference between a skill that replays on a
-real site and one that does not: a model that has just watched a run writes
-``ctx.see.by_kind("text")[1]`` for the search box, which is true of exactly the page
-it watched. Where the recording names nothing to anchor on the lookup is KEPT and
-made to log that it navigates by position - a brittle skill that says so is worth
-more than no skill. Hardening first, admission second: what is judged is what is
-stored, and the gate's guarantee is untouched by any of it.
+A failure is fed back with the error AND the sandbox trace, and the skill is rewritten
+up to ``max_repairs`` times. An unreadable reply is a FORMATTING failure, retried
+without spending a repair; assistant prefill would be tidier and is not available, since
+``claude-opus-5`` rejects a conversation ending on an assistant turn. The draft goes
+through :mod:`skillweaver.skills.refactor` first: what is judged is what is stored.
 """
 
 from __future__ import annotations
@@ -147,103 +99,47 @@ Stage = Literal[
 """Where an attempt stopped. Everything before ``reset`` is decided without touching
 the environment at all.
 
-``"reset"`` and ``"precondition"`` both mean the environment was not on the recorded
-starting screen, and they are not the same finding. ``"precondition"`` is a verdict
-on the SKILL: the world was genuinely put back and the screen still does not match.
-``"reset"`` is a verdict on the HARNESS: nothing put the world back, so the candidate
-was neither proved nor disproved and no amount of rewriting it would help.
-
-``"discrimination"`` is a verdict on the VERIFIER rather than on the code: the skill
-ran and its verifier said yes, and the same verifier also says yes to the screen the
-skill STARTED from, so its yes carries no information. See
-:class:`_StartScreen`."""
+``"precondition"`` is a verdict on the SKILL: the world was genuinely put back and the
+screen still does not match. ``"reset"`` is a verdict on the HARNESS: nothing put the
+world back, so the candidate was neither proved nor disproved and no rewriting helps.
+``"discrimination"`` is a verdict on the VERIFIER: it also says yes to the screen the
+skill STARTED from, so its yes carries no information."""
 
 _MAX_REPLY_TOKENS = 16000
 """Ceiling on the token cap a re-ask may escalate to.
 
-Two reasons for this number and not a larger one. A reply that does not fit in it is
-not a skill, it is a program. And the Anthropic SDK refuses a NON-streaming request
-whose implied duration passes ten minutes - a real run died at ``max_tokens=32000``
-with "Streaming is required for operations that may take longer than 10 minutes"
-before this ceiling was lowered. 16000 is the contract's own default for
-``LLMClient.complete`` and has been exercised live against ``claude-opus-5``."""
+A reply that does not fit is not a skill, it is a program - and the Anthropic SDK
+refuses a NON-streaming request whose implied duration passes ten minutes, which a run
+at ``max_tokens=32000`` hit before this ceiling was lowered. 16000 is the contract's
+own default for ``LLMClient.complete`` and is exercised live against ``claude-opus-5``."""
 
 
 MIN_PRECONDITION_SIMILARITY = SAME_STATE_THRESHOLD
-"""How like the recorded starting screen the environment must be before a candidate
-is re-run in it.
+"""How like the recorded starting screen the environment must be before a candidate is
+re-run in it.
 
-This used to be ``1.0`` - the EXACT same screen - and that is why nothing was ever
-learned on a real website. A live page does not reproduce exactly. The demo site
-does, at 1.000 after ``/__reset``, so every sandbox run looked green while every
-live run wrote a correct skill and threw it away.
+This used to be ``1.0`` - the EXACT screen - and that is why nothing was ever learned on
+a real website: a reset local page reproduces at 1.000, so a run against one looked green
+while every live run wrote a correct skill and threw it away. It is
+deliberately not a number of its own but ``SAME_STATE_THRESHOLD``, which carries the
+corpora it was calibrated on. Do not copy those measurements here - an earlier version
+of this docstring did, and the table outlived the signal it described.
 
-It is deliberately not a number of its own. "Am I looking at the screen I recorded?"
-is one question, and the project answers it in one place:
-:data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD`, which carries the two
-corpora it was calibrated on and what it refuses. Do not copy those measurements here.
-An earlier version of this docstring did, as a table of whole twenty-fifths, and when
-the fingerprinter was rebuilt the table became a record of a signal that no longer
-existed - still stating that a page pushed down by a notice was a DIFFERENT screen,
-which by then was the defect rather than the behaviour. A threshold is only meaningful
-against the shape of the signal it judges, and a second copy of it drifts silently.
+Which way to be wrong: a false REJECT destroys a correctly written skill; a false ACCEPT
+costs one sandbox execution, since the candidate must still execute, satisfy its own
+verifier and satisfy the critic. Where the two are close, prefer admitting.
 
-What this gate sees, specifically
----------------------------------
-
-The gate walks a COLD first observation - what the recording captured - against a WARM
-re-navigation in the SAME browser, which is what ``navigating_environment`` hands it.
-That path is kinder than the general case: across the live ``learn`` runs on
-en.wikipedia.org behind this constant the precondition scored **1.000 every time**, and
-the sandbox scores 1.000 after a reset. The margin the calibration leaves is spent on
-the live page that has moved between the two captures, not on this path's own noise.
-
-Which way to be wrong
----------------------
-
-A false REJECT is total: the skill was written correctly and is destroyed, which is the
-defect this constant exists to fix. A false ACCEPT costs one sandbox execution and
-nothing else - the precondition is the third of five gates, and a candidate run against
-the wrong screen still has to execute, satisfy its own verifier and satisfy the critic
-before anything is stored. So where the two are close, prefer admitting.
-
-Headed and headless are NOT made comparable
--------------------------------------------
-
-Two FRESH browsers on one page, one visible and one headless, score 0.126 (Wikipedia
-Main Page) and 0.421 (``docs.python.org/3/library/json.html``) - straddling the cut, and
-the Main Page decisively below it; the same comparison on the sandbox ordering app scores
-0.819, above it. Two browsers of the same mode score 1.000 anywhere. The recorded
-:class:`~skillweaver.contracts.Fingerprint` still carries no mode, for three reasons.
-
-The gate never compares across modes. ``orchestrator._open_world`` builds ONE controller
-and ``navigating_environment`` re-navigates in THAT controller, so the recording and the
-re-run are always the same window. The gap is real and is simply not on this path.
-
-Where it IS real - a stored skill replayed later by another process in another mode - the
-precondition is the wrong place to carry the answer, and it does not: the mode is
-recorded beside the skill by :mod:`skillweaver.skills.store` and read back by
-``Agent._explained``, which names the crossing on a warm attempt that lost its screen.
-Two strings are compared, and no stored screen identity grew a field for it -
-``Fingerprint`` is shared surface besides. See :mod:`skillweaver.render_mode`, which also
-says why that is an explanation rather than a refusal: 0.819 means the crossing is
-survivable on a small clean page, and a gate tuned against the sandbox is the kind that
-looks green until it meets a website.
-
-And it would make the identity worse. A screen is the same screen whoever rendered it;
-these scores are the fingerprinter correctly reporting that two renderers produce
-measurably different pixels. The answer is to run one renderer - ``eval/wikipedia.yaml``
-already says headless, for exactly this reason, and ``--headless`` is now how a run says
-so - not to teach the identity to ignore a difference it was right to notice.
-"""
+Headed and headless are NOT made comparable and the Fingerprint carries no mode: two
+fresh browsers of opposite modes score 0.126 (Wikipedia Main Page) and 0.421
+(``json.html``) but 0.819 on the sandbox app. The gate never compares across modes -
+``_open_world`` builds ONE controller and ``navigating_environment`` re-navigates in it.
+Where the crossing IS real, the mode is recorded beside the skill by
+:mod:`skillweaver.skills.store`; see :mod:`skillweaver.render_mode`."""
 
 
 @lru_cache(maxsize=4)
 def load_prompt(name: str = PROMPT) -> str:
-    """The text of a prompt shipped in ``skillweaver.agent.prompts``.
-
-    Cached: the file does not change while a process runs, and synthesis reads it
-    on every call.
+    """The text of a prompt shipped in ``skillweaver.agent.prompts``. Cached.
 
     Raises:
         FileNotFoundError: if no such prompt is packaged.
@@ -260,26 +156,17 @@ def load_prompt(name: str = PROMPT) -> str:
 class ReplayEnvironment:
     """A world to re-execute a candidate skill in, standing at the recorded start.
 
-    ``controller`` and ``perceiver`` are what the skill acts and sees through;
-    ``graph`` is the read-only site graph it may consult, if there is one.
-
-    The gate asks for a FRESH one per attempt - see ``environment`` in
-    :meth:`Synthesizer.admit` - so a repair never inherits the half-finished screen
-    its predecessor left behind, which would let a broken skill pass by accident.
+    The gate asks for a FRESH one per attempt, so a repair never inherits the
+    half-finished screen its predecessor left behind.
 
     Attributes:
-        controller: The hands the candidate acts through.
-        perceiver: The eyes it sees through.
-        graph: The read-only site graph, when there is one.
-        restored: Whether something ACTUALLY put this world back to its starting
-            state - a seed reload, a fresh database, ``controller.reset()`` - as
-            opposed to merely re-opening the screen it started on. It decides what a
-            precondition mismatch is allowed to mean: with ``True`` the world was put
-            back and the candidate is judged, with ``False`` the gate cannot tell a
-            wrong skill from an unrestorable world and says the second, which is the
-            honest answer. Defaults to ``False`` because re-navigating is the thing
-            most callers can do and it is NOT a restore: nothing about re-opening
-            an inbox un-archives the message the run archived.
+        restored: Whether something ACTUALLY put this world back to its starting state
+            - a seed reload, a fresh database, ``controller.reset()`` - as opposed to
+            merely re-opening the screen it started on. With ``True`` a precondition
+            mismatch is judged against the candidate; with ``False`` the gate cannot
+            tell a wrong skill from an unrestorable world and says the second. Defaults
+            to ``False``: re-navigating is what most callers can do and it is NOT a
+            restore - nothing about re-opening an inbox un-archives a message.
     """
 
     controller: Controller
@@ -307,14 +194,8 @@ class Attempt:
     Attributes:
         index: ``0`` for the first generation, ``1..n`` for repairs.
         stage: Where it stopped, or ``"critic"`` when it passed everything.
-        ok: Whether this attempt was admitted.
         skill: The candidate as it was judged - hardened, validated, NOT stored.
-            ``None`` when the model returned nothing usable.
-        error: Why it failed, in the words the model is shown. ``None`` when ``ok``.
-        trace: The sandbox trace of the run, when it got as far as running.
-        result: The raw :class:`~skillweaver.contracts.SkillResult`, when it ran.
-        verdict: The critic's judgment, when one was asked for.
-        hardening: What the hardening pass changed before this attempt.
+        error: Why it failed, in the words the model is shown.
     """
 
     index: int
@@ -336,12 +217,8 @@ class Attempt:
 class Admission:
     """The outcome of :meth:`Synthesizer.admit`.
 
-    Attributes:
-        ok: Whether a skill entered the library.
-        skill: The STORED skill (``version >= 1``) when ``ok``, else ``None``. A
-            non-``None`` value here is a promise: this code ran, and a critic agreed.
-        attempts: Every attempt, in order. ``attempts[0]`` is the first generation.
-        reason: One line saying why, for a log or a status line.
+    ``skill`` is the STORED skill (``version >= 1``) when ``ok``, and a non-``None``
+    value there is a promise: this code ran, and a critic agreed.
     """
 
     ok: bool
@@ -359,10 +236,9 @@ class Admission:
         """Whether the gate never got to judge this skill because the world could not
         be put back - as opposed to judging it and finding it wanting.
 
-        A caller that reports both as "rejected" tells its user the model wrote bad
-        code, when in fact the harness has no way to undo what the task changed and
-        NO skill for that task could ever be admitted. The fix is a reset hook, not a
-        better model, and only this flag says so.
+        A caller reporting both as "rejected" says the model wrote bad code, when the
+        harness cannot undo what the task changed and NO skill for it could be
+        admitted. The fix is a reset hook, not a better model.
         """
         return bool(self.attempts) and self.attempts[-1].stage == "reset"
 
@@ -388,27 +264,20 @@ class _Draft:
 
 # --------------------------------------------------------------------------------------
 # Describing the run to the model
-# --------------------------------------------------------------------------------------
 #
-# :func:`~skillweaver.trajectory.render.describe_trajectory` is the whole of it, and it
-# lives with the recording rather than here: what a trajectory MEANS - which steps were
-# one move, which moves the critic threw out - is a property of the recording, and this
-# module only asks for it. Re-exported because that is where every caller and test
-# already reaches for it.
+# ``describe_trajectory`` is the whole of it and lives with the recording: what a
+# trajectory MEANS is a property of the recording. Re-exported because that is where
+# every caller and test already reaches for it.
 
 
 def _repair_brief(attempt: Attempt) -> str:
     """What the model is shown after a rejection: the stage, the error, the trace.
 
-    Rewrites the hardening pass made are normally left unsaid - the model is being
-    asked about the defect, not about the polish. The two that change how the skill
-    WAITS are the exception, and deliberately so: the model cannot see the code that
-    was actually run. A sleep it genuinely needed and is never told was deleted is a
-    repair loop with no exit - it would write the same wait again, the pass would
-    remove it again, and the gate would reject it again until the attempts ran out.
-    A read the pass made wait is the same debt the other way round: told nothing, the
-    model reads a failure that is no longer about timing and "fixes" the wait it
-    already has.
+    Hardening rewrites are normally left unsaid, but the two that change how the skill
+    WAITS are told: the model cannot see the code that ran. A sleep it needed and is
+    never told was deleted is a repair loop with no exit - it writes the same wait, the
+    pass removes it, the gate rejects it. A read the pass made wait is the same debt the
+    other way: told nothing, the model "fixes" a wait it already has.
     """
     lines = [
         "Your skill was REJECTED and has not been stored.",
@@ -486,22 +355,15 @@ _SLOWER_THAN_THE_RECORDING = (
 )
 """What a skill rejected at EXECUTION is told, on top of its error.
 
-The synthesizer writes a skill from a recording made at model speed and it is then
-re-run at code speed, which is one to two orders of magnitude faster. Every failure
-mode that is really a race looks, in the error text, exactly like a logic bug: "the
-cart is still empty" is what an empty cart and a cart read too early both say.
+A skill written from a recording made at model speed is re-run at code speed, and every
+failure that is really a race reads exactly like a logic bug: "the cart is still empty"
+is what an empty cart and a cart read too early both say. Measured on live splitkb.com
+2026-09-19, a correct add-to-cart run was rejected three times and the model's repair
+each time was to wrap the sequence in a retry, which fails identically, only twice.
 
-Without this the repair loop reliably picks the wrong fix. Measured on live
-splitkb.com on 2026-09-19, a correctly-explored add-to-cart run was rejected at
-execution on all three attempts, and the model's repair each time was to wrap the
-whole sequence in a retry - which fails identically, only twice, because the second
-pass is just as fast as the first.
-
-It is NOT offered when the hardening pass removed a wait, nor when it already made a
-read wait: both cases have their own and more specific message directly above, and two
-paragraphs about waiting would make the more precise one easier to miss. The second
-exclusion matters most - telling a model to add a wait to code the pass has ALREADY
-made wait is how a repair loop spends three attempts on a race that is no longer there.
+NOT offered when the hardening pass removed a wait or already made a read wait: both
+have their own message, and telling a model to add a wait to code that already waits
+spends three attempts on a race that is no longer there.
 """
 
 
@@ -509,49 +371,32 @@ made wait is how a repair loop spends three attempts on a race that is no longer
 # Is the verifier worth storing?
 # --------------------------------------------------------------------------------------
 #
-# A verifier is only worth storing if it can FAIL on a screen the skill might
-# plausibly land on. That is the whole property, and it is not what "the verifier
-# passed" measures: a check that matches SITE CHROME - the top nav, the footer, the
-# logo, a category word that every page of the site carries - passes on the finished
-# job and on every unfinished one alike, so its yes says nothing.
+# A verifier is only worth storing if it can FAIL on a screen the skill might plausibly
+# land on, which is not what "the verifier passed" measures: a check matching SITE CHROME
+# passes on the finished job and every unfinished one alike. Measured on live splitkb.com
+# 2026-09-19, a verifier matching "Keycaps" - in that shop's top nav on EVERY page -
+# passed 8 of 8 replays whose carts were empty all 8 times by /cart.js, and SkillStats
+# read 14 runs, 14 successes. Nothing downstream can notice: the store is told ok by the
+# sandbox, the sandbox by the verifier. Only the warm critic caught it.
 #
-# Measured on live splitkb.com on 2026-09-19. A synthesized add-to-cart skill was
-# given a verifier matching the word "Keycaps", which that shop's top navigation
-# shows on EVERY page. It passed 8 of 8 replays whose carts were empty all 8 times
-# by the site's own ``/cart.js`` (``item_count=0``), and ``SkillStats`` for that
-# skill read 14 runs, 14 successes. Nothing downstream can notice this: the store is
-# told ``ok`` by the sandbox, and the sandbox is told ``ok`` by the verifier. Only
-# the warm critic caught it, every time, which is the system working - but a
-# verifier that passes on the wrong screen is worse than no verifier at all, because
-# it is what turns a skill that did nothing into a STORED one, and then into a
-# statistic.
-#
-# The gate already re-runs a candidate SKILL from its recorded start screen before
-# admitting it. This is the same move for the verifier, and it costs nothing: the
-# start screen has ALREADY been observed by this attempt - it is the ``before`` the
-# precondition was measured against - so replaying the verifier over it is a
-# dictionary lookup and a function call. No capture, no detector, no OCR, no second
-# browser, and the live page is never touched.
+# This is the same move the gate already makes for the code, and it costs nothing: the
+# start screen has ALREADY been observed by this attempt, so replaying the verifier over
+# it is a dictionary lookup and a call. No capture, no OCR, no second browser.
 
 
 class _StartScreen:
-    """One already-captured :class:`~skillweaver.contracts.Observation` dressed as a
-    :class:`~skillweaver.contracts.Controller` and a
-    :class:`~skillweaver.contracts.Perceiver`, so a verifier can be asked about the
-    screen the skill started from without going back to it.
+    """One already-captured Observation dressed as a Controller and a Perceiver, so a
+    verifier can be asked about the screen the skill started from without going back.
 
-    Going back to it is the alternative, and it is the wrong one twice over: it costs
-    a second reset and a second full perception pass per attempt, and on a live site
-    the screen it returned to would not be the screen the precondition was measured
-    against anyway. The observation this attempt already took IS that screen.
+    Going back is wrong twice over: it costs a second reset and a second full perception
+    pass per attempt, and on a live site the screen it returned to would not be the one
+    the precondition was measured against. The observation this attempt already took IS
+    that screen.
 
-    Every action is REFUSED rather than performed. A verifier is a read-only question
-    about the end state; one that clicks would be mutating the world from inside the
-    gate, and here there is no world to mutate - only a frozen frame. The refusal
-    surfaces to skill code as the ordinary ``ControllerError`` that
-    :class:`~skillweaver.skills.api.ActionView` raises for any refused action, which
-    makes the probe inconclusive, and an inconclusive probe ADMITS (see
-    :meth:`Synthesizer._passes_on_the_start_screen`).
+    Every action is REFUSED rather than performed - a verifier is a read-only question,
+    and here there is no world to mutate. The refusal surfaces as the ordinary
+    ``ControllerError``, which makes the probe inconclusive, and an inconclusive probe
+    ADMITS (:meth:`Synthesizer._passes_on_the_start_screen`).
     """
 
     __slots__ = ("_observation",)
@@ -565,8 +410,7 @@ class _StartScreen:
     # -- Perceiver -------------------------------------------------------------------
 
     def observe(self, controller: Controller) -> Observation:
-        """The captured screen, every time. ``controller`` is ignored: there is
-        nothing to capture and nothing that could have changed."""
+        """The captured screen, every time. ``controller`` is ignored."""
         return self._observation
 
     # -- Controller ------------------------------------------------------------------
@@ -601,20 +445,14 @@ class _StartScreen:
 
 
 _PROBE_SUFFIX = "__on_the_start_screen"
-"""Appended to the candidate's name for the probe run.
-
-The probe must not land in the library's statistics. A candidate is not in the store
-during admission, so ``SkillRunner._record`` finds nothing to write and says so - but
-a RELEARN of a skill that is already stored would be recorded, and a probe run is not
-a run of the skill. A name no store holds is the whole mechanism."""
+"""Appended to the candidate's name for the probe run, so it cannot land in the
+library's statistics: a RELEARN of an already-stored skill would otherwise be recorded,
+and a probe run is not a run of the skill. A name no store holds is the mechanism."""
 
 _PROBE_CODE = "def run(ctx, result):\n    return result\n"
-"""The probe's ``run``: it performs nothing and hands the real run's return value
-straight to the verifier.
-
-The verifier is ``verify(ctx, result)`` and a real one may read ``result``, so the
-probe has to be able to supply it. Passing it as an argument is the only way in - a
-skill's source is text, and a Python value cannot be written into it."""
+"""The probe's ``run``: it performs nothing and hands the real run's return value to the
+verifier. ``verify(ctx, result)`` may read ``result``, and passing it as an argument is
+the only way in - a skill's source is text, and a Python value cannot be written into it."""
 
 _INDISCRIMINATE = (
     "the verifier for {name!r} ALSO passes on the screen the skill started from, so "
@@ -650,15 +488,12 @@ _A_VERIFIER_MUST_BE_ABLE_TO_FAIL = (
 )
 """What a skill rejected at ``"discrimination"`` is told, on top of its error.
 
-Ordered deliberately, and the order is the fix rather than the paragraph. A longer
-lecture about rigour produces a longer verifier over the same words; naming the
-SIGNALS - a count, a newly present row carrying the parameter's own value, a changed
-URL, text that exists only when the job is done - moves the check onto something the
-starting screen does not have. Each of those is a thing the ACTION changed, which is
-the only class of evidence that can distinguish the two screens at all.
-
-It also says which half to rewrite. A model told only "rejected" rewrites the code,
-because that is what a rejection has always meant here, and the code was fine.
+Ordered deliberately, and the order is the fix: a longer lecture about rigour produces a
+longer verifier over the same words, while NAMING the signals - a count that moved, a
+newly present row carrying the parameter's own value, a changed URL, text that exists
+only when the job is done - moves the check onto something the starting screen does not
+have. It also says which half to rewrite: a model told only "rejected" rewrites the
+code, and the code was fine.
 """
 
 
@@ -673,15 +508,12 @@ class _Unreadable:
 
     Attributes:
         why: The sentence the model is shown.
-        format_only: ``True`` when nothing JSON-shaped came back AT ALL - prose, a
-            fence with no object in it, an empty turn, a reply cut off mid-object.
-            Such a reply says nothing about the skill, so it is re-asked for rather
-            than charged to the repair budget. ``False`` is a real content defect -
-            a JSON object with no verifier, say - which IS the model's mistake to
-            fix and does spend a repair.
-        needs_room: Whether re-asking is only worth it with a larger token cap. An
-            empty reply counts: on a thinking model an empty turn usually means the
-            cap was spent before any text was written.
+        format_only: ``True`` when nothing JSON-shaped came back AT ALL, which says
+            nothing about the skill and so is re-asked rather than charged to the repair
+            budget. ``False`` is a real content defect and does spend a repair.
+        needs_room: Whether re-asking is only worth it with a larger token cap. An empty
+            reply counts: on a thinking model that usually means the cap was spent
+            before any text was written.
     """
 
     why: str
@@ -692,12 +524,10 @@ class _Unreadable:
 def _balanced_objects(text: str) -> Iterator[str]:
     """Every balanced ``{...}`` span in ``text``, outermost first, in order.
 
-    String-aware, so a brace inside a JSON string - and Python code full of them is
-    exactly what these replies carry - does not end the span. This is what makes the
-    reader tolerant of the model explaining itself: prose before the object, a
-    ``{placeholder}`` in that prose, a second fenced snippet afterwards. Each of
-    those defeated a ``find("{")``/``rfind("}")`` pair, and each of them cost a
-    generation attempt in a live run.
+    String-aware, so a brace inside a JSON string - and these replies carry Python code
+    full of them - does not end the span. Prose before the object, a ``{placeholder}`` in
+    that prose and a second fenced snippet each defeated a ``find``/``rfind`` pair, and
+    each cost a generation attempt in a live run.
     """
     depth, start, in_string, escaped = 0, -1, False, False
     for index, char in enumerate(text):
@@ -723,10 +553,8 @@ def _balanced_objects(text: str) -> Iterator[str]:
 def _json_object(text: str) -> dict[str, Any] | None:
     """The skill object in a model reply, however it was wrapped, or ``None``.
 
-    Tries the whole reply first, then every balanced object in it. An object with a
-    ``code`` key is unmistakably the answer and wins immediately; any other object -
-    a ``{}`` in a code sample, say - is only a fallback, so a stray brace earlier in
-    the reply cannot shadow the real one.
+    An object with a ``code`` key wins immediately; any other - a ``{}`` in a code
+    sample - is only a fallback, so a stray brace cannot shadow the real one.
     """
     fallback: dict[str, Any] | None = None
     for candidate in (text.strip(), *_balanced_objects(text)):
@@ -746,12 +574,8 @@ def _json_object(text: str) -> dict[str, Any] | None:
 
 
 def _parse_draft(text: str, *, truncated: bool = False) -> tuple[_Draft | None, _Unreadable | None]:
-    """A draft from one reply, or ``(None, why it is not one)``.
-
-    Args:
-        text: The reply.
-        truncated: Whether the provider stopped at the token cap.
-    """
+    """A draft from one reply, or ``(None, why it is not one)``. ``truncated`` says
+    whether the provider stopped at the token cap."""
     data = _json_object(text)
     if data is None:
         if not text.strip():
@@ -814,11 +638,9 @@ broken."""
 def _echo(reply: str) -> tuple[LLMMessage, ...]:
     """The model's own reply, as the assistant turn a follow-up hangs off.
 
-    Empty when the reply was empty. There is nothing to quote back, and an empty
-    assistant turn is worse than no turn: some providers refuse a conversation that
-    ends on one, and ``claude-opus-5`` refuses an assistant turn in final position
-    outright. A follow-up user turn on its own is accepted, and was confirmed against
-    the live API before this was written.
+    Empty when the reply was empty: some providers refuse a conversation ending on an
+    empty assistant turn, and ``claude-opus-5`` refuses an assistant turn in final
+    position outright. A follow-up user turn on its own is accepted.
     """
     return (LLMMessage(role="assistant", text=reply),) if reply.strip() else ()
 
@@ -841,17 +663,14 @@ _sleep = time.sleep
 def _with_what_it_earned(skill: Skill, generation: _Generation, trajectory: Trajectory) -> Skill:
     """``skill`` with its action signature and its first precedent, IF it earned them.
 
-    Called for a candidate the gate has just ADMITTED, and that is the whole point of
-    where it sits: by this line the exact code has run to completion in a reset world,
-    its own verifier has said yes to the end screen and no to the start screen, and
-    the critic has agreed. What a skill DOES (:mod:`skillweaver.skills.family`) and
-    the sentence-and-arguments it is proven to serve
-    (:class:`~skillweaver.contracts.Precedent`) are both claims other skills and later
-    requests will lean on, so neither is written from anything less.
+    Called for a candidate the gate has just ADMITTED, which is the point of where it
+    sits: the exact code has run to completion in a reset world, its verifier said yes
+    to the end screen and no to the start screen, and the critic agreed. What a skill
+    DOES and the sentence it is proven to serve are both claims other skills and later
+    requests lean on, so neither is written from less.
 
-    A candidate with NO verifier is admitted on the critic alone, as it always was,
-    and gets neither: nothing checked its own account of its end state, so it joins
-    no family and lends nobody a template. Arguments that are not plain values are
+    A candidate with NO verifier is admitted on the critic alone and gets neither: it
+    joins no family and lends nobody a template. Arguments that are not plain values are
     left out of the precedent rather than stringified - a template is matched against
     text, and a list has no place in a sentence.
     """
@@ -884,26 +703,17 @@ def _with_what_it_earned(skill: Skill, generation: _Generation, trajectory: Traj
 def _observe_at_rest(env: ReplayEnvironment) -> Observation:
     """Observe the environment once it has STOPPED CHANGING, and not before.
 
-    The gate reads the screen twice - where the candidate starts and where it ended -
-    and both reads used to happen the instant the controller returned. ``_settle`` waits
-    for the load event, and a page that paints after it has already fired is then
-    photographed mid-paint. On live walmart.com the gate's precondition read 0.40, 1.00,
+    ``_settle`` waits for the load event, and a page that paints after it has fired is
+    photographed mid-paint: on live walmart.com the gate's precondition read 0.40, 1.00,
     0.238, 0.238, 1.00, 0.40 over six attempts against one recorded screen and a 0.26
-    cut: not six different pages, one page caught at six moments. The filled cart moved
-    through five fingerprints in its first 340ms (0.474 to its own final screen at 0s)
-    and then held ONE, exactly equal, for every one of the next 125 reads.
+    cut - one page caught at six moments. The filled cart moved through five fingerprints
+    in its first 340ms and then held ONE, exactly equal, for the next 125 reads.
 
-    That equality is the signal. This waits for a THING - the fingerprint holding still
-    for :data:`REST_WINDOW_MS` - and never for the score: it is not told what the screen
-    is about to be compared with, so it cannot keep looking until a screen happens to
-    pass. It returns ONE observation, the last one, which is then judged exactly as
-    strictly as before. A screen that never rests inside :data:`REST_BUDGET_MS` - a
-    carousel, a clock - is judged as it stands, which is what happened before this
-    existed; the wait costs such a page time and buys it nothing.
-
-    A window and not a single quiet poll, because a zero-window check reads quiet before
-    the page has started (25-45ms, measured; AGENTS.md). This is the gate, which runs a
-    handful of times per LEARNED skill - not ``_settle``, which would tax every action.
+    That equality is the signal. This waits for the fingerprint to hold still for
+    :data:`REST_WINDOW_MS` and is never told the score, so it cannot keep looking until a
+    screen happens to pass. A window, not a single quiet poll, because a zero-window
+    check reads quiet before the page has started (25-45ms). This is the gate, which runs
+    a handful of times per LEARNED skill - not ``_settle``, which would tax every action.
     """
     started = time.monotonic()
     seen = env.perceiver.observe(env.controller)
@@ -933,15 +743,12 @@ def _not_at_the_start(
 ) -> str:
     """Why the candidate was not run, in the words the difference deserves.
 
-    The same fingerprint mismatch means two opposite things. With the world genuinely
-    put back it is about the skill; without, it is about the harness, and saying so
-    is the difference between "your model wrote bad code" and "this task changes
-    something and nothing here can change it back", which is the reason a mutating
-    task could never be learned at all.
-
-    The threshold is quoted next to the score either way. A bare "similarity 0.96" is
-    what this gate reported for a year while a ``1.0`` default rejected every live
-    page, and reading it needs the number it was measured against.
+    The same fingerprint mismatch means two opposite things: with the world genuinely
+    put back it is about the skill, without it is about the harness - the difference
+    between "your model wrote bad code" and "this task changes something and nothing
+    here can change it back". The threshold is quoted next to the score either way,
+    because a bare "similarity 0.96" is what this gate reported for a year while a
+    ``1.0`` default rejected every live page.
     """
     where = (
         f"(similarity {similarity:.2f}, below the {threshold:.2f} required, "
@@ -962,11 +769,9 @@ def _not_at_the_start(
 
 @dataclass(frozen=True, slots=True)
 class _Generation:
-    """One draft, and the conversation that produced it.
-
-    ``messages`` is the conversation the final reply answered - including any
-    re-asks - so a repair is appended to what the model actually last saw.
-    """
+    """One draft, and the conversation that produced it. ``messages`` is the
+    conversation the final reply answered, re-asks included, so a repair is appended to
+    what the model actually last saw."""
 
     draft: _Draft | None
     unreadable: _Unreadable | None
@@ -981,33 +786,18 @@ class _Generation:
 
 
 class Synthesizer:
-    """A :class:`~skillweaver.contracts.Synthesizer` with an admission gate.
+    """A Synthesizer with an admission gate.
 
     Args:
-        llm: Writes and repairs the code. Its ``name()`` is recorded in provenance.
-        store: Where an ADMITTED skill is put. Private: the only call to ``put`` in
-            this class is the one after the gate, so there is no way to store a skill
-            that has not proved itself through this object.
-        critic: Judges the replayed run. Required, for the same reason.
-        max_repairs: How many times a rejected skill may be rewritten. ``0`` means
-            one attempt and no repairs. Bounded because a model that cannot fix its
-            code in three goes will not fix it in thirty, and every go costs money.
-            Only a JUDGED skill spends one - see ``max_format_retries``.
-        max_format_retries: How many times an UNREADABLE reply may simply be
-            re-asked for, per attempt. Prose around the object, an empty turn, a
-            reply cut off at the token cap: none of those is a fact about the skill,
-            so charging them to ``max_repairs`` spends the gate's whole budget on
-            punctuation and stores nothing. ``0`` restores the old behaviour.
-        limits: Sandbox limits for the admission run.
-        min_steps: Runs shorter than this are not worth a skill; ``synthesize``
-            returns ``None`` for them.
-        min_similarity: How like the recorded starting screen the environment must
-            be before a candidate is run in it, in ``0.0..1.0``. Defaults to
-            :data:`MIN_PRECONDITION_SIMILARITY`, which is measured; ``1.0`` demands
-            the byte-identical screen and no live page ever gives one.
-        max_tokens, temperature: Passed to ``llm.complete``.
-
-    Not thread-safe, and one instance may be reused across trajectories.
+        store: Where an ADMITTED skill is put. Private: the only ``put`` is the one after
+            the gate, so nothing can store a skill that has not proved itself here.
+        max_repairs: How many times a rejected skill may be rewritten. Bounded because a
+            model that cannot fix its code in three goes will not fix it in thirty. Only
+            a JUDGED skill spends one.
+        max_format_retries: How many times an UNREADABLE reply may be re-asked for.
+            Charging those to ``max_repairs`` spends the whole budget on punctuation.
+        min_similarity: Defaults to :data:`MIN_PRECONDITION_SIMILARITY`; ``1.0`` demands
+            the byte-identical screen and no live page gives one.
     """
 
     __slots__ = (
@@ -1044,10 +834,8 @@ class Synthesizer:
         if max_format_retries < 0:
             raise ValueError(f"max_format_retries must not be negative, got {max_format_retries}")
         if not 0.0 <= min_similarity <= 1.0:
-            # A value above 1.0 is unreachable - `Fingerprint.similarity` is capped
-            # there - so it silently rejects EVERY candidate. That is how a test rig
-            # can look like it is exercising the gate while proving nothing, and it
-            # is worth a loud failure rather than an afternoon.
+            # Above 1.0 is unreachable - `Fingerprint.similarity` is capped there - so it
+            # would silently reject EVERY candidate while looking like a gate under test.
             raise ValueError(f"min_similarity must be within 0.0..1.0, got {min_similarity}")
         self._llm = llm
         self._store = store
@@ -1073,8 +861,8 @@ class Synthesizer:
         """Write a candidate skill from ``trajectory``: hardened, validated,
         ``version=0``, and **not stored**.
 
-        ``None`` when the run failed, was too short to be worth a skill, or the model
-        did not return usable code. Storing happens only in :meth:`admit`.
+        ``None`` when the run failed, was too short, or the model returned nothing
+        usable. Storing happens only in :meth:`admit`.
 
         Raises:
             ProviderError: if the model call fails.
@@ -1097,30 +885,14 @@ class Synthesizer:
     def admit(self, trajectory: Trajectory, environment: EnvironmentFactory) -> Admission:
         """Synthesize a skill and store it ONLY if it proves itself.
 
-        The candidate is hardened, structurally validated, statically scanned,
-        re-executed through the sandbox against a fresh ``environment`` standing at
-        the recorded starting screen, asked to prove its VERIFIER discriminates - see
-        :meth:`_passes_on_the_start_screen` - and judged by the critic. A rejection is
-        fed back to the model with its error and trace and the skill is rewritten, up
-        to ``max_repairs`` times.
+        A rejection is fed back with its error and trace and the skill is rewritten, up
+        to ``max_repairs`` times. An attempt stopping at ``"reset"`` ends the loop at
+        once - nothing was learned about the candidate - and :attr:`Admission.unproved`
+        marks that, so a caller can say "give me a way to restore this world" instead of
+        "the model wrote bad code".
 
-        An attempt that stops at ``"reset"`` ends the loop at once: the world could
-        not be put back, so nothing was learned about the candidate and rewriting it
-        would only spend money to fail the same way. :attr:`Admission.unproved` marks
-        that outcome so a caller can say "give me a way to restore this world"
-        instead of "the model wrote bad code".
-
-        Args:
-            trajectory: The successful run to learn from.
-            environment: Called once per attempt; returns the recorded environment
-                put back to the trajectory's first screen, saying through
-                :attr:`ReplayEnvironment.restored` whether it managed to.
-
-        Returns:
-            An :class:`Admission`. ``ok`` means - and only means - that this exact
-            code ran to completion in the replayed environment, its verifier agreed
-            and the critic agreed, and ``skill`` is what the store now holds.
-            Otherwise nothing was stored and ``attempts`` says why.
+        ``ok`` means, and only means, that this exact code ran to completion in the
+        replayed environment, its verifier agreed and the critic agreed.
 
         Raises:
             ProviderError: if a model call fails.
@@ -1198,10 +970,9 @@ class Synthesizer:
     def _generate(self, messages: Sequence[LLMMessage]) -> _Generation:
         """One draft, re-asking for the JSON object when the reply is unreadable.
 
-        A re-ask is not a repair. It costs a model call and says so in the log, but
-        it does not advance the repair counter, because the skill has not been judged
-        - the reply merely could not be read. A reply that ran out of room gets a
-        bigger cap on the way round; a reply that was simply chatty does not need one.
+        A re-ask is not a repair: it costs a model call but does not advance the repair
+        counter, because the skill has not been judged. A reply that ran out of room gets
+        a bigger cap on the way round.
 
         Raises:
             ProviderError: if a model call fails.
@@ -1270,10 +1041,9 @@ class Synthesizer:
         before = _observe_at_rest(env)
         if candidate.precondition is not None:
             similarity = before.fingerprint.similarity(candidate.precondition)
-            # Logged whether it passes or fails. A gate that only speaks when it
-            # refuses cannot be calibrated: the number that mattered here was the one
-            # from the runs that were REJECTED at 0.96, and nobody could see the ones
-            # that passed to know how much room was left.
+            # Logged whether it passes or fails: a gate that only speaks when it refuses
+            # cannot be calibrated, and the number that mattered was how much room the
+            # runs that PASSED had left.
             log.info(
                 "skill.admit.precondition",
                 name=candidate.name,
@@ -1361,34 +1131,18 @@ class Synthesizer:
         value: Any,
         graph: GraphView | None,
     ) -> bool:
-        """Whether ``candidate``'s verifier ALSO says yes to the screen the skill
-        started from - in which case its yes about the end screen means nothing.
+        """Whether ``candidate``'s verifier ALSO says yes to the screen the skill started
+        from - in which case its yes about the end screen means nothing.
 
-        The verifier is replayed exactly as the runner replays it, through the same
-        ``SkillRunner.run``, so what is probed is what will be stored. Only two things
-        differ: the world is :class:`_StartScreen`, the observation this attempt
-        already took, and ``run`` is :data:`_PROBE_CODE`, which performs nothing and
-        hands ``value`` - the real run's return value - to ``verify``.
+        Replayed through the same ``SkillRunner.run`` the runner uses, so what is probed
+        is what will be stored; only the world (:class:`_StartScreen`) and ``run``
+        (:data:`_PROBE_CODE`, which hands ``value`` straight to ``verify``) differ.
 
-        Args:
-            runner: The runner the candidate was just executed through.
-            candidate: The skill whose verifier is in question.
-            before: The screen the skill started on, already observed by the gate.
-            value: What ``run`` returned on the real screen, so a verifier that reads
-                ``result`` is asked the same question it was asked for real.
-            graph: The environment's site graph, so a verifier that consults it can.
-
-        Returns:
-            ``True`` only when the verifier ran to completion on the starting screen
-            and returned a truthy value. Anything else - it returned false, it raised,
-            it tried to ACT and the frozen controller refused, the probe blew a limit -
-            is INCONCLUSIVE and answers ``False``, which admits.
-
-            That asymmetry is the whole design. A false accept here costs what it
-            always cost: the critic still has to agree before anything is stored. A
-            false REJECT would destroy a correct skill over a verifier this probe
-            could not run, which is the more expensive mistake and the one this
-            project has already made once, with ``min_similarity`` at ``1.0``.
+        ``True`` only when the verifier ran to completion and returned truthy. Anything
+        else - false, a raise, an attempt to ACT the frozen controller refused, a blown
+        limit - is INCONCLUSIVE and answers ``False``, which ADMITS. A false accept costs
+        what it always cost, since the critic must still agree; a false REJECT would
+        destroy a correct skill over a verifier this probe could not run.
         """
         if not candidate.verifier_code:
             return False
@@ -1413,9 +1167,8 @@ class Synthesizer:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - an unrunnable probe proves nothing
-            # Including BudgetExceeded, which SkillRunner.run re-raises. The probe has
-            # its own fresh ledger, so one here is about the probe and not about the
-            # agent's remaining budget; aborting a whole run over it would be wrong.
+            # Including BudgetExceeded: the probe has its own fresh ledger, so one here is
+            # about the probe, not the agent's remaining budget.
             log.info("skill.admit.discrimination.unrunnable", name=candidate.name, why=str(exc))
             return False
         log.info(
@@ -1431,11 +1184,9 @@ class Synthesizer:
     def _build(
         self, draft: _Draft, trajectory: Trajectory
     ) -> tuple[Skill | None, str | None, Hardening | None]:
-        """Harden the draft and validate it into a :class:`Skill`.
-
-        The precondition is the trajectory's FIRST screen: where the recording
-        started is where the skill may be used, and the planner routes there.
-        """
+        """Harden the draft and validate it into a :class:`Skill`. The precondition is
+        the trajectory's FIRST screen: where the recording started is where the skill may
+        be used, and the planner routes there."""
         hardening = harden(draft.code, trajectory, params=draft.params)
         params = {**dict(draft.params), **dict(hardening.added_params)}
         if hardening.changed:
@@ -1446,9 +1197,9 @@ class Synthesizer:
                 anchored=hardening.positions_anchored,
             )
         if hardening.positions_announced:
-            # Not a rejection: the recording offered nothing to anchor these on, so
-            # the skill keeps them and says so in its own trace. Worth a line in the
-            # run log, because it is the honest measure of how thin a skill is.
+            # Not a rejection: the recording offered nothing to anchor these on, so the
+            # skill keeps them and says so in its own trace. Worth a log line, because it
+            # is the honest measure of how thin a skill is.
             log.info(
                 "skill.harden.positional",
                 name=draft.name,

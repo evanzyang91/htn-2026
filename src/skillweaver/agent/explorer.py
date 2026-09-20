@@ -1,78 +1,16 @@
 """The explorer: the cold path, where a task nobody has done before gets done anyway.
 
-Everything else in this project either feeds this loop or lives off what it leaves
-behind. Synthesis compiles a verified trajectory from here into a stored skill; the site
-graph grows only because this loop writes down every transition it sees. There is no
-separate crawler and no offline indexing pass: the map is a by-product of working.
+observe -> prompt -> ask the model -> ground and perform -> judge -> continue?
+Synthesis compiles a verified trajectory from here into a stored skill, and the site
+graph grows only because this loop writes down every transition it sees.
 
-The loop is six steps, bounded four ways::
-
-    observe -> prompt -> ask the model -> ground and perform -> judge -> continue?
-
-**Observe.** One :class:`~skillweaver.contracts.Perceiver` call. This module sees exactly
-what the perceiver it was handed returns - a screenshot, elements and a fingerprint - and
-never reaches past it for anything else. It does not know or care which eyes produced
-those elements, and it must not learn: it has no route to
-:class:`~skillweaver.controllers.browser.BrowserGroundTruth`, whose whole job is to know
-what the agent is supposed to work out, and reaching THAT from here would make every
-number the project reports meaningless.
-
-Which perceiver arrives is the caller's decision and is now two:
-:class:`~skillweaver.orchestrator.ComposedPerceiver` (YOLO and OCR over the screenshot,
-the DEFAULT) or :class:`~skillweaver.perception.dom.DomPerceiver` (the page's own control
-list, browser only, opt-in). ``AGENTS.md`` carries the standing rule and how far it is
-relaxed; :mod:`skillweaver.perception_mode` carries why the two keep separate libraries.
-
-**Prompt.** :class:`ElementCatalog` gives every element on the current screen a short id,
-and the model is required to act by id. Around that go the goal, the graph neighbourhood
-of the current state, any retrieved skills, the run so far - and the failure memory.
-
-**The failure memory is the part that makes this terminate.** An explorer that forgets
-what it just tried proposes it again, because the screen that prompted it has not changed,
-and then loops until its budget runs out with nothing to show. So every failed attempt is
-recorded against the fingerprint of the screen it was tried on (:class:`FailureMemory`),
-listed back in the prompt, and - because a model that is told not to repeat itself still
-sometimes does - *enforced*: a move whose signature is already a dead end at this exact
-state is refused without being performed, and the model is asked again knowing why. The
-guard is what the test asserts; the prompt section is what usually makes the guard
-unnecessary.
-
-**Ground and perform.** The model may answer with one primitive action or with a short
-code block. Both go through the same grounding: an action names an element id that must be
-in the catalogue of the screen in front of it, and code blocks run in the same sandbox
-that stored skills run in (:class:`~skillweaver.skills.sandbox.SkillRunner`), with the
-catalogue passed in as ``el``. Whatever a move performs is taped
-(:class:`_TapedController`) so that one action, one trajectory step and one graph edge
-stay the same thing whether it came from a primitive or from a block.
-
-**Judge.** Every verdict comes from the :class:`~skillweaver.contracts.Critic`, never from
-this module. :class:`~skillweaver.agent.critic.TieredCritic` answers most step questions -
-"the screen did not change" and "an error appeared" - with no model call at all, which is
-most of why this loop is affordable.
-
-**Continue?** :class:`~skillweaver.contracts.Budget` bounds the run four independent ways:
-steps, wall-clock seconds, dollars and model calls. Each one alone can stop the loop.
-Money and calls are charged from the difference in
-:meth:`~skillweaver.contracts.LLMClient.total_usage` across each model call, so an
-escalation the critic makes on the same client is charged to the run that caused it; a
-client that under-reports is still charged for the call this loop made itself.
-
-Failure is a result, not an exception
--------------------------------------
-
-Running out of budget, a model that will not produce a usable answer, a screen with no way
-out: all of these return :class:`ExplorationOutcome` - a real
-:class:`~skillweaver.contracts.RunOutcome`, so any caller typed against the Protocol is
-unaffected - with ``ok=False`` and a :class:`Diagnosis` naming the state it was stuck in,
-the limit that stopped it, and everything it had tried there. A failed run that says where
-it got stuck is worth keeping; one that says "failed" is not. The only exception allowed
-out is :class:`~skillweaver.errors.ControllerError`, per the
-:class:`~skillweaver.contracts.Explorer` Protocol: a broken controller is not a judgment
-about the task.
-
-A malformed reply, an id that is not on the screen, an action the controller cannot
-perform, a code block that raises - each is a recoverable step failure. It is remembered,
-explained back to the model, and the loop goes round again.
+This module sees exactly what the perceiver it was handed returns and must never reach
+past it - it has no route to BrowserGroundTruth, and reaching that from here would make
+every number the project reports meaningless. Every verdict comes from the Critic, never
+from here. Failure is a result, not an exception: running out of budget, an unusable
+model answer or a screen with no way out all return an ``ok=False``
+:class:`ExplorationOutcome` carrying a :class:`Diagnosis`. Only ControllerError is
+allowed out - a broken controller is not a judgment about the task.
 """
 
 from __future__ import annotations
@@ -170,9 +108,8 @@ block, so the step after the current one is the furthest a fitting move can land
 MAX_BLOCK_ACTIONS = 8
 """Controller actions one model-written code block may perform.
 
-A block is a move, not a program: the loop has to see the screen again to stay grounded,
-and a block that acts more than this has stopped being one decision. The sandbox stops it
-at the limit and the actions it already performed are kept and judged.
+A block is a move, not a program: the loop has to see the screen again to stay grounded.
+The sandbox stops it at the limit and the actions it already performed are kept and judged.
 """
 
 RECENT_MOVES = 8
@@ -201,12 +138,11 @@ def load_prompt() -> str:
 
 
 class PolicyBlocked(Exception):
-    """An :class:`ActingPolicy` reporting that nothing on this screen can make progress.
+    """An acting policy reporting that nothing on this screen can make progress.
 
-    Not a failure of the loop and not an error: it is the policy's own ``BLOCKED``
-    answer, which upstream Jev treats as a terminal state. The loop stops and the run is
-    diagnosed as blocked at the screen it was on, which is more useful than burning the
-    remaining budget asking the same question of the same page.
+    The policy's own ``BLOCKED`` answer, which upstream Jev treats as terminal - not a
+    failure of the loop. The run is diagnosed as blocked at the screen it was on, which
+    beats burning the remaining budget on the same question.
     """
 
 
@@ -219,20 +155,13 @@ class PolicyBlocked(Exception):
 class ActingPolicy(Protocol):
     """Whatever decides the next move, when it is not this module's own model call.
 
-    The DEFAULT is ``None`` and the default path is unchanged: :meth:`Explorer._ask`
-    composes a prompt, sends it with the screenshot and returns the reply. A policy
-    replaces that one step and NOTHING else - the failure memory, the grounding, the
-    taped controller, the critic, the graph writing, the trajectory and all four budget
-    limits are the same code either way, which is why a stored skill learned through a
-    policy is an ordinary stored skill.
+    The DEFAULT is ``None`` and that path is unchanged. A policy replaces that one step
+    and NOTHING else - failure memory, grounding, the taped controller, the critic, the
+    graph writing, the trajectory and all four budget limits are the same code either
+    way, which is why a skill learned through a policy is an ordinary stored skill.
 
     The return value is the explorer's ANSWER PROTOCOL: the same JSON object
-    :meth:`Explorer._ground` parses out of a model reply - ``thought``, ``expect``,
-    ``done``, and one of ``action`` or ``code``. A policy writes that object directly
-    rather than a model writing it in prose, and the docstring says so plainly because
-    it looks like a fiction and is not one: grounding is where an element id is checked
-    against the screen in front of it, and a policy that skipped it would be a policy
-    nothing checks.
+    ``Explorer._ground`` parses out of a model reply.
 
     Raises:
         PolicyBlocked: when the policy reports no supported operation can progress.
@@ -251,15 +180,12 @@ class ActingPolicy(Protocol):
         """The next move, as an answer object.
 
         Args:
-            task: What is being attempted, in the words it was asked in.
-            observation: The screen in front of the policy.
-            catalog: That screen's elements under the ids an answer must name.
+            catalog: The screen's elements under the ids an answer must name.
             history: One line per move so far, oldest first.
-            dead_ends: What has already been tried ON THIS SCREEN and did not work.
-                A policy that re-proposes one of these is refused by
-                :meth:`Explorer._refuse_repeat` and asked again, so honouring them is
-                how a policy avoids paying for the same answer twice;
-                :func:`signature_move` reads the move and its element back out of one.
+            dead_ends: What was already tried ON THIS SCREEN and did not work. A policy
+                that re-proposes one is refused and asked again, so honouring them is how
+                it avoids paying for the same answer twice; ``signature_move`` reads the
+                move and its element back out of one.
             rejection: Why the previous answer was refused, when it was.
         """
         ...
@@ -272,16 +198,12 @@ class ActingPolicy(Protocol):
 def signature_move(signature: str) -> tuple[str, str] | None:
     """The ``(kind, element_id)`` a :attr:`Move.signature` aims at, or ``None``.
 
-    Signatures are built in :func:`_resolve`, one place, in the form
-    ``<kind>:<element_id>[:...]``. This function is where that format is READ, so a
-    caller outside this module - an :class:`ActingPolicy` pruning targets it already
-    knows are dead - does not have to know how it is spelled.
-
-    The KIND comes back with the id because a dead end is a move at an element, not an
-    element: a click that did nothing says nothing about typing into the same field, and
-    a caller that dropped the field on the strength of the click would have taken the
-    task's only way forward away from itself. See
-    :data:`~skillweaver.agent.jev_driver.DEAD_END_OPERATIONS`.
+    Signatures are built in ``_resolve`` as ``<kind>:<element_id>[:...]``; this is where
+    that format is READ, so a policy pruning known-dead targets need not know how it is
+    spelled. The KIND comes back with the id because a dead end is a move at an element,
+    not an element: a click that did nothing says nothing about typing into the same
+    field, and dropping the field on the strength of the click can take the task's only
+    way forward away.
     """
     kind, _, rest = signature.partition(":")
     if kind in _TARGETLESS or kind in ("code", "done", "malformed") or not rest:
@@ -293,14 +215,12 @@ def signature_move(signature: str) -> tuple[str, str] | None:
 class _Invalid(Exception):
     """A model answer that cannot be turned into a grounded move.
 
-    Private and never allowed out of this module: the loop catches it and turns it into a
-    recoverable step failure, because being unable to use one answer is not being unable
-    to do the task. The message is written to be read by the model that will be asked
-    again, so it names what was wrong and what would have been right.
+    Never allowed out of this module: the loop turns it into a recoverable step failure.
+    The message is written to be read by the model that will be asked again.
 
     ``record`` is ``False`` when the refusal came from the failure memory itself, which
-    has already counted the repeat. Filing it a second time would make the diagnosis
-    report one stubborn idea as two different problems.
+    has already counted the repeat - filing it twice would report one stubborn idea as
+    two problems.
     """
 
     def __init__(self, message: str, *, record: bool = True) -> None:
@@ -316,13 +236,11 @@ class _Invalid(Exception):
 class ElementCatalog:
     """The elements of ONE observation, each under a short id the model acts by.
 
-    An element's :attr:`~skillweaver.contracts.Element.stable_id` is its id when it has
-    one and it is unique on this screen, so the same control keeps the same name across
-    observations of the same state and the failure memory can recognise a repeat. Anything
-    else gets a positional ``e0``, ``e1`` id, which is stable within this screen only.
+    An element's ``stable_id`` is its id when it has one and is unique on this screen, so
+    the same control keeps the same name across observations and the failure memory can
+    recognise a repeat; anything else gets a positional ``e0``, ``e1``.
 
-    The catalogue is the grounding boundary: an id that is not in it is not on the screen,
-    and :meth:`get` refuses it with a message naming what is available instead.
+    The catalogue is the grounding boundary: an id not in it is not on the screen.
     """
 
     __slots__ = ("_by_id", "_ids")
@@ -370,8 +288,8 @@ class ElementCatalog:
 
         Raises:
             _Invalid: if the id is missing, not a string, or not on this screen. The
-                message lists the ids that ARE on it, truncated, because that is the
-                correction the model needs.
+                message lists the ids that ARE on it, because that is the correction the
+                model needs.
         """
         if not isinstance(element_id, str) or not element_id:
             raise _Invalid(
@@ -416,15 +334,11 @@ class Move:
     """One grounded decision: what to do next, and what it is supposed to achieve.
 
     Attributes:
-        thought: The model's stated reasoning, for the trajectory and the log.
         expect: What the model said would be visibly different afterwards. Handed to the
-            critic as the expectation, which is the whole reason the prompt demands it.
-        done: The model's claim that this move completes the task. A claim only: the
-            critic decides, comparing the run's first screen with the one this leaves.
-        action: The single primitive action, or ``None`` for a code move.
-        code: The model's code block, or ``None`` for a primitive move.
+            critic as the expectation, which is why the prompt demands it.
+        done: A CLAIM that this move completes the task; the critic decides.
         summary: One human-readable line, used in prompts, logs and the diagnosis.
-        signature: The move's identity for :class:`FailureMemory`. Built from what was
+        signature: The move's identity for :class:`FailureMemory`, built from what was
             ASKED for - the element id, not the resolved pixel - so that "the same move
             again" means what a reader would mean by it.
     """
@@ -452,9 +366,8 @@ class Move:
 class Attempt:
     """One thing that was tried on one screen and did not work.
 
-    ``state`` is the :class:`~skillweaver.contracts.Fingerprint` value of the screen it
-    was tried on - failure is a property of a move AT a state, not of the move - and
-    ``count`` is how many times it has been proposed since.
+    ``state`` is the fingerprint value of the screen it was tried on - failure is a
+    property of a move AT a state - and ``count`` is how often it has been proposed since.
     """
 
     state: str
@@ -467,39 +380,18 @@ class Attempt:
 class FailureMemory:
     """What this run has already tried, per screen, and why it did not work.
 
-    Keyed by ``(state fingerprint, move signature)``, because the same click is a fresh
-    idea on a different screen and a dead end on this one. Three readers:
+    Keyed by ``(state fingerprint, move signature)``: the same click is a fresh idea on a
+    different screen and a dead end on this one. Read by the prompt through :meth:`at`,
+    by the repeat guard through :meth:`seen`, and by an acting policy through
+    :meth:`near`.
 
-    * the prompt, through :meth:`at`, so the model can avoid repeating itself;
-    * the loop, through :meth:`seen`, so that when it repeats itself anyway the move is
-      refused before it is performed rather than after;
-    * an :class:`ActingPolicy`, through :meth:`near`, which is :meth:`at` with the
-      identity question asked the way the rest of this project asks it.
-
-    Why :meth:`near` exists, measured
-    ---------------------------------
-
-    :meth:`at` and :meth:`seen` key on the fingerprint VALUE, which is exact equality,
-    and a move that fails is very often a move that repainted the page without changing
-    it. Those two facts together mean the dead end is filed under a screen the next step
-    is not standing on. Measured on one live sandbox run of 33 actions: of the 11 moves
-    the critic failed, SEVEN left a screen that is the same state by
-    :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` - and exactly ONE of
-    those seven fingerprinted identically. The other six were unreachable from the very
-    next step, so the same target was offered again at full attractiveness and failed
-    again; the guard only bit on the third try, once two observations happened to agree.
-
-    That is the rule ``AGENTS.md`` states for the whole project - a live page never
-    fingerprints identically twice, so nothing that compares two screens may ask it to -
-    arriving here. :meth:`near` therefore asks
-    :meth:`~skillweaver.contracts.Fingerprint.similarity` against the one calibrated cut
-    every other comparison defers to. The separation in that run was not marginal:
-    same-screen pairs scored 0.719-1.000 and moved-on pairs 0.107-0.135, with the cut at
-    0.26 between them.
-
-    :meth:`at` and :meth:`seen` are deliberately LEFT exact. The prompt path and the
-    repeat guard are shared with the default explorer, and widening what they see is a
-    change to a run this task was not asked to change.
+    :meth:`near` exists because the other two key on the fingerprint VALUE, exact
+    equality, while a move that fails usually repaints the page without changing it - so
+    the dead end is filed under a screen the next step is not standing on. Measured on
+    one 33-action sandbox run: of 11 critic-failed moves, SEVEN left a screen that is the
+    same state by ``SAME_STATE_THRESHOLD`` and exactly ONE of those fingerprinted
+    identically. :meth:`at` and :meth:`seen` are LEFT exact, because the default
+    explorer's prompt and repeat guard are calibrated against them.
     """
 
     __slots__ = ("_by_key", "_screens")
@@ -514,12 +406,9 @@ class FailureMemory:
     def remember(self, state: Fingerprint, signature: str, summary: str, reason: str) -> Attempt:
         """Record a failed attempt, or count one more of an attempt already known.
 
-        The FIRST reason is kept: it is the one observed when the move was actually
-        performed, while a later one is usually this memory's own refusal.
-
-        The whole :class:`~skillweaver.contracts.Fingerprint` is taken rather than its
-        value because :meth:`near` needs the ``parts`` to compare screens at all; only
-        the value is stored on the :class:`Attempt`.
+        The FIRST reason is kept - observed when the move was actually performed, where a
+        later one is usually this memory's own refusal. The whole Fingerprint is taken
+        because :meth:`near` needs its ``parts``; only the value is stored on the Attempt.
         """
         key = (state.value, signature)
         known = self._by_key.get(key)
@@ -545,7 +434,7 @@ class FailureMemory:
         """Every failed attempt on this screen OR one indistinguishable from it.
 
         Same order as :meth:`at`, and the same answer whenever the fingerprints agree
-        exactly. The class docstring holds the measurement that says they usually do not.
+        exactly. The class docstring holds the measurement saying they usually do not.
         """
         same = {
             value
@@ -567,15 +456,12 @@ class FailureMemory:
 
 @dataclass(frozen=True, slots=True)
 class Diagnosis:
-    """Where a run got stuck and what it had tried there.
+    """Where a run got stuck and what it had tried there, so a failed run is still useful.
 
-    The point of this type is that a failed run is still useful. ``state`` is the
-    fingerprint value of the screen the loop was on when it stopped - the single most
-    important fact, because it says whether the agent was lost, in a dead end, or one move
-    from the goal - with ``label`` and ``url`` to make it legible to a human.
-
-    ``stopped_by`` is ``"budget"`` (a limit was reached, named in ``limit``), ``"error"``
-    (something broke; ``detail`` says what) or ``"gave-up"``.
+    ``state`` is the fingerprint of the screen the loop stopped on - it says whether the
+    agent was lost, in a dead end, or one move from the goal. ``stopped_by`` is
+    ``"budget"`` (a limit named in ``limit``), ``"error"`` (``detail`` says what) or
+    ``"gave-up"``.
     """
 
     stopped_by: str
@@ -616,11 +502,10 @@ class Diagnosis:
 
 @dataclass(frozen=True, slots=True)
 class ExplorationOutcome(RunOutcome):
-    """A :class:`~skillweaver.contracts.RunOutcome` that says where it got stuck.
+    """A RunOutcome that says where it got stuck.
 
-    ``diagnosis`` is ``None`` on a successful run and a :class:`Diagnosis` on every failed
-    one; :attr:`~skillweaver.contracts.RunOutcome.note` carries the same thing rendered,
-    so a caller that only knows the Protocol still sees it.
+    ``diagnosis`` is ``None`` on success; ``note`` carries the same thing rendered, so a
+    caller that only knows the Protocol still sees it.
     """
 
     diagnosis: Diagnosis | None = None
@@ -643,15 +528,12 @@ class _Performed:
 
 
 class _TapedController:
-    """A :class:`~skillweaver.contracts.Controller` that observes after every action.
+    """A Controller that observes after every action.
 
-    This is what makes a primitive move and a code block the same thing downstream: both
-    perform through this, so both leave a list of :class:`_Performed` entries, and one
-    entry is one trajectory step and one graph edge either way. The observation after an
-    action becomes the one before the next, so a block of ``n`` actions costs ``n``
-    observations rather than ``2n``.
-
-    It delegates everything else to the real controller and owns none of it.
+    What makes a primitive move and a code block the same thing downstream: both leave a
+    list of :class:`_Performed`, and one entry is one trajectory step and one graph edge
+    either way. The observation after an action becomes the one before the next, so a
+    block of ``n`` actions costs ``n`` observations rather than ``2n``.
     """
 
     __slots__ = ("_inner", "_perceiver", "last", "tape")
@@ -728,37 +610,23 @@ class _Run:
 
 
 class Explorer:
-    """An :class:`~skillweaver.contracts.Explorer`: learn one task by trying things.
+    """An Explorer: learn one task by trying things. Reusable; keeps no state between runs.
 
     Args:
-        llm: The computer-use model that proposes each move. Its
-            :meth:`~skillweaver.contracts.LLMClient.total_usage` is what the dollar and
-            call budgets are charged from, so a critic sharing this client has its
-            escalations charged to the run that caused them.
-        perceiver: Eyes. Called once before the loop and once after every action.
-        critic: Who decides whether a move worked. Defaults to a
-            :class:`~skillweaver.agent.critic.TieredCritic` over ``llm``, which answers
-            most steps without a model call. Never re-implement judging here.
-        graph: Where transitions are written. ``None`` means this run teaches the project
-            nothing about the site, so pass one unless you have a reason not to.
-        recorder: Where the trajectory is built. ``None`` means
-            :class:`skillweaver.trajectory.record.Recorder`, which writes to the
-            configured data directory; tests pass an in-memory one.
-        retriever: Consulted ONCE per run for skills worth reusing, which are described to
-            the model. ``None`` skips it.
+        llm: The computer-use model that proposes each move. Its ``total_usage`` is what
+            the dollar and call budgets are charged from, so a critic sharing this client
+            has its escalations charged to the run that caused them.
+        critic: Defaults to a :class:`TieredCritic` over ``llm``, which answers most steps
+            without a model call. Never re-implement judging here.
+        graph: ``None`` means this run teaches the project nothing about the site.
+        retriever: Consulted ONCE per run for skills worth reusing.
         runner: The sandbox code blocks execute in. ``None`` builds one with no skill
             store, so a block can act but cannot call a stored skill.
-        policy: Who decides the next move. ``None`` - the DEFAULT - is ``llm``, asked
-            with the acting prompt and the screenshot, which is the path every stored
-            skill in this project was learned on. An :class:`ActingPolicy` replaces that
-            one step; see that Protocol for what it does NOT replace.
-        library: Every stored skill on every site, read ONCE per run to find a
-            workflow worth aiming at - see :meth:`_adopt_skeleton`. ``None`` means a
-            cold run is as blind as it always was.
-        max_tokens: Cap on each acting reply.
-        max_block_actions: Actions one code block may perform.
-
-    One explorer is reusable across runs; :meth:`explore` keeps no state between them.
+        policy: ``None`` - the DEFAULT - is ``llm`` asked with the acting prompt and the
+            screenshot, the path every stored skill was learned on. See
+            :class:`ActingPolicy` for what it does NOT replace.
+        library: Read ONCE per run to find a workflow worth aiming at
+            (:meth:`_adopt_skeleton`).
     """
 
     def __init__(
@@ -821,9 +689,8 @@ class Explorer:
             self._recorder.finish(False, "the controller broke mid-run")
             raise
         except PolicyBlocked as exc:
-            # The policy's own terminal answer, not a limit and not a fault. It is
-            # recorded as where the run stopped so the diagnosis names the screen, which
-            # is the thing a person re-running this needs.
+            # The policy's own terminal answer, not a limit and not a fault; recorded as
+            # where the run stopped so the diagnosis names the screen.
             run.stopped_by = "blocked"
             run.detail = str(exc) or "the policy reported no supported operation could progress"
             log.info("explore.blocked", task=task.text, detail=run.detail)
@@ -894,9 +761,8 @@ class Explorer:
                 run.rejection = None
             self._follow(run, performed, verdict.ok)
         elif move.acts:
-            # A move that reached nothing is still a move that did not work, and it is
-            # the one most likely to be proposed again verbatim: the screen that
-            # suggested it is untouched. Remember it so the guard catches the repeat.
+            # A move that reached nothing did not work, and is the one most likely to be
+            # proposed again verbatim: the screen that suggested it is untouched.
             reason = run.rejection or "it performed no action at all"
             run.memory.remember(before.fingerprint, move.signature, move.summary, reason)
             run.history.append(f"{run.moves}. {move.summary} -> performed nothing: {reason}")
@@ -927,19 +793,16 @@ class Explorer:
     def _adopt_skeleton(self, task: TaskSpec, run: _Run) -> None:
         """Give a cold run the workflow of the nearest stored relative, if there is one.
 
-        Why: an acting policy is handed the WHOLE errand on every decision, so every
-        decision re-plans it. Measured on walmart.com (run ``...0315307``): asked to
-        *add X to the cart, then open the cart*, the policy searched, opened the empty
-        cart, went back, searched again, added, opened the cart - DONE at action 10 -
-        and then typed the product into the search box again, 17 actions for a
-        five-step errand. A skill that has ALREADY done this kind of errand knows the
-        order, and its signature says it with no site's labels in it
-        (:mod:`skillweaver.skills.family`).
+        An acting policy is handed the WHOLE errand on every decision, so every decision
+        re-plans it: measured on walmart.com, asked to *add X to the cart, then open the
+        cart*, the policy searched, opened the empty cart, went back, searched again,
+        added, opened the cart - DONE at action 10 - then typed the product in again, 17
+        actions for a five-step errand. A skill that has already done this kind of errand
+        knows the order, and its signature says it with no site's labels in it.
 
-        A PRIOR, NEVER A RAIL. Nothing here constrains what may be proposed,
-        grounded or performed; it changes only what the policy is told to aim at
-        (:meth:`_aimed`, :meth:`_workflow`). :meth:`_follow` drops it after
-        :data:`MAX_STRAYS` moves that do not fit, and a run never fails for leaving it.
+        A PRIOR, NEVER A RAIL: nothing here constrains what may be proposed, grounded or
+        performed. :meth:`_follow` drops it after :data:`MAX_STRAYS` moves that do not
+        fit, and a run never fails for leaving it.
         """
         if self._library is None:
             return
@@ -966,13 +829,11 @@ class Explorer:
         return run.skeleton[run.at] if run.at < len(run.skeleton) else None
 
     def _aimed(self, task: TaskSpec, run: _Run) -> TaskSpec:
-        """``task`` as an :class:`ActingPolicy` should be shown it RIGHT NOW.
+        """``task`` as an acting policy should be shown it RIGHT NOW.
 
-        While a skeleton is being followed the goal LEADS with the current subgoal and
-        carries the errand after it - the errand cannot be left out, because it is
-        where the value to type and the thing to click are named. Once the skeleton is
-        spent or dropped this is ``task`` itself, so "is every requirement satisfied?"
-        is asked about the whole errand, exactly as before.
+        While a skeleton is followed the goal LEADS with the current subgoal and carries
+        the errand after it - the errand cannot be left out, because it names the value to
+        type and the thing to click. Otherwise this is ``task`` itself.
         """
         subgoal = self._subgoal(run)
         if subgoal is None:
@@ -1003,24 +864,14 @@ class Explorer:
         """Move along the skeleton, or away from it, after one judged move.
 
         A move that REACHED THE SCREEN and is the current step (or the one after it -
-        sites skip steps) advances past it, whatever the critic then said about it. A
-        move that worked and fits nothing is a stray, and :data:`MAX_STRAYS` strays in
-        a row drop the skeleton: the screen has shown this is not that workflow, and a
-        wrong goal is worse than a vague one. A move with no token - a scroll, a wait,
-        a back - is how a page is reached, not a step of the errand, and counts as
-        neither; nor does a move that fits nothing and FAILED, which says something
-        about the move and nothing about the workflow.
+        sites skip steps) advances past it, whatever the critic said. One that worked and
+        fits nothing is a stray, and :data:`MAX_STRAYS` in a row drop the skeleton.
 
-        The verdict is deliberately not what advances it, and that was measured rather
-        than chosen. On live splitkb.com, 2026-09-20, the first version required
-        ``ok``: the policy typed the product into the search field, the critic's
-        ``state_changed`` check called it a failure (a filled field is 0.898 similar
-        to an empty one), the step did not advance, the policy - still told to type -
-        clicked the field again, and the skeleton was dropped at step 0 of 4 after two
-        moves. The same check calls an AJAX *Add to cart* a failure on this site every
-        time. A stalled skeleton is not neutral: it tells the policy to REDO the step
-        it just did. Advancing past a step that truly failed costs less - the errand
-        is still in the goal, and the policy can see the page.
+        The verdict deliberately does not advance it, measured on live splitkb.com
+        2026-09-20: requiring ``ok`` stalled the skeleton at step 0 of 4 after two moves,
+        because ``state_changed`` calls a filled search field a failure (0.898 similar to
+        an empty one) and an AJAX *Add to cart* a failure every time. A stalled skeleton
+        tells the policy to REDO the step it just did.
         """
         if self._subgoal(run) is None:
             return
@@ -1053,12 +904,10 @@ class Explorer:
     def _only_the_subgoal_is_done(self, move: Move, run: _Run) -> bool:
         """Whether a ``done`` claim was about the STEP the policy was aimed at.
 
-        A policy shown a subgoal as its goal answers DONE when the subgoal is
-        satisfied, which is the right answer to the question it was asked and says
-        nothing about the errand. Settling it as a task claim would spend a critic
-        call and file a dead end against a policy that was correct. So while steps
-        remain, a bare DONE advances the skeleton and the policy is asked again; on
-        the last step, or with no skeleton, it is the task claim it always was.
+        A policy shown a subgoal answers DONE when the subgoal is satisfied, which says
+        nothing about the errand; settling it as a task claim would spend a critic call
+        and file a dead end against a policy that was correct. So while steps remain, a
+        bare DONE advances the skeleton and the policy is asked again.
         """
         if not move.done or move.acts or self._subgoal(run) is None:
             return False
@@ -1074,12 +923,9 @@ class Explorer:
     def _ask(self, task: TaskSpec, run: _Run, catalog: ElementCatalog) -> str:
         """The next move, as an answer object: from the policy, or from the model.
 
-        One step, two implementations, and everything downstream is shared - see
-        :class:`ActingPolicy`. The policy branch is charged exactly as the model branch
-        is (:meth:`_charge` with ``at_least=1``), so a Jev step counts against
-        ``max_llm_calls`` and against the dollar budget on the same terms a Claude step
-        does. A policy whose provider under-reports still cannot make the call limit
-        unenforceable.
+        The policy branch is charged exactly as the model branch is (``at_least=1``), so a
+        Jev step counts against ``max_llm_calls`` and the dollar budget on the same terms
+        a Claude step does, even if its provider under-reports.
         """
         if self._policy is not None:
             try:
@@ -1087,17 +933,11 @@ class Explorer:
             except PolicyBlocked:
                 if self._subgoal(run) is None:
                     raise
-                # BLOCKED is the policy's answer to the question it was ASKED, and it
-                # was asked about a borrowed step - so it may not end the run. The
-                # skeleton goes, and the same screen is asked about the whole errand;
-                # a second BLOCKED is the policy's answer to THAT and stands.
-                # Measured on the sandbox shop, 2026-09-20, and stated exactly because
-                # the first reading was wrong: a workflow learned on a site that opens
-                # on its search box was handed to an errand that opens on a Mail
-                # screen, and the run ended BLOCKED at 0 moves. With this in place the
-                # skeleton was dropped, the whole errand was asked - and that was
-                # BLOCKED too. The skeleton had not caused the failure; it had only
-                # been in a position to, which is reason enough for the guard.
+                # BLOCKED answers the question the policy was ASKED, and it was asked
+                # about a borrowed step, so it may not end the run: the skeleton goes and
+                # the whole errand is asked about the same screen. Measured on the sandbox
+                # shop 2026-09-20, the second ask was BLOCKED too - the skeleton had not
+                # caused the failure, only been in a position to.
                 self._charge(run, at_least=1)
                 log.info(
                     "explore.skeleton.dropped",
@@ -1126,10 +966,8 @@ class Explorer:
     def _ask_model(self, task: TaskSpec, run: _Run, catalog: ElementCatalog) -> str:
         """One model call: the whole situation in one user turn, plus the screenshot.
 
-        The conversation is rebuilt each time rather than grown. What has been tried is
-        then an explicit, curated section of the prompt instead of something the model has
-        to infer from a transcript - which is the difference between an explorer that
-        learns from its failures and one that merely has them in its context.
+        The conversation is rebuilt each time rather than grown, so what has been tried is
+        a curated prompt section instead of something to infer from a transcript.
         """
         message = LLMMessage(
             role="user",
@@ -1221,10 +1059,9 @@ class Explorer:
         """Turn one model reply into a :class:`Move`, or refuse it.
 
         Raises:
-            _Invalid: for anything unusable - not JSON, no decision in it, an action kind
-                that does not exist, an element id that is not on the screen, an action
-                this controller cannot perform. The loop turns each into a recoverable
-                step failure.
+            _Invalid: for anything unusable - not JSON, no decision in it, an unknown
+                action kind, an element id not on the screen, an action this controller
+                cannot perform. The loop turns each into a recoverable step failure.
         """
         data = _parse_answer(text)
         if data is None:
@@ -1267,11 +1104,9 @@ class Explorer:
     def _refuse_repeat(self, move: Move, run: _Run) -> None:
         """Refuse a move already known to fail on this exact screen.
 
-        The prompt asks the model not to repeat itself and usually that is enough. This is
-        what happens when it is not: the same move on the same screen has the same
-        outcome, so performing it would spend a step to learn nothing. Refusing costs the
-        model call that proposed it and returns a message naming the previous reason,
-        which is the input it needs to propose something else.
+        The same move on the same screen has the same outcome, so performing it would
+        spend a step to learn nothing. The refusal names the previous reason, which is
+        the input the model needs to propose something else.
 
         Raises:
             _Invalid: when the move is a known dead end here.
@@ -1311,11 +1146,9 @@ class Explorer:
     ) -> list[_Performed]:
         """Run the move against the screen and return every action that reached it.
 
-        A primitive action goes straight through the tape. A code block goes through the
-        same sandbox that stored skills run in, with the current screen's catalogue bound
-        to ``el``: a block that raises, violates the sandbox or hits its own limits still
-        keeps whatever it managed to do, because those actions really did happen and the
-        critic has to judge the screen they left behind.
+        A code block goes through the same sandbox stored skills run in, with the
+        catalogue bound to ``el``; a block that raises or hits its limits still keeps
+        whatever it managed to do, because those actions really did happen.
         """
         tape = _TapedController(controller, self._perceiver, run.current)
         if move.action is not None:
@@ -1365,14 +1198,13 @@ class Explorer:
     ) -> None:
         """Record the move in the trajectory and in the site graph.
 
-        One performed action is one trajectory step and one graph edge, whether it came
-        from a primitive move or from inside a code block. The verdict belongs to the
-        move, so it is attached to the move's LAST action - the one the critic actually
-        looked at - and the earlier ones are marked as what they are.
+        One performed action is one trajectory step and one graph edge, primitive or
+        block. The verdict belongs to the move, so it is attached to the move's LAST
+        action - the one the critic looked at.
 
-        Every edge is written, failures included: an edge that led nowhere is exactly what
-        stops a later run walking into the same dead end, and the graph's persistence sums
-        statistics rather than overwriting them, so recording a failure is never a loss.
+        Every edge is written, failures included: an edge that led nowhere is what stops a
+        later run walking into the same dead end, and the graph sums statistics rather
+        than overwriting them, so recording a failure is never a loss.
         """
         last = len(performed) - 1
         for index, step in enumerate(performed):
@@ -1433,12 +1265,10 @@ class Explorer:
     def _spent(self) -> Usage:
         """Everything every model behind this loop has been asked for so far.
 
-        The sum of the :class:`~skillweaver.contracts.LLMClient` and, when there is one,
-        the :class:`ActingPolicy` - which is a SECOND provider with its own meter, and a
-        run that counted only the first would report a Jev step as free. Reading the
-        meters rather than the answers is the standing rule here: a call the critic made
-        on the same client, or one a policy's text helper made, is charged to the run
-        that caused it whether or not that run knows the call happened.
+        The LLMClient plus, when there is one, the policy - a SECOND provider with its own
+        meter, and a run counting only the first would report a Jev step as free. Reading
+        the meters rather than the answers is the standing rule: a call the critic or a
+        policy's text helper made is charged to the run that caused it.
         """
         total = self._llm.total_usage()
         policy_usage = getattr(self._policy, "total_usage", None)
@@ -1454,10 +1284,9 @@ class Explorer:
     def _charge(self, run: _Run, *, at_least: int) -> None:
         """Charge model spend since the last charge against the run's budget.
 
-        Taken as the difference in the clients' own running totals rather than from one
-        response, so a model call the critic made on the same client is charged here too -
-        it was made because of this run. ``at_least`` floors the call count, so a client
-        that does not report ``calls`` still cannot make ``max_llm_calls`` unenforceable.
+        The difference in the clients' own running totals, not one response, so a call the
+        critic made on the same client is charged here too. ``at_least`` floors the call
+        count, so a client that does not report ``calls`` cannot void ``max_llm_calls``.
         """
         total = self._spent()
         mark = run.usage_mark
@@ -1476,8 +1305,8 @@ class Explorer:
     def _go_to_start(self, task: TaskSpec, controller: Controller) -> None:
         """Load ``params["start_url"]`` when the controller can and is not already there.
 
-        Best effort by design: a desktop controller cannot navigate and a browser may
-        already be on the page, and neither is a reason not to attempt the task.
+        Best effort: a desktop controller cannot navigate and a browser may already be on
+        the page, and neither is a reason not to attempt the task.
         """
         url = task.params.get("start_url")
         if not isinstance(url, str) or not url or not controller.supports("navigate"):
@@ -1550,8 +1379,7 @@ def _parse_answer(text: str) -> dict[str, Any] | None:
     """The JSON object in a model reply, or ``None``.
 
     Tolerates a code fence and prose around the object, because models do both despite
-    being asked not to and neither is a reason to throw away a usable answer. Anything
-    else is ``None`` and becomes a recoverable step failure.
+    being asked not to and neither is a reason to throw away a usable answer.
     """
     if not text or not text.strip():
         return None
@@ -1572,9 +1400,9 @@ def _parse_answer(text: str) -> dict[str, Any] | None:
 def _resolve(spec: Any, catalog: ElementCatalog, controller: Controller) -> tuple[Action, str, str]:
     """``(action, signature, summary)`` for one action spec from the model.
 
-    This is where grounding is enforced: every action with a target names an element id
-    that is in ``catalog``, and the resulting point is that element's center in LOGICAL
-    pixels. The model never sends coordinates, so it can never send stale ones.
+    Where grounding is enforced: every action with a target names an element id in
+    ``catalog``, and the point is that element's center in LOGICAL pixels. The model never
+    sends coordinates, so it can never send stale ones.
 
     Raises:
         _Invalid: for a spec that is not an object, an unknown kind, a missing or wrong
@@ -1667,14 +1495,12 @@ def _resolve(spec: Any, catalog: ElementCatalog, controller: Controller) -> tupl
 
 
 def _retarget(action: Action, catalog: ElementCatalog, observation: Observation) -> str:
-    """:func:`~skillweaver.skills.api.describe_action`, with pixels named as element ids.
+    """``describe_action``, with pixels named as element ids.
 
-    The graph stores what was performed, which is a point, because a point is what a
-    controller takes. Quoting that point back at a model which is required to act by id
-    would be showing it something it is not allowed to use and cannot check. So a point is
-    named by the element under it ON THE CURRENT SCREEN, and stays a point when the screen
-    has nothing there - which is itself the useful signal that the remembered move does
-    not apply here any more.
+    The graph stores a point, because a point is what a controller takes. Quoting it back
+    at a model required to act by id would show it something it may not use, so a point is
+    named by the element under it ON THE CURRENT SCREEN - and stays a point when nothing
+    is there, which is the useful signal that the remembered move no longer applies.
     """
     point = _target_of(action)
     if point is None:
@@ -1722,9 +1548,8 @@ def _normalize_code(code: str) -> str:
 def _block_skill(move: Move, task: TaskSpec, model: str) -> Skill:
     """The model's code block as a throwaway, unstored skill the sandbox can run.
 
-    The block is plain statements, so it is wrapped in the ``run(ctx, el)`` the runner
-    calls. It goes through exactly the same static scan and limits as a stored skill:
-    the explorer must not be a way to run code a skill would not be allowed to run.
+    It goes through exactly the same static scan and limits as a stored skill: the
+    explorer must not be a way to run code a skill would not be allowed to run.
     """
     body = "\n".join(f"    {line}" for line in move.code.splitlines()) if move.code else "    pass"
     return Skill(
@@ -1750,7 +1575,7 @@ def _label_of(observation: Observation) -> str:
 
 
 def _limit_of(exc: BudgetExceeded) -> str:
-    """The limit named by a :class:`~skillweaver.errors.BudgetExceeded` message."""
+    """The limit named by a BudgetExceeded message."""
     head = str(exc).split(" ", 1)[0]
     return head if head.startswith("max_") else ""
 

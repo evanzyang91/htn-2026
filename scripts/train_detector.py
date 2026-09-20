@@ -10,18 +10,19 @@ printed at the end are what goes in the report.
 Rebuilding from nothing
 -----------------------
 Trained weights are committed at ``data/models/ui_detector.pt``, so nobody needs to
-run this to use the detector. Run it to improve the model, or after changing the
-sandbox app or the class map. Two commands, roughly nine minutes end to end on an
-Apple GPU::
+run this to use the detector, and the shipped detector is unaffected by anything
+below::
 
-    uv run python scripts/build_ui_dataset.py --out data/models/ui-dataset   # ~1 min
-    uv run python scripts/train_detector.py --data data/models/ui-dataset/data.yaml  # ~8 min
+    uv run python scripts/train_detector.py --data <a dataset>/data.yaml  # ~8 min
 
-The first needs the sandbox site; it starts and stops its own copy on port 8791
-unless ``--url`` names one already running, so nothing has to be launched by hand.
-The second downloads ``yolov8n.pt`` once, which is the only step that needs a
-network. The dataset itself is git-ignored - 240 screenshots regenerate in under a
-minute, and are not worth carrying in the repository.
+**There is no in-repo way to produce that dataset any more.** It was built by
+``scripts/build_ui_dataset.py``, which drove the local demo site, and it went with
+that site. This script still trains on any YOLO dataset laid out the usual way and
+labelled with the class map in :mod:`skillweaver.perception.labeling`, but supplying
+one is now the caller's problem. Retraining therefore starts with building a
+harvester against real pages, not with running a command that exists.
+
+Training downloads ``yolov8n.pt`` once, which is the only step that needs a network.
 
 The best checkpoint is copied to ``<models_dir>/ui_detector.pt``, which is exactly
 where :class:`~skillweaver.perception.detect_yolo.YoloDetector` looks for it, so a
@@ -149,7 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--data",
         type=Path,
         default=Path("data/models/ui-dataset/data.yaml"),
-        help="dataset yaml written by scripts/build_ui_dataset.py",
+        help="dataset yaml: a YOLO dataset laid out the usual way, see the module docstring",
     )
     parser.add_argument("--base", default=DEFAULT_BASE, help="starting checkpoint")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
@@ -170,8 +171,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not args.data.is_file():
         parser.error(
-            f"{args.data} does not exist - build it first with\n"
-            f"  uv run python scripts/build_ui_dataset.py --out {args.data.parent}"
+            f"{args.data} does not exist. This repository no longer ships a harvester "
+            "that builds one - see the module docstring - so point --data at a YOLO "
+            "dataset you have built yourself."
         )
 
     runs = settings().models_dir / "runs"
