@@ -91,6 +91,7 @@ from skillweaver.trajectory.render import moves_of
 __all__ = [
     "INTENTS",
     "MAX_FAMILY_DISTANCE",
+    "MIN_FAMILY_STEPS",
     "UNKNOWN_ROLE",
     "Subgoal",
     "derive_signature",
@@ -118,30 +119,44 @@ MAX_FAMILY_DISTANCE = 0.34
 """How far apart two signatures may be and still be one family, as a fraction of the
 longer one (:func:`distance`). ``0.34`` admits one edit in three tokens.
 
-Chosen by measuring, 2026-09-20, over every signature this repository's libraries
-hold (``scripts/measure_families.py``, which prints the whole table and is re-runnable
-in a second). The pairs fall into two populations with a gap between them:
+Chosen by measuring, 2026-09-20, over the eleven signatures this project then had:
+five from the live Wikipedia library, three learned on walmart.com, and three on
+splitkb.com - one per perception path from the homepage, and the older one-click skill
+from a product page. ``scripts/measure_families.py`` prints the whole table and
+re-runs in a second. All 55 pairs, read by what the two skills are FOR:
 
-    same workflow, different site or sentence       0.00 to 0.33
-        the three Walmart add-to-cart skills to each other          0.00 - 0.25
-        the two Wikipedia search-and-open skills to each other      0.00 - 0.33
-        splitkb search-and-add to Walmart search-and-add            0.25 - 0.33
-    different workflow                              0.50 to 1.00
-        any add-to-cart skill to ``jump_to_toc_section``            0.67 - 1.00
-        any search skill to the one-click navigation skills         0.50 - 0.75
+    the same errand (search, then add to the cart), across sites,
+    sentences and perception paths                         nine pairs, 0.12 to 0.30
+        splitkb pixels ~ splitkb DOM ~ Walmart add-and-open-cart   0.12, 0.12, 0.12
+        the rest, Walmart to splitkb and Walmart to Walmart        0.20 to 0.30
+    the two Wikipedia search-and-open skills                       0.00
+    one pair that is arguably the same errand and is NOT admitted  0.40
+        Walmart's three-step "add X" against its five-step "add X,
+        then open the cart" with a trailing click
+    different errands                                      every other pair, >= 0.50
+        any shop skill to any Wikipedia skill                      0.50 to 0.88
 
-The cut sits in the gap, a sixth above the worst true pair and a sixth below the best
-false one. It is RELATIVE on purpose: an absolute cut of one edit would make every
-one-action skill (``CLICK(link)``) a relative of every two-action one, and the
-one-action skills are exactly the navigation helpers that bind to anything
-(:data:`~skillweaver.agent.planner.MIN_ACCOUNTED_FOR` was calibrated against one).
+The cut sits between 0.30 and 0.40. That is a narrow margin below and a wide one
+above, and the asymmetry is the right way round: a relative wrongly left out costs a
+slower run, a stranger wrongly let in lends its sentence to an errand it does not
+perform. It is RELATIVE so that length matters - one edit is a sixth of a six-step
+workflow and the whole of a one-step one.
 
-What the cut does NOT separate, measured in the same table: Wikipedia's
-search-and-open-the-article and a shop's search-and-add-to-cart are 0.25 to 0.33
-apart. They ARE the same shape - type, submit, click the result - and only the intent
-differs, which is :func:`same_intent`'s half of the decision and the reason a family
-is never used without it.
+Two things this measurement showed that the cut cannot fix, both handled elsewhere:
+
+* **Shape is not intent.** Nothing in the table separates adding to a cart from
+  removing from one, because no removal skill exists yet to measure and because it
+  would not: it is the same controls in the other order of effect. That half of every
+  family decision is :func:`same_intent`.
+* **One action is not a shape.** ``go_to_wikipedia_main_page`` and
+  ``open_linked_article`` are 0.00 apart - each is a single ``CLICK`` - and they are
+  different errands. A one-token signature describes half the library, so
+  :data:`MIN_FAMILY_STEPS` keeps such skills out of every family.
 """
+
+MIN_FAMILY_STEPS = 2
+"""The shortest signature that may belong to a family. See the second note on
+:data:`MAX_FAMILY_DISTANCE` for the measured pair that set it."""
 
 _ROLE_COST = 0.5
 """What it costs when two tokens agree on the operation and disagree on the role.
@@ -480,6 +495,8 @@ def same_family(left: Skill, right: Skill) -> bool:
     that is :func:`same_intent`, and a caller that reuses across a family needs both."""
     if not (earned(left) and earned(right)):
         return False
+    if min(len(left.action_signature), len(right.action_signature)) < MIN_FAMILY_STEPS:
+        return False
     return distance(left.action_signature, right.action_signature) <= MAX_FAMILY_DISTANCE
 
 
@@ -661,7 +678,7 @@ def skeleton(signature: Sequence[str]) -> tuple[Subgoal, ...]:
     return tuple(out)
 
 
-MIN_SKELETON_STEPS = 2
+MIN_SKELETON_STEPS = MIN_FAMILY_STEPS
 """A workflow shorter than this is not worth handing to a cold run: one step is the
 errand itself, and saying it again in vaguer words helps nobody."""
 

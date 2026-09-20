@@ -10,8 +10,8 @@ reads every stored skill (demoted ones included - a retired skill still did what
 did), derives its signature from its code and from the recording it was synthesized
 from when that is still on disk, and prints every pairwise distance, nearest first.
 
-``--backfill`` stores the derived signature, and the admission run as the first
-precedent, on skills that were admitted BEFORE signatures existed. It is not a way
+``--backfill`` stores the derived signature on skills that were admitted BEFORE
+signatures existed (no precedent: the arguments of that run were not kept). It is not a way
 round "earned, never guessed": it writes only to a skill that carries a verifier and
 has at least one recorded success, which is the same evidence the admission gate
 demands today, and it says which skills it skipped and why.
@@ -29,6 +29,7 @@ from skillweaver.errors import SkillWeaverError
 from skillweaver.orchestrator import build_workbench
 from skillweaver.skills.family import (
     MAX_FAMILY_DISTANCE,
+    MIN_FAMILY_STEPS,
     derive_signature,
     distance,
     render,
@@ -77,7 +78,8 @@ def main() -> int:
         (distance(derived[a], derived[b]), a, b) for a, b in combinations(sorted(derived), 2)
     )
     for d, a, b in pairs:
-        mark = "FAMILY" if d <= MAX_FAMILY_DISTANCE else "      "
+        long_enough = min(len(derived[a]), len(derived[b])) >= MIN_FAMILY_STEPS
+        mark = "FAMILY" if d <= MAX_FAMILY_DISTANCE and long_enough else "      "
         print(f"  {d:0.2f}  {mark}  {a[0]}@{a[1]}  ~  {b[0]}@{b[1]}")
 
     if not args.backfill:
