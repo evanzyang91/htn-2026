@@ -32,6 +32,7 @@ the rest of the page is reached.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,17 +58,42 @@ from skillweaver.perception.ocr import PerceptionCounters
 log = get_logger(__name__)
 
 __all__ = [
+    "ARRIVAL_REST_MS",
+    "CHANGED_REST_MS",
     "MAX_CONTROLS",
     "MAX_PAGE_TEXT",
     "MAX_TEXT_NODES",
+    "NO_CHANGE_REST_MS",
     "SNAPSHOT_ATTEMPTS",
     "SNAPSHOT_RETRY_MS",
     "DomControl",
     "DomOption",
     "DomPerceiver",
+    "DomScroller",
     "DomSnapshot",
     "ROLE_KINDS",
 ]
+
+ARRIVAL_REST_MS: tuple[float, float] = (150.0, 1500.0)
+"""``(quiet, cap)`` for a move that CHANGED THE ADDRESS: a navigation may still be
+materializing its content, and a decision belongs on a quiet page rather than on
+whatever rendered first. Upstream's numbers. See :meth:`DomPerceiver.rest_after`."""
+
+NO_CHANGE_REST_MS: tuple[float, float] = (120.0, 1000.0)
+"""``(quiet, cap)`` for a move after which the page reads EXACTLY as before: the effect may
+land asynchronously - a cart badge, a toast - so look once more before "no change" is
+what the policy is told. Upstream's numbers."""
+
+CHANGED_REST_MS: tuple[float, float] = (150.0, 1500.0)
+"""``(quiet, cap)`` for a move after which the page CHANGED IN PLACE. This one is not
+upstream's - its two conditions leave this case unrested, and so did this project's for a
+day - and it was paid for on a live site. splitkb.com, a product page's *More info*: the
+click opened a modal, the page had visibly answered, so the next frame was taken at once -
+and the policy was offered ONE control, the modal's close button, because the video player
+inside it had not hydrated yet. It closed the popup it had been asked to play a video in.
+The same page observed after a quiesce offers two. A page answers in PHASES
+(``AGENTS.md``, where Walmart's *Add* button arrives 0.61s after its title), and a frame
+taken between two of them is a skeleton whatever the address bar says."""
 
 MAX_CONTROLS = 250
 """Controls reported from one frame, matching Jev's own cap: it bounds the policy's
@@ -171,6 +197,30 @@ class DomControl:
 
 
 @dataclass(frozen=True, slots=True)
+class DomScroller:
+    """The box a wheel at the middle of the viewport would scroll, when that is not the
+    document: a dialog's option list, a results pane, a drawer.
+
+    Found by walking up from ``elementFromPoint`` at the viewport centre to the nearest
+    ancestor that overflows and may scroll, as upstream Jev's ``snapshot.js`` does. The
+    start point is not arbitrary: it is where this path's targetless ``Scroll`` is
+    delivered (``Explorer._resolve`` wheels at ``controller.viewport().center``, the same
+    floor division), so the box found IS the box the wheel moves and the offer cannot
+    disagree with the action. Aiming at the box's own centre instead would not be safer -
+    a nested scroller can sit under that point and take the wheel.
+
+    Attributes:
+        can_down / can_up: Whether THIS box has content past its own fold.
+        label: What the box calls itself, for the log - ``aria-label``, else its role,
+            else its tag.
+    """
+
+    can_down: bool
+    can_up: bool
+    label: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class DomSnapshot:
     """Everything one ``page.evaluate`` returned, beside the observation it produced.
 
@@ -181,8 +231,18 @@ class DomSnapshot:
         texts: Visible text runs as ready-made ``text`` elements, not in the policy's
             target table.
         viewport: The visible area in logical pixels.
-        scroll_y / page_height: What decides whether scrolling is offered.
+        scroll_y / page_height: What decides whether scrolling is offered, when the
+            DOCUMENT is what a wheel would move.
+        scroller: The box a wheel would move instead, or ``None`` when that is the
+            document. When set it ALONE decides the offer; see :attr:`can_scroll_down`.
+        loading: The page saying it is still arriving - ``readyState`` short of
+            ``complete``, or an ``aria-busy`` / ``progressbar`` on it. ADVISORY, as
+            upstream has it: shown to the policy so a ``WAIT`` can be deliberate, and
+            part of nothing that identifies the screen.
         omitted_controls: How many controls :data:`MAX_CONTROLS` cut.
+        covered_controls: How many controls were left out because something else is at
+            the point a click on them would land - clipped by a scrolling list, or under
+            a banner. See :data:`_SNAPSHOT_JS`.
         can_go_back: Whether this tab has a previous session-history entry - the page's
             own answer from the Navigation API, not ``history.length``. It counts only
             entries contiguous and SAME-ORIGIN with this one, so the ``about:blank`` a run
@@ -200,17 +260,59 @@ class DomSnapshot:
     scroll_y: float = 0.0
     page_height: float = 0.0
     omitted_controls: int = 0
+    covered_controls: int = 0
     can_go_back: bool = False
+    scroller: DomScroller | None = None
+    loading: bool = False
     by_element_id: dict[str, DomControl] = field(default_factory=dict, compare=False, repr=False)
 
     @property
+    def digest(self) -> str:
+        """Whether the page is LITERALLY the page it was: upstream's ``fingerprint``.
+
+        Address, visible text, every control with its value and state, and where things
+        are scrolled to. A change DETECTOR and an exact one, which is a different job from
+        identifying a screen: that stays ``StateFingerprinter`` and its calibrated
+        similarity, and nothing stored is ever keyed on this. It sees what the pixel
+        identity cannot - a ticked box, a list scrolled inside a dialog, a cart badge
+        going from 0 to 1 - which are the changes a policy's history has to be honest
+        about.
+        """
+        scroller = self.scroller
+        content = [
+            self.url,
+            self.text,
+            [(c.element_id, c.value, c.checked, c.selected, c.expanded) for c in self.controls],
+            self.scroll_y,
+            None if scroller is None else (scroller.can_down, scroller.can_up),
+        ]
+        return hashlib.sha256(json.dumps(content).encode("utf-8")).hexdigest()[:16]
+
+    @property
     def can_scroll_down(self) -> bool:
-        """Whether there is page below the fold."""
+        """Whether a wheel at the middle of the screen has anything below to reveal.
+
+        The document's own extent answered this alone until 2026-09-20, and that is
+        wrong under a dialog: the page behind is locked, so the document reports nothing
+        to scroll while the option list in front of it has a fold of its own. Measured on
+        a modal of 40 options over a locked 800px page: ``False`` here, NO scroll
+        operation offered, and 14 controls the policy could never reach - while one wheel
+        at the viewport centre moved that list 0 -> 560. With :attr:`scroller` the same
+        screen offers ``SCROLL_DOWN``, and ``SCROLL_UP`` once it has moved.
+
+        The box decides ALONE when there is one, as upstream does it: a locked document
+        often still reports a tall ``scrollHeight``, and offering a scroll on the
+        strength of that is offering a wheel that moves nothing.
+        """
+        if self.scroller is not None:
+            return self.scroller.can_down
         return self.scroll_y + self.viewport.h < self.page_height - 2
 
     @property
     def can_scroll_up(self) -> bool:
-        """Whether there is page above the fold."""
+        """Whether there is anything above to bring back. See :attr:`can_scroll_down`."""
+        if self.scroller is not None:
+            return self.scroller.can_up
         return self.scroll_y > 0
 
 
@@ -229,7 +331,16 @@ class DomPerceiver:
     Not thread-safe: :attr:`last` is one slot, so one perceiver drives one browser.
     """
 
-    __slots__ = ("_counters", "_fingerprinter", "_last")
+    __slots__ = (
+        "_acted_ms",
+        "_armed",
+        "_counters",
+        "_fingerprinter",
+        "_last",
+        "_observed_ms",
+        "_rested_ms",
+        "_rests",
+    )
 
     def __init__(
         self,
@@ -240,6 +351,11 @@ class DomPerceiver:
         self._fingerprinter = fingerprinter if fingerprinter is not None else StateFingerprinter()
         self._counters = counters if counters is not None else PerceptionCounters()
         self._last: DomSnapshot | None = None
+        self._armed: tuple[int, DomSnapshot, bool] | None = None
+        self._rests = 0
+        self._rested_ms = 0.0
+        self._observed_ms = 0.0
+        self._acted_ms = 0.0
 
     def __repr__(self) -> str:
         return f"DomPerceiver(counts={self._counters.snapshot()})"
@@ -258,6 +374,51 @@ class DomPerceiver:
         """
         return self._last
 
+    @property
+    def site_ms(self) -> float:
+        """Milliseconds this run has spent on the SITE rather than on a model.
+
+        Time inside :meth:`observe` - the capture, the page script, and any
+        :meth:`rest_after` wait - plus the controller's own ``acted_ms``, read off it at
+        each observation: input delivery and ``_settle``. Together that is everything a
+        run waits on the page for, which is upstream's ``load_ms``.
+
+        A DURATION, where ``PerceptionCounters`` is deliberately counts - seconds move
+        with machine load, and OCR taught this project that twice. This one is kept
+        because its question cannot be asked in counts: of a run's wall clock, how much
+        was the models and how much was the website? It is dominated by the network and
+        the page, not by this machine, and it is reported beside the counts, never
+        instead of them.
+        """
+        return self._observed_ms + self._acted_ms
+
+    @property
+    def rests(self) -> tuple[int, float]:
+        """``(how many times, total milliseconds)`` :meth:`rest_after` made a frame wait."""
+        return self._rests, self._rested_ms
+
+    def rest_after(self, actions: int, basis: DomSnapshot, *, waited: bool = False) -> None:
+        """Arm ONE coming observation to be taken on a page that has come to rest.
+
+        An acting policy calls this as it answers: ``basis`` is the screen it decided
+        on, and ``actions`` how many controller actions its move performs - the explorer
+        observes after each, and the one worth waiting for is the LAST, which is the
+        frame the next decision is made on. That frame is taken on a page at rest,
+        whichever of three things the move did to it: changed the address
+        (:data:`ARRIVAL_REST_MS`), left it reading exactly as ``basis`` did
+        (:data:`NO_CHANGE_REST_MS`, skipped when the move WAS a wait), or changed it in
+        place (:data:`CHANGED_REST_MS`). The first two are upstream's; the third is the
+        one a live run added, and its constant says what that cost. On a page that has
+        finished answering, the wait is one quiet window and no more.
+
+        Armed per move rather than switched on, because every other reader of this
+        perceiver must stay untaxed: a warm replay, the admission gate's rest loop and a
+        skill's ``wait_for_text`` all observe in a loop, and a quiet window inside each
+        read is what ``AGENTS.md`` forbids ``_settle`` for. Re-arming replaces whatever
+        was armed, so a move that stopped early cannot leave a wait behind for long.
+        """
+        self._armed = (max(int(actions), 1), basis, waited)
+
     def observe(self, controller: Controller) -> Observation:
         """One frame: capture, ask the page, index, fingerprint.
 
@@ -266,10 +427,18 @@ class DomPerceiver:
             PerceptionError: if the page answers with something unusable, or if
                 fingerprinting fails.
         """
+        began = time.monotonic()
         shot: Screenshot = controller.capture()
         self._counters.captures += 1
         snapshot = self._read(controller, shot)
         self._counters.detections += 1
+        if self._rested(controller, snapshot):
+            # Capture AGAIN, then read: the frame and the controls must be one moment,
+            # and the frame taken before the wait is the moment being replaced.
+            shot = controller.capture()
+            self._counters.captures += 1
+            snapshot = self._read(controller, shot)
+            self._counters.detections += 1
         self._last = snapshot
         elements = _elements_of(snapshot)
         url = controller.url()
@@ -282,7 +451,39 @@ class DomPerceiver:
             taken_at=utcnow(),
         )
         self._counters.observations += 1
+        self._observed_ms += (time.monotonic() - began) * 1000.0
+        acted = getattr(controller, "acted_ms", None)
+        if isinstance(acted, (int, float)):
+            self._acted_ms = float(acted)
         return observation
+
+    def _rested(self, controller: Controller, snapshot: DomSnapshot) -> bool:
+        """Whether this frame was the armed one AND the page was then made to rest."""
+        if self._armed is None:
+            return False
+        remaining, basis, waited = self._armed
+        if remaining > 1:
+            self._armed = (remaining - 1, basis, waited)
+            return False
+        self._armed = None
+        if snapshot.url != basis.url:
+            why, (quiet, cap) = "arrived", ARRIVAL_REST_MS
+        elif snapshot.digest != basis.digest:
+            why, (quiet, cap) = "changed", CHANGED_REST_MS
+        elif not waited:
+            why, (quiet, cap) = "unchanged", NO_CHANGE_REST_MS
+        else:
+            return False
+        quiesce = getattr(controller, "quiesce", None)
+        if not callable(quiesce):
+            return False
+        started = time.monotonic()
+        quiesce(quiet, cap)
+        spent = (time.monotonic() - started) * 1000.0
+        self._rests += 1
+        self._rested_ms += spent
+        log.info("dom.rest", why=why, waited_ms=round(spent), controls=len(snapshot.controls))
+        return True
 
     def _read(self, controller: Controller, shot: Screenshot) -> DomSnapshot:
         """Run :data:`_SNAPSHOT_JS` on the controller's page and parse the result.
@@ -345,14 +546,28 @@ def _snapshot_from(raw: dict[str, Any], shot: Screenshot) -> DomSnapshot:
             viewport=viewport,
             scroll_y=float(raw.get("scrollY") or 0.0),
             can_go_back=bool(raw.get("canGoBack")),
+            scroller=_scroller_from(raw.get("scroller")),
+            loading=bool(raw.get("loading")),
             page_height=float(raw.get("pageHeight") or 0.0),
             omitted_controls=int(raw.get("omitted") or 0),
+            covered_controls=int(raw.get("covered") or 0),
             by_element_id={control.element_id: control for control in controls},
         )
     except PerceptionError:
         raise
     except (TypeError, ValueError, KeyError) as exc:
         raise PerceptionError(f"the page snapshot could not be read: {exc}") from exc
+
+
+def _scroller_from(entry: Any) -> DomScroller | None:
+    """The page's scroller, or ``None`` - which means the document is what scrolls."""
+    if not isinstance(entry, dict):
+        return None
+    return DomScroller(
+        can_down=bool(entry.get("canDown")),
+        can_up=bool(entry.get("canUp")),
+        label=_clean(entry.get("label"))[:80],
+    )
 
 
 def _control_from(
@@ -550,6 +765,7 @@ _SNAPSHOT_JS = (
   };
 
   const controls = [];
+  let covered = 0;
   for (const el of document.querySelectorAll(SELECTOR)) {
     if (!safe(el) || !visible(el) || el.matches(':disabled') ||
         el.closest('[aria-disabled="true"]')) continue;
@@ -562,6 +778,21 @@ _SNAPSHOT_JS = (
         cx < 0 || cy < 0 || cx >= innerWidth || cy >= innerHeight) continue;
     // A grid cell that contains its own button would shadow it with a bigger box.
     if (rname === 'gridcell' && el.querySelector('button,[role="button"]')) continue;
+
+    // Is the control what is actually AT the point a click on it would be delivered
+    // to? checkVisibility cannot say: it knows nothing of a scroll container clipping
+    // its children, or of anything drawn on top. The point is the centre of the box
+    // clipped to the viewport, which is where Python will aim (see _control_from). A
+    // hit on the control's own <label> counts, because that click activates it.
+    const px0 = Math.max(Math.round(r.x), 0), py0 = Math.max(Math.round(r.y), 0);
+    const px1 = Math.min(Math.round(r.x + r.width), innerWidth);
+    const py1 = Math.min(Math.round(r.y + r.height), innerHeight);
+    const hit = document.elementFromPoint(
+      px0 + Math.floor((px1 - px0) / 2), py0 + Math.floor((py1 - py0) / 2));
+    if (!hit || !(el.contains(hit) || [...(el.labels || [])].some((l) => l.contains(hit)))) {
+      covered += 1;
+      continue;
+    }
 
     const editable = !el.readOnly && el.getAttribute('aria-readonly') !== 'true' &&
       (['textbox', 'searchbox', 'spinbutton'].includes(rname) ||
@@ -623,6 +854,27 @@ _SNAPSHOT_JS = (
   const nav = window.navigation;
   const canGoBack = !!(nav && nav.canGoBack);
 
+  // What a wheel at the middle of the viewport would actually scroll. Under a dialog
+  // the document is locked and its option list scrolls on its own, so a document-only
+  // test offers no way to the controls below that list's fold. Walk up from the centre
+  // to the nearest ancestor that overflows and may scroll; null means the document.
+  // The start point is where this path delivers a targetless Scroll - see DomScroller.
+  let scroller = null;
+  for (let el = document.elementFromPoint(innerWidth >> 1, innerHeight >> 1);
+       el && el !== document.body && el !== document.documentElement;
+       el = el.parentElement) {
+    if (el.scrollHeight > el.clientHeight + 2 &&
+        /auto|scroll/.test(getComputedStyle(el).overflowY)) {
+      scroller = {
+        canDown: el.scrollTop + el.clientHeight < el.scrollHeight - 2,
+        canUp: el.scrollTop > 0,
+        label: el.getAttribute('aria-label') || el.getAttribute('role') ||
+          el.tagName.toLowerCase(),
+      };
+      break;
+    }
+  }
+
   return {
     url: location.href,
     title: document.title,
@@ -630,11 +882,15 @@ _SNAPSHOT_JS = (
     h: innerHeight,
     scrollY: scrollY,
     canGoBack: canGoBack,
+    scroller: scroller,
+    loading: document.readyState !== 'complete' ||
+      !!document.querySelector('[aria-busy="true"],[role="progressbar"]'),
     pageHeight: document.documentElement.scrollHeight,
     text: words.join('\\n').slice(0, MAX_PAGE_TEXT),
     controls: controls,
     texts: texts,
     omitted: omitted,
+    covered: covered,
   };
 }
 """.replace("%(max_controls)d", str(MAX_CONTROLS))
@@ -643,8 +899,15 @@ _SNAPSHOT_JS = (
 )
 """The one page script this perceiver runs, adapted from ``jev-ultrafast/snapshot.js``.
 
-Three differences from Jev's. No node-identity ``WeakMap`` or freshness guard: this path
-acts by POINT and the explorer re-observes after every action, so a stale target shows up
-as the next observation disagreeing. Text nodes come back WITH their rectangles, because
-this path needs ``Element``s. And select options are carried although no select action
-exists - see :mod:`skillweaver.llm.jev_`."""
+Differences from Jev's. No node-identity ``WeakMap`` or freshness guard: this path acts
+by POINT and the explorer re-observes after every action, so a stale target shows up as
+the next observation disagreeing. Its HIT-TEST is kept, though, and moved from the
+executor to here: upstream reports a covered control and refuses the click
+(``CoveredTarget``); this path never offers it, because a click by point lands on
+whatever is on top and says nothing. Measured on an option dialog scrolled to its end:
+8 of 18 checkboxes reported sat outside the list's visible box, and a click on the one
+the task wanted was delivered to the backdrop - 0 ticked, no error anywhere.
+
+Text nodes come back WITH their rectangles, because this path needs ``Element``s. And
+select options are carried although no select action exists - see
+:mod:`skillweaver.llm.jev_`."""

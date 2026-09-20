@@ -19,7 +19,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import sys
-from collections.abc import Collection, Mapping, Sequence
+import time
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any
 
 from skillweaver.agent.explorer import (
@@ -39,6 +40,7 @@ log = get_logger(__name__)
 __all__ = [
     "BACK_SIGNATURE",
     "DEAD_END_OPERATIONS",
+    "NO_CHANGE_LIMIT",
     "SCROLL_PIXELS",
     "SELECT_ALL_CHORD",
     "WAIT_MS",
@@ -72,6 +74,17 @@ another until the run gave up at ``BLOCKED`` - 9 provider calls on a move that c
 be performed.
 """
 
+NO_CHANGE_LIMIT = 4
+"""How many moves in a row one address may absorb without changing before the run stops.
+
+Upstream's bound, and its reason for the address: a navigation that commits after the
+observation window records a false "no change", so differing URLs across the streak are
+proof of progress even when each step looked idle. ``WAIT`` is not counted - time passing
+IS the point of one. Nothing else here bounds a single screen: all four ``Budget`` limits
+are global, so without this a page that repaints slightly on every failed click can absorb
+the whole run and be reported as ``budget`` rather than as the dead end it was.
+"""
+
 SCROLL_PIXELS = 560
 """Logical pixels one ``SCROLL_DOWN`` or ``SCROLL_UP`` moves, as upstream Jev scrolls.
 Deliberately less than a viewport (800 here), so two consecutive scrolls overlap and a
@@ -83,6 +96,15 @@ WAIT_MS = 500
 A real pause, not a reflex one: the policy saying the control it needs is not on screen
 YET, which no load event covers. Not the kind ``strip_reflex_waits`` removes, though a
 learned skill that keeps one will be told to justify it by the same gate."""
+
+_ERRAND_MARKER = "The errand: "
+"""How ``Explorer._aimed`` introduces the task inside a borrowed step's goal. Read, never
+written, here; see :meth:`JevDriver._goal_shown` for what happens if it stops matching."""
+
+_ACTIONS_IN: Mapping[str, int] = {"TYPE_TEXT": 3}
+"""Controller actions in the move this driver writes for an operation, when not one:
+:func:`_type_into` is click, chord, type. The explorer observes after each, and
+``DomPerceiver.rest_after`` needs to know which observation is the last."""
 
 SELECT_ALL_CHORD: tuple[str, str] = ("Meta", "a") if sys.platform == "darwin" else ("Control", "a")
 """The chord that selects a field's contents before it is retyped.
@@ -102,18 +124,32 @@ class JevDriver:
         perceiver: The DOM perceiver driving the same run. The driver reads ``.last``
             from it, because the roles, values and states a policy needs are not on
             Element and putting them there would change the shared surface.
+        refine: ``(goal, url) -> goal``, a rewrite of the errand into the short ordered
+            sentences a small policy follows best, or ``None`` - the DEFAULT - for the
+            user's own words. See :meth:`_goal_shown`, which is the only place its
+            result is ever used, for why that is a hard rule.
 
     Raises:
         SkillWeaverError: from :meth:`propose` if the perceiver has no snapshot for the
             observation asked about, which means the two were not driving the same run.
     """
 
-    __slots__ = ("_perceiver", "_policy", "_steps")
+    __slots__ = ("_decided_ms", "_perceiver", "_policy", "_refine", "_refined", "_steps", "_taken")
 
-    def __init__(self, policy: BrowserPolicy, perceiver: DomPerceiver) -> None:
+    def __init__(
+        self,
+        policy: BrowserPolicy,
+        perceiver: DomPerceiver,
+        *,
+        refine: Callable[[str, str], str] | None = None,
+    ) -> None:
         self._policy = policy
         self._perceiver = perceiver
+        self._refine = refine
+        self._refined: dict[str, str] = {}
         self._steps: list[dict[str, Any]] = []
+        self._taken: dict[str, set[str]] = {}
+        self._decided_ms = 0.0
 
     def __repr__(self) -> str:
         return f"JevDriver({self._policy.name()})"
@@ -121,6 +157,15 @@ class JevDriver:
     def name(self) -> str:
         """The policy model identifier."""
         return self._policy.name()
+
+    @property
+    def policy_ms(self) -> float:
+        """Milliseconds this driver's own models have taken so far: every Jev round trip
+        and every call to the text writer. The MODEL half of upstream's split, whose
+        other half is ``DomPerceiver.site_ms``. It is not all of a run's model time - the
+        critic's calls are the explorer's - and the report says so rather than folding
+        them in."""
+        return self._decided_ms
 
     def total_usage(self) -> Usage:
         """What the policy has spent, so the explorer can charge it. See
@@ -146,16 +191,29 @@ class JevDriver:
             ProviderError: from the policy, on a provider failure.
         """
         snapshot = self._snapshot_for(observation)
-        exclude, restored = _exclusions(snapshot, dead_ends)
+        if not history and self._steps:
+            # No moves yet and steps on file: the explorer has begun another run.
+            self._steps, self._taken, self._refined = [], {}, {}
+        state = snapshot.digest
+        self._settle(snapshot, state, rejection)
+        self._stop_if_inert(observation)
+        exclude, restored = _exclusions(snapshot, dead_ends, self._spent(state))
         asked = snapshot
         if snapshot.can_go_back and any(a.signature == BACK_SIGNATURE for a in dead_ends):
             asked = dataclasses.replace(snapshot, can_go_back=False)
-        self._settle(history, rejection)
-        decision = self._policy.decide(task.text, asked, self._steps, exclude)
-        self._remember(decision)
+        goal = self._goal_shown(task.text, observation.url or snapshot.url)
+        decision = self._policy.decide(goal, asked, self._steps, exclude)
+        self._remember(decision, state)
+        if decision.operation not in ("DONE", "BLOCKED"):
+            self._perceiver.rest_after(
+                _ACTIONS_IN.get(decision.operation, 1),
+                snapshot,
+                waited=decision.operation == "WAIT",
+            )
         log.info(
             "jev.decide",
             operation=decision.operation,
+            changed=self._steps[-2].get("page_changed") if len(self._steps) > 1 else None,
             confidence=round(decision.confidence, 3),
             probability=round(decision.probability, 3),
             policy_ms=round(decision.policy_ms),
@@ -169,6 +227,42 @@ class JevDriver:
                 f"the policy found no supported operation on {observation.url or 'this screen'}"
             )
         return json.dumps(_answer(decision, catalog, snapshot, _note(exclude, restored)))
+
+    def _goal_shown(self, text: str, url: str) -> str:
+        """The goal as THE POLICY is shown it: refined when refinement is on, and the
+        refinement goes nowhere else.
+
+        That is a hard rule, not a preference. ``task`` is what the explorer hands the
+        recorder, so its text becomes ``Trajectory.task`` and then the stored skill's
+        ``Precedent`` - and the warm path is decided by gates that count WORDS
+        (``bind_args``, ``MIN_ACCOUNTED_FOR``, ``asks_for``). A rewrite into simplified
+        technical English that reached the store would leave the user's own next request
+        matched against prose they never typed. So this returns a string for one call and
+        ``task`` is never touched, replaced or re-created here: the explorer's own
+        ``_aimed`` draws the same line, showing a policy a goal the store never sees.
+
+        The explorer may hand over an AIMED goal - a borrowed step, then
+        ``"The errand: <the task>"`` - and the step changes every move while the errand
+        does not. Only the errand is rewritten, once per run, and put back where it was;
+        if that wording ever changes this rewrites the whole text instead, which costs
+        calls and nothing else. A failed rewrite falls back to the user's own words, and
+        says so: it is an optimization, and the run is not worth less without it.
+        """
+        if self._refine is None:
+            return text
+        head, marker, errand = text.rpartition(_ERRAND_MARKER)
+        errand = errand if marker else text
+        if errand not in self._refined:
+            began = time.perf_counter()
+            try:
+                self._refined[errand] = self._refine(errand, url)
+                log.info("jev.goal.refined", asked=errand, shown=self._refined[errand])
+            except SkillWeaverError as exc:
+                log.warning("jev.goal.unrefined", why=str(exc))
+                self._refined[errand] = errand
+            # The rewrite is this policy's models at work, so it is this policy's time.
+            self._decided_ms += (time.perf_counter() - began) * 1000.0
+        return f"{head}{marker}{self._refined[errand]}"
 
     # -- odds and ends -----------------------------------------------------------------
 
@@ -195,33 +289,130 @@ class JevDriver:
             )
         return snapshot
 
-    def _settle(self, history: Sequence[str], rejection: str | None) -> None:
-        """Close the previous step with what actually became of it, before asking again.
+    def _settle(self, snapshot: DomSnapshot, state: str, rejection: str | None) -> None:
+        """Close the previous step with what LITERALLY became of the page, before asking.
 
-        The half upstream Jev fills in from its own post-action fingerprint. Here the
-        explorer owns the after-observation and the CRITIC owns the verdict, so the
-        honest thing to report is the critic's.
+        ``page_changed`` is upstream's field and upstream's meaning: did the page's
+        content differ afterwards (``DomSnapshot.digest``). It was the CRITIC's verdict
+        here until 2026-09-20, and the two are different questions. Measured live on an
+        option dialog: the policy scrolled the list twice, ticked the right add-on and
+        added it to the order - the task, done - while ``state_changed`` called both
+        scrolls and the tick failures (0.925, 0.767, and "the fingerprints are identical"
+        for a ticked checkbox). So the policy was told three times that nothing happened,
+        and under rules that make the history "the authoritative record of progress" it
+        answered a finished task with ``BLOCKED`` 0.57 against ``DONE`` 0.23.
+        ``AGENTS.md`` already says nothing may be keyed on that per-move verdict.
 
-        A policy not told its last click did nothing has no reason to choose differently,
-        and the screen that prompted the click has not changed - which is the loop the
-        failure memory exists to break.
+        The verdict is not lost: a move it failed is still a dead end in the explorer's
+        memory and still withheld by :func:`_exclusions`.
+
+        ``refused`` is relayed only when the page does not contradict it. The explorer's
+        ``rejection`` is one string for two things - an answer refused BEFORE it ran, and
+        a move that ran and that the critic then failed - and the second is that same
+        per-move verdict arriving by another door. Measured on a results page whose cart
+        line updates in place: the policy's second move was the right *Add to cart* at
+        p=1.00, the page said so, and ``state_changed`` failed it (0.633). Told
+        ``page_changed: true`` AND "your last move did not work", it added the other nine
+        products one after another and never said ``DONE``. A page that literally changed
+        is a move that ran, so what is relayed is what the policy can act on: nothing
+        happened, and here is why.
         """
         if not self._steps:
             return
         last = self._steps[-1]
-        outcome = history[-1] if history else ""
-        last["page_changed"] = None if not outcome else ("FAILED" not in outcome)
-        if rejection:
+        last["page_changed"] = state != last["state"]
+        last["url"] = snapshot.url
+        # Upstream's per-step split: what the models took to choose this move, against
+        # what the site took to answer it - performing, settling, observing, resting.
+        log.info(
+            "jev.step",
+            kind=last["kind"],
+            changed=last["page_changed"],
+            model_ms=round(last["model_ms"]),
+            site_ms=round(self._perceiver.site_ms - last["site_mark"]),
+        )
+        if rejection and not last["page_changed"]:
             last["refused"] = rejection
+        elif last["kind"] == "CLICK" and last["element_id"]:
+            self._taken.setdefault(last["state"], set()).add(last["element_id"])
 
-    def _remember(self, decision: PolicyDecision) -> None:
-        """Open a step with what the policy asked for. :meth:`_settle` closes it."""
+    def _remember(self, decision: PolicyDecision, state: str) -> None:
+        """Open a step with what the policy asked for. :meth:`_settle` closes it.
+
+        ``state``, ``element_id`` and later ``url`` are this driver's own bookkeeping;
+        the request builder names the keys it sends, so they never reach the wire.
+        """
         self._steps.append(
             {
                 "action": decision.why or decision.operation,
                 "kind": decision.operation,
                 "text": decision.text,
+                "state": state,
+                "element_id": decision.element_id,
+                "model_ms": decision.latency_ms,
+                "site_mark": self._perceiver.site_ms,
             }
+        )
+        self._decided_ms += decision.latency_ms
+
+    def _spent(self, state: str) -> dict[str, set[str]]:
+        """``{operation: element ids}`` this exact page state has already used up.
+
+        Two of upstream's rules, both proofs BY IDENTITY and so both keyed on the exact
+        ``DomSnapshot.digest`` rather than on fingerprint similarity. A click already
+        made from this state, when the run is standing on the state again, did not
+        advance the goal however much it changed the page - that is what turns
+        open/close into an oscillation. And whatever has changed nothing since the page
+        last changed will change nothing now; a ``WAIT`` ends that streak, because time
+        passing is a reason a dead control may work.
+
+        Exact on purpose, and it is the opposite call from
+        :meth:`~skillweaver.agent.explorer.FailureMemory.near`. At the 0.26 same-state
+        cut a dialog with one more box ticked IS the same screen, so similarity here
+        would withhold a legitimate second ``Add``. On a page too noisy to digest
+        identically twice this withholds nothing: it fails open, similarity fails closed.
+        """
+        spent: dict[str, set[str]] = {}
+        if state in self._taken:
+            spent["CLICK"] = set(self._taken[state])
+        for step in reversed(self._steps):
+            if step.get("page_changed") is not False or step["kind"] == "WAIT":
+                break
+            if step["state"] != state:
+                break
+            if step["kind"] in ("CLICK", "TYPE_TEXT") and step["element_id"]:
+                spent.setdefault(step["kind"], set()).add(step["element_id"])
+        return spent
+
+    def _stop_if_inert(self, observation: Observation) -> None:
+        """Give up on a page that has absorbed :data:`NO_CHANGE_LIMIT` moves unchanged.
+
+        Raises:
+            PolicyBlocked: which the explorer already turns into a diagnosed stop at this
+                screen, after its one retry without a borrowed workflow.
+        """
+        recent = self._steps[-NO_CHANGE_LIMIT:]
+        if len(recent) < NO_CHANGE_LIMIT:
+            return
+        inert = all(s.get("page_changed") is False and s["kind"] != "WAIT" for s in recent)
+        if not inert or len({s.get("url") for s in recent}) != 1:
+            return
+        where = observation.url or "this screen"
+        if all(s["kind"] == "DONE" for s in recent):
+            # Not the page's fault and must not read as if it were. Measured: a correctly
+            # finished errand whose DONE the critic answered four times with an EMPTY
+            # reply - the computer-tool hazard AGENTS.md records as unfixed in the critic.
+            # Asking a fifth time buys another such call; the claim and its refusals are
+            # the finding, so they are what is reported.
+            raise PolicyBlocked(
+                f"the policy reported DONE {NO_CHANGE_LIMIT} times on {where} and the claim "
+                "was not accepted once, with nothing changing in between; read the critic's "
+                "reasons before concluding the task was not done"
+            )
+        tried = "; ".join(str(s["action"]) for s in recent)
+        raise PolicyBlocked(
+            f"{where} did not change across the last {NO_CHANGE_LIMIT} moves ({tried}), "
+            "so nothing more is spent on it"
         )
 
 
@@ -325,7 +516,9 @@ def _type_into(element_id: str, text: str) -> str:
 
 
 def _exclusions(
-    snapshot: DomSnapshot, dead_ends: Sequence[Attempt]
+    snapshot: DomSnapshot,
+    dead_ends: Sequence[Attempt],
+    spent: Mapping[str, Collection[str]] | None = None,
 ) -> tuple[dict[str, set[str]], set[str]]:
     """``({operation: element ids to withhold}, {operations put back})``.
 
@@ -341,8 +534,11 @@ def _exclusions(
     target head is PUT BACK and said out loud by :func:`_note`: a policy offered only
     ``WAIT``, ``DONE`` and ``BLOCKED`` answers one of them, and a false ``BLOCKED`` is a
     silent failure. Measured on the sandbox's Mail screen: 17 controls, 0 offered.
+
+    ``spent`` is :meth:`JevDriver._spent` - what this exact page state has used up by
+    upstream's two identity rules - and rides the same put-back as everything else.
     """
-    wanted: dict[str, set[str]] = {}
+    wanted: dict[str, set[str]] = {op: set(ids) for op, ids in (spent or {}).items() if ids}
     for attempt in dead_ends:
         move = signature_move(attempt.signature)
         if move is None:
@@ -374,7 +570,7 @@ def _note(exclude: Mapping[str, Collection[str]], restored: Collection[str]) -> 
         return ""
     plural = "" if withheld == 1 else "s"
     return (
-        f"; {withheld} target{plural} already tried and failed on this screen "
+        f"; {withheld} target{plural} already used up on this screen "
         f"{'was' if withheld == 1 else 'were'} withheld"
     )
 

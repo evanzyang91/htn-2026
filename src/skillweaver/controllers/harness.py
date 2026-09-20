@@ -52,6 +52,7 @@ from skillweaver.contracts import (
     utcnow,
 )
 from skillweaver.controllers import _coords
+from skillweaver.controllers._quiesce import QUIESCE_JS
 from skillweaver.errors import ControllerError
 from skillweaver.logging_ import get_logger
 
@@ -157,6 +158,7 @@ class HarnessBrowserController:
         self._target: str | None = None
         self._session: str | None = None
         self._closed = False
+        self._acted_ms = 0.0
         try:
             from browser_harness.admin import ensure_daemon
             from browser_harness.helpers import cdp
@@ -277,9 +279,25 @@ class HarnessBrowserController:
             error = f"{action.kind} timed out: {_brief(exc)}"
         except RuntimeError as exc:
             error = f"{action.kind} failed: {_brief(exc)}"
-        return ActionResult(
-            ok=error is None, error=error, elapsed_ms=(time.perf_counter() - started) * 1000.0
-        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._acted_ms += elapsed_ms
+        return ActionResult(ok=error is None, error=error, elapsed_ms=elapsed_ms)
+
+    @property
+    def acted_ms(self) -> float:
+        """Milliseconds spent inside :meth:`perform` so far, as
+        :attr:`BrowserController.acted_ms` counts them."""
+        return self._acted_ms
+
+    def quiesce(self, quiet_ms: float, cap_ms: float) -> float | None:
+        """Wait until the page has been still for ``quiet_ms``, at most ``cap_ms``.
+        The same script and the same ADVISORY contract as
+        :meth:`BrowserController.quiesce`: ``None`` when the document went away."""
+        self._live()
+        try:
+            return float(self._expression(f"({QUIESCE_JS})([{float(quiet_ms)}, {float(cap_ms)}])"))
+        except (RuntimeError, TimeoutError, TypeError, ValueError):
+            return None
 
     def viewport(self) -> Box:
         """The page area in logical pixels, anchored at ``(0, 0)``."""

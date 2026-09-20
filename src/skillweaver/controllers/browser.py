@@ -42,6 +42,7 @@ from skillweaver.contracts import (
     utcnow,
 )
 from skillweaver.controllers import _coords
+from skillweaver.controllers._quiesce import QUIESCE_JS
 from skillweaver.controllers.chrome_launch import PLAINLY_LAUNCHED, ChromeProcess
 from skillweaver.errors import ControllerError
 
@@ -228,6 +229,7 @@ class BrowserController:
         self._drag_steps = max(int(drag_steps), 1)
         self._navigation_timeout_ms = float(navigation_timeout_ms)
         self._settle_timeout_ms = max(float(settle_timeout_ms), 0.0)
+        self._acted_ms = 0.0
         self._blocked: tuple[str | re.Pattern[str], ...] = (
             SOMETIMES_ONLY_OVERLAYS if block is None else tuple(block)
         )
@@ -395,9 +397,16 @@ class BrowserController:
             if page.is_closed():
                 raise ControllerError(f"page closed during {action.kind}") from exc
             error = f"{action.kind} failed: {_brief(exc)}"
-        return ActionResult(
-            ok=error is None, error=error, elapsed_ms=(time.perf_counter() - started) * 1000.0
-        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._acted_ms += elapsed_ms
+        return ActionResult(ok=error is None, error=error, elapsed_ms=elapsed_ms)
+
+    @property
+    def acted_ms(self) -> float:
+        """Milliseconds spent inside :meth:`perform` so far: delivering input and then
+        waiting for the page in :meth:`_settle`. Half of what a run's site time is; the
+        DOM perceiver adds the other half - see ``DomPerceiver.site_ms``."""
+        return self._acted_ms
 
     def viewport(self) -> Box:
         """The page area in logical pixels, anchored at ``(0, 0)``."""
@@ -444,6 +453,35 @@ class BrowserController:
             return page.evaluate(script)
         except PlaywrightError as exc:
             raise ControllerError(f"could not evaluate page script: {_brief(exc)}") from exc
+
+    def quiesce(self, quiet_ms: float, cap_ms: float) -> float | None:
+        """Wait until the page has been STILL for ``quiet_ms``, at most ``cap_ms``.
+
+        READ-ONLY, duck-typed like :meth:`evaluate`, and the milliseconds it waited -
+        or ``None`` when the wait was interrupted, which a navigating document does to
+        any evaluation. It is ADVISORY either way: nothing that already happened may fail
+        because the page would not hold still.
+
+        NOT called from :meth:`_settle`, and it must not be. ``AGENTS.md`` says a quiet
+        window taxes every action on every site, and measured here it is 164ms per call
+        on a page with nothing to wait for. So the caller decides when a still page is
+        worth that: the DOM perceiver, on the one observation that follows a policy's
+        move (:meth:`~skillweaver.perception.dom.DomPerceiver.rest_after`).
+
+        What it does and does not catch, measured through this class and
+        ``DomPerceiver``, n=5 per page, 5 of 5 agreeing. A results page that streams a
+        row every 90ms for ~900ms after ``load``: :meth:`_settle` hands over a frame with
+        2 of 20 controls at ~165ms; after this, 20 of 20, for ~906ms. A page that sits
+        idle and paints once at 700ms: 0 of 16 before and STILL 0 of 16 after, because
+        ``quiet_ms`` of nothing happening is satisfied before the paint. It waits for a
+        busy page to finish, not for an idle one to start - that second shape is what
+        ``ctx.wait_for_text`` is for.
+        """
+        page = self._live_page()
+        try:
+            return float(page.evaluate(QUIESCE_JS, [quiet_ms, cap_ms]))
+        except PlaywrightError:
+            return None
 
     def describe(self) -> str:
         """One line for logs and prompts, e.g. ``playwright chromium 1280x800 @2x``.

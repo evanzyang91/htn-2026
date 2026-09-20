@@ -22,6 +22,7 @@ having run out of money is the one fallback that is always wrong.
 from __future__ import annotations
 
 import enum
+import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -175,6 +176,21 @@ class AttemptRecord:
             read from the model client across the attempt and not from the plan it
             returned - a call spent on a discarded plan is still a call.
         usd: Model spend, counted the same way.
+        wall_ms: Wall-clock milliseconds of the attempt, taken over the SAME boundary as
+            the two clocks below so they can never add up to more than it. NOT
+            ``seconds``, which is the budget's clock and starts later: measured on a warm
+            Wikipedia replay, ``site_ms`` came to 104% of ``seconds``, because the first
+            observation happens before the budget starts counting.
+        policy_ms: Milliseconds an acting policy's OWN models took - Jev and its text
+            writer - and ``0.0`` without one. Upstream's model half. Not the critic's
+            calls: those are inside ``wall_ms`` and outside both halves, so
+            ``wall_ms - policy_ms - site_ms`` is judging, recording and overhead -
+            which on a cold Wikipedia run was 73% of the wall, against 15% and 12%.
+        site_ms: Milliseconds spent waiting on the SITE - performing, settling, observing
+            and resting - when the eyes keep that clock (``DomPerceiver.site_ms``), and
+            ``0.0`` when they do not. Meaningful on the warm path too, where it is nearly
+            all of the run. Like every timing here it is for a run whose ground truth
+            passed; ``eval.metrics._measured`` is the only door to a comparison.
         perception: What the eyes did, as COUNTS, so it means the same on a busy machine
             as on an idle one.
         cross_mode: The render-mode crossing that most likely lost the screen. Its own
@@ -195,6 +211,9 @@ class AttemptRecord:
     llm_calls: int = 0
     usd: float = 0.0
     seconds: float = 0.0
+    wall_ms: float = 0.0
+    policy_ms: float = 0.0
+    site_ms: float = 0.0
     perception: PerceptionCounts = PerceptionCounts()
     cross_mode: str | None = None
     demoted: str | None = None
@@ -372,6 +391,7 @@ class Agent:
         "_llm",
         "_perceiver",
         "_planner",
+        "_policy",
         "_retriever",
         "_store",
         "_synthesis",
@@ -395,7 +415,9 @@ class Agent:
         llm: LLMClient | None = None,
         budget: Budget | None = None,
         top_k: int = 5,
+        policy: Any | None = None,
     ) -> None:
+        self._policy = policy
         self._controller = controller
         self._perceiver = perceiver
         self._store = store
@@ -442,9 +464,10 @@ class Agent:
         attempts: list[AttemptRecord] = []
 
         if warm:
-            mark, spent = perception_counts(self._perceiver), self._usage()
+            mark, spent, clock = perception_counts(self._perceiver), self._usage(), self._clock()
             record, outcome = self._try_warm(task)
             record = self._charge_model(self._charge_eyes(record, mark), spent)
+            record = self._charge_clock(record, clock)
             attempts.append(record)
             if record.ok and outcome is not None:
                 self._persist()
@@ -478,9 +501,10 @@ class Agent:
                 candidates=candidates,
             )
 
-        mark, spent = perception_counts(self._perceiver), self._usage()
+        mark, spent, clock = perception_counts(self._perceiver), self._usage(), self._clock()
         record, outcome = self._try_cold(task)
         record = self._charge_model(self._charge_eyes(record, mark), spent)
+        record = self._charge_clock(record, clock)
         attempts.append(record)
         learned, admission, note = self._learn(task, outcome, enabled=learn)
         self._persist()
@@ -500,6 +524,31 @@ class Agent:
         # Counted here, not inside each attempt: the perceiver is shared by the planner,
         # the explorer and every skill they run, so the attempt is the only honest boundary.
         return replace(record, perception=perception_counts(self._perceiver) - mark)
+
+    def _clock(self) -> tuple[float, float, float]:
+        """``(now_ms, policy_ms, site_ms)`` so far, from whoever keeps them - duck-typed,
+        because neither clock is on a shared Protocol and most policies and eyes keep
+        neither. ``now_ms`` rides along so all three are read at one moment."""
+        policy = getattr(self._policy, "policy_ms", 0.0)
+        site = getattr(self._perceiver, "site_ms", 0.0)
+        return (
+            time.monotonic() * 1000.0,
+            float(policy) if isinstance(policy, (int, float)) else 0.0,
+            float(site) if isinstance(site, (int, float)) else 0.0,
+        )
+
+    def _charge_clock(
+        self, record: AttemptRecord, mark: tuple[float, float, float]
+    ) -> AttemptRecord:
+        # Same boundary as _charge_eyes and for the same reason: both clocks are shared by
+        # every path, so the attempt is the only honest place to take the difference.
+        now_ms, policy_ms, site_ms = self._clock()
+        return replace(
+            record,
+            wall_ms=now_ms - mark[0],
+            policy_ms=policy_ms - mark[1],
+            site_ms=site_ms - mark[2],
+        )
 
     def _charge_model(self, record: AttemptRecord, mark: Usage) -> AttemptRecord:
         """Charge ``record`` every model call since ``mark``, keeping the attempt's own
@@ -1544,6 +1593,7 @@ def build_agent(
         llm=llm,
         budget=budget,
         top_k=top_k,
+        policy=policy,
     )
 
 
@@ -1758,12 +1808,17 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
 
     ``--policy jev`` without ``--perception dom`` raises: Jev answers with an index into a
     table of named controls, and OCR gives a box some text was near, not a control with a
-    role and a value. A missing Jev credential also raises, before a browser opens.
+    role and a value. A missing Jev credential also raises, before a browser opens - and
+    so does a missing ``OPENAI_API_KEY``, because what the policy types is written by an
+    OpenAI-compatible text model and there is no fall-back writer
+    (:class:`~skillweaver.llm.openai_.OpenAITextWriter` says why the role left ``llm``,
+    which is kept in the signature for the callers that pass it and is no longer used).
     """
     if config.policy != "jev":
         return None
     from skillweaver.agent.jev_driver import JevDriver
-    from skillweaver.llm.jev_ import JevPolicy, LLMTextWriter
+    from skillweaver.llm.jev_ import CATEGORY_RULES, MIN_CATEGORY_CONFIDENCE, JevPolicy
+    from skillweaver.llm.openai_ import OpenAITextWriter
     from skillweaver.perception.dom import DomPerceiver
 
     if not isinstance(perceiver, DomPerceiver):
@@ -1771,7 +1826,26 @@ def _open_policy(config: Settings, perceiver: Perceiver, llm: LLMClient) -> Any 
             "--policy jev needs --perception dom: the policy chooses an index into the "
             "page's own list of named controls, which only the DOM path produces."
         )
-    return JevDriver(JevPolicy(LLMTextWriter(llm), api_key=config.typesafe_api_key), perceiver)
+    writer = OpenAITextWriter(
+        api_key=config.openai_api_key,
+        model=config.text_model,
+        base_url=config.text_base_url,
+        effort=config.text_effort,
+        refine_model=config.refine_model,
+    )
+    policy = JevPolicy(writer, api_key=config.typesafe_api_key)
+    if not config.refine_goal:
+        return JevDriver(policy, perceiver)
+
+    def refine(goal: str, url: str) -> str:
+        # Upstream's refine_goal: one Jev choice picks the kind of task, which only selects
+        # WORDING guidance and only above its confidence floor; then one rewrite.
+        category, confidence = policy.classify(goal, url)
+        applied = category is not None and confidence >= MIN_CATEGORY_CONFIDENCE
+        log.info("jev.goal.category", category=category, confidence=confidence, applied=applied)
+        return writer.rewrite_goal(goal, url, CATEGORY_RULES[category] if applied else "")
+
+    return JevDriver(policy, perceiver, refine=refine)
 
 
 def budget_from(

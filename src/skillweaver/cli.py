@@ -166,8 +166,9 @@ def root(
             "--policy",
             help="Who chooses each exploratory move: 'claude' (the acting prompt - the "
             "DEFAULT) or 'jev' (TypeSafe's Jev, one request per step that picks both "
-            "the operation and its target). 'jev' requires --perception dom and "
-            "TYPESAFE_API_KEY. It replaces the move decision ONLY: the critic, the "
+            "the operation and its target). 'jev' requires --perception dom, "
+            "TYPESAFE_API_KEY, and OPENAI_API_KEY for the text model that writes what it "
+            "types. It replaces the move decision ONLY: the critic, the "
             "admission gate, the synthesizer and every stored skill are unchanged. "
             "Overrides SKILLWEAVER_POLICY.",
             show_default=False,
@@ -691,6 +692,10 @@ def _report_json(report: RunReport, where: DomainChoice | None = None) -> dict[s
                 "steps": a.steps,
                 "llm_calls": a.llm_calls,
                 "usd": round(a.usd, 6),
+                "seconds": round(a.seconds, 3),
+                "wall_ms": round(a.wall_ms),
+                "policy_ms": round(a.policy_ms),
+                "site_ms": round(a.site_ms),
                 "cross_mode": a.cross_mode,
                 "demoted": a.demoted,
             }
