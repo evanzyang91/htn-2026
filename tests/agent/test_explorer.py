@@ -50,6 +50,7 @@ from skillweaver.agent.explorer import (
 from skillweaver.contracts import (
     Budget,
     Click,
+    Fingerprint,
     LLMResponse,
     Observation,
     RunOutcome,
@@ -699,9 +700,9 @@ def test_the_catalog_falls_back_to_positional_ids(scenario: Scenario) -> None:
 
 def test_the_failure_memory_is_per_screen_and_keeps_the_first_reason() -> None:
     memory = FailureMemory()
-    memory.remember("state-a", "click:x", "click [x]", "the screen did not change")
-    memory.remember("state-a", "click:x", "click [x]", "refused: already tried")
-    memory.remember("state-b", "click:x", "click [x]", "an error appeared")
+    memory.remember(Fingerprint("state-a"), "click:x", "click [x]", "the screen did not change")
+    memory.remember(Fingerprint("state-a"), "click:x", "click [x]", "refused: already tried")
+    memory.remember(Fingerprint("state-b"), "click:x", "click [x]", "an error appeared")
 
     here = memory.at("state-a")
     assert [(a.count, a.reason) for a in here] == [(2, "the screen did not change")]

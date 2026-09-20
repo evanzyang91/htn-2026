@@ -101,6 +101,7 @@ from skillweaver.contracts import (
     Critic,
     Drag,
     Element,
+    Fingerprint,
     LLMClient,
     LLMMessage,
     Navigate,
@@ -129,6 +130,7 @@ from skillweaver.contracts import (
 from skillweaver.contracts import Move as PointerMove
 from skillweaver.errors import BudgetExceeded, ControllerError, SkillWeaverError
 from skillweaver.logging_ import get_logger
+from skillweaver.perception.fingerprint import SAME_STATE_THRESHOLD
 from skillweaver.skills.api import SkillLimits, describe_action
 from skillweaver.skills.sandbox import SkillRunner
 
@@ -145,7 +147,7 @@ __all__ = [
     "Move",
     "PolicyBlocked",
     "load_prompt",
-    "signature_target",
+    "signature_move",
 ]
 
 log = get_logger(__name__)
@@ -243,7 +245,7 @@ class ActingPolicy(Protocol):
                 A policy that re-proposes one of these is refused by
                 :meth:`Explorer._refuse_repeat` and asked again, so honouring them is
                 how a policy avoids paying for the same answer twice;
-                :func:`signature_target` reads the element id back out of one.
+                :func:`signature_move` reads the move and its element back out of one.
             rejection: Why the previous answer was refused, when it was.
         """
         ...
@@ -253,19 +255,25 @@ class ActingPolicy(Protocol):
         ...
 
 
-def signature_target(signature: str) -> str | None:
-    """The element id a :attr:`Move.signature` aims at, or ``None`` when it aims at none.
+def signature_move(signature: str) -> tuple[str, str] | None:
+    """The ``(kind, element_id)`` a :attr:`Move.signature` aims at, or ``None``.
 
     Signatures are built in :func:`_resolve`, one place, in the form
     ``<kind>:<element_id>[:...]``. This function is where that format is READ, so a
     caller outside this module - an :class:`ActingPolicy` pruning targets it already
     knows are dead - does not have to know how it is spelled.
+
+    The KIND comes back with the id because a dead end is a move at an element, not an
+    element: a click that did nothing says nothing about typing into the same field, and
+    a caller that dropped the field on the strength of the click would have taken the
+    task's only way forward away from itself. See
+    :data:`~skillweaver.agent.jev_driver.DEAD_END_OPERATIONS`.
     """
     kind, _, rest = signature.partition(":")
     if kind in _TARGETLESS or kind in ("code", "done", "malformed") or not rest:
         return None
     target = rest.partition(":")[0]
-    return target or None
+    return (kind, target) if target else None
 
 
 class _Invalid(Exception):
@@ -446,35 +454,68 @@ class FailureMemory:
     """What this run has already tried, per screen, and why it did not work.
 
     Keyed by ``(state fingerprint, move signature)``, because the same click is a fresh
-    idea on a different screen and a dead end on this one. Two readers:
+    idea on a different screen and a dead end on this one. Three readers:
 
     * the prompt, through :meth:`at`, so the model can avoid repeating itself;
     * the loop, through :meth:`seen`, so that when it repeats itself anyway the move is
-      refused before it is performed rather than after.
+      refused before it is performed rather than after;
+    * an :class:`ActingPolicy`, through :meth:`near`, which is :meth:`at` with the
+      identity question asked the way the rest of this project asks it.
+
+    Why :meth:`near` exists, measured
+    ---------------------------------
+
+    :meth:`at` and :meth:`seen` key on the fingerprint VALUE, which is exact equality,
+    and a move that fails is very often a move that repainted the page without changing
+    it. Those two facts together mean the dead end is filed under a screen the next step
+    is not standing on. Measured on one live sandbox run of 33 actions: of the 11 moves
+    the critic failed, SEVEN left a screen that is the same state by
+    :data:`~skillweaver.perception.fingerprint.SAME_STATE_THRESHOLD` - and exactly ONE of
+    those seven fingerprinted identically. The other six were unreachable from the very
+    next step, so the same target was offered again at full attractiveness and failed
+    again; the guard only bit on the third try, once two observations happened to agree.
+
+    That is the rule ``AGENTS.md`` states for the whole project - a live page never
+    fingerprints identically twice, so nothing that compares two screens may ask it to -
+    arriving here. :meth:`near` therefore asks
+    :meth:`~skillweaver.contracts.Fingerprint.similarity` against the one calibrated cut
+    every other comparison defers to. The separation in that run was not marginal:
+    same-screen pairs scored 0.719-1.000 and moved-on pairs 0.107-0.135, with the cut at
+    0.26 between them.
+
+    :meth:`at` and :meth:`seen` are deliberately LEFT exact. The prompt path and the
+    repeat guard are shared with the default explorer, and widening what they see is a
+    change to a run this task was not asked to change.
     """
 
-    __slots__ = ("_by_key",)
+    __slots__ = ("_by_key", "_screens")
 
     def __init__(self) -> None:
         self._by_key: dict[tuple[str, str], Attempt] = {}
+        self._screens: dict[str, Fingerprint] = {}
 
     def __len__(self) -> int:
         return len(self._by_key)
 
-    def remember(self, state: str, signature: str, summary: str, reason: str) -> Attempt:
+    def remember(self, state: Fingerprint, signature: str, summary: str, reason: str) -> Attempt:
         """Record a failed attempt, or count one more of an attempt already known.
 
         The FIRST reason is kept: it is the one observed when the move was actually
         performed, while a later one is usually this memory's own refusal.
+
+        The whole :class:`~skillweaver.contracts.Fingerprint` is taken rather than its
+        value because :meth:`near` needs the ``parts`` to compare screens at all; only
+        the value is stored on the :class:`Attempt`.
         """
-        key = (state, signature)
+        key = (state.value, signature)
         known = self._by_key.get(key)
         entry = (
-            Attempt(state, signature, summary, reason)
+            Attempt(state.value, signature, summary, reason)
             if known is None
-            else Attempt(state, signature, known.summary, known.reason, known.count + 1)
+            else Attempt(state.value, signature, known.summary, known.reason, known.count + 1)
         )
         self._by_key[key] = entry
+        self._screens.setdefault(state.value, state)
         return entry
 
     def seen(self, state: str, signature: str) -> Attempt | None:
@@ -484,6 +525,20 @@ class FailureMemory:
     def at(self, state: str) -> list[Attempt]:
         """Every failed attempt on one screen, most-repeated first."""
         found = [a for a in self._by_key.values() if a.state == state]
+        return sorted(found, key=lambda a: -a.count)
+
+    def near(self, state: Fingerprint) -> list[Attempt]:
+        """Every failed attempt on this screen OR one indistinguishable from it.
+
+        Same order as :meth:`at`, and the same answer whenever the fingerprints agree
+        exactly. The class docstring holds the measurement that says they usually do not.
+        """
+        same = {
+            value
+            for value, known in self._screens.items()
+            if value == state.value or known.similarity(state) >= SAME_STATE_THRESHOLD
+        }
+        found = [a for a in self._by_key.values() if a.state in same]
         return sorted(found, key=lambda a: -a.count)
 
     def all(self) -> tuple[Attempt, ...]:
@@ -806,7 +861,7 @@ class Explorer:
             )
             if not verdict.ok:
                 run.memory.remember(
-                    before.fingerprint.value, move.signature, move.summary, verdict.reason
+                    before.fingerprint, move.signature, move.summary, verdict.reason
                 )
                 run.rejection = f"your last move ({move.summary}) did not work: {verdict.reason}"
             else:
@@ -816,7 +871,7 @@ class Explorer:
             # the one most likely to be proposed again verbatim: the screen that
             # suggested it is untouched. Remember it so the guard catches the repeat.
             reason = run.rejection or "it performed no action at all"
-            run.memory.remember(before.fingerprint.value, move.signature, move.summary, reason)
+            run.memory.remember(before.fingerprint, move.signature, move.summary, reason)
             run.history.append(f"{run.moves}. {move.summary} -> performed nothing: {reason}")
 
         if move.done:
@@ -830,7 +885,7 @@ class Explorer:
             log.info("explore.solved", task=task.text, steps=run.steps, moves=run.moves)
             return
         run.memory.remember(
-            run.current.fingerprint.value,
+            run.current.fingerprint,
             f"done:{move.signature}",
             f"claim the task is complete after {move.summary}",
             verdict.reason,
@@ -858,7 +913,7 @@ class Explorer:
                 run.current,
                 catalog,
                 run.history,
-                run.memory.at(run.current.fingerprint.value),
+                run.memory.near(run.current.fingerprint),
                 run.rejection,
             )
             self._charge(run, at_least=1)
@@ -1016,8 +1071,8 @@ class Explorer:
         Raises:
             _Invalid: when the move is a known dead end here.
         """
-        state = run.current.fingerprint.value
-        known = run.memory.seen(state, move.signature)
+        state = run.current.fingerprint
+        known = run.memory.seen(state.value, move.signature)
         if known is None:
             return
         run.memory.remember(state, move.signature, move.summary, known.reason)
@@ -1035,7 +1090,7 @@ class Explorer:
         why = str(refusal)
         if refusal.record:
             run.memory.remember(
-                run.current.fingerprint.value,
+                run.current.fingerprint,
                 f"malformed:{hashlib.sha256(answer.encode()).hexdigest()[:10]}",
                 "an answer that could not be used",
                 why,

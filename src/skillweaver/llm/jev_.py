@@ -67,7 +67,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -92,6 +92,7 @@ __all__ = [
     "LLMTextWriter",
     "PolicyDecision",
     "TextWriter",
+    "targets_of",
 ]
 
 TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
@@ -219,7 +220,11 @@ class BrowserPolicy(Protocol):
     """
 
     def decide(
-        self, goal: str, snapshot: DomSnapshot, history: Sequence[Mapping[str, Any]]
+        self,
+        goal: str,
+        snapshot: DomSnapshot,
+        history: Sequence[Mapping[str, Any]],
+        exclude: Mapping[str, Collection[str]] | None = None,
     ) -> PolicyDecision:
         """Choose the next operation and its target.
 
@@ -229,6 +234,9 @@ class BrowserPolicy(Protocol):
                 :class:`~skillweaver.perception.dom.DomPerceiver`.
             history: The moves already made, oldest first, each a mapping with at least
                 ``action`` and ``kind``. Only the most recent are sent.
+            exclude: ``{operation: element ids}`` this screen has already proved dead,
+                which must not be offered as targets for that operation. See
+                :func:`targets_of`.
 
         Raises:
             ProviderError: on any network, auth, rate-limit or malformed-reply failure,
@@ -440,16 +448,23 @@ class JevPolicy:
     # -- deciding ----------------------------------------------------------------------
 
     def decide(
-        self, goal: str, snapshot: DomSnapshot, history: Sequence[Mapping[str, Any]]
+        self,
+        goal: str,
+        snapshot: DomSnapshot,
+        history: Sequence[Mapping[str, Any]],
+        exclude: Mapping[str, Collection[str]] | None = None,
     ) -> PolicyDecision:
         """One round trip: the operation head and every target head at once.
+
+        ``exclude`` names the moves already known to be dead on this exact screen; see
+        :func:`targets_of`, which is where it is applied.
 
         Raises:
             ProviderError: on a network, auth or rate-limit failure after retries, or on
                 a reply this cannot validate. Nothing is performed on a bad reply -
                 :func:`_validate_choice` is the upstream check, kept whole.
         """
-        targets = _targets(snapshot)
+        targets = targets_of(snapshot, exclude)
         offered = _offered(snapshot, targets)
         body = _request(self._model, goal, snapshot, history, targets, offered)
         started = time.perf_counter()
@@ -604,17 +619,38 @@ class JevPolicy:
 # --------------------------------------------------------------------------------------
 
 
-def _targets(snapshot: DomSnapshot) -> dict[str, dict[str, DomControl]]:
+def targets_of(
+    snapshot: DomSnapshot, exclude: Mapping[str, Collection[str]] | None = None
+) -> dict[str, dict[str, DomControl]]:
     """``{operation: {index: control}}`` for every operation that HAS a target here.
 
     The index is the string of :attr:`~skillweaver.perception.dom.DomControl.index`, so
     what the policy answers with is what the element table quoted at it.
+
+    Args:
+        snapshot: The screen.
+        exclude: ``{operation: element ids}`` to leave OUT of that operation's target
+            head - the moves already known to lead nowhere on this exact screen, which
+            :class:`~skillweaver.agent.jev_driver.JevDriver` reads out of the explorer's
+            failure memory. Per OPERATION rather than per control, because a click that
+            achieved nothing is not evidence against typing into the same field.
+
+    An excluded control is still in the request's ``elements`` list, and deliberately:
+    the policy is choosing from a page, and a page with a control silently missing is a
+    page it is being lied to about. What changes is only that no target head offers it,
+    so it cannot be chosen - which is cheaper and more certain than asking a model not
+    to choose it, and is the one thing this policy shape can do that a prompted one
+    cannot. Leaving the table in place also leaves every index where it was, so an index
+    quoted in ``recent_actions`` still means the same control a step later.
     """
     click: dict[str, DomControl] = {}
     type_text: dict[str, DomControl] = {}
+    no_click = frozenset((exclude or {}).get("CLICK", ()))
+    no_type = frozenset((exclude or {}).get("TYPE_TEXT", ()))
     for control in snapshot.controls:
-        click[str(control.index)] = control
-        if control.editable:
+        if control.element_id not in no_click:
+            click[str(control.index)] = control
+        if control.editable and control.element_id not in no_type:
             type_text[str(control.index)] = control
     out: dict[str, dict[str, DomControl]] = {}
     if click:

@@ -42,27 +42,48 @@ Select-all is :data:`SELECT_ALL_CHORD` and the reason it is a constant is writte
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any
 
 from skillweaver.agent.explorer import (
     Attempt,
     ElementCatalog,
     PolicyBlocked,
-    signature_target,
+    signature_move,
 )
 from skillweaver.contracts import Observation, TaskSpec, Usage
 from skillweaver.errors import SkillWeaverError
-from skillweaver.llm.jev_ import BrowserPolicy, PolicyDecision
+from skillweaver.llm.jev_ import BrowserPolicy, PolicyDecision, targets_of
 from skillweaver.logging_ import get_logger
 from skillweaver.perception.dom import DomPerceiver, DomSnapshot
 
 log = get_logger(__name__)
 
-__all__ = ["SCROLL_PIXELS", "SELECT_ALL_CHORD", "WAIT_MS", "JevDriver"]
+__all__ = [
+    "DEAD_END_OPERATIONS",
+    "SCROLL_PIXELS",
+    "SELECT_ALL_CHORD",
+    "WAIT_MS",
+    "JevDriver",
+]
+
+DEAD_END_OPERATIONS: Mapping[str, str] = {"click": "CLICK"}
+"""Which Jev operation a failed move's signature kind is evidence against.
+
+Read this before adding to it. A :attr:`~skillweaver.agent.explorer.Move.signature` is
+``<kind>:<element_id>:...`` and this driver only ever produces two shapes: a ``CLICK``
+grounds to ``click:<id>:...``, and a ``TYPE_TEXT`` grounds to a CODE BLOCK, whose
+signature names no element at all (:func:`~skillweaver.agent.explorer.signature_move`
+returns ``None`` for it). ``SCROLL_UP``/``SCROLL_DOWN`` and ``WAIT`` name none either.
+
+So a click is the only dead end this path can record, and ``CLICK`` is the only thing it
+is evidence against. Mapping ``scroll`` or ``drag`` in here would let a move the policy
+never made withhold a target it never tried, and mapping a control's failed click onto
+``TYPE_TEXT`` would take away the search box on the one screen whose task is to type in
+it.
+"""
 
 SCROLL_PIXELS = 560
 """Logical pixels one ``SCROLL_DOWN`` or ``SCROLL_UP`` moves, as upstream Jev scrolls.
@@ -149,14 +170,9 @@ class JevDriver:
             ProviderError: from the policy, on a provider failure.
         """
         snapshot = self._snapshot_for(observation)
-        dead = {
-            target
-            for attempt in dead_ends
-            if (target := signature_target(attempt.signature)) is not None
-        }
-        pruned = _without(snapshot, dead)
+        exclude, restored = _exclusions(snapshot, dead_ends)
         self._settle(history, rejection)
-        decision = self._policy.decide(task.text, pruned, self._steps)
+        decision = self._policy.decide(task.text, snapshot, self._steps, exclude)
         self._remember(decision)
         log.info(
             "jev.decide",
@@ -165,14 +181,15 @@ class JevDriver:
             probability=round(decision.probability, 3),
             policy_ms=round(decision.policy_ms),
             latency_ms=round(decision.latency_ms),
-            offered=len(pruned.controls),
-            pruned=len(snapshot.controls) - len(pruned.controls),
+            offered=len(snapshot.controls),
+            withheld=sum(len(ids) for ids in exclude.values()),
+            restored=sorted(restored) or None,
         )
         if decision.operation == "BLOCKED":
             raise PolicyBlocked(
                 f"the policy found no supported operation on {observation.url or 'this screen'}"
             )
-        return json.dumps(_answer(decision, catalog, snapshot))
+        return json.dumps(_answer(decision, catalog, snapshot, _note(exclude, restored)))
 
     # -- odds and ends -----------------------------------------------------------------
 
@@ -239,9 +256,12 @@ class JevDriver:
 
 
 def _answer(
-    decision: PolicyDecision, catalog: ElementCatalog, snapshot: DomSnapshot
+    decision: PolicyDecision, catalog: ElementCatalog, snapshot: DomSnapshot, note: str = ""
 ) -> dict[str, Any]:
     """One decision as the JSON object :meth:`Explorer._ground` parses.
+
+    ``note`` is :func:`_note`'s sentence about targets this screen withheld, appended to
+    the thought so it reaches the trajectory with the move it applied to.
 
     ``expect`` is filled from what the operation is FOR rather than left empty, because
     the critic is handed it as the expectation and a critic with nothing to check
@@ -254,17 +274,16 @@ def _answer(
             frames diverged and performing the move would be performing it blind.
     """
     operation = decision.operation
+    odds = _odds(decision) + note
     if operation == "DONE":
         return {
-            "thought": (
-                f"the policy reports every requirement is visibly satisfied {_odds(decision)}"
-            ),
+            "thought": (f"the policy reports every requirement is visibly satisfied {odds}"),
             "expect": "",
             "done": True,
         }
     if operation == "WAIT":
         return {
-            "thought": f"the policy is waiting for the page to update {_odds(decision)}",
+            "thought": f"the policy is waiting for the page to update {odds}",
             "expect": "the page finishes loading and the control it needs appears",
             "done": False,
             "action": {"kind": "wait", "ms": WAIT_MS},
@@ -272,7 +291,7 @@ def _answer(
     if operation in ("SCROLL_DOWN", "SCROLL_UP"):
         down = operation == "SCROLL_DOWN"
         return {
-            "thought": f"the policy is scrolling {'down' if down else 'up'} {_odds(decision)}",
+            "thought": f"the policy is scrolling {'down' if down else 'up'} {odds}",
             "expect": f"content from {'below' if down else 'above'} the fold comes into view",
             "done": False,
             "action": {"kind": "scroll", "dy": SCROLL_PIXELS if down else -SCROLL_PIXELS},
@@ -289,7 +308,7 @@ def _answer(
 
     if operation == "CLICK":
         return {
-            "thought": f"the policy is clicking {label!r} {_odds(decision)}",
+            "thought": f"the policy is clicking {label!r} {odds}",
             "expect": f"the page responds to {label!r}",
             "done": False,
             "action": {"kind": "click", "element_id": element_id},
@@ -302,7 +321,7 @@ def _answer(
                 "nothing is guessed, so the move is refused"
             )
         return {
-            "thought": f"the policy is typing into {label!r} {_odds(decision)}",
+            "thought": f"the policy is typing into {label!r} {odds}",
             "expect": f"the field {label!r} now contains {text!r}",
             "done": False,
             "code": _type_into(element_id, text),
@@ -328,33 +347,72 @@ def _type_into(element_id: str, text: str) -> str:
     )
 
 
-def _without(snapshot: DomSnapshot, dead: set[str]) -> DomSnapshot:
-    """``snapshot`` with the controls in ``dead`` removed, re-indexed.
+def _exclusions(
+    snapshot: DomSnapshot, dead_ends: Sequence[Attempt]
+) -> tuple[dict[str, set[str]], set[str]]:
+    """``({operation: element ids to withhold}, {operations put back})``.
 
     A target already known to fail ON THIS SCREEN is not offered again. The explorer
     would refuse the repeat anyway (:meth:`Explorer._refuse_repeat`), so this does not
     change what can happen - it changes what it COSTS, from one wasted provider call per
     repeat to none, which on a screen with one obvious-looking wrong button is the
     difference between a run that moves on and a run that spends its budget insisting.
+    Not offering it at all is the one thing this policy shape can do and a prompted model
+    cannot: a prompt can only ASK a model not to repeat itself.
 
-    Re-indexing matters: a policy's answer is an index into the table it was shown, so
-    the table it was shown has to be the one the answer is read against. Everything else
-    joins on :attr:`~skillweaver.perception.dom.DomControl.element_id`, which does not
-    move.
+    Two rules, and they pull against each other.
+
+    A failure is a MOVE at an element, not an element, so
+    :data:`DEAD_END_OPERATIONS` maps the signature kinds this driver can actually produce
+    onto the operations they came from and nothing else is excluded. A click that
+    achieved nothing says nothing about typing into the same field, and a version of this
+    that dropped the control outright took the search box away from a run whose whole
+    task was to type in it.
+
+    And an exclusion that empties an operation's target head is PUT BACK, named in the
+    second return value and said out loud in the trajectory by :func:`_note`. A screen
+    whose every clickable control has failed is a screen this would otherwise hand the
+    policy with no ``CLICK`` at all - and a policy offered only ``WAIT``, ``DONE`` and
+    ``BLOCKED`` answers one of them. Measured on the sandbox's Mail screen: 17 controls,
+    0 offered, and the only operations left were the two that end the run. A false
+    ``BLOCKED`` is a silent failure, so the last resort is to offer the dead targets
+    again and let the explorer's own repeat guard say no to them one at a time.
     """
-    if not dead:
-        return snapshot
-    kept = [control for control in snapshot.controls if control.element_id not in dead]
-    if len(kept) == len(snapshot.controls):
-        return snapshot
-    renumbered = tuple(
-        dataclasses.replace(control, index=position)
-        for position, control in enumerate(kept, start=1)
-    )
-    return dataclasses.replace(
-        snapshot,
-        controls=renumbered,
-        by_element_id={control.element_id: control for control in renumbered},
+    wanted: dict[str, set[str]] = {}
+    for attempt in dead_ends:
+        move = signature_move(attempt.signature)
+        if move is None:
+            continue
+        operation = DEAD_END_OPERATIONS.get(move[0])
+        if operation is not None:
+            wanted.setdefault(operation, set()).add(move[1])
+    if not wanted:
+        return {}, set()
+    full, kept = targets_of(snapshot), targets_of(snapshot, wanted)
+    restored = {op for op in wanted if op in full and op not in kept}
+    return {op: ids for op, ids in wanted.items() if op not in restored}, restored
+
+
+def _note(exclude: Mapping[str, Collection[str]], restored: Collection[str]) -> str:
+    """What the trajectory is told about targets withheld here, or ``""``.
+
+    It goes on the move's ``thought``, which is the line
+    :meth:`~skillweaver.agent.explorer.Explorer._write_down` records against the step -
+    so a run where the policy was choosing from less than the whole screen says so where
+    anyone reading the run will see it, rather than only in a log line nobody keeps.
+    """
+    if restored:
+        return (
+            f"; every {'/'.join(sorted(restored)).lower()} target on this screen has already "
+            "failed here, so they are offered again rather than reporting blocked"
+        )
+    withheld = sum(len(ids) for ids in exclude.values())
+    if not withheld:
+        return ""
+    plural = "" if withheld == 1 else "s"
+    return (
+        f"; {withheld} target{plural} already tried and failed on this screen "
+        f"{'was' if withheld == 1 else 'were'} withheld"
     )
 
 
