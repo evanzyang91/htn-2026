@@ -515,6 +515,19 @@ Every `/api` request needs the startup token, the frame included: it is a photog
 browser that may be logged in. Per-target odds are absent because `PolicyDecision` carries
 only the chosen target's; wire them in `_decision_json` when it carries more.
 
+`skillweaver search` is full-text search over the RECORDS - runs, steps with the text
+that was on screen, graph nodes and edges, stored skill code - through Elasticsearch, and
+it is observability, not retrieval: nothing on a run's path reaches it, and it does not
+rank skills, because a better ranking was measured not to pay (above). The agent side is
+read-only by construction, not by promise - `scripts/index_elastic.py` is the only writer
+and nothing under `src/` calls a writing method; `dashboard/elastic.py` carries the five
+indices, the `code` analyzer (the standard one keeps `ctx.see.find_text` as ONE token, so
+`find_text` matched nothing across seven skills that all call it) and the `field:value`
+syntax that asks about a count or a flag. `SKILLWEAVER_ELASTIC_URL` unset means the
+subcommand says so and nothing else changes. Proven 2026-09-20 against a local
+single-node 8.15: 41 runs / 777 steps / 136 states / 429 edges / 7 skills indexed in 4s,
+queries 40-200ms.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

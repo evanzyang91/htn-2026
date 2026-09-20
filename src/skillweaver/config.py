@@ -90,6 +90,8 @@ class Settings:
     skill_max_seconds: float = DEFAULT_SKILL_MAX_SECONDS
     embedder_enabled: bool = DEFAULT_EMBEDDER_ENABLED
     embedder_dir_override: Path | None = None
+    elastic_url: str | None = None
+    elastic_api_key: str | None = field(default=None, repr=False)
     anthropic_api_key: str | None = field(default=None, repr=False)
     gemini_api_key: str | None = field(default=None, repr=False)
     typesafe_api_key: str | None = field(default=None, repr=False)
@@ -233,6 +235,8 @@ def load_settings(
             if merged.get("SKILLWEAVER_EMBEDDER_DIR")
             else None
         ),
+        elastic_url=merged.get("SKILLWEAVER_ELASTIC_URL") or None,
+        elastic_api_key=merged.get("SKILLWEAVER_ELASTIC_API_KEY") or None,
         anthropic_api_key=merged.get("ANTHROPIC_API_KEY") or None,
         gemini_api_key=merged.get("GEMINI_API_KEY") or merged.get("GOOGLE_API_KEY") or None,
         typesafe_api_key=merged.get("TYPESAFE_API_KEY") or None,

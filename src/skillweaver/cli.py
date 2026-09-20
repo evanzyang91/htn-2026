@@ -1236,6 +1236,99 @@ def _list_runs(bench: Workbench, as_json: bool) -> None:
         typer.echo(f"  {run_id}")
 
 
+@app.command("search")
+def search_command(
+    ctx: typer.Context,
+    query: Annotated[
+        str,
+        typer.Argument(
+            help=(
+                'Words that must all appear; "quote a phrase" to match it exactly; '
+                "field:value for a stored field, e.g. 'ok:false AND rejected_steps:>0'."
+            ),
+            show_default=False,
+        ),
+    ],
+    kinds: Annotated[
+        str | None,
+        typer.Option(
+            "--in",
+            help="Comma-separated: runs, steps, states, edges, skills. Default: all.",
+            show_default=False,
+        ),
+    ] = None,
+    domain: Annotated[
+        str | None,
+        typer.Option("--domain", help="Only this site (as stored, e.g. dom@en.wikipedia.org)."),
+    ] = None,
+    k: Annotated[int, typer.Option("--k", help="How many results.")] = 10,
+    as_json: JsonOpt = False,
+) -> None:
+    """Search everything the agent has recorded, through Elasticsearch. Read-only.
+
+    Runs, their steps (including the text that was ON SCREEN before and after each
+    action), site-graph screens and edges, and the stored skills' code. Needs
+    SKILLWEAVER_ELASTIC_URL and an index built by `scripts/index_elastic.py`; this
+    command never writes to it and changes nothing about how the agent decides.
+
+    Examples: `search "Your cart" --in steps` (which step saw it on screen);
+    `search "ok:false AND rejected_steps:>0" --in runs --domain dom@www.walmart.com`;
+    `search find_text --in skills` (a grep over the library).
+    """
+    from skillweaver.dashboard.elastic import KINDS, ElasticClient, ElasticError, search
+
+    bench = _bench(ctx)
+    url = bench.settings.elastic_url
+    if not url:
+        _die(
+            "no Elasticsearch configured. Set SKILLWEAVER_ELASTIC_URL (e.g. "
+            "http://127.0.0.1:9200) and index the data directory with "
+            "`uv run python scripts/index_elastic.py`."
+        )
+    wanted = [k_.strip() for k_ in kinds.split(",") if k_.strip()] if kinds else list(KINDS)
+    client = ElasticClient(url, bench.settings.elastic_api_key)
+    try:
+        hits, took_ms = search(client, query, kinds=wanted, domain=domain, k=k)
+    except ElasticError as exc:
+        _die(str(exc))
+    if as_json:
+        _emit(
+            {
+                "query": query,
+                "kinds": wanted,
+                "domain": domain,
+                "took_ms": round(took_ms, 1),
+                "hits": [
+                    {
+                        "kind": h.kind,
+                        "score": round(h.score, 3),
+                        "where": h.where(),
+                        "highlights": h.highlights,
+                        "doc": h.doc,
+                    }
+                    for h in hits
+                ],
+            },
+            True,
+        )
+        return
+    if not hits:
+        typer.echo(
+            f"nothing matched {query!r} in {', '.join(wanted)}"
+            + (f" for {domain}" if domain else "")
+            + f" ({took_ms:.0f} ms). Is the index built? scripts/index_elastic.py"
+        )
+        return
+    typer.echo(f"{len(hits)} result(s) in {took_ms:.0f} ms:")
+    for hit in hits:
+        where = hit.doc.get("domain", "")
+        typer.echo(f"  {hit.score:5.2f}  {hit.kind:<6} {hit.where():<34} {where}")
+        typer.echo(f"         {_fit(' '.join(hit.headline().split()), 110)}")
+        for field_name, fragments in list(hit.highlights.items())[:2]:
+            fragment = " ".join(fragments[0].split())
+            typer.echo(f"         {field_name}: {_fit(fragment, 100)}")
+
+
 @dashboard_app.command("build")
 def dashboard_build(
     ctx: typer.Context,
