@@ -20,13 +20,29 @@ worse than "I could not get it to run, here is where it stopped". The linter sti
 `perception/dom.py` and runs no detector and no OCR; `--policy jev`
 (`SKILLWEAVER_POLICY`) then lets TypeSafe's Jev choose each move through `llm/jev_.py`.
 Both default OFF and the pixel path is untouched. Actions stay POINT-based through the
-unchanged `BrowserController` - there is no second action plane - and the only thing the
-DOM path adds to that class is a read-only `evaluate`. Computer use is still pixels-only
-and no part of this reaches a desktop target. `BrowserGroundTruth` remains what it was:
+one `BrowserController` - there is no second action plane - and what the DOM path adds to
+that class is a read-only `evaluate` and, for `Back`, one `page.go_back`. Computer use is
+still pixels-only and no part of this reaches a desktop target. `BrowserGroundTruth` remains what it was:
 an offline teacher, reachable only from `_dom_of`, and NOT what the DOM perceiver uses.
 The two paths keep SEPARATE skill libraries, namespaced by domain in `perception_mode.py` -
 read that module before assuming a fingerprint would have caught the crossing, because it
 does not: `parts` come from the screenshot and the URL, which both paths share.
+
+Jev's action space has one operation this project added: `BACK`, the browser's own
+history, a `Back` in `contracts.py` that only a controller with a session history
+supports. It is OFFERED from `DomSnapshot.can_go_back`, which is the Navigation API's
+`canGoBack` and not `history.length` - length counts entries in both directions and would
+offer a back with nothing behind it - and WITHHELD again by `BACK_SIGNATURE` in
+`agent/jev_driver.py` once a back is on this screen's dead-end list, because a targetless
+move is the one `_without` cannot prune and the policy will otherwise re-pick it until the
+run gives up. A skill CANNOT replay a back and that is deliberate: `ActionSurface` has no
+`back()` any more than it has `navigate()`, and the sandbox namespace holds no action
+class, so a stored skill can never pop a history stack it did not build. Two measured
+facts to save a re-derivation: the operation head picks `BACK` only when the goal names
+returning (0.41-0.90 there, 0.00-0.04 when a forward route exists), so on an ordinary task
+it changes no step counts and is not meant to; and the criterion's WORDING moves that mass
+far more than anything else - naming "the browser's Back button" went from 0.01 to 0.85 on
+the same screen.
 
 The command line is the way to drive all of this: `uv run python -m skillweaver.cli --help`.
 There is no `skillweaver` console script - `pyproject.toml` has no `[project.scripts]`, and
