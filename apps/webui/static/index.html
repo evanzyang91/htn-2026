@@ -74,18 +74,18 @@
   button:disabled { opacity: .35; cursor: default; }
   .hint { text-align: center; color: var(--muted); font-size: 13px; margin-top: 16px; min-height: 1.2em; }
   .runs { margin: 26px auto 0; max-width: 720px; width: 100%; }
-  .run { padding: 10px 14px; border-top: 1px solid var(--pill-border); position: relative; overflow: hidden; }
+  .run { padding: 10px 14px; border-top: 1px solid var(--pill-border); position: relative; }
   /* A faint shine that glides along the bar above a live run, back and forth. */
   .run.busy::before {
     content: "";
     position: absolute;
     top: -1px; left: 0;
-    height: 1px; width: 32%;
+    height: 2px; width: 32%;
     background: linear-gradient(90deg, transparent, rgba(138, 180, 255, 0.55), transparent);
     animation: shine 2.6s ease-in-out infinite alternate;
     pointer-events: none;
   }
-  @keyframes shine { from { transform: translateX(-10%); } to { transform: translateX(240%); } }
+  @keyframes shine { from { transform: translateX(0); } to { transform: translateX(212%); } }
   .run .title { display: flex; gap: 10px; align-items: baseline; font-size: 14px; }
   .run .title .n { color: var(--muted); flex: none; }
   .run .title .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
