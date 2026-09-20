@@ -534,7 +534,7 @@ class DomPerceiver:
     def polls(self) -> int:
         """How many times an unchanged page was re-read while a mutation's effect was
         watched for (:data:`EFFECT_BUDGET_MS`). Page-script reads with no capture, so
-        they are in ``counters.detections`` and not in ``counters.captures``."""
+        they are in ``counters.dom_reads`` and not in ``counters.captures``."""
         return self._polls
 
     @property

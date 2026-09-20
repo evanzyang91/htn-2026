@@ -358,8 +358,10 @@ def speculation() -> None:
     check("a discarded speculation was still started", writer.calls == ["e1"])
     policy.close()
     check(
-        "a discarded speculation is still CHARGED once it returns",
-        policy.total_usage().calls == 2,
+        "a discarded speculation is still CHARGED once it returns, in tokens and not as a call",
+        policy.total_usage().calls == 1
+        and policy.total_usage().input_tokens == 110
+        and policy.discarded_calls() == 1,
         str(policy.total_usage()),
     )
     check("close() shuts the worker down", policy._workers is None)
