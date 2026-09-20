@@ -9,5 +9,6 @@
   {"kind": "click",
    "find": "Remove", "via": "dom",
    "until_seen": "Sign in to see your saved items",
-   "max_rounds": 12}
+   "max_rounds": 12},
+  {"kind": "navigate", "url": "https://www.walmart.com/cart"}
 ]

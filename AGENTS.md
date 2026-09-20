@@ -404,6 +404,22 @@ longer verifier over the same chrome words, so `_A_VERIFIER_MUST_BE_ABLE_TO_FAIL
 that moved, a row carrying the parameter's own value, a changed URL - and say that `verify`
 sees only `ctx` and `result`, so a parameter reaches it by being RETURNED from `run`.
 
+On live walmart.com the HOMEPAGE cannot anchor a skill's precondition and the empty cart
+page can, both measured 2026-09-19 through the DOM perceiver: a homepage observed right
+after `_settle` still shows the previous page (0.045 to a settled reference), is a 36-part
+skeleton at 1s (0.181), and only reaches 0.48 from 2s on, so the admission gate rejected
+two genuinely successful cold runs at stage `precondition` (0.24, 0.10); signed-out
+`/cart` scores 1.000 at every delay from 0s. A `--reset-steps` recipe therefore owns where
+the SCREEN ends as well as the world - `undo/walmart-empty-cart.json` ends on a fresh
+`/cart` for that reason. Two more facts from the same session: this machine geolocates to
+Canada, so walmart.com pins `fulfillment_method:Shipping` and store-fulfilled items
+(anything Great Value) return "We couldn't find a match" - pick a product that ships; and
+NO Walmart skill has been stored since, because one unusable model reply aborts a cold
+run: the text writer in `llm/jev_.py` returned nothing for the Search field twice running
+from a `/cart` start, the critic returned empty replies, and `_validate_choice` has no
+re-ask. Both caps are 512 tokens (`_MAX_TEXT_TOKENS`, the critic's `max_tokens`), which is
+the SUSPECT and was not proven. Settle that before budgeting a Walmart demo.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
